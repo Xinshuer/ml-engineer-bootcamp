@@ -1,0 +1,548 @@
+@@ day 10
+title: DiT + Flow Matching：文生图其实就是你写过的 Transformer
+part: 图像生成
+hours: 3–4 小时
+--- goal
+TODO: 一句话写今天学完能做什么。
+--- checklist
+- 先清空复习区
+- 读完知识卡片并改动运行
+- 练习区全部通过
+
+@@ item d10-01
+type: code
+title: patchify / unpatchify 往返
+level: 2
+targets: patchify, unpatchify
+ref: day8, day10
+--- context
+TODO
+--- prompt
+01  patchify：把图片切成 token
+--- starter
+def patchify(x, p):
+    """x: (B, C, H, W)，H 和 W 都能被 p 整除。
+    -> (B, N, p*p*C)，N = (H/p) * (W/p)，patch 按行优先排列。
+    每个 patch 内部的展平顺序: 先 C，再 ph，再 pw（即 reshape 后 permute 到 (B, nh, nw, C, ph, pw) 再 flatten）。
+    """
+    # --- TODO 01 ---
+    raise todo()
+
+def unpatchify(tok, p, H, W, C):
+    """patchify 的逆操作。"""
+    # --- TODO 01b ---
+    raise todo()
+--- solution
+def patchify(x, p):
+    B, C, H, W = x.shape
+    nh, nw = H // p, W // p
+    x = x.reshape(B, C, nh, p, nw, p)
+    x = x.permute(0, 2, 4, 1, 3, 5)            # (B, nh, nw, C, p, p)
+    return x.reshape(B, nh * nw, C * p * p)
+
+def unpatchify(tok, p, H, W, C):
+    B = tok.size(0)
+    nh, nw = H // p, W // p
+    x = tok.reshape(B, nh, nw, C, p, p).permute(0, 3, 1, 4, 2, 5)
+    return x.reshape(B, C, H, W)
+--- tests
+@check("patchify / unpatchify 往返")
+def t01():
+    x = torch.randn(2, 3, 8, 8)
+    tok = patchify(x, 2)
+    shape_is(tok, (2, 16, 12), "8/2=4, 4*4=16 个 patch，每个 2*2*3=12 维")
+    eq(unpatchify(tok, 2, 8, 8, 3), x, msg="往返必须完全还原")
+    # 256x256 的图用 patch=16 -> 256 个 token，正好是 DiT 的常用配置
+    shape_is(patchify(torch.randn(1, 4, 32, 32), 2), (1, 256, 16))
+--- hints
+- TODO
+
+@@ item d10-02
+type: code
+title: 二维位置编码
+level: 2
+targets: pos_embed_2d
+ref: day8, day10
+--- context
+TODO
+--- prompt
+02  二维正弦位置编码
+--- starter
+def pos_embed_2d(dim, h, w):
+    """返回 (h*w, dim)。做法: 高和宽各用 dim/2 维的一维正弦编码，然后拼起来。
+    一维部分用: freqs = 1 / 10000 ** (arange(0, d, 2) / d)，emb = cat([sin(pos*freqs), cos(pos*freqs)])
+    token 顺序行优先。
+    """
+    # --- TODO 02 ---
+    raise todo()
+--- solution
+def pos_embed_2d(dim, h, w):
+    half = dim // 2
+    row = _pe_1d(half, torch.arange(h))         # (h, half)
+    col = _pe_1d(half, torch.arange(w))         # (w, half)
+    r = row[:, None, :].expand(h, w, half)
+    c = col[None, :, :].expand(h, w, half)
+    return torch.cat([r, c], dim=-1).reshape(h * w, dim)
+--- tests
+@check("二维位置编码")
+def t02():
+    pe = pos_embed_2d(64, 4, 4)
+    shape_is(pe, (16, 64))
+    true(not torch.allclose(pe[0], pe[1]), "同一行相邻的两个 token 编码必须不同")
+    true(not torch.allclose(pe[0], pe[4]), "同一列相邻的两个 token 编码必须不同")
+    # 前一半只依赖行，后一半只依赖列
+    eq(pe[0, :32], pe[3, :32], msg="前一半应该只编码行坐标，token 0 和 3 同在第 0 行")
+    eq(pe[0, 32:], pe[12, 32:], msg="后一半应该只编码列坐标，token 0 和 12 同在第 0 列")
+--- hints
+- TODO
+
+@@ item d10-03
+type: code
+title: modulate
+level: 2
+targets: modulate
+ref: day8, day10
+--- context
+TODO
+--- prompt
+03  modulate：adaLN 的核心一行
+--- starter
+def modulate(x, shift, scale):
+    """x: (B, N, D)   shift/scale: (B, D)
+    返回 x * (1 + scale) + shift。注意 1+ 这个偏移，它让 scale=0 时是恒等。
+    """
+    # --- TODO 03 ---
+    raise todo()
+--- solution
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+--- tests
+@check("modulate")
+def t03():
+    x = torch.randn(2, 5, 8)
+    z = torch.zeros(2, 8)
+    eq(modulate(x, z, z), x, msg="shift=scale=0 时必须是恒等")
+    eq(modulate(x, torch.ones(2, 8), z), x + 1)
+    eq(modulate(x, z, torch.ones(2, 8)), x * 2)
+--- hints
+- TODO
+
+@@ item d10-04
+type: code
+title: adaLN-Zero 调制参数
+level: 2
+targets: AdaLNModulation
+ref: day8, day10
+--- context
+TODO
+--- prompt
+04  adaLN-Zero 的调制参数
+--- starter
+class AdaLNModulation(nn.Module):
+    """把条件向量 c (B, D) 变成 6 组调制参数:
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+    结构: SiLU -> Linear(D, 6D)，且这个 Linear 的**权重和 bias 都初始化为 0**
+    （这就是 "adaLN-Zero" 的 Zero：训练一开始整个 block 是恒等映射）
+    """
+
+    def __init__(self, dim):
+        super().__init__()
+        # --- TODO 04 ---
+        raise todo()
+--- solution
+class AdaLNModulation(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.act = nn.SiLU()
+        self.lin = nn.Linear(dim, 6 * dim)
+        nn.init.zeros_(self.lin.weight)      # Zero 的来历
+        nn.init.zeros_(self.lin.bias)
+
+    def forward(self, c):
+        return self.lin(self.act(c)).chunk(6, dim=-1)
+--- tests
+@check("adaLN-Zero 调制参数")
+def t04():
+    m = AdaLNModulation(16)
+    out = m(torch.randn(3, 16))
+    true(isinstance(out, (tuple, list)) and len(out) == 6, "应该返回 6 个张量")
+    for i, o in enumerate(out):
+        shape_is(o, (3, 16), f"第 {i} 个")
+    for o in out:
+        eq(o, torch.zeros(3, 16), msg="零初始化：一开始 6 个参数全应该是 0")
+--- hints
+- TODO
+
+@@ item d10-05
+type: code
+title: DiTBlock
+level: 2
+targets: DiTBlock
+ref: day8, day10
+--- context
+TODO
+--- prompt
+05  DiTBlock —— 把 Day 4 的 Block 换个条件注入方式
+--- starter
+class DiTBlock(nn.Module):
+    """结构:
+        s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp = modulation(c)
+        x = x + g_msa.unsqueeze(1) * attn(modulate(norm1(x), s_msa, sc_msa))
+        x = x + g_mlp.unsqueeze(1) * mlp( modulate(norm2(x), s_mlp, sc_mlp))
+    norm1/norm2 是 LayerNorm(dim, elementwise_affine=False)（缩放交给 adaLN 了）。
+    mlp: Linear(dim, 4dim) -> GELU -> Linear(4dim, dim)
+    对比 Day 4:  x = x + attn(ln1(x))  —— 多的只有 modulate 和 gate 两处。
+    """
+
+    def __init__(self, dim, n_head):
+        super().__init__()
+        # --- TODO 05 ---
+        raise todo()
+--- solution
+class DiTBlock(nn.Module):
+    def __init__(self, dim, n_head):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.attn = SelfAttention(dim, n_head)
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+        self.modulation = AdaLNModulation(dim)
+
+    def forward(self, x, c):
+        s1, sc1, g1, s2, sc2, g2 = self.modulation(c)
+        x = x + g1.unsqueeze(1) * self.attn(modulate(self.norm1(x), s1, sc1))
+        x = x + g2.unsqueeze(1) * self.mlp(modulate(self.norm2(x), s2, sc2))
+        return x
+--- tests
+@check("DiTBlock")
+def t05():
+    seed(0)
+    b = DiTBlock(32, 4)
+    x, c = torch.randn(2, 9, 32), torch.randn(2, 32)
+    shape_is(b(x, c), (2, 9, 32))
+    eq(b(x, c), x, tol=1e-5,
+       msg="零初始化的 gate 让整个 block 一开始就是恒等映射。不相等说明 gate 没接上，"
+           "或者 modulation 的 Linear 没有零初始化")
+    # 训练起来之后（人为给 gate 一个非零值）就不再是恒等了
+    with torch.no_grad():
+        for p in b.modulation.parameters():
+            p.normal_(0, 0.3)
+    true(not torch.allclose(b(x, c), x, atol=1e-4), "gate 非零后应该真的改变 x")
+--- hints
+- TODO
+
+@@ item d10-06
+type: code
+title: Rectified Flow 插值与目标
+level: 2
+targets: flow_interpolate, flow_target
+ref: day8, day10
+--- context
+TODO
+--- prompt
+06  Rectified Flow：训练数据的构造
+--- starter
+def flow_interpolate(x0_noise, x1_data, t):
+    """x_t = (1 - t) * noise + t * data
+    x0_noise / x1_data: (B, C, H, W)   t: (B,) 取值 [0, 1] 的浮点。
+    """
+    # --- TODO 06 ---
+    raise todo()
+
+def flow_target(x0_noise, x1_data):
+    """速度场的目标: v = data - noise（这是一条直线，从噪声直接指向数据）。"""
+    # --- TODO 06b ---
+    raise todo()
+--- solution
+def flow_interpolate(x0_noise, x1_data, t):
+    tt = t.reshape(-1, *([1] * (x0_noise.dim() - 1)))
+    return (1 - tt) * x0_noise + tt * x1_data
+
+def flow_target(x0_noise, x1_data):
+    return x1_data - x0_noise
+--- tests
+@check("Rectified Flow 插值与目标")
+def t06():
+    n, d = torch.randn(4, 1, 4, 4), torch.randn(4, 1, 4, 4)
+    eq(flow_interpolate(n, d, torch.zeros(4)), n, msg="t=0 应该是纯噪声")
+    eq(flow_interpolate(n, d, torch.ones(4)), d, msg="t=1 应该是干净数据")
+    eq(flow_interpolate(n, d, torch.full((4,), 0.5)), (n + d) / 2)
+    eq(flow_target(n, d), d - n)
+    # 关键性质: 沿 t 求导恒等于目标速度
+    t1, t2 = torch.full((4,), 0.3), torch.full((4,), 0.3001)
+    num = (flow_interpolate(n, d, t2) - flow_interpolate(n, d, t1)) / 0.0001
+    eq(num, flow_target(n, d), tol=1e-2, msg="x_t 对 t 的导数应该正好是目标速度")
+--- hints
+- TODO
+
+@@ item d10-07
+type: code
+title: Flow 训练目标
+level: 2
+targets: flow_loss
+ref: day8, day10
+--- context
+TODO
+--- prompt
+07  Flow 的训练目标：5 行
+--- starter
+def flow_loss(model, x1_data):
+    """1) t ~ U(0,1)，每个样本一个
+       2) noise ~ N(0, I)
+       3) x_t = 插值
+       4) 返回 mse(model(x_t, t), data - noise)
+    model(x, t) -> 和 x 同形状。
+    """
+    # --- TODO 07 ---
+    raise todo()
+--- solution
+def flow_loss(model, x1_data):
+    B = x1_data.size(0)
+    t = torch.rand(B, device=x1_data.device)
+    noise = torch.randn_like(x1_data)
+    xt = flow_interpolate(noise, x1_data, t)
+    return F.mse_loss(model(xt, t), flow_target(noise, x1_data))
+--- tests
+@check("Flow 训练目标")
+def t07():
+    seed(1)
+
+    class Zero(nn.Module):
+        def forward(self, x, t):
+            return torch.zeros_like(x)
+
+    # data 也是标准正态时，v = data - noise 的方差是 2
+    l = flow_loss(Zero(), torch.randn(4096, 1, 4, 4))
+    true(abs(l.item() - 2.0) < 0.15,
+         f"永远输出 0 的模型，loss 应该 ≈ Var(data - noise) = 2，实际 {l.item():.3f}")
+    true(l.dim() == 0)
+--- hints
+- TODO
+
+@@ item d10-08
+type: code
+title: 欧拉采样
+level: 2
+targets: flow_sample
+ref: day8, day10
+--- context
+TODO
+--- prompt
+08  欧拉采样
+--- starter
+@torch.no_grad()
+def flow_sample(model, shape, steps=20, device="cpu"):
+    """从 t=0 的纯噪声出发，用欧拉法积分到 t=1:
+        dt = 1 / steps
+        for i in range(steps):  t = i * dt;  x = x + model(x, t_batch) * dt
+    返回最终的 x。
+    """
+    # --- TODO 08 ---
+    raise todo()
+--- solution
+@torch.no_grad()
+def flow_sample(model, shape, steps=20, device="cpu"):
+    x = torch.randn(shape, device=device)
+    dt = 1.0 / steps
+    for i in range(steps):
+        t = torch.full((shape[0],), i * dt, device=device)
+        x = x + model(x, t) * dt
+    return x
+--- tests
+@check("欧拉采样")
+def t08():
+    class ConstV(nn.Module):
+        """速度场恒等于 5：从 x 出发积分 1 个单位时间，结果必须是 x + 5，
+        而且和步数无关（这是检验积分写对没有的最好办法）。"""
+        def forward(self, x, t):
+            return torch.full_like(x, 5.0)
+
+    m = ConstV()
+    torch.manual_seed(0)
+    a = flow_sample(m, (2, 1, 3, 3), steps=4)
+    torch.manual_seed(0)
+    b = flow_sample(m, (2, 1, 3, 3), steps=100)
+    eq(a, b, tol=1e-4, msg="常速度场下，结果不该随步数变化 —— 你的 dt 算错了")
+    torch.manual_seed(0)
+    x0 = torch.randn(2, 1, 3, 3)
+    eq(a, x0 + 5.0, tol=1e-4, msg="积分了 1 个单位时间，位移应该正好是速度 × 1")
+--- hints
+- TODO
+
+@@ item d10-09
+type: code
+title: 代码量对比（自评）
+level: 2
+targets: LOC
+ref: day8, day10
+--- context
+TODO
+--- prompt
+09  Flow 和 DDPM 的代码量对比（自评）
+数一下你写的行数（不含空行和注释）:
+--- starter
+LOC = {
+    "DDPM 的 q_sample + p_sample_step": None,
+    "Flow 的 flow_interpolate + 欧拉一步": None,
+}
+--- solution
+LOC = {
+    "DDPM 的 q_sample + p_sample_step": 9,
+    "Flow 的 flow_interpolate + 欧拉一步": 3,
+}
+--- tests
+@check("代码量对比（自评）")
+def t09():
+    true(all(v is not None for v in LOC.values()), "还没填。数完再填，这一题是让你有个体感")
+    true(LOC["Flow 的 flow_interpolate + 欧拉一步"] < LOC["DDPM 的 q_sample + p_sample_step"],
+         "Flow 那边应该明显更短 —— 这就是它现在成为主流的一大原因")
+--- hints
+- TODO
+
+@@ item d10-10
+type: code
+title: MiniDiT 前向
+level: 2
+targets: MiniDiT
+ref: day8, day10
+--- context
+TODO
+--- prompt
+10  完整的 mini DiT
+--- starter
+class MiniDiT(nn.Module):
+    """结构:
+        x -> patchify(p) -> Linear(p*p*C, dim) -> + pos_embed_2d
+        c = t_embed(t) + (可选的 class 嵌入)     这里只做 t
+        n_layer 个 DiTBlock(x, c)
+        LayerNorm(no affine) -> modulate(最后一组 shift/scale) -> Linear(dim, p*p*C) -> unpatchify
+    forward(x, t) -> 和 x 同形状
+    t_embed: 复用 Day 8 的 timestep_embedding(t, dim) 再过一个两层 MLP。
+    最后那个 Linear(dim, p*p*C) 和输出侧的 modulate 层都要**零初始化**（DiT 论文的做法：
+    训练开始时整个网络输出恒为 0，梯度从一个干净的起点长出来）。
+    """
+
+    def __init__(self, in_ch=4, img=8, patch=2, dim=64, n_layer=2, n_head=4):
+        super().__init__()
+        # --- TODO 10 ---
+        raise todo()
+--- solution
+class MiniDiT(nn.Module):
+    def __init__(self, in_ch=4, img=8, patch=2, dim=64, n_layer=2, n_head=4):
+        super().__init__()
+        self.in_ch, self.img, self.patch, self.dim = in_ch, img, patch, dim
+        pdim = patch * patch * in_ch
+        self.embed = nn.Linear(pdim, dim)
+        n = (img // patch) ** 2
+        self.register_buffer("pos", pos_embed_2d(dim, img // patch, img // patch))
+        self.t_mlp = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
+        self.blocks = nn.ModuleList([DiTBlock(dim, n_head) for _ in range(n_layer)])
+        self.norm_out = nn.LayerNorm(dim, elementwise_affine=False)
+        self.mod_out = nn.Linear(dim, 2 * dim)
+        nn.init.zeros_(self.mod_out.weight)
+        nn.init.zeros_(self.mod_out.bias)
+        self.head = nn.Linear(dim, pdim)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, x, t):
+        h = self.embed(patchify(x, self.patch)) + self.pos
+        c = self.t_mlp(timestep_embedding(t, self.dim))
+        for b in self.blocks:
+            h = b(h, c)
+        shift, scale = self.mod_out(F.silu(c)).chunk(2, dim=-1)
+        h = self.head(modulate(self.norm_out(h), shift, scale))
+        return unpatchify(h, self.patch, self.img, self.img, self.in_ch)
+--- tests
+@check("MiniDiT 前向")
+def t10():
+    seed(2)
+    m = MiniDiT(in_ch=4, img=8, patch=2, dim=64, n_layer=2)
+    x = torch.randn(2, 4, 8, 8)
+    t = torch.rand(2)
+    shape_is(m(x, t), (2, 4, 8, 8))
+    eq(m(x, t), torch.zeros(2, 4, 8, 8),
+       msg="零初始化的输出层让训练前的输出恒为 0 —— 这是对的，不是 bug")
+    # 给所有参数加一点扰动，模拟"训练了几步之后"，再检查时间条件有没有真的接进去
+    with torch.no_grad():
+        for p in m.parameters():
+            p.add_(torch.randn_like(p) * 0.1)
+    o1, o2 = m(x, torch.zeros(2)), m(x, torch.ones(2))
+    true(not torch.allclose(o1, o2, atol=1e-5), "换了 t 输出没变 —— 时间条件没接上")
+--- hints
+- TODO
+
+@@ item d10-11
+type: self
+title: 复用检验（自评）
+level: 1
+--- context
+TODO
+--- prompt
+11  复用检验：DiT 里的 attention 和 Day 4 的是不是同一段代码
+打开 drills/day04.py 里你写的 CausalSelfAttention，和本文件顶部给出的 SelfAttention 对比。
+确认两段代码的差别只有: (a) is_causal / mask，(b) 没有 block_size buffer。
+确认之后把下面改成 True。
+--- checklist
+- TODO: 从 prompt 里的 [ ] 清单搬过来
+
+@@ item d10-12
+type: fix
+title: 找 bug: DiTBlockBuggy
+level: 2
+targets: DiTBlockBuggy
+ref: day8, day10
+--- context
+TODO
+--- prompt
+12  找 bug —— 这个 DiTBlock 有 4 处错
+--- starter
+class DiTBlockBuggy(nn.Module):
+    def __init__(self, dim, n_head):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.attn = SelfAttention(dim, n_head)
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+        nn.init.normal_(self.modulation[1].weight, std=0.02)
+
+    def forward(self, x, c):
+        s1, sc1, g1, s2, sc2, g2 = self.modulation(c).chunk(6, dim=-1)
+        x = x + self.attn(self.norm1(x) * sc1.unsqueeze(1) + s1.unsqueeze(1))
+        x = x + g2.unsqueeze(1) * self.mlp(self.norm2(x) * (1 + sc2.unsqueeze(1)) + s2.unsqueeze(1))
+        return x
+--- solution
+class DiTBlockBuggy(nn.Module):
+    def __init__(self, dim, n_head):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)   # 修 4
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)   # 修 4
+        self.attn = SelfAttention(dim, n_head)
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+        nn.init.zeros_(self.modulation[1].weight)                  # 修 1
+        nn.init.zeros_(self.modulation[1].bias)
+
+    def forward(self, x, c):
+        s1, sc1, g1, s2, sc2, g2 = self.modulation(c).chunk(6, dim=-1)
+        # 修 2: 补上 gate；修 3: scale 要写成 (1 + scale)
+        x = x + g1.unsqueeze(1) * self.attn(
+            self.norm1(x) * (1 + sc1.unsqueeze(1)) + s1.unsqueeze(1))
+        x = x + g2.unsqueeze(1) * self.mlp(
+            self.norm2(x) * (1 + sc2.unsqueeze(1)) + s2.unsqueeze(1))
+        return x
+--- tests
+@check("找 bug: DiTBlockBuggy")
+def t12():
+    seed(3)
+    b = DiTBlockBuggy(32, 4)
+    x, c = torch.randn(2, 9, 32), torch.randn(2, 32)
+    eq(b(x, c), x, tol=1e-5,
+       msg="其中三处: modulation 的 Linear 要零初始化；attn 那一路漏了 gate；"
+           "attn 那一路的 scale 要写成 (1 + scale)")
+    ln = [m for m in b.modules() if isinstance(m, nn.LayerNorm)]
+    true(all(m.elementwise_affine is False for m in ln),
+         "第四处: adaLN 已经负责缩放了，两个 LayerNorm 都应该 elementwise_affine=False")
+--- hints
+- TODO

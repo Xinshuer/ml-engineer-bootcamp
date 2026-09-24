@@ -1,0 +1,493 @@
+@@ day 1
+title: 只学写模型用得上的那 20% Python
+part: 地基
+hours: 3–4 小时
+--- goal
+TODO: 一句话写今天学完能做什么。
+--- checklist
+- 先清空复习区
+- 读完知识卡片并改动运行
+- 练习区全部通过
+
+@@ item d1-01
+type: code
+title: dataclass 当 config
+level: 2
+targets: TrainConfig
+ref: day1
+--- context
+TODO
+--- prompt
+01  dataclass 当 config —— 所有训练脚本的入口就长这样
+要求: 定义 TrainConfig，字段与默认值:
+  lr=3e-4(float)  batch_size=32(int)  n_layer=6(int)
+  device="cuda"(str)  betas=(0.9, 0.95)(tuple)
+  tags=[] (list，注意：可变默认值不能直接写 []，会报错，要用 field)
+再加一个方法 scaled_lr(self, k) 返回 self.lr * k
+--- starter
+@dataclass
+class TrainConfig:
+    lr: float = 3e-4
+--- solution
+@dataclass
+class TrainConfig:
+    lr: float = 3e-4
+    batch_size: int = 32
+    n_layer: int = 6
+    device: str = "cuda"
+    betas: tuple = (0.9, 0.95)
+    tags: list = field(default_factory=list)   # 可变默认值必须走 default_factory
+
+    def scaled_lr(self, k):
+        return self.lr * k
+--- tests
+@check("dataclass 当 config")
+def t01():
+    c = TrainConfig()
+    true(c.lr == 3e-4, "lr 默认值不对")
+    true(c.batch_size == 32 and c.n_layer == 6, "batch_size / n_layer 不对")
+    true(c.device == "cuda", "device 不对")
+    true(c.betas == (0.9, 0.95), "betas 不对")
+    a, b = TrainConfig(), TrainConfig()
+    a.tags.append("x")
+    true(b.tags == [], "两个实例共享了同一个 list —— 这就是必须用 field(default_factory=list) 的原因")
+    true(close(TrainConfig(lr=1e-3).scaled_lr(2), 2e-3), "scaled_lr 不对")
+--- hints
+- TODO
+
+@@ item d1-02
+type: code
+title: 切片: chunk
+level: 2
+targets: chunk
+ref: day1
+--- context
+TODO
+--- prompt
+02  切片 —— 把一个序列切成固定长度的块，最后不足的丢掉
+--- starter
+def chunk(seq, n):
+    """chunk([0,1,2,3,4,5,6], 3) -> [[0,1,2],[3,4,5]]   (7 号元素被丢掉)"""
+    # --- TODO 02 ---
+    for chunk in range(0, len(seq), n):
+        if chunk + n <= len(seq):
+            yield seq[chunk:chunk+n]
+    raise todo()
+--- solution
+def chunk(seq, n):
+    return [seq[i:i + n] for i in range(0, len(seq) - n + 1, n)]
+--- tests
+@check("切片: chunk")
+def t02():
+    true(chunk(list(range(7)), 3) == [[0, 1, 2], [3, 4, 5]])
+    true(chunk(list(range(6)), 3) == [[0, 1, 2], [3, 4, 5]])
+    true(chunk([], 3) == [])
+    true(chunk("abcdefg", 2) == ["ab", "cd", "ef"], "对字符串也要能用（切片是通用的）")
+--- hints
+- TODO
+
+@@ item d1-03
+type: code
+title: 下一 token 预测的 x / y 错位
+level: 2
+targets: make_xy
+ref: day1
+--- context
+TODO
+--- prompt
+03  下一 token 预测的数据长什么样 —— 纯 Python 版，明天用张量重写一遍
+--- starter
+def make_xy(data, i, block_size):
+    """从位置 i 取一个训练样本。
+    x = data[i : i+block_size]
+    y = x 右移一位（也就是每个位置的"下一个"）
+    返回 (x, y)，两个都是长度 block_size 的 list。
+    """
+    # --- TODO 03 ---
+    raise todo()
+--- solution
+def make_xy(data, i, block_size):
+    x = data[i:i + block_size]
+    y = data[i + 1:i + 1 + block_size]
+    return x, y
+--- tests
+@check("下一 token 预测的 x / y 错位")
+def t03():
+    d = list(range(20))
+    x, y = make_xy(d, 3, 5)
+    true(x == [3, 4, 5, 6, 7], f"x 不对: {x}")
+    true(y == [4, 5, 6, 7, 8], f"y 不对: {y}  —— y 是 x 右移一位，不是 x 本身")
+    true(len(x) == len(y) == 5)
+--- hints
+- TODO
+
+@@ item d1-04
+type: code
+title: dict 计数与排序
+level: 2
+targets: char_freq, top_k
+ref: day1
+--- context
+TODO
+--- prompt
+04  dict 计数 + 推导式
+--- starter
+def char_freq(text):
+    """统计每个字符出现次数，返回 dict。不许用 collections.Counter。"""
+    # --- TODO 04 ---
+    raise todo()
+
+def top_k(freq, k):
+    """按次数从高到低返回前 k 个 (字符, 次数)。次数相同时按字符升序。"""
+    # --- TODO 04b ---
+    raise todo()
+--- solution
+def char_freq(text):
+    f = {}
+    for ch in text:
+        f[ch] = f.get(ch, 0) + 1
+    return f
+
+def top_k(freq, k):
+    return sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[:k]
+--- tests
+@check("dict 计数与排序")
+def t04():
+    f = char_freq("abracadabra")
+    true(f == {"a": 5, "b": 2, "r": 2, "c": 1, "d": 1}, f"计数不对: {f}")
+    true(top_k(f, 3) == [("a", 5), ("b", 2), ("r", 2)], f"top_k 不对: {top_k(f, 3)}")
+--- hints
+- TODO
+
+@@ item d1-05
+type: code
+title: class: __init__ / __call__
+level: 2
+targets: RunningMean
+ref: day1
+--- context
+TODO
+--- prompt
+05  class 的最小集: __init__ / self / __call__
+--- starter
+class RunningMean:
+    """滑动统计器。用法:
+        m = RunningMean()
+        m(1.0); m(3.0)
+        m.value  -> 2.0
+        m.n      -> 2
+        m.reset(); m.value -> 0.0
+    """
+
+    # --- TODO 05 ---
+    def __init__(self):
+        raise todo()
+--- solution
+class RunningMean:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.total = 0.0
+        self.n = 0
+
+    def __call__(self, x):
+        self.total += float(x)
+        self.n += 1
+        return self.value
+
+    @property
+    def value(self):
+        return self.total / self.n if self.n else 0.0
+--- tests
+@check("class: __init__ / __call__")
+def t05():
+    m = RunningMean()
+    true(m.value == 0.0 and m.n == 0, "初始状态不对")
+    m(1.0)
+    m(3.0)
+    true(close(m.value, 2.0), f"均值不对: {m.value}")
+    true(m.n == 2)
+    m.reset()
+    true(m.value == 0.0 and m.n == 0, "reset 不对")
+--- hints
+- TODO
+
+@@ item d1-06
+type: code
+title: 继承与 super()
+level: 2
+targets: EMAMean
+ref: day1
+--- context
+TODO
+--- prompt
+06  继承 + super()  —— nn.Module 全靠这个
+--- starter
+class EMAMean(RunningMean):
+    """指数滑动平均。__init__(self, decay=0.9) 里必须调 super().__init__()。
+    调用时: value = decay * value + (1 - decay) * x   （第一次直接等于 x）
+    n 的行为和父类一样，继续累加。
+    """
+
+    # --- TODO 06 ---
+    pass
+--- solution
+class EMAMean(RunningMean):
+    def __init__(self, decay=0.9):
+        super().__init__()
+        self.decay = decay
+        self._v = None
+
+    def __call__(self, x):
+        x = float(x)
+        self._v = x if self._v is None else self.decay * self._v + (1 - self.decay) * x
+        self.n += 1
+        return self._v
+
+    @property
+    def value(self):
+        return 0.0 if self._v is None else self._v
+
+    def reset(self):
+        super().reset()
+        self._v = None
+--- tests
+@check("继承与 super()")
+def t06():
+    e = EMAMean(decay=0.5)
+    true(hasattr(e, "n"), "忘了调 super().__init__()，父类的 n 没建出来")
+    e(1.0)
+    true(close(e.value, 1.0), "第一次应该直接等于 x")
+    e(3.0)
+    true(close(e.value, 2.0), f"EMA 不对: {e.value}")
+    true(e.n == 2, "n 应该由父类逻辑继续累加")
+--- hints
+- TODO
+
+@@ item d1-07
+type: code
+title: @property
+level: 2
+targets: Budget
+ref: day1
+--- context
+TODO
+--- prompt
+07  @property —— 只读的计算属性
+--- starter
+class Budget:
+    def __init__(self, total_steps, step=0):
+        self.total_steps = total_steps
+        self.step = step
+--- solution
+class Budget:
+    def __init__(self, total_steps, step=0):
+        self.total_steps = total_steps
+        self.step = step
+
+    @property
+    def progress(self):
+        return self.step / self.total_steps
+
+    @property
+    def done(self):
+        return self.step >= self.total_steps
+--- tests
+@check("@property")
+def t07():
+    b = Budget(100, 25)
+    true(close(b.progress, 0.25), "progress 不对（注意：是属性不是方法，不要写成 b.progress()）")
+    true(b.done is False)
+    b.step = 100
+    true(b.done is True)
+--- hints
+- TODO
+
+@@ item d1-08
+type: code
+title: *args / **kwargs 与装饰器
+level: 2
+targets: logged
+ref: day1
+--- context
+TODO
+--- prompt
+TODO
+--- starter
+def logged(fn):
+    """装饰器: 调用时把 (函数名, args, kwargs) 追加到 CALLS，然后原样调用并返回结果。
+    必须能装饰任意签名的函数。"""
+    # --- TODO 08 ---
+    raise todo()
+--- solution
+def logged(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        CALLS.append((fn.__name__, args, kwargs))
+        return fn(*args, **kwargs)
+    return wrapper
+--- tests
+@check("*args / **kwargs 与装饰器")
+def t08():
+    CALLS.clear()
+
+    @logged
+    def add(a, b, scale=1):
+        return (a + b) * scale
+
+    true(add(1, 2) == 3)
+    true(add(1, 2, scale=10) == 30)
+    true(CALLS == [("add", (1, 2), {}), ("add", (1, 2), {"scale": 10})], f"记录不对: {CALLS}")
+    true(add.__name__ == "add", "被装饰后函数名丢了 —— 用 @functools.wraps(fn)")
+--- hints
+- TODO
+
+@@ item d1-09
+type: code
+title: f-string 格式化
+level: 2
+targets: log_line
+ref: day1
+--- context
+TODO
+--- prompt
+09  f-string 格式化 —— 训练日志天天写
+--- starter
+def log_line(step, loss, lr, dt):
+    """输出形如:
+        step  1200 | loss 1.4832 | lr 3.00e-04 | 125.3ms
+    规则: step 右对齐宽度 5；loss 保留 4 位小数；lr 用科学计数 2 位小数；
+          dt 传入的是秒，要转成毫秒保留 1 位小数并加 'ms'。
+    """
+    # --- TODO 09 ---
+    raise todo()
+--- solution
+def log_line(step, loss, lr, dt):
+    return f"step {step:5d} | loss {loss:.4f} | lr {lr:.2e} | {dt * 1000:.1f}ms"
+--- tests
+@check("f-string 格式化")
+def t09():
+    got = log_line(1200, 1.48321, 3e-4, 0.12534)
+    want = "step  1200 | loss 1.4832 | lr 3.00e-04 | 125.3ms"
+    true(got == want, f"\n       你的: {got!r}\n       应为: {want!r}")
+--- hints
+- TODO
+
+@@ item d1-10
+type: code
+title: zip / enumerate
+level: 2
+targets: deltas, label_pairs
+ref: day1
+--- context
+TODO
+--- prompt
+10  zip / enumerate
+--- starter
+def deltas(xs):
+    """相邻差: [3, 5, 4] -> [2, -1]。用 zip，不要用索引。"""
+    # --- TODO 10 ---
+    raise todo()
+
+def label_pairs(names, values):
+    """[("a",1),("b",2)] 这种，但要带序号:
+    ["0:a=1", "1:b=2"]。names 和 values 等长。"""
+    # --- TODO 10b ---
+    raise todo()
+--- solution
+def deltas(xs):
+    return [b - a for a, b in zip(xs, xs[1:])]
+
+def label_pairs(names, values):
+    return [f"{i}:{n}={v}" for i, (n, v) in enumerate(zip(names, values))]
+--- tests
+@check("zip / enumerate")
+def t10():
+    true(deltas([3, 5, 4]) == [2, -1])
+    true(deltas([1]) == [])
+    true(label_pairs(["a", "b"], [1, 2]) == ["0:a=1", "1:b=2"])
+--- hints
+- TODO
+
+@@ item d1-11
+type: code
+title: pathlib 与目录创建
+level: 2
+targets: ckpt_path
+ref: day1
+--- context
+TODO
+--- prompt
+11  pathlib —— checkpoint 路径管理
+--- starter
+def ckpt_path(root, run_name, step):
+    """返回 Path 对象: root/run_name/ckpt_000500.pt   (step 补零到 6 位)
+    同时要保证 root/run_name 这个目录被创建出来（父目录不存在也要一起建）。"""
+    # --- TODO 11 ---
+    raise todo()
+--- solution
+def ckpt_path(root, run_name, step):
+    d = Path(root) / run_name
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"ckpt_{step:06d}.pt"
+--- tests
+@check("pathlib 与目录创建")
+def t11():
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        p = ckpt_path(tmp, "gpt-tiny", 500)
+        true(isinstance(p, Path), "要返回 Path 对象，不是 str")
+        true(p.name == "ckpt_000500.pt", f"文件名不对: {p.name}")
+        true(p.parent.is_dir(), "父目录没建出来（用 mkdir(parents=True, exist_ok=True)）")
+        true(p.parent.name == "gpt-tiny")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+--- hints
+- TODO
+
+@@ item d1-12
+type: fix
+title: 找 bug: bucket_by_len
+level: 2
+targets: bucket_by_len
+ref: day1
+--- context
+TODO
+--- prompt
+12  找 bug —— 下面这段有 3 个错误，修到测试过为止
+意图: 把一批样本按长度分桶，每桶最多 bucket_size 个，返回 {长度: [样本, ...]}
+      桶满了就丢弃后来的，不要报错。
+--- starter
+def bucket_by_len(samples, bucket_size=2, out={}):
+    for s in samples:
+        L = len(s)
+        out[L] = out.get(L, [])
+        out[L].append(s)
+        if len(out[L]) > bucket_size:
+            raise ValueError("bucket full")
+    return out
+--- solution
+def bucket_by_len(samples, bucket_size=2):
+    out = {}                       # 修 1: 可变默认值挪进函数体
+    for s in samples:
+        L = len(s)
+        out.setdefault(L, [])
+        if len(out[L]) >= bucket_size:
+            continue               # 修 2+3: 满了跳过，不 append 也不报错
+        out[L].append(s)
+    return out
+--- tests
+@check("找 bug: bucket_by_len")
+def t12():
+    got = bucket_by_len(["ab", "cd", "ef", "xyz"], bucket_size=2)
+    true(got == {2: ["ab", "cd"], 3: ["xyz"]}, f"结果不对: {got}")
+    # 陷阱 1: 默认参数如果写成可变对象会跨调用共享
+    got2 = bucket_by_len(["q"])
+    true(got2 == {1: ["q"]}, f"第二次调用被上一次污染了: {got2}")
+    # 陷阱 2: 满了之后应该跳过，而不是报错
+    got3 = bucket_by_len(["ab", "cd", "ef"], bucket_size=2)
+    true(got3 == {2: ["ab", "cd"]}, f"超出桶容量没被丢弃: {got3}")
+--- hints
+- TODO

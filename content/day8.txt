@@ -1,0 +1,608 @@
+@@ day 8
+title: DDPM 从零
+part: 图像生成
+hours: 3–4 小时
+--- goal
+TODO: 一句话写今天学完能做什么。
+--- checklist
+- 先清空复习区
+- 读完知识卡片并改动运行
+- 练习区全部通过
+
+@@ item d8-01
+type: code
+title: 线性 beta 调度
+level: 2
+targets: linear_schedule
+ref: day8
+--- context
+TODO
+--- prompt
+01  线性 beta 调度
+--- starter
+def linear_schedule(T, beta_start=1e-4, beta_end=0.02):
+    """返回 dict，至少包含:
+        betas          (T,)   在 [beta_start, beta_end] 上线性取 T 个点
+        alphas         (T,)   = 1 - betas
+        alphas_cumprod (T,)   = alphas 的累积乘积（论文里的 alpha_bar）
+    """
+    # --- TODO 01 ---
+    raise todo()
+--- solution
+def linear_schedule(T, beta_start=1e-4, beta_end=0.02):
+    betas = torch.linspace(beta_start, beta_end, T)
+    alphas = 1.0 - betas
+    return {"betas": betas, "alphas": alphas, "alphas_cumprod": alphas.cumprod(0)}
+--- tests
+@check("线性 beta 调度")
+def t01():
+    s = linear_schedule(1000)
+    shape_is(s["betas"], (1000,))
+    eq(s["betas"][0], torch.tensor(1e-4))
+    eq(s["betas"][-1], torch.tensor(0.02))
+    eq(s["alphas"], 1 - s["betas"])
+    eq(s["alphas_cumprod"][0], s["alphas"][0])
+    eq(s["alphas_cumprod"][4], s["alphas"][:5].prod())
+    ab = s["alphas_cumprod"]
+    true((ab[1:] < ab[:-1]).all(), "alpha_bar 必须单调递减")
+    true(ab[-1] < 0.01, f"最后一步 alpha_bar 应该接近 0（信号被噪声淹没），实际 {ab[-1]:.4f}")
+--- hints
+- TODO
+
+@@ item d8-02
+type: code
+title: cosine 调度
+level: 2
+targets: cosine_schedule
+ref: day8
+--- context
+TODO
+--- prompt
+02  cosine 调度 —— 改进版，低分辨率上明显更好
+--- starter
+def cosine_schedule(T, s=0.008):
+    """f(t) = cos((t/T + s) / (1 + s) * pi/2) ** 2,  t = 0..T
+    alphas_cumprod[i] = f(i+1) / f(0)
+    betas[i] = 1 - alphas_cumprod[i] / alphas_cumprod[i-1]，并 clip 到 [0, 0.999]
+    返回和第 1 题同样结构的 dict。
+    """
+    # --- TODO 02 ---
+    raise todo()
+--- solution
+def cosine_schedule(T, s=0.008):
+    t = torch.arange(T + 1, dtype=torch.float)
+    f = torch.cos((t / T + s) / (1 + s) * math.pi / 2) ** 2
+    ab = (f / f[0])[1:]
+    prev = torch.cat([torch.ones(1), ab[:-1]])
+    betas = (1 - ab / prev).clamp(0, 0.999)
+    return {"betas": betas, "alphas": 1 - betas, "alphas_cumprod": ab}
+--- tests
+@check("cosine 调度")
+def t02():
+    c = cosine_schedule(1000)
+    ab = c["alphas_cumprod"]
+    shape_is(ab, (1000,))
+    true(ab[0] > 0.999, f"第一步几乎不加噪, alpha_bar[0]={ab[0]:.5f}")
+    true(ab[-1] < 0.01)
+    true((ab[1:] <= ab[:-1]).all(), "必须单调不增")
+    true((c["betas"] >= 0).all() and (c["betas"] <= 0.999).all(), "betas 要 clip 到 [0, 0.999]")
+    # cosine 的特点: 中段掉得比 linear 慢
+    lin = linear_schedule(1000)["alphas_cumprod"]
+    true(ab[500] > lin[500], "cosine 在中段应该保留更多信号，这就是它更好的原因")
+--- hints
+- TODO
+
+@@ item d8-03
+type: code
+title: extract 广播工具
+level: 2
+targets: extract
+ref: day8
+--- context
+TODO
+--- prompt
+03  extract —— 扩散代码里出现频率最高的小工具
+--- starter
+def extract(arr, t, x_shape):
+    """arr: (T,) 的系数表；t: (B,) int64 的时间步；x_shape: 目标张量形状如 (B,C,H,W)。
+    返回 (B, 1, 1, 1) 这样能和 x 广播的张量。
+    """
+    # --- TODO 03 ---
+    raise todo()
+--- solution
+def extract(arr, t, x_shape):
+    out = arr.to(t.device).gather(0, t)
+    return out.reshape(t.shape[0], *([1] * (len(x_shape) - 1)))
+--- tests
+@check("extract 广播工具")
+def t03():
+    arr = torch.arange(10).float()
+    t = torch.tensor([3, 7])
+    o = extract(arr, t, (2, 3, 4, 4))
+    shape_is(o, (2, 1, 1, 1))
+    eq(o.flatten(), torch.tensor([3.0, 7.0]))
+    o2 = extract(arr, t, (2, 5))
+    shape_is(o2, (2, 1), "二维输入时应该是 (B, 1)")
+    true((o * torch.ones(2, 3, 4, 4)).shape == (2, 3, 4, 4), "要能和 x 广播")
+--- hints
+- TODO
+
+@@ item d8-04
+type: code
+title: q_sample 闭式
+level: 2
+targets: q_sample
+ref: day8
+# merged checks: t05 闭式 == 逐步加噪
+--- context
+TODO
+--- prompt
+04  q_sample：一步跳到任意时刻 t
+--- starter
+def q_sample(x0, t, noise, sched):
+    """x_t = sqrt(alpha_bar_t) * x0 + sqrt(1 - alpha_bar_t) * noise
+    x0/noise: (B,C,H,W)；t: (B,)。
+    """
+    # --- TODO 04 ---
+    raise todo()
+--- solution
+def q_sample(x0, t, noise, sched):
+    ab = extract(sched["alphas_cumprod"], t, x0.shape)
+    return ab.sqrt() * x0 + (1 - ab).sqrt() * noise
+--- tests
+@check("q_sample 闭式")
+def t04():
+    seed(0)
+    s = linear_schedule(1000)
+    x0 = torch.randn(4, 3, 8, 8)
+    n = torch.randn_like(x0)
+    t0 = torch.zeros(4, dtype=torch.long)
+    xt = q_sample(x0, t0, n, s)
+    true((xt - x0).abs().mean() < 0.02, "t=0 时几乎还是原图")
+    tT = torch.full((4,), 999, dtype=torch.long)
+    xT = q_sample(x0, tT, n, s)
+    true((xT - n).abs().mean() < 0.1, "t=T 时几乎就是纯噪声")
+    # 不同样本可以有不同的 t
+    tm = torch.tensor([0, 500, 999, 250])
+    shape_is(q_sample(x0, tm, n, s), x0.shape)
+
+@check("闭式 == 逐步加噪")
+def t05():
+    seed(1)
+    T = 200
+    s = linear_schedule(T, 1e-4, 0.05)
+    N = 20000
+    x0 = torch.full((N, 1), 2.0)                 # 固定信号，方便看统计量
+    step = 60
+
+    # 逐步: x_t = sqrt(1-beta_t) * x_{t-1} + sqrt(beta_t) * eps
+    x = x0.clone()
+    for i in range(step + 1):
+        b = s["betas"][i]
+        x = (1 - b).sqrt() * x + b.sqrt() * torch.randn_like(x)
+
+    ab = s["alphas_cumprod"][step]
+    want_mean = (ab.sqrt() * 2.0).item()
+    want_std = (1 - ab).sqrt().item()
+    true(abs(x.mean().item() - want_mean) < 0.02,
+         f"逐步加噪的均值 {x.mean().item():.4f} 应该 ≈ sqrt(alpha_bar)*x0 = {want_mean:.4f}")
+    true(abs(x.std().item() - want_std) < 0.02,
+         f"逐步加噪的 std {x.std().item():.4f} 应该 ≈ sqrt(1-alpha_bar) = {want_std:.4f}")
+
+    # 你的 q_sample 必须给出同样的统计量
+    xt = q_sample(x0, torch.full((N,), step, dtype=torch.long), torch.randn(N, 1), s)
+    true(abs(xt.mean().item() - want_mean) < 0.02, "q_sample 的均值和逐步加噪对不上")
+    true(abs(xt.std().item() - want_std) < 0.02, "q_sample 的方差和逐步加噪对不上")
+--- hints
+- TODO
+
+@@ item d8-05
+type: code
+title: 正弦时间嵌入
+level: 2
+targets: timestep_embedding
+ref: day8
+--- context
+TODO
+--- prompt
+06  正弦时间嵌入
+--- starter
+def timestep_embedding(t, dim, max_period=10000):
+    """t: (B,) 整数时间步  ->  (B, dim)
+    half = dim // 2
+    freqs = exp(-log(max_period) * arange(half) / half)
+    args  = t[:, None] * freqs[None]
+    返回 cat([cos(args), sin(args)], dim=-1)   （先 cos 后 sin）
+
+    注意: arange 要写 device=t.device。不写在 CPU 上测不出问题，
+    一搬到 GPU 就报 "Expected all tensors to be on the same device"。
+    """
+    # --- TODO 06 ---
+    raise todo()
+--- solution
+def timestep_embedding(t, dim, max_period=10000):
+    half = dim // 2
+    # device 必须跟着 t 走，否则模型搬到 GPU 之后这里会报 "two devices" —— 
+    # 这类 bug 在 CPU 上永远测不出来
+    freqs = torch.exp(-math.log(max_period)
+                      * torch.arange(half, dtype=torch.float, device=t.device) / half)
+    args = t.float()[:, None] * freqs[None]
+    return torch.cat([args.cos(), args.sin()], dim=-1)
+--- tests
+@check("正弦时间嵌入")
+def t06():
+    e = timestep_embedding(torch.tensor([0, 1, 100]), 64)
+    shape_is(e, (3, 64))
+    eq(e[0, :32], torch.ones(32), msg="t=0 时 cos 部分应该全 1")
+    eq(e[0, 32:], torch.zeros(32), msg="t=0 时 sin 部分应该全 0")
+    true(not torch.allclose(e[1], e[2]), "不同 t 必须给出不同嵌入")
+    # 低频维度对 t 的变化不敏感
+    true((e[1, 31] - e[2, 31]).abs() < (e[1, 0] - e[2, 0]).abs(), "高维应该是低频")
+--- hints
+- TODO
+
+@@ item d8-06
+type: code
+title: FiLM 条件注入
+level: 2
+targets: FiLM
+ref: day8
+--- context
+TODO
+--- prompt
+07  FiLM：把时间信息注入卷积特征
+--- starter
+class FiLM(nn.Module):
+    """把 (B, t_dim) 的时间嵌入变成每个通道的 scale 和 shift:
+        emb -> SiLU -> Linear(t_dim, 2*ch) -> 拆成 scale, shift
+        h = h * (1 + scale) + shift        （注意是 1+scale，让初始接近恒等）
+    forward(h, emb): h 是 (B, ch, H, W)
+    """
+
+    def __init__(self, t_dim, ch):
+        super().__init__()
+        # --- TODO 07 ---
+        raise todo()
+--- solution
+class FiLM(nn.Module):
+    def __init__(self, t_dim, ch):
+        super().__init__()
+        self.proj = nn.Linear(t_dim, 2 * ch)
+
+    def forward(self, h, emb):
+        scale, shift = self.proj(F.silu(emb))[:, :, None, None].chunk(2, dim=1)
+        return h * (1 + scale) + shift
+--- tests
+@check("FiLM 条件注入")
+def t07():
+    m = FiLM(16, 8)
+    h = torch.randn(2, 8, 4, 4)
+    emb = torch.randn(2, 16)
+    shape_is(m(h, emb), (2, 8, 4, 4))
+    with torch.no_grad():                    # Linear 权重清零 -> scale=shift=0 -> 恒等
+        for p in m.parameters():
+            p.zero_()
+    eq(m(h, emb), h, msg="scale/shift 为 0 时应该是恒等映射（这就是要写 1+scale 的原因）")
+--- hints
+- TODO
+
+@@ item d8-07
+type: code
+title: ResBlock
+level: 2
+targets: ResBlock
+ref: day8
+--- context
+TODO
+--- prompt
+08  ResBlock
+--- starter
+class ResBlock(nn.Module):
+    """结构:
+        h = Conv3x3(GroupNorm(8, in) -> SiLU -> x)
+        h = FiLM(h, emb)
+        h = Conv3x3(GroupNorm(8, out) -> SiLU -> h)
+        return h + skip(x)      # in != out 时 skip 是 1x1 卷积，否则恒等
+    """
+
+    def __init__(self, in_ch, out_ch, t_dim):
+        super().__init__()
+        # --- TODO 08 ---
+        raise todo()
+--- solution
+class ResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, t_dim):
+        super().__init__()
+        self.n1 = nn.GroupNorm(8, in_ch)
+        self.c1 = nn.Conv2d(in_ch, out_ch, 3, 1, 1)
+        self.film = FiLM(t_dim, out_ch)
+        self.n2 = nn.GroupNorm(8, out_ch)
+        self.c2 = nn.Conv2d(out_ch, out_ch, 3, 1, 1)
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x, emb):
+        h = self.c1(F.silu(self.n1(x)))
+        h = self.film(h, emb)
+        h = self.c2(F.silu(self.n2(h)))
+        return h + self.skip(x)
+--- tests
+@check("ResBlock")
+def t08():
+    m = ResBlock(8, 8, 16)
+    shape_is(m(torch.randn(2, 8, 16, 16), torch.randn(2, 16)), (2, 8, 16, 16))
+    m2 = ResBlock(8, 16, 16)
+    shape_is(m2(torch.randn(2, 8, 16, 16), torch.randn(2, 16)), (2, 16, 16, 16))
+    true(any(isinstance(mm, nn.Conv2d) and mm.kernel_size == (1, 1) for mm in m2.modules()),
+         "通道数变了，skip 分支需要一个 1x1 卷积")
+--- hints
+- TODO
+
+@@ item d8-08
+type: code
+title: skip 拼接
+level: 2
+targets: unet_skip_concat
+ref: day8
+--- context
+TODO
+--- prompt
+09  下采样 / 上采样 / skip 拼接
+--- starter
+def unet_skip_concat(up_feat, skip_feat):
+    """UNet 解码侧的标准操作: 沿通道维拼接。
+    up_feat: (B, C1, H, W)   skip_feat: (B, C2, H, W)  ->  (B, C1+C2, H, W)
+    如果空间尺寸差 1（奇数尺寸下采样后常见），先把 up_feat 用 F.pad 补齐。
+    """
+    # --- TODO 09 ---
+    raise todo()
+--- solution
+def unet_skip_concat(up_feat, skip_feat):
+    dh = skip_feat.size(-2) - up_feat.size(-2)
+    dw = skip_feat.size(-1) - up_feat.size(-1)
+    if dh or dw:
+        up_feat = F.pad(up_feat, (0, dw, 0, dh))
+    return torch.cat([up_feat, skip_feat], dim=1)
+--- tests
+@check("skip 拼接")
+def t09():
+    a, b = torch.randn(2, 8, 16, 16), torch.randn(2, 4, 16, 16)
+    shape_is(unet_skip_concat(a, b), (2, 12, 16, 16))
+    # 尺寸不齐的情况
+    a2 = torch.randn(2, 8, 7, 7)
+    b2 = torch.randn(2, 4, 8, 8)
+    shape_is(unet_skip_concat(a2, b2), (2, 12, 8, 8), "尺寸对不齐时要先 pad")
+--- hints
+- TODO
+
+@@ item d8-09
+type: code
+title: MiniUNet 前向
+level: 2
+targets: MiniUNet
+ref: day8
+--- context
+TODO
+--- prompt
+10  一个能跑的 mini UNet
+--- starter
+class MiniUNet(nn.Module):
+    """结构（32x32 输入）:
+        t_mlp:  timestep_embedding(t, 64) -> Linear(64,128) -> SiLU -> Linear(128,128)
+        stem:   Conv3x3(in_ch -> 32)
+        down1:  ResBlock(32, 32)  存 skip  -> Conv stride2 到 16x16
+        down2:  ResBlock(32, 64)  存 skip  -> Conv stride2 到 8x8
+        mid:    ResBlock(64, 64)
+        up2:    Upsample -> concat(skip2) -> ResBlock(64+64, 32)
+        up1:    Upsample -> concat(skip1) -> ResBlock(32+32, 32)
+        out:    GroupNorm -> SiLU -> Conv3x3(32 -> in_ch)
+    forward(x, t) -> 和 x 同形状（预测的噪声）
+    """
+
+    def __init__(self, in_ch=1, t_dim=128):
+        super().__init__()
+        # --- TODO 10 ---
+        raise todo()
+--- solution
+class MiniUNet(nn.Module):
+    def __init__(self, in_ch=1, t_dim=128):
+        super().__init__()
+        self.t_dim = t_dim
+        self.t_mlp = nn.Sequential(nn.Linear(64, t_dim), nn.SiLU(), nn.Linear(t_dim, t_dim))
+        self.stem = nn.Conv2d(in_ch, 32, 3, 1, 1)
+        self.rb1 = ResBlock(32, 32, t_dim)
+        self.ds1 = nn.Conv2d(32, 32, 4, 2, 1)
+        self.rb2 = ResBlock(32, 64, t_dim)
+        self.ds2 = nn.Conv2d(64, 64, 4, 2, 1)
+        self.mid = ResBlock(64, 64, t_dim)
+        self.up = nn.Upsample(scale_factor=2, mode="nearest")
+        self.rb3 = ResBlock(64 + 64, 32, t_dim)
+        self.rb4 = ResBlock(32 + 32, 32, t_dim)
+        self.out = nn.Sequential(nn.GroupNorm(8, 32), nn.SiLU(), nn.Conv2d(32, in_ch, 3, 1, 1))
+
+    def forward(self, x, t):
+        emb = self.t_mlp(timestep_embedding(t, 64))
+        h = self.stem(x)
+        s1 = self.rb1(h, emb)
+        h = self.ds1(s1)
+        s2 = self.rb2(h, emb)
+        h = self.ds2(s2)
+        h = self.mid(h, emb)
+        h = self.rb3(unet_skip_concat(self.up(h), s2), emb)
+        h = self.rb4(unet_skip_concat(self.up(h), s1), emb)
+        return self.out(h)
+--- tests
+@check("MiniUNet 前向")
+def t10():
+    m = MiniUNet(1)
+    x = torch.randn(2, 1, 32, 32)
+    t = torch.randint(0, 1000, (2,))
+    shape_is(m(x, t), (2, 1, 32, 32), "UNet 的输出必须和输入同形状（它预测的是噪声）")
+    # 不同的 t 必须给出不同的输出，否则时间条件根本没接上
+    o1 = m(x, torch.zeros(2, dtype=torch.long))
+    o2 = m(x, torch.full((2,), 999, dtype=torch.long))
+    true(not torch.allclose(o1, o2, atol=1e-4), "换了时间步输出没变 —— 时间嵌入没接进网络")
+--- hints
+- TODO
+
+@@ item d8-10
+type: code
+title: DDPM 训练目标
+level: 2
+targets: ddpm_loss
+ref: day8
+--- context
+TODO
+--- prompt
+11  训练目标：就一行
+--- starter
+def ddpm_loss(model, x0, sched, T):
+    """1) 每个样本随机采一个 t ~ U[0, T)
+       2) 采噪声 noise ~ N(0, I)
+       3) x_t = q_sample(x0, t, noise)
+       4) 返回 mse(model(x_t, t), noise)
+    """
+    # --- TODO 11 ---
+    raise todo()
+--- solution
+def ddpm_loss(model, x0, sched, T):
+    t = torch.randint(0, T, (x0.size(0),), device=x0.device)
+    noise = torch.randn_like(x0)
+    xt = q_sample(x0, t, noise, sched)
+    return F.mse_loss(model(xt, t), noise)      # 目标是噪声，不是 x0
+--- tests
+@check("DDPM 训练目标")
+def t11():
+    seed(2)
+    s = linear_schedule(100)
+    m = MiniUNet(1)
+    loss = ddpm_loss(m, torch.randn(4, 1, 32, 32), s, 100)
+    true(loss.dim() == 0, "loss 要是标量")
+    true(loss.item() > 0.1, "随机初始化的模型预测噪声，loss 应该在 1 附近")
+    # 目标必须是 noise 而不是 x0
+    class Zero(nn.Module):
+        def forward(self, x, t):
+            return torch.zeros_like(x)
+    l0 = ddpm_loss(Zero(), torch.randn(64, 1, 8, 8) * 10, s, 100)
+    true(abs(l0.item() - 1.0) < 0.15,
+         f"永远输出 0 的模型，loss 应该 ≈ 噪声的方差 = 1，实际 {l0.item():.3f}。"
+         "如果远大于 1，说明你的目标写成了 x0")
+--- hints
+- TODO
+
+@@ item d8-11
+type: code
+title: p_sample 一步
+level: 2
+targets: p_sample_step
+ref: day8
+--- context
+TODO
+--- prompt
+12  反向一步 p_sample
+--- starter
+def p_sample_step(x_t, t, eps_pred, sched, noise=None):
+    """DDPM 反向一步:
+        mean = (x_t - beta_t / sqrt(1 - alpha_bar_t) * eps_pred) / sqrt(alpha_t)
+        t > 0 时:  x_{t-1} = mean + sqrt(beta_t) * noise
+        t == 0 时: x_0 = mean          （最后一步不加噪声）
+    t 是 (B,) 张量；noise 为 None 时自己采。
+    """
+    # --- TODO 12 ---
+    raise todo()
+--- solution
+def p_sample_step(x_t, t, eps_pred, sched, noise=None):
+    beta = extract(sched["betas"], t, x_t.shape)
+    alpha = extract(sched["alphas"], t, x_t.shape)
+    ab = extract(sched["alphas_cumprod"], t, x_t.shape)
+    mean = (x_t - beta / (1 - ab).sqrt() * eps_pred) / alpha.sqrt()
+    if noise is None:
+        noise = torch.randn_like(x_t)
+    keep = (t > 0).float().reshape(-1, *([1] * (x_t.dim() - 1)))
+    return mean + keep * beta.sqrt() * noise    # t=0 时不加噪声
+--- tests
+@check("p_sample 一步")
+def t12():
+    seed(3)
+    s = linear_schedule(100)
+    x = torch.randn(4, 1, 4, 4)
+    eps = torch.randn_like(x)
+    n = torch.randn_like(x)
+    t50 = torch.full((4,), 50, dtype=torch.long)
+    a = p_sample_step(x, t50, eps, s, noise=n)
+    shape_is(a, x.shape)
+    b = p_sample_step(x, t50, eps, s, noise=torch.zeros_like(x))
+    true(not torch.allclose(a, b), "t>0 时应该加噪声")
+    t0 = torch.zeros(4, dtype=torch.long)
+    c1 = p_sample_step(x, t0, eps, s, noise=n)
+    c2 = p_sample_step(x, t0, eps, s, noise=torch.randn_like(x))
+    eq(c1, c2, msg="最后一步（t=0）不能加噪声，否则生成的图会永远带一层沙")
+    # 完美预测噪声时，一步应该把 x_t 拉回接近 x0 的方向
+    x0 = torch.ones(1, 1, 2, 2)
+    tt = torch.tensor([1])
+    xt = q_sample(x0, tt, eps[:1, :, :2, :2], s)
+    back = p_sample_step(xt, tt, eps[:1, :, :2, :2], s, noise=torch.zeros_like(xt))
+    true((back - x0).abs().mean() < 0.2, "喂进真实噪声，反向一步应该接近 x0")
+--- hints
+- TODO
+
+@@ item d8-12
+type: code
+title: 信噪比
+level: 2
+targets: snr
+ref: day8
+--- context
+TODO
+--- prompt
+13  信噪比
+--- starter
+def snr(sched, t):
+    """SNR(t) = alpha_bar_t / (1 - alpha_bar_t)。t 是 (B,)，返回 (B,)。"""
+    # --- TODO 13 ---
+    raise todo()
+--- solution
+def snr(sched, t):
+    ab = sched["alphas_cumprod"].gather(0, t)
+    return ab / (1 - ab)
+--- tests
+@check("信噪比")
+def t13():
+    s = linear_schedule(1000)
+    v = snr(s, torch.tensor([0, 500, 999]))
+    shape_is(v, (3,))
+    true(v[0] > v[1] > v[2], "SNR 必须随 t 单调下降")
+    true(v[0] > 1000, "t=0 时几乎没噪声，SNR 应该很大")
+    true(v[-1] < 0.01, "t=T 时几乎全是噪声")
+--- hints
+- TODO
+
+@@ item d8-13
+type: fix
+title: 找 bug: q_sample_buggy
+level: 2
+targets: q_sample_buggy
+ref: day8
+--- context
+TODO
+--- prompt
+14  找 bug —— 这个加噪函数有 2 处错
+--- starter
+def q_sample_buggy(x0, t, noise, sched):
+    a = extract(sched["alphas"], t, x0.shape)
+    return a * x0 + (1 - a) * noise
+--- solution
+def q_sample_buggy(x0, t, noise, sched):
+    ab = extract(sched["alphas_cumprod"], t, x0.shape)   # 修 1: alphas -> alphas_cumprod
+    return ab.sqrt() * x0 + (1 - ab).sqrt() * noise      # 修 2: 两个系数都要开根号
+--- tests
+@check("找 bug: q_sample_buggy")
+def t14():
+    seed(4)
+    s = linear_schedule(1000)
+    x0, n = torch.randn(4, 1, 8, 8), torch.randn(4, 1, 8, 8)
+    for tv in [0, 300, 999]:
+        t = torch.full((4,), tv, dtype=torch.long)
+        eq(q_sample_buggy(x0, t, n, s), q_sample(x0, t, n, s), tol=1e-5,
+           msg="两处: 系数表应该用 alphas_cumprod 而不是 alphas；两个系数都要开根号")
+--- hints
+- TODO
