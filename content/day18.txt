@@ -226,7 +226,7 @@ title: 可复现：种子和确定性开关
 
 - `torch.backends.cudnn.benchmark = False`：设成 True 时，cuDNN 会先试跑几种卷积算法、挑最快的。不同次运行可能挑到不同的算法，结果差在最后几位。
 - `torch.backends.cudnn.deterministic = True`：卷积只用确定性的算法。
-- `torch.use_deterministic_algorithms(True)`：所有算子都必须用确定性实现；某个算子没有确定性版本，就直接报错，而不是悄悄给出不同的结果。在 GPU 上，还要在程序一开始（任何 GPU 计算之前）设置环境变量 `CUBLAS_WORKSPACE_CONFIG=:4096:8`，否则矩阵乘会报错。
+- `torch.use_deterministic_algorithms(True)`：所有算子都必须用确定性实现；某个算子没有确定性版本，就直接报错，而不是悄悄给出不同的结果。有些 PyTorch 版本在 GPU 上还要求先设置环境变量 `CUBLAS_WORKSPACE_CONFIG=:4096:8`，否则矩阵乘会报错（报错信息会直接告诉你要设这一行）。较新的版本（比如写这门课时用的 2.12）已经不需要了；老代码里常能看到这一行，设置了也没有坏处。
 
 这些开关会让程序变慢，一般只在调试、写测试、需要严格复现时打开。
 

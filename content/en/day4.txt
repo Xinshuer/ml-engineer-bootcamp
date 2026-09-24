@@ -652,6 +652,15 @@ def t06():
             p.zero_()
     eq(b(x), x, tol=1e-5,
        msg="with both sub-layers outputting 0, the Block should return x unchanged. If not, the residual is wrong (e.g. x = attn(ln(x))) or the LN is on the main road (post-LN)")
+
+@check("each sub-layer gets LN(x) as its input")
+def t06b():
+    seed(3)
+    b = Block(32, 4, 16)
+    x = torch.randn(2, 7, 32) * 3 + 1
+    h = x + b.attn(b.ln1(x))
+    eq(b(x), h + b.mlp(b.ln2(h)), tol=1e-5,
+       msg="the output should be x + attn(ln1(x)), then + mlp(ln2(...)). Did you leave out ln1 / ln2, or put them somewhere else?")
 --- hints
 - `__init__`: `self.ln1 = nn.LayerNorm(n_embd)`, `self.attn = CausalSelfAttention(n_embd, n_head, block_size)`, and the same idea for `ln2` and `mlp`.
 - "Residual" means **adding** the sub-layer's output back to its input: `x = x + sublayer(...)`, not `x = sublayer(...)`.
@@ -954,6 +963,15 @@ def t12():
         for p in b.mlp.parameters():
             p.zero_()
     eq(b(x), x, tol=1e-5, msg="two places: the LN belongs inside the residual branch (pre-LN); the MLP line lost its residual")
+
+@check("each sub-layer gets LN(x) as its input")
+def t12b():
+    seed(7)
+    b = BlockBuggy(32, 4, 16)
+    x = torch.randn(2, 7, 32) * 3 + 1
+    h = x + b.attn(b.ln1(x))
+    eq(b(x), h + b.mlp(b.ln2(h)), tol=1e-5,
+       msg="the output should be x + attn(ln1(x)), then + mlp(ln2(...)). Removing the LN is not the fix: move it inside the branch")
 --- explain
 1. The first line is post-LN: the LN wraps `x + attn(x)`, and attn gets the un-normalised x. Change it to `x = x + self.attn(self.ln1(x))`.
 2. The second line has no `x +`: the MLP output replaces x, so the residual is gone. Change it to `x = x + self.mlp(self.ln2(x))`.

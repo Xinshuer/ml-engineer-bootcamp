@@ -123,7 +123,7 @@ class PointsRequest(BaseModel):
 
 `PointsRequest.model_validate(一个 dict)` 做检查：合格就返回对象，不合格就抛 `ValidationError`，里面写着哪个位置（loc）出了什么错。
 
-注意，pydantic 默认是「宽松模式」：字符串 `"1.5"` 会被转成 `1.5`，整数 `3` 会被转成 `3.0`。连这个也想拒绝，就用 strict 模式（比如 `model_validate(..., strict=True)`）。
+注意，pydantic 默认是「宽松模式」：字符串 `"1.5"` 会被转成 `1.5`，整数 `3` 会被转成 `3.0`。想拒绝 `"1.5"` 这样的字符串，就用 strict 模式（比如 `model_validate(..., strict=True)`）。整数在 strict 模式下也照样被当成 float 收下。
 
 放进 FastAPI 以后，检查不通过会自动变成 **422** 响应（Unprocessable Entity：JSON 能读，但内容不合格），你的 handler 根本不会被调用。
 --- code

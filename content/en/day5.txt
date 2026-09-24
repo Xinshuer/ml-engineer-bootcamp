@@ -407,6 +407,17 @@ def t04():
        msg="the dot product of q at 3 and k at 5 should equal that of q at 20 and k at 22 (distance 2 in both). "
            "If not, the rotation formula is wrong")
     true(not torch.allclose(dot_at(3, 5), dot_at(3, 9), atol=1e-4), "different distances (2 and 6) give the same dot product: your function does not seem to rotate at all")
+
+@check("pairs are neighbouring dimensions: (x0, x1), (x2, x3), …")
+def t04b():
+    cos, sin = precompute_freqs(8, 4)
+    x = torch.zeros(1, 1, 4, 8)
+    x[..., 1] = 1.0                            # only dimension 1 is non-zero: the point (0, 1) of pair 0
+    want = torch.zeros(1, 1, 4, 8)
+    want[..., 0], want[..., 1] = -sin[:, 0], cos[:, 0]   # (0, 1) turned by t radians is (-sin t, cos t)
+    eq(apply_rope(x, cos, sin), want,
+       msg="dimension 1 should be paired with dimension 0 (neighbouring pairs), and every other dimension should stay 0. "
+           "Did you pair the first half with the second half (HuggingFace's rotate_half convention)?")
 --- hints
 - `a, b = x[..., 0::2], x[..., 1::2]`: both are (B, nh, T, hd/2) and broadcast directly against the (T, hd/2) cos and sin.
 - Compute `o1 = a * cos - b * sin` and `o2 = a * sin + b * cos`, then interleave them back: `torch.stack([o1, o2], dim=-1).flatten(-2)`.
@@ -505,6 +516,14 @@ def t06():
     m = SwiGLU(16, 32)
     shape_is(m(torch.randn(2, 5, 16)), (2, 5, 16), "the output should have the input's shape (B, T, C)")
     true(params(m) == 16 * 32 * 3, f"there should be three Linear layers without bias, {16 * 32 * 3} parameters in total; yours has {params(m)}")
+
+@check("forward = w2(silu(w1(x)) * w3(x))")
+def t06b():
+    seed(7)
+    m = SwiGLU(16, 32)
+    x = torch.randn(2, 5, 16)
+    eq(m(x), m.w2(F.silu(m.w1(x)) * m.w3(x)),
+       msg="the output does not match w2(silu(w1(x)) * w3(x)). silu goes on w1(x); w3(x) is the gate and is multiplied in element by element")
 --- hints
 - Rounding h up to a multiple of m: `m * ((h + m - 1) // m)`. Example: h = 170, m = 8 → 8 × 22 = 176.
 - Write each layer as `nn.Linear(in, out, bias=False)`; the parameter count should be exactly 3 × C × H.
@@ -985,7 +1004,7 @@ Without notes, write `apply_rope(x, cos, sin)`:
 - Neighbouring dimensions form a pair: pair i, (a, b) = (x[2i], x[2i+1]), becomes (a·cos[i] − b·sin[i], a·sin[i] + b·cos[i]) in the same two places.
 - No Python loops.
 
-The checks are the same as in exercise d5-03: shape, no turn at position 0, length unchanged, dot product depends only on the distance.
+The checks are the same as in exercise d5-03: shape, no turn at position 0, length unchanged, dot product depends only on the distance, neighbouring pairs.
 --- starter
 def apply_rope(x, cos, sin):
     raise todo()
@@ -1023,6 +1042,17 @@ def t04():
        msg="the dot product of q at 3 and k at 5 should equal that of q at 20 and k at 22 (distance 2 in both). "
            "If not, the rotation formula is wrong")
     true(not torch.allclose(dot_at(3, 5), dot_at(3, 9), atol=1e-4), "different distances (2 and 6) give the same dot product: your function does not seem to rotate at all")
+
+@check("pairs are neighbouring dimensions: (x0, x1), (x2, x3), …")
+def t04b():
+    cos, sin = precompute_freqs(8, 4)
+    x = torch.zeros(1, 1, 4, 8)
+    x[..., 1] = 1.0                            # only dimension 1 is non-zero: the point (0, 1) of pair 0
+    want = torch.zeros(1, 1, 4, 8)
+    want[..., 0], want[..., 1] = -sin[:, 0], cos[:, 0]   # (0, 1) turned by t radians is (-sin t, cos t)
+    eq(apply_rope(x, cos, sin), want,
+       msg="dimension 1 should be paired with dimension 0 (neighbouring pairs), and every other dimension should stay 0. "
+           "Did you pair the first half with the second half (HuggingFace's rotate_half convention)?")
 --- hints
 - Even and odd dimensions: `x[..., 0::2]` and `x[..., 1::2]`.
 - Interleave back: `torch.stack([o1, o2], dim=-1).flatten(-2)`.

@@ -19,7 +19,7 @@ attention 吃的是「一串 token」，形状 (B, T, C)：B 个样本，每个 
 - 一共 H*W 个 token。顺序是**行优先**：先第 0 行从左到右，再第 1 行，依此类推。
 - 写法：`x.flatten(2)` 把第 2 维以后的 (H, W) 合成一维，得到 (B, C, H*W)；再 `.transpose(1, 2)` 交换第 1、2 维，得到 (B, H*W, C)。
 
-attention 做完要接回卷积，得变回去：先 `transpose(1, 2)` 回到 (B, C, H*W)，再 `reshape(B, C, H, W)`。注意：transpose 之后内存不连续，这里用 `view` 会报错，要用 `reshape`。
+attention 做完要接回卷积，得变回去：先 `transpose(1, 2)` 回到 (B, C, H*W)，再 `reshape(B, C, H, W)`。注意：transpose 之后内存不连续，这时 `view` 只要需要合并维度就会报错。`reshape` 永远能用，所以 transpose 之后习惯用 `reshape`。
 
 真实的数字：64×64 的特征图、320 个通道，摊平以后是 4096 个 token，每个 320 维。
 --- code
@@ -305,7 +305,7 @@ def t01():
 --- hints
 - `x.flatten(2)` 把第 2 维以后的 H、W 合成一维，得到 (B, C, H*W)。还差一步：把 C 换到最后。
 - `to_tokens`：`x.flatten(2).transpose(1, 2)`。
-- `to_spatial`：先 `tok.transpose(1, 2)` 回到 (B, C, H*W)，再 `.reshape(B, C, H, W)`。这里用 `view` 会报错，因为 transpose 之后内存不连续。
+- `to_spatial`：先 `tok.transpose(1, 2)` 回到 (B, C, H*W)，再 `.reshape(B, C, H, W)`。transpose 之后优先用 `reshape` 而不是 `view`：内存已经不连续，`view` 一遇到要合并维度就会报错。
 
 @@ item d9-02
 type: code

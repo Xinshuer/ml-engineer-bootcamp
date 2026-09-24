@@ -605,7 +605,7 @@ ref: day23
 3. 找到 stop 就停，不再读后面的段。流结束时还扣着文字，就把它发出去。
 4. 不要 yield 空字符串。
 
-卡片里的 `held(text, stop)` 算的是「末尾要扣住几个字符」。这里有好几个 stop，要对每个都算，取最大的。
+卡片里的 `held(text, stop)` 算的是「末尾要扣住几个字符」。这里有好几个 stop，要对每个都算，取最大的。准备代码里没有 `held`：要用它，就把它抄进你的答案，或者自己写这个循环。
 --- starter
 def stream_until_stop(pieces, stops):
     buf = ""                                             # 还没发出去的文字
@@ -695,7 +695,7 @@ cards: 采样参数：先校验，再上 GPU
 targets: validate_sampling
 ref: day23
 --- context
-坏参数不会让服务崩溃，而是悄悄出怪结果：temperature 是 NaN 时输出一堆乱码，拼错的参数名被忽略，max_new_tokens 超过上下文长度时生成到一半出错。在进 GPU 之前拦下它们，还能一次告诉用户所有错误。
+坏参数很少在门口就报错，而是在后面出事：temperature 是 NaN 时所有概率都变成 NaN（输出乱码，或者采样时报错；在 GPU 上甚至会触发 CUDA 错误，把整个进程搞坏），拼错的参数名被悄悄忽略，max_new_tokens 超过上下文长度时生成到一半出错。在进 GPU 之前拦下它们，还能一次告诉用户所有错误。
 --- prompt
 写 `validate_sampling(params, prompt_len, context_len)`。`params` 是从请求 JSON 里读出来的 dict，可能只有其中几个参数（没给的用服务的默认值，不用检查）。
 
@@ -1261,7 +1261,7 @@ prefill + decode + 流式 + 停止条件，是所有 LLM 推理服务的骨架�
 
 - `prompt_ids`：(1, T) long。模型接口：`logits, cache = model(ids, cache)`。
 - 第一次把整个 prompt 喂进去（cache 为 `None`），之后每次只喂上一个新 token（形状 (1, 1)）并带上 cache。
-- 生成出 `eos_id` 就停，eos 不 yield；最多 yield `max_new_tokens` 个；最后一个 token 之后不再调用模型。
+- 生成出 `eos_id` 就停，eos 不 yield；最多 yield `max_new_tokens` 个；最后一个 token 之后不再调用模型（`max_new_tokens=0` 时一次都不调用）。
 --- starter
 def stream_tokens(model, prompt_ids, max_new_tokens, eos_id):
     raise todo()

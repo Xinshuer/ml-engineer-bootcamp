@@ -250,7 +250,7 @@ Generation is the same loop as day 4's greedy generation, except that each step 
 
 Repeat n_new times to get (1, n_q, T0 + n_new).
 
-- Use `@torch.no_grad()` and `model.eval()`: generation needs no gradients, which saves memory and time.
+- Use `@torch.no_grad()`: generation needs no gradients, which saves memory and time. Also call `model.eval()`: it switches dropout off (it does not turn off gradients), so greedy generation gives the same result every time.
 - argmax is greedy: the same input always gives the same result. Real systems sample with a temperature and top-k (day 5).
 - Here every step runs the whole sequence again. Simple but slow; real systems use a KV cache (day 5).
 - If training used the delay pattern, the generated sequence is delayed too: undo_delay it first, then give it to the codec's decoder to get a waveform.
@@ -767,6 +767,10 @@ def t10():
     true(out.dtype == torch.long and out.max() < 50 and out.min() >= 0,
          f"generated codes should be integers from 0 to 49 (torch.long); your dtype is {out.dtype}")
     eq(out, generate_codes(m, p, 5, 50), msg="greedy generation must be deterministic")
+    for t in range(6, 11):                             # every new column = argmax at the last time step of what came before
+        eq(out[:, :, t], m(out[:, :, :t])[:, :, -1].argmax(-1),
+           msg=f"time step {t} is not the argmax of the last time step's logits. Feed the whole current sequence "
+               "(not just the prompt) to the model each step, and take logits[:, :, -1]")
 --- hints
 - `logits[:, :, -1]` takes the last time step: (1, n_q, vocab).
 - `.argmax(-1)` gives (1, n_q); `.unsqueeze(-1)` makes it (1, n_q, 1) so that torch.cat on dim=-1 works.

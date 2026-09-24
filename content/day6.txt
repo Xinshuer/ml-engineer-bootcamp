@@ -13,7 +13,7 @@ hours: 3–4 小时
 @@ concept
 title: LoRA：原权重不动，旁边加一条小路
 --- body
-微调（fine-tuning）就是拿别人训练好的模型，用自己的数据再训练一会儿。全量微调要更新每一个参数。一个 7B 模型有 70 亿个参数，普通显卡放不下（最后一张卡「显存账」会算给你看）。
+微调（fine-tuning）就是拿别人训练好的模型，用自己的数据再训练一会儿。全量微调要更新每一个参数。一个 7B 模型有 70 亿个参数，全量微调它要的显存远远超过普通显卡（最后一张卡「显存账」会算给你看）。
 
 LoRA（Low-Rank Adaptation，低秩适配）的想法：原来的权重 `W`（形状 `(out, in)`）一个数都不改，只在旁边加一条小路：
 
@@ -302,6 +302,7 @@ def t01():
     true(close(m.scaling, 2.0), f"scaling 应为 alpha/r = 2.0，你的是 {m.scaling}")
     shape_is(m.A, (4, 16), "A 的形状应为 (r, in_features)")
     shape_is(m.B, (8, 4), "B 的形状应为 (out_features, r)")
+    true(m.A.abs().sum() > 0, "A 全是 0。A 和 B 都是 0 时，两个都永远拿不到梯度，LoRA 什么也学不到：A 要用 normal_(0, 0.01) 初始化，只有 B 是全 0")
 
 @check("初始等价性")
 def t02():
@@ -543,7 +544,7 @@ def t08():
     got = grad_accum_step(model, xs, ys, n_micro=4)
     for n in ref:
         eq(got[n], ref[n], tol=1e-5,
-           msg=f"参数 {n} 的梯度对不上。正好大 4 倍：忘了除以 n_micro；差得更多：可能没先清空旧梯度")
+           msg=f"参数 {n} 的梯度对不上。大了 4 倍：忘了除以 n_micro；大了 2 倍：没先清空旧梯度（调用你的函数时 .grad 里还留着旧梯度）")
 --- hints
 - 开头 `model.zero_grad()`。每份的大小 `n = xs.size(0) // n_micro`，第 i 份是 `xs[i*n:(i+1)*n]`。
 - `cross_entropy` 默认对这一份取平均。n_micro 份的平均直接加起来会大 n_micro 倍，所以每份的 loss 先除以 `n_micro` 再 backward。
@@ -852,6 +853,7 @@ def t01():
     true(close(m.scaling, 2.0), f"scaling 应为 alpha/r = 2.0，你的是 {m.scaling}")
     shape_is(m.A, (4, 16), "A 的形状应为 (r, in_features)")
     shape_is(m.B, (8, 4), "B 的形状应为 (out_features, r)")
+    true(m.A.abs().sum() > 0, "A 全是 0。A 和 B 都是 0 时，两个都永远拿不到梯度，LoRA 什么也学不到：A 要用 normal_(0, 0.01) 初始化，只有 B 是全 0")
 
 @check("初始等价性")
 def t02():
@@ -916,7 +918,7 @@ def t08():
     got = grad_accum_step(model, xs, ys, n_micro=4)
     for n in ref:
         eq(got[n], ref[n], tol=1e-5,
-           msg=f"参数 {n} 的梯度对不上。正好大 4 倍：忘了除以 n_micro；差得更多：可能没先清空旧梯度")
+           msg=f"参数 {n} 的梯度对不上。大了 4 倍：忘了除以 n_micro；大了 2 倍：没先清空旧梯度（调用你的函数时 .grad 里还留着旧梯度）")
 --- hints
 - 每份的 loss 要先除以 `n_micro` 再 backward。
 - 开头要清空旧梯度，结尾用 `named_parameters()` 收集 `p.grad.clone()`。

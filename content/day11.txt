@@ -172,7 +172,7 @@ title: mel 刻度和 mel 滤波器组
 - `fb @ mag`：`(80, 513) @ (513, 63)` → `(80, 63)`
 - mag 带 batch 时：`(80, 513) @ (B, 513, 63)` → `(B, 80, 63)`，`@` 会自动广播
 
-实际项目里 fb 用现成函数生成（`torchaudio.functional.melscale_fbanks` 或 `librosa.filters.mel`）。下面手写一个，看清它长什么样。
+实际项目里 fb 用现成函数生成（`torchaudio.functional.melscale_fbanks` 或 `librosa.filters.mel`）。注意方向：librosa 返回的和这里一样是 `(n_mels, n_freq)`，torchaudio 返回的却是转置 `(n_freq, n_mels)`，要先 `.T` 再 `fb @ mag`。下面手写一个，看清它长什么样。
 --- code
 def hz_to_mel(f):
     return 2595 * math.log10(1 + f / 700)
@@ -852,7 +852,7 @@ cards: 波形和采样率：一秒有多少个数; STFT：频点数和帧数; me
 一个模型用 16kHz 音频的 log-mel 训练（n_fft=1024，hop=256，mel 滤波器按 sr=16000 生成）。上线后有人上传了 44.1kHz 的文件，代码没有重采样，直接算 log-mel 喂给模型。会发生什么？
 --- options
 - 报错：shape 对不上，模型根本跑不起来
-- 不报错，但每帧只覆盖约 5.8 毫秒（训练时是 16 毫秒），每个频点代表的 Hz 也变了。模型看到的像是被放慢、音调变低的声音，效果悄悄变差
+- 不报错，但相邻两帧只隔约 5.8 毫秒（训练时是 16 毫秒），每个频点代表的 Hz 也变了。模型看到的像是被放慢、音调变低的声音，效果悄悄变差
 - 没有影响：mel 谱和采样率无关
 - 效果更好：采样率越高，信息越多
 answer: 2

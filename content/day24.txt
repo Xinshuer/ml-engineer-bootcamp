@@ -217,7 +217,7 @@ ref: day24
 
 **回滚（rollback）**：新版本上线后出了问题（投诉变多、延迟变高），第一件事是回到上一个版本，让线上先恢复正常，再慢慢查原因。有了 `history`，回滚就是：去掉 history 的最后一个，把 production 设成新的最后一个。history 里不到 2 个版本，就没有可回的，`raise ValueError`。
 
-注意：**回滚不过门槛。** 上一个版本的分数本来就比现在的低（不然当初也不会换掉它），拿门槛去拦它，回滚就永远做不成。出事的时候，要的是一步回到「已知能用」的状态。
+注意：**回滚不过门槛。** 上一个版本的分数通常比现在的低（不然当初也不会换掉它），拿门槛去拦它，回滚就永远做不成。出事的时候，要的是一步回到「已知能用」的状态。
 
 真实的系统在上线前还会做更多检查，比如先只放一小部分流量（canary），第 25 天讲。
 --- code
@@ -801,6 +801,9 @@ def _():
 def _():
     r = best_run(sample_runs(), "val_acc")          # run-03 崩了，它的 metrics 是空的
     true(_id(r) == "run-04", f"带上崩掉的 run-03，val_acc 最高的还是 run-04，你返回的是 {_id(r)!r}")
+    r = best_run(sample_runs(), "val_loss", higher_is_better=False)
+    true(_id(r) == "run-02", f"带上崩掉的 run-03，val_loss 最低的还是 run-02，你返回的是 {_id(r)!r}。"
+         "run-03 没有 val_loss，要跳过它。把缺的指标当成 0，越小越好时崩掉的实验反而成了「最好」的。")
     try:
         best_run(sample_runs(), "f1")
     except ValueError:
@@ -1073,7 +1076,7 @@ def _():
         try:
             back = reg.rollback()
         except ValueError as e:
-            true(False, f"rollback 报错了：{e}。回滚不过门槛：上一个版本的分数本来就比现在的低。直接改 production 和 history，不要调用 promote。")
+            true(False, f"rollback 报错了：{e}。回滚不过门槛：上一个版本的分数通常比现在的低。直接改 production 和 history，不要调用 promote。")
         true(back == 1, f"rollback() 应该返回回到的版本 1，你返回的是 {back!r}")
         other = Registry(folder)
         true(other.production() == 1, "rollback 之后线上应该是 v1（新建的 Registry 也要看得到）")
@@ -1396,7 +1399,7 @@ def _():
         try:
             back = reg.rollback()
         except ValueError as e:
-            true(False, f"rollback 报错了：{e}。回滚不过门槛：上一个版本的分数本来就比现在的低。直接改 production 和 history，不要调用 promote。")
+            true(False, f"rollback 报错了：{e}。回滚不过门槛：上一个版本的分数通常比现在的低。直接改 production 和 history，不要调用 promote。")
         true(back == 1, f"rollback() 应该返回回到的版本 1，你返回的是 {back!r}")
         other = Registry(folder)
         true(other.production() == 1, "rollback 之后线上应该是 v1（新建的 Registry 也要看得到）")

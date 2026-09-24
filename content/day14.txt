@@ -406,7 +406,7 @@ ref: day14
 --- prompt
 写 `overfit_one_batch(model, x, y, steps=300, lr=1e-2)`：
 
-- 用 `torch.optim.AdamW(model.parameters(), lr=lr)` 建优化器。
+- 在循环外面用 `torch.optim.AdamW(model.parameters(), lr=lr)` 建一次优化器。
 - 在同一个 `(x, y)` 上训练 `steps` 步，loss 用 `F.cross_entropy(model(x), y)`。
 - 每一步的顺序：算 loss → `zero_grad` → `backward` → `step`。
 - 返回每一步的 loss 组成的列表，元素是 Python float（用 `loss.item()`）。
@@ -436,11 +436,26 @@ def t03():
     seed(0)
     model = nn.Sequential(nn.Linear(8, 32), nn.ReLU(), nn.Linear(32, 5))
     x, y = torch.randn(16, 8), torch.randint(0, 5, (16,))
-    losses = overfit_one_batch(model, x, y)
+    made = []
+    real_adamw = torch.optim.AdamW
+
+    class CountingAdamW(real_adamw):                    # 数一数优化器被建了几次
+        def __init__(self, *args, **kwargs):
+            made.append(1)
+            super().__init__(*args, **kwargs)
+
+    torch.optim.AdamW = CountingAdamW
+    try:
+        losses = overfit_one_batch(model, x, y)
+    finally:
+        torch.optim.AdamW = real_adamw
     true(isinstance(losses[0], float), "列表里要存 loss.item()（Python float），不是 tensor")
+    true(len(made) <= 1,
+         f"AdamW 被建了 {len(made)} 次。优化器要在循环外面只建一次：每一步都新建，"
+         "它累积的动量等状态就全丢了，已经不是在用 Adam 了")
     true(losses[-1] < 0.01,
          f"最后的 loss = {losses[-1]:.4f}。一个 16 个样本的 batch 应该能被轻松记住，"
-         "记不住就是代码有问题（优化器建在循环里了？忘了 step？）")
+         "记不住就是代码有问题（忘了 zero_grad？忘了 step？）")
     true(losses[-1] < losses[0], "loss 没有下降")
 --- hints
 - 优化器只在循环外面建一次：`opt = torch.optim.AdamW(model.parameters(), lr=lr)`。
@@ -947,9 +962,24 @@ def t03():
     seed(0)
     model = nn.Sequential(nn.Linear(8, 32), nn.ReLU(), nn.Linear(32, 5))
     x, y = torch.randn(16, 8), torch.randint(0, 5, (16,))
-    losses = overfit_one_batch(model, x, y)
+    made = []
+    real_adamw = torch.optim.AdamW
+
+    class CountingAdamW(real_adamw):                    # 数一数优化器被建了几次
+        def __init__(self, *args, **kwargs):
+            made.append(1)
+            super().__init__(*args, **kwargs)
+
+    torch.optim.AdamW = CountingAdamW
+    try:
+        losses = overfit_one_batch(model, x, y)
+    finally:
+        torch.optim.AdamW = real_adamw
     true(isinstance(losses[0], float), "列表里要存 loss.item()（Python float），不是 tensor")
+    true(len(made) <= 1,
+         f"AdamW 被建了 {len(made)} 次。优化器要在循环外面只建一次：每一步都新建，"
+         "它累积的动量等状态就全丢了，已经不是在用 Adam 了")
     true(losses[-1] < 0.01,
          f"最后的 loss = {losses[-1]:.4f}。一个 16 个样本的 batch 应该能被轻松记住，"
-         "记不住就是代码有问题（优化器建在循环里了？忘了 step？）")
+         "记不住就是代码有问题（忘了 zero_grad？忘了 step？）")
     true(losses[-1] < losses[0], "loss 没有下降")

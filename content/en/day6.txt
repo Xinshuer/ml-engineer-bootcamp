@@ -13,7 +13,7 @@ After today you can read and write the core of LoRA fine-tuning (a frozen base, 
 @@ concept
 title: LoRA: keep W, add a small side path
 --- body
-Fine-tuning means taking a model someone else trained and training it a bit more on your own data. Full fine-tuning updates every parameter. A 7B model has 7 billion parameters, which does not fit on a normal GPU (the last card, "The memory bill", does the math).
+Fine-tuning means taking a model someone else trained and training it a bit more on your own data. Full fine-tuning updates every parameter. A 7B model has 7 billion parameters, and fully fine-tuning it needs far more memory than a normal GPU has (the last card, "The memory bill", does the math).
 
 LoRA (Low-Rank Adaptation) leaves the original weight `W` (shape `(out, in)`) untouched and adds a small side path next to it:
 
@@ -302,6 +302,7 @@ def t01():
     true(close(m.scaling, 2.0), f"scaling should be alpha/r = 2.0, yours is {m.scaling}")
     shape_is(m.A, (4, 16), "A should have shape (r, in_features)")
     shape_is(m.B, (8, 4), "B should have shape (out_features, r)")
+    true(m.A.abs().sum() > 0, "A is all zeros. With A and B both zero, neither ever gets a gradient and LoRA learns nothing: initialise A with normal_(0, 0.01); only B starts at zero")
 
 @check("Same output as the base at the start")
 def t02():
@@ -543,7 +544,7 @@ def t08():
     got = grad_accum_step(model, xs, ys, n_micro=4)
     for n in ref:
         eq(got[n], ref[n], tol=1e-5,
-           msg=f"the gradient of {n} does not match. Exactly 4 times too big: you forgot to divide by n_micro; off by more: maybe the old gradients were not cleared first")
+           msg=f"the gradient of {n} does not match. 4 times too big: you forgot to divide by n_micro; 2 times too big: you did not clear the old gradients first (they are still in .grad when your function is called)")
 --- hints
 - Start with `model.zero_grad()`. Each chunk has `n = xs.size(0) // n_micro` samples; chunk i is `xs[i*n:(i+1)*n]`.
 - `cross_entropy` takes the mean over the chunk. Adding n_micro means gives n_micro times too much, so divide each chunk's loss by `n_micro` before backward.
@@ -852,6 +853,7 @@ def t01():
     true(close(m.scaling, 2.0), f"scaling should be alpha/r = 2.0, yours is {m.scaling}")
     shape_is(m.A, (4, 16), "A should have shape (r, in_features)")
     shape_is(m.B, (8, 4), "B should have shape (out_features, r)")
+    true(m.A.abs().sum() > 0, "A is all zeros. With A and B both zero, neither ever gets a gradient and LoRA learns nothing: initialise A with normal_(0, 0.01); only B starts at zero")
 
 @check("Same output as the base at the start")
 def t02():
@@ -916,7 +918,7 @@ def t08():
     got = grad_accum_step(model, xs, ys, n_micro=4)
     for n in ref:
         eq(got[n], ref[n], tol=1e-5,
-           msg=f"the gradient of {n} does not match. Exactly 4 times too big: you forgot to divide by n_micro; off by more: maybe the old gradients were not cleared first")
+           msg=f"the gradient of {n} does not match. 4 times too big: you forgot to divide by n_micro; 2 times too big: you did not clear the old gradients first (they are still in .grad when your function is called)")
 --- hints
 - Divide each chunk's loss by `n_micro` before backward.
 - Clear the old gradients at the start; at the end collect `p.grad.clone()` with `named_parameters()`.

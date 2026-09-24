@@ -763,9 +763,9 @@ def _run_step():
     seed(0)
     mel = torch.randn(2, 6, 4)
     lengths = torch.tensor([6, 3])
-    dur = torch.tensor([[2, 2, 2], [1, 1, 1]])
-    lp = torch.log(dur.float() + 1)
-    dm = torch.ones(2, 3)
+    dur = torch.tensor([[2, 2, 2], [1, 2, 0]])                 # sentence 1: its last text position is padding
+    lp = torch.log(dur.float() + 1) + torch.tensor([[0.1, -0.2, 0.3], [0.2, -0.1, 2.0]])
+    dm = torch.tensor([[1., 1., 1.], [1., 1., 0.]])
     return (mel, lengths, lp, dur, dm), tts_step_buggy(mel, lengths, lp, dur, dm)
 
 @check("mistake 1: the decoder input is shifted right by one")
@@ -780,11 +780,12 @@ def t11b():
     eq(mel_l, masked_mel_loss(torch.zeros_like(mel), mel, mask),
        msg="the mel loss must use the mask: padding must not count")
 
-@check("mistake 3: the duration loss is in the log domain")
+@check("mistake 3: the duration loss is in the log domain, on real text positions only")
 def t11c():
     (mel, lengths, lp, dur, dm), (dec_in, mask, mel_l, dur_l) = _run_step()
     eq(dur_l, duration_loss(lp, dur, dm), tol=1e-5,
-       msg="durations must be compared in the log domain, not against raw frame counts")
+       msg="durations must be compared in the log domain (log(d + 1)), not against raw frame counts, "
+           "and only on real text positions: dur_mask must be used too")
 --- hints
 - Look at `dec_in`: can the decoder input simply be the target?
 - `F.l1_loss` averages over every position, padding included, and the `mask` computed on the line above is never used.

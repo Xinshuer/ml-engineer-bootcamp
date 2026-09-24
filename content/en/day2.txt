@@ -225,7 +225,7 @@ The sentences in a batch have different lengths, but a tensor must be a neat box
 The function a DataLoader uses to stack samples into a batch is called `collate_fn`, and padding usually happens there. Useful tools:
 - `torch.full((B, Tmax), pad_id, dtype=torch.long)`: make a tensor full of pad_id first, then fill in the real tokens
 - `x[i, :n] = s`: put sample s (length n) into the first n positions of row i
-- token ids must be `int64` (that is `torch.long`), because `nn.Embedding` only accepts integer ids
+- token ids are `int64` (that is `torch.long`): `nn.Embedding` only accepts integer ids, and `F.cross_entropy` rejects int32 class labels, so int64 is used everywhere
 
 Once there is padding, every statistic must respect the mask. For example, the average vector of each sample: padded positions must not count in the sum, and the divisor counts only real tokens:
 
@@ -639,7 +639,7 @@ Write two functions. Both normalise along the last dim, each vector on its own. 
 - `my_layernorm(x, g, b, eps=1e-5)`: `(x - mean) / sqrt(var + eps) * g + b`. Use the variance that divides by N (`unbiased=False`). The result must match `F.layer_norm(x, (C,), g, b)`
 - `my_rmsnorm(x, g, eps=1e-6)`: no mean subtraction and no b: `x / sqrt(mean(x²) + eps) * g`
 
-Build them from basic operations (mean, var, sqrt); do not call `F.layer_norm` or `F.rms_norm`. The check also tests that with g all ones, every vector has a mean square close to 1 after RMSNorm.
+Build them from basic operations (mean, var, sqrt); do not call `F.layer_norm` or `F.rms_norm`. The check also tests that with g all ones, every vector has a mean square close to 1 after RMSNorm, and it compares your RMSNorm with the formula above, element by element, for a random g.
 --- starter
 def my_layernorm(x, g, b, eps=1e-5):
     """Normalise over the last dim. g and b both have shape (C,)."""
@@ -658,7 +658,7 @@ def my_rmsnorm(x, g, eps=1e-6):
     rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
     return x * rms * g
 --- tests
-@check("LayerNorm matches F.layer_norm; mean square ≈ 1 after RMSNorm")
+@check("LayerNorm matches F.layer_norm; RMSNorm has mean square ≈ 1 and matches the formula")
 def t08():
     seed(3)
     x = torch.randn(2, 5, 8)
@@ -668,6 +668,8 @@ def t08():
     r = my_rmsnorm(x, torch.ones(8))
     eq(r.pow(2).mean(-1), torch.ones(2, 5), tol=1e-3,
        msg="after RMSNorm every vector's mean square should be ≈ 1")
+    eq(my_rmsnorm(x, g), x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * g,
+       msg="RMSNorm does not match the formula x / sqrt(mean(x²) + eps) * g: do not subtract the mean, and multiply by g at the end")
 --- hints
 - Compute the mean and the variance with `dim=-1, keepdim=True`; the results are `(..., 1)` and broadcast against x
 - Variance: `x.var(-1, keepdim=True, unbiased=False)`, then `torch.sqrt(var + eps)`. g and b are `(C,)`; multiplying and adding them broadcasts onto every vector
@@ -845,11 +847,11 @@ def t12():
     true(keys == {"weight", "running_max"}, f"wrong state_dict keys: {keys} (register running_max with register_buffer)")
     true([n for n, _ in m.named_parameters()] == ["weight"],
          "running_max must not be a Parameter (the optimizer must not update it)")
-    x = torch.randn(8, 4)
+    x = torch.randn(8, 4, requires_grad=True)     # like the input of a layer inside a model, x requires gradients
     out = m(x)
     eq(out, x, msg="weight starts as all ones, so forward should return x unchanged")
     eq(m.running_max, x.max(0).values.clamp(min=0), msg="running_max was not updated correctly")
-    true(not m.running_max.requires_grad, "a buffer should not require gradients")
+    true(not m.running_max.requires_grad, "a buffer should not require gradients: running_max became part of the computation graph. Put the line that updates it inside with torch.no_grad():")
 --- hints
 - In `__init__`: `self.weight = nn.Parameter(torch.ones(dim))` and `self.register_buffer("running_max", torch.zeros(dim))`
 - The max along the batch dim: `x.max(0).values`; the element-wise larger of two tensors: `torch.maximum(a, b)`
@@ -938,7 +940,7 @@ def t14():
     shape_is(x, (3, 3))
     eq(x, torch.tensor([[1, 2, 3], [4, 99, 99], [5, 6, 99]]))
     eq(mask, torch.tensor([[1, 1, 1], [1, 0, 0], [1, 1, 0]]))
-    true(x.dtype == torch.long, "x must be int64: embedding layers only accept that")
+    true(x.dtype == torch.long, "x must be int64 (torch.long): token ids are int64 by convention, and if they are floats the embedding layer raises an error")
 --- hints
 - `Tmax = max(s.numel() for s in samples)`; `torch.full((B, Tmax), pad_id, dtype=torch.long)` makes a tensor full of padding to start from
 - Start the mask as `torch.zeros(B, Tmax, dtype=torch.long)`, then fill it row by row

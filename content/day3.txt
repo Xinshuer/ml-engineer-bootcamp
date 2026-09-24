@@ -127,7 +127,7 @@ title: 大语料：uint16 的 .bin 文件和 np.memmap
 
 - `.bin` 文件不记录 dtype。读的时候 dtype 必须和写的时候一样，不然读出来全是错的数（下面的代码故意用 uint8 读了一次）。
 - `mode="r"` 是只读，防止训练代码不小心改坏语料。
-- 词表超过 65536（比如 10 万词的 tokenizer）就不能用 uint16，要用 uint32。uint16 装不下的数不会报错，会悄悄变成别的数。
+- 词表超过 65536（比如 10 万词的 tokenizer）就不能用 uint16，要用 uint32。装不下的数如果来自 Python list，numpy 会报 OverflowError；如果来自 int64 的 numpy 数组（比如用 `astype` 转），不会报错，会悄悄变成别的数。
 - 送进模型前，把切出来的一段转成 int64 tensor：`torch.from_numpy(m[i:i+T].astype(np.int64))`。
 --- code
 import os, tempfile
@@ -775,7 +775,7 @@ def t10():
         except RuntimeError as e:
             true(False, f"报错了：{str(e)[:80]}。起点太靠后，切片变短，torch.stack 叠不起来 —— 起点上界应该是 len(data) - block_size")
         shape_is(x, (4, 16), "x 的形状应为 (batch_size, block_size)")
-        true(x.dtype == torch.long and y.dtype == torch.long, f"embedding 层只吃 int64，你返回的是 {x.dtype} / {y.dtype}")
+        true(x.dtype == torch.long and y.dtype == torch.long, f"x 要送进 embedding 层，y 是 cross_entropy 的标签，都要 int64，float 会直接报错。你返回的是 {x.dtype} / {y.dtype}")
         eq(y, x + 1, msg="y 没有右移：y 的切片应该从 i + 1 开始")
 --- hints
 - 第 1 处：起点的上界。i 取到 `len(data) - 1` 时，`data[i:i + block_size]` 还剩几个元素？
@@ -876,7 +876,7 @@ title: uint16 装不下时会发生什么
 level: 2
 cards: 大语料：uint16 的 .bin 文件和 np.memmap
 --- context
-.bin 文件用 uint16 存 token id，比 int64 省 4 倍磁盘。但 uint16 最大只有 65535：词表更大的 tokenizer 硬存进去，numpy 不报错，只会悄悄把 id 变成别的数，训练数据就这样坏掉了。
+.bin 文件用 uint16 存 token id，比 int64 省 4 倍磁盘。但 uint16 最大只有 65535：词表更大的 tokenizer 的 id 放在 int64 数组里硬转成 uint16，numpy 不报错，只会悄悄把 id 变成别的数，训练数据就这样坏掉了。
 --- prompt
 先别运行，写出下面代码打印的两行。uint16 能表示 0 到 65535；`.nbytes` 是数组一共占多少字节。
 --- code
@@ -885,11 +885,11 @@ ids = np.array([50256, 65535, 65536, 70000], dtype=np.int64)
 print(ids.astype(np.uint16).tolist())
 print(np.array([1, 2, 3], dtype=np.uint16).nbytes, np.array([1, 2, 3], dtype=np.int64).nbytes)
 --- explain
-50256 和 65535 装得下，原样保留。65536 变成了 0，70000 变成了 4464：转 dtype 时，numpy 只留下低 16 位，相当于对 65536 取余数（70000 - 65536 = 4464），不报错也不警告。所以词表超过 65536 的 tokenizer（比如 10 万词的）要用 uint32 存。
+50256 和 65535 装得下，原样保留。65536 变成了 0，70000 变成了 4464：用 `astype` 转 dtype 时，numpy 只留下低 16 位，相当于对 65536 取余数（70000 - 65536 = 4464），不报错也不警告。所以词表超过 65536 的 tokenizer（比如 10 万词的）要用 uint32 存。
 
 第二行：3 个 uint16 占 3 × 2 = 6 字节，3 个 int64 占 3 × 8 = 24 字节。这就是 .bin 文件用 uint16 的原因。
 --- hints
-- uint16 装不下的数不会报错，只保留「除以 65536 的余数」。
+- `astype` 转成 uint16 时，装不下的数不会报错，只保留「除以 65536 的余数」。
 - 65536 % 65536 = 0，70000 % 65536 = 4464。
 - uint16 每个元素 2 字节，int64 每个 8 字节，两个数组都是 3 个元素。
 

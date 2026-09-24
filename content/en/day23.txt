@@ -605,7 +605,7 @@ Requirements:
 3. Stop once a stop string is found and read no more pieces. If the stream ends while you still hold some text, send it.
 4. Never yield an empty string.
 
-`held(text, stop)` on the card computes "how many characters at the end to hold back". Here there are several stop strings: compute it for each one and take the largest.
+`held(text, stop)` on the card computes "how many characters at the end to hold back". Here there are several stop strings: compute it for each one and take the largest. `held` is not in the setup code: to use it, copy it into your answer, or write the loop yourself.
 --- starter
 def stream_until_stop(pieces, stops):
     buf = ""                                             # text not sent yet
@@ -695,7 +695,7 @@ cards: Sampling parameters: validate before the GPU
 targets: validate_sampling
 ref: day23
 --- context
-Bad parameters do not crash the service; they quietly produce strange results. A NaN temperature gives garbage text, a misspelled parameter name is ignored, and a max_new_tokens beyond the context length fails halfway through generation. Stop them before the GPU, and tell the user about all the errors at once.
+Bad parameters seldom fail cleanly at the door; the trouble shows up later. A NaN temperature turns every probability into NaN (garbage text, or an error when sampling; on a GPU it can even trigger a CUDA error that breaks the whole process), a misspelled parameter name is silently ignored, and a max_new_tokens beyond the context length fails halfway through generation. Stop them before the GPU, and tell the user about all the errors at once.
 --- prompt
 Write `validate_sampling(params, prompt_len, context_len)`. `params` is the dict read from the request JSON; it may contain only some of the parameters (the missing ones get the service's defaults and need no checking).
 
@@ -1261,7 +1261,7 @@ Write the generator `stream_tokens(model, prompt_ids, max_new_tokens, eos_id)`: 
 
 - `prompt_ids`: (1, T) long. The model is called as `logits, cache = model(ids, cache)`.
 - The first call feeds the whole prompt (cache is `None`); after that, each call feeds only the previous new token (shape (1, 1)) together with the cache.
-- Stop when `eos_id` is generated, without yielding it; yield at most `max_new_tokens` tokens; do not call the model after the last token.
+- Stop when `eos_id` is generated, without yielding it; yield at most `max_new_tokens` tokens; do not call the model after the last token (with `max_new_tokens=0`, do not call it at all).
 --- starter
 def stream_tokens(model, prompt_ids, max_new_tokens, eos_id):
     raise todo()

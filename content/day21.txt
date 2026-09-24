@@ -706,7 +706,7 @@ def _():
     spy = Spy(net)
     with onnx_file(data) as path:
         verify_export(spy, path, torch.randn(2, FEATURES), batch_sizes=(1, 3, 7))
-    true(sorted(set(spy.seen)) == [1, 3, 7], f"PyTorch 这边跑过的 batch 大小是 {spy.seen}，应该把 1、3、7 都试一遍")
+    true({1, 3, 7} <= set(spy.seen), f"PyTorch 这边跑过的 batch 大小是 {spy.seen}，应该把 1、3、7 都试一遍")
 --- hints
 - 结构：`model.eval()` → 建 session、读输入名 → `for b in batch_sizes:` 里造输入、两边各跑一次、更新 `worst` → 循环结束后判断 `worst > tol`。
 - PyTorch 这边：`with torch.inference_mode(): want = model(x).numpy()`（带梯度的张量不能直接 `.numpy()`）。误差：`float(np.abs(got - want).max())`。
@@ -858,7 +858,7 @@ cards: int8 量化：1 个字节存一个权重
 targets: quantize_int8
 ref: day21
 --- context
-真实的 int8 量化几乎都是「每个输出通道一个 scale」（per-channel）：权重矩阵里有的行数大、有的行数小，共用一个 scale，小的那些行几乎全变成 0。亲手写一遍，你就知道 quantize_dynamic 里存的是什么。
+真实的 int8 量化通常是「每个输出通道一个 scale」（per-channel）：权重矩阵里有的行数大、有的行数小，共用一个 scale，小的那些行几乎全变成 0。亲手写一遍，你就知道 int8 权重存的是什么：整数加 scale。（quantize_dynamic 默认整个矩阵只用一个 scale，per-channel 要另外设置。）
 --- prompt
 写 `quantize_int8(w)`，对 `(out, in)` 的权重矩阵做对称 int8 量化，**每一行一个 scale**：
 
@@ -1249,7 +1249,7 @@ def _():
     spy = Spy(net)
     with onnx_file(data) as path:
         verify_export(spy, path, torch.randn(2, FEATURES), batch_sizes=(1, 3, 7))
-    true(sorted(set(spy.seen)) == [1, 3, 7], f"PyTorch 这边跑过的 batch 大小是 {spy.seen}，应该把 1、3、7 都试一遍")
+    true({1, 3, 7} <= set(spy.seen), f"PyTorch 这边跑过的 batch 大小是 {spy.seen}，应该把 1、3、7 都试一遍")
 --- hints
 - 顺序：eval → 建 session、读输入名 → 循环每个 batch 大小，两边各跑一次，记下最大误差 → 和 tol 比。
 - PyTorch 那边放在 `with torch.inference_mode():` 里再 `.numpy()`；误差用 `float(np.abs(got - want).max())`。

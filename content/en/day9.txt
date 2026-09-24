@@ -19,7 +19,7 @@ Attention works on a sequence of tokens with shape (B, T, C): B samples, T token
 - There are H*W tokens. The order is **row-major**: row 0 from left to right, then row 1, and so on.
 - In code: `x.flatten(2)` merges the dimensions from 2 on, (H, W), into one: (B, C, H*W). Then `.transpose(1, 2)` swaps dimensions 1 and 2: (B, H*W, C).
 
-After attention you go back to convolutions, so you need the reverse: `transpose(1, 2)` back to (B, C, H*W), then `reshape(B, C, H, W)`. After a transpose the memory is not contiguous, so `view` fails here; use `reshape`.
+After attention you go back to convolutions, so you need the reverse: `transpose(1, 2)` back to (B, C, H*W), then `reshape(B, C, H, W)`. After a transpose the memory is not contiguous, and `view` then fails whenever it has to merge dimensions. `reshape` always works, so make it your habit after a transpose.
 
 Real numbers: a 64×64 feature map with 320 channels becomes 4096 tokens of 320 numbers each.
 --- code
@@ -305,7 +305,7 @@ def t01():
 --- hints
 - `x.flatten(2)` merges H and W (dimensions 2 and on) into one: (B, C, H*W). One step left: move C to the end.
 - `to_tokens`: `x.flatten(2).transpose(1, 2)`.
-- `to_spatial`: `tok.transpose(1, 2)` back to (B, C, H*W), then `.reshape(B, C, H, W)`. `view` fails here because the memory is not contiguous after a transpose.
+- `to_spatial`: `tok.transpose(1, 2)` back to (B, C, H*W), then `.reshape(B, C, H, W)`. Prefer `reshape` to `view` after a transpose: the memory is no longer contiguous, and `view` fails whenever it has to merge dimensions.
 
 @@ item d9-02
 type: code

@@ -52,7 +52,7 @@ The correct order:
 
 A simple check (this is an invariant test): **change only the test set, and the transformed training data must stay exactly the same.** If it changes, you have a leak.
 
-The same rule holds for a tokenizer's vocabulary, feature selection and deduplication: they may only "learn" from the training set.
+The same rule holds for a tokenizer's vocabulary, feature selection and the values used to fill in missing data: they may only "learn" from the training set.
 
 In the example below the test distribution has shifted. The leaky version hides half of that shift: in evaluation the test data looks only 1.74 standard deviations away, but in production the model faces 3.39.
 --- code
@@ -181,9 +181,9 @@ print("LayerNorm weight after 10 steps:", net[1].weight.data)
 @@ concept
 title: Step the LR scheduler every step
 --- body
-A learning-rate scheduler sets the current learning rate from how many times `scheduler.step()` has been called. Warmup (raising the learning rate slowly from a tiny value over the first few hundred steps), cosine decay and the other usual schedules are all designed in **optimizer steps**.
+A learning-rate scheduler sets the current learning rate from how many times `scheduler.step()` has been called. Warmup (raising the learning rate slowly from a tiny value over the first few hundred steps) and cosine decay, the usual schedules for training Transformers, are designed in **optimizer steps**. (A schedule written in epochs, such as "divide the lr by 10 every 30 epochs", is stepped once per epoch: call `scheduler.step()` in the unit the schedule was designed in.)
 
-So the call belongs in the inner loop, right after `optimizer.step()`:
+So for a schedule in steps, the call belongs in the inner loop, right after `optimizer.step()`:
 
 ```
 for x, y in loader:
@@ -781,12 +781,22 @@ def _():
 
 @check("every step's learning rate matches the schedule")
 def _():
-    used = _run()
+    from torch.optim.optimizer import register_optimizer_step_pre_hook
+    seen = []                                    # the lr that each opt.step() really runs with
+    handle = register_optimizer_step_pre_hook(lambda opt, args, kwargs: seen.append(opt.param_groups[0]["lr"]))
+    try:
+        used = _run()
+    finally:
+        handle.remove()
     want = [0.1 * min(1.0, (s + 1) / 8) for s in range(12)]
     bad = [i for i in range(min(len(used), 12)) if not close(used[i], want[i], 1e-9)]
     true(len(used) == 12 and not bad,
          f"Mismatch from index {bad[0] if bad else len(used)} on.\n       schedule: {[round(v, 4) for v in want]}\n       yours:    {[round(v, 4) for v in used]}\n"
          "       Call scheduler.step() after opt.step() in every step: not in the epoch loop, and not before opt.step().")
+    bad = [i for i in range(min(len(seen), 12)) if not close(seen[i], want[i], 1e-9)]
+    true(len(seen) == 12 and not bad,
+         f"Your list matches the schedule, but opt.step() really ran with {[round(v, 4) for v in seen]}. "
+         "Probably sched.step() comes before opt.step(), so every step uses the next step's learning rate: call it right after opt.step().")
 --- hints
 - Which loop is `sched.step()` in now? How many times is it called per epoch?
 - Move it into the inner loop, on the line after `opt.step()`.

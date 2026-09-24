@@ -123,7 +123,7 @@ Piece by piece:
 
 `PointsRequest.model_validate(a dict)` does the check. Valid input returns an object; invalid input raises `ValidationError`, which says at which position (loc) what went wrong.
 
-Note that pydantic is "lax" by default: the string `"1.5"` becomes `1.5` and the integer `3` becomes `3.0`. To reject those too, use strict mode (for example `model_validate(..., strict=True)`).
+Note that pydantic is "lax" by default: the string `"1.5"` becomes `1.5` and the integer `3` becomes `3.0`. To reject strings like `"1.5"`, use strict mode (for example `model_validate(..., strict=True)`). Even in strict mode, an integer is still accepted as a float.
 
 Inside FastAPI, a failed check automatically becomes a **422** response (Unprocessable Entity: the JSON can be read, but its content is not valid). Your handler is never called.
 --- code

@@ -406,7 +406,7 @@ Overfitting one batch is the cheapest bug test there is: in seconds it proves th
 --- prompt
 Write `overfit_one_batch(model, x, y, steps=300, lr=1e-2)`:
 
-- Create the optimizer with `torch.optim.AdamW(model.parameters(), lr=lr)`.
+- Create the optimizer once, before the loop, with `torch.optim.AdamW(model.parameters(), lr=lr)`.
 - Train `steps` steps on the same `(x, y)`, with the loss `F.cross_entropy(model(x), y)`.
 - The order in each step: compute the loss → `zero_grad` → `backward` → `step`.
 - Return the list of the losses of every step, as Python floats (use `loss.item()`).
@@ -436,11 +436,26 @@ def t03():
     seed(0)
     model = nn.Sequential(nn.Linear(8, 32), nn.ReLU(), nn.Linear(32, 5))
     x, y = torch.randn(16, 8), torch.randint(0, 5, (16,))
-    losses = overfit_one_batch(model, x, y)
+    made = []
+    real_adamw = torch.optim.AdamW
+
+    class CountingAdamW(real_adamw):                    # counts how often an optimizer is created
+        def __init__(self, *args, **kwargs):
+            made.append(1)
+            super().__init__(*args, **kwargs)
+
+    torch.optim.AdamW = CountingAdamW
+    try:
+        losses = overfit_one_batch(model, x, y)
+    finally:
+        torch.optim.AdamW = real_adamw
     true(isinstance(losses[0], float), "store loss.item() (a Python float) in the list, not the tensor")
+    true(len(made) <= 1,
+         f"AdamW was created {len(made)} times. Create it once, before the loop: a new AdamW every step "
+         "throws away its running averages (momentum), so it no longer works like Adam")
     true(losses[-1] < 0.01,
          f"the last loss is {losses[-1]:.4f}. A batch of 16 examples should be easy to memorise; "
-         "if it is not, the code has a bug (optimizer created inside the loop? step missing?)")
+         "if it is not, the code has a bug (zero_grad or step missing?)")
     true(losses[-1] < losses[0], "the loss did not go down")
 --- hints
 - Create the optimizer once, outside the loop: `opt = torch.optim.AdamW(model.parameters(), lr=lr)`.
@@ -947,9 +962,24 @@ def t03():
     seed(0)
     model = nn.Sequential(nn.Linear(8, 32), nn.ReLU(), nn.Linear(32, 5))
     x, y = torch.randn(16, 8), torch.randint(0, 5, (16,))
-    losses = overfit_one_batch(model, x, y)
+    made = []
+    real_adamw = torch.optim.AdamW
+
+    class CountingAdamW(real_adamw):                    # counts how often an optimizer is created
+        def __init__(self, *args, **kwargs):
+            made.append(1)
+            super().__init__(*args, **kwargs)
+
+    torch.optim.AdamW = CountingAdamW
+    try:
+        losses = overfit_one_batch(model, x, y)
+    finally:
+        torch.optim.AdamW = real_adamw
     true(isinstance(losses[0], float), "store loss.item() (a Python float) in the list, not the tensor")
+    true(len(made) <= 1,
+         f"AdamW was created {len(made)} times. Create it once, before the loop: a new AdamW every step "
+         "throws away its running averages (momentum), so it no longer works like Adam")
     true(losses[-1] < 0.01,
          f"the last loss is {losses[-1]:.4f}. A batch of 16 examples should be easy to memorise; "
-         "if it is not, the code has a bug (optimizer created inside the loop? step missing?)")
+         "if it is not, the code has a bug (zero_grad or step missing?)")
     true(losses[-1] < losses[0], "the loss did not go down")

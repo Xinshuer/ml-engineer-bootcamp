@@ -226,7 +226,7 @@ Even with the same seed, GPU results can differ between runs. There are three mo
 
 - `torch.backends.cudnn.benchmark = False`: when it is True, cuDNN times several convolution algorithms and picks the fastest. Different runs may pick different algorithms, and results differ in the last digits.
 - `torch.backends.cudnn.deterministic = True`: convolutions use only deterministic algorithms.
-- `torch.use_deterministic_algorithms(True)`: every operation must use a deterministic implementation; an operation without one raises an error instead of quietly giving different results. On a GPU you must also set the environment variable `CUBLAS_WORKSPACE_CONFIG=:4096:8` at the very start of the program (before any GPU work), or matrix multiplications raise an error.
+- `torch.use_deterministic_algorithms(True)`: every operation must use a deterministic implementation; an operation without one raises an error instead of quietly giving different results. Some PyTorch versions also require the environment variable `CUBLAS_WORKSPACE_CONFIG=:4096:8` on a GPU, or matrix multiplications raise an error (the error message tells you to set it). Newer versions, such as the 2.12 this course was written with, no longer need it; you will often see that line in older code, and setting it does no harm.
 
 These switches make the program slower. Turn them on for debugging, for tests, or when you need exact reproduction.
 

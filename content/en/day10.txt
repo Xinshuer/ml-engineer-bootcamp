@@ -689,7 +689,7 @@ Write `flow_loss(model, x1_data)`, returning a scalar loss:
 
 `model(x, t)` returns a tensor with the same shape as x. The random numbers must be on the same device as the data.
 
-Check: with a model that always outputs 0 and 4096 standard normal "data" samples, the loss should be about 2 (the card explains why).
+Checks: with a model that always outputs 0 and 4096 standard normal "data" samples, the loss should be about 2 (the card explains why); with a model that can work out the true velocity, it should be about 0.
 --- starter
 def flow_loss(model, x1_data):
     """t ~ U(0,1) per sample; noise ~ N(0, I); x_t = interpolation; return mse(model(x_t, t), data - noise)."""
@@ -715,6 +715,19 @@ def t07():
     true(l.dim() == 0, "the loss should be a scalar (a 0-dim tensor): F.mse_loss averages by default")
     true(abs(l.item() - 2.0) < 0.15,
          f"for a model that always outputs 0 the loss should be about Var(data - noise) = 2, got {l.item():.3f}")
+
+    # a model that knows the data can work out the true velocity from (x_t, t):
+    # data - x_t = (1 - t) * (data - noise), so v = (data - x_t) / (1 - t). Its loss must be about 0
+    data = torch.randn(256, 1, 4, 4)
+
+    class Oracle(nn.Module):
+        def forward(self, x, t):
+            return (data - x) / (1 - t.reshape(-1, 1, 1, 1))
+
+    lo = flow_loss(Oracle(), data)
+    true(lo.item() < 1e-3,
+         f"a model that predicts the true velocity should get a loss of about 0, got {lo.item():.3f}. Check the convention "
+         "x_t = (1 - t) * noise + t * data and the direction of the target: data - noise, not noise - data")
 --- hints
 - `t = torch.rand(B, device=x1_data.device)`, `noise = torch.randn_like(x1_data)`.
 - The target is `flow_target(noise, x1_data)`, i.e. data - noise; mind the argument order: noise first, then data.
@@ -809,7 +822,7 @@ No code for this one; just count lines (not blank lines, not comments):
 
 Then tick the list below honestly.
 --- checklist
-- I counted the DDPM side (the reference answer has 2 + 7 = 9 lines)
+- I counted the DDPM side (the reference answer has 2 + 8 = 10 lines)
 - I counted the flow side (the reference answer has 2 + 1 = 3 lines); it is clearly shorter
 - I can say what flow drops: no beta schedule, no alphas_cumprod or extract, no chain of coefficients in the update, and no special case for the last step
 --- hints
@@ -1164,7 +1177,7 @@ Closed book: write `flow_loss(model, x1_data)` from blank, returning a scalar lo
 
 Write the interpolation yourself; do not call `flow_interpolate` / `flow_target`. `model(x, t)` returns a tensor with the same shape as x, and t has shape (B,).
 
-Check: for a model that always outputs 0, the loss on standard normal data is about 2.
+Checks: for a model that always outputs 0, the loss on standard normal data is about 2; for a model that can work out the true velocity, it is about 0.
 --- starter
 def flow_loss(model, x1_data):
     raise todo()
@@ -1189,3 +1202,16 @@ def t07():
     true(l.dim() == 0, "the loss should be a scalar (a 0-dim tensor): F.mse_loss averages by default")
     true(abs(l.item() - 2.0) < 0.15,
          f"for a model that always outputs 0 the loss should be about Var(data - noise) = 2, got {l.item():.3f}")
+
+    # a model that knows the data can work out the true velocity from (x_t, t):
+    # data - x_t = (1 - t) * (data - noise), so v = (data - x_t) / (1 - t). Its loss must be about 0
+    data = torch.randn(256, 1, 4, 4)
+
+    class Oracle(nn.Module):
+        def forward(self, x, t):
+            return (data - x) / (1 - t.reshape(-1, 1, 1, 1))
+
+    lo = flow_loss(Oracle(), data)
+    true(lo.item() < 1e-3,
+         f"a model that predicts the true velocity should get a loss of about 0, got {lo.item():.3f}. Check the convention "
+         "x_t = (1 - t) * noise + t * data and the direction of the target: data - noise, not noise - data")

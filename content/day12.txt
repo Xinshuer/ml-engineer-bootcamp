@@ -763,9 +763,9 @@ def _run_step():
     seed(0)
     mel = torch.randn(2, 6, 4)
     lengths = torch.tensor([6, 3])
-    dur = torch.tensor([[2, 2, 2], [1, 1, 1]])
-    lp = torch.log(dur.float() + 1)
-    dm = torch.ones(2, 3)
+    dur = torch.tensor([[2, 2, 2], [1, 2, 0]])                 # 第 1 句的最后一个文本位是 pad
+    lp = torch.log(dur.float() + 1) + torch.tensor([[0.1, -0.2, 0.3], [0.2, -0.1, 2.0]])
+    dm = torch.tensor([[1., 1., 1.], [1., 1., 0.]])
     return (mel, lengths, lp, dur, dm), tts_step_buggy(mel, lengths, lp, dur, dm)
 
 @check("第 1 处：解码器输入右移一位")
@@ -780,11 +780,12 @@ def t11b():
     eq(mel_l, masked_mel_loss(torch.zeros_like(mel), mel, mask),
        msg="mel loss 要带 mask，pad 区域不能算进去")
 
-@check("第 3 处：duration loss 在 log 域")
+@check("第 3 处：duration loss 在 log 域，只算有效文本位")
 def t11c():
     (mel, lengths, lp, dur, dm), (dec_in, mask, mel_l, dur_l) = _run_step()
     eq(dur_l, duration_loss(lp, dur, dm), tol=1e-5,
-       msg="duration 要在 log 域比较，不能直接和原始帧数比")
+       msg="duration 要在 log 域（log(d + 1)）比较，不能直接和原始帧数比；"
+           "而且只算有效的文本位：dur_mask 也要用上")
 --- hints
 - 看 `dec_in`：解码器的输入能直接等于目标吗？
 - `F.l1_loss` 对所有位置求平均，pad 也算进去了；而上一行刚算好的 `mask` 根本没被用上。

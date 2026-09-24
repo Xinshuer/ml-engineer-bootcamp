@@ -24,7 +24,7 @@ Work this number out in your head before training starts, then compare it with t
 
 - About the same (a few tenths apart): fine.
 - Much larger: the model starts out "confidently wrong". Common causes: the initial weights are too large, or the logits (the raw score the model gives each class, before softmax) are scaled up.
-- Much smaller: the model may be peeking at the answer (for example, the label leaked into the input), or the loss is wrong.
+- Much smaller: a model that has learned nothing cannot beat guessing, so the loss is probably computed wrong, or the weights are not freshly initialized (for example, a trained checkpoint was loaded by mistake). A label that leaked into the input does not lower the first loss; it shows up a few steps later, as a loss that falls towards 0 suspiciously fast.
 
 In the example below, a normally initialized model has a first loss of 2.478, close to ln 10 = 2.303. Multiply the weights by 30 and the first loss becomes 25.738.
 --- code

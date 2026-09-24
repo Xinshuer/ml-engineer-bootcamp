@@ -407,6 +407,17 @@ def t04():
        msg="q 在 3、k 在 5 的内积，应该等于 q 在 20、k 在 22 的内积（距离都是 2）。"
            "不相等说明旋转公式写错了")
     true(not torch.allclose(dot_at(3, 5), dot_at(3, 9), atol=1e-4), "距离不同（2 和 6），内积却一样：你的函数好像根本没有旋转")
+
+@check("相邻两维配对：(x0, x1)、(x2, x3)、…")
+def t04b():
+    cos, sin = precompute_freqs(8, 4)
+    x = torch.zeros(1, 1, 4, 8)
+    x[..., 1] = 1.0                            # 只有第 1 维不是 0：第 0 对里的点 (0, 1)
+    want = torch.zeros(1, 1, 4, 8)
+    want[..., 0], want[..., 1] = -sin[:, 0], cos[:, 0]   # (0, 1) 转 t 弧度以后是 (-sin t, cos t)
+    eq(apply_rope(x, cos, sin), want,
+       msg="第 1 维应该和第 0 维配对（相邻配对），其余各维应该保持 0。"
+           "是不是写成了前一半和后一半配对（HuggingFace 的 rotate_half 约定）？")
 --- hints
 - `a, b = x[..., 0::2], x[..., 1::2]`，形状都是 (B, nh, T, hd/2)，能直接和 (T, hd/2) 的 cos、sin 广播。
 - 按公式算出 `o1 = a * cos - b * sin`、`o2 = a * sin + b * cos`，然后交错放回：`torch.stack([o1, o2], dim=-1).flatten(-2)`。
@@ -505,6 +516,14 @@ def t06():
     m = SwiGLU(16, 32)
     shape_is(m(torch.randn(2, 5, 16)), (2, 5, 16), "输出形状应该和输入一样 (B, T, C)")
     true(params(m) == 16 * 32 * 3, f"应该是三个没有 bias 的 Linear，共 {16 * 32 * 3} 个参数，你的是 {params(m)}")
+
+@check("forward = w2(silu(w1(x)) * w3(x))")
+def t06b():
+    seed(7)
+    m = SwiGLU(16, 32)
+    x = torch.randn(2, 5, 16)
+    eq(m(x), m.w2(F.silu(m.w1(x)) * m.w3(x)),
+       msg="输出和 w2(silu(w1(x)) * w3(x)) 对不上。silu 套在 w1(x) 上；w3(x) 是「门」，逐元素乘上去")
 --- hints
 - 向上取整到 m 的倍数：`m * ((h + m - 1) // m)`。例：h = 170、m = 8 → 8 × 22 = 176。
 - 三个层都写成 `nn.Linear(输入, 输出, bias=False)`，参数量应该正好是 3 × C × H。
@@ -985,7 +1004,7 @@ RoPE 是今天最重要的零件，也是面试手写题的常客。不看资料
 - 相邻两维一对：第 i 对 (a, b) = (x[2i], x[2i+1])，旋转成 (a·cos[i] − b·sin[i], a·sin[i] + b·cos[i])，放回原来的两个位置。
 - 不要写 Python 循环。
 
-判题和练习 d5-03 一样：形状、位置 0 不转、长度不变、内积只看相对距离。
+判题和练习 d5-03 一样：形状、位置 0 不转、长度不变、内积只看相对距离、相邻两维配对。
 --- starter
 def apply_rope(x, cos, sin):
     raise todo()
@@ -1023,6 +1042,17 @@ def t04():
        msg="q 在 3、k 在 5 的内积，应该等于 q 在 20、k 在 22 的内积（距离都是 2）。"
            "不相等说明旋转公式写错了")
     true(not torch.allclose(dot_at(3, 5), dot_at(3, 9), atol=1e-4), "距离不同（2 和 6），内积却一样：你的函数好像根本没有旋转")
+
+@check("相邻两维配对：(x0, x1)、(x2, x3)、…")
+def t04b():
+    cos, sin = precompute_freqs(8, 4)
+    x = torch.zeros(1, 1, 4, 8)
+    x[..., 1] = 1.0                            # 只有第 1 维不是 0：第 0 对里的点 (0, 1)
+    want = torch.zeros(1, 1, 4, 8)
+    want[..., 0], want[..., 1] = -sin[:, 0], cos[:, 0]   # (0, 1) 转 t 弧度以后是 (-sin t, cos t)
+    eq(apply_rope(x, cos, sin), want,
+       msg="第 1 维应该和第 0 维配对（相邻配对），其余各维应该保持 0。"
+           "是不是写成了前一半和后一半配对（HuggingFace 的 rotate_half 约定）？")
 --- hints
 - 偶数维和奇数维：`x[..., 0::2]`、`x[..., 1::2]`。
 - 交错放回：`torch.stack([o1, o2], dim=-1).flatten(-2)`。

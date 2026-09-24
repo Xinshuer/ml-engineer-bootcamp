@@ -924,10 +924,20 @@ def t12():
     shape_is(a, x.shape)
     b = p_sample_step(x, t50, eps, s, noise=torch.zeros_like(x))
     true(not torch.allclose(a, b), "for t > 0 you should add sqrt(beta_t) * noise")
+    want = (x - s["betas"][50] / (1 - s["alphas_cumprod"][50]).sqrt() * eps) / s["alphas"][50].sqrt()
+    eq(b, want, msg="with noise = 0 the result should be exactly mean = (x_t - beta_t / sqrt(1 - alpha_bar_t) * eps_pred) / sqrt(alpha_t). "
+                    "Check each coefficient: alpha_t and alpha_bar_t are different tables")
     t0 = torch.zeros(4, dtype=torch.long)
     c1 = p_sample_step(x, t0, eps, s, noise=n)
     c2 = p_sample_step(x, t0, eps, s, noise=torch.randn_like(x))
     eq(c1, c2, msg="the last step (t=0) must not add noise: it outputs the finished image, so a different noise must not change the result")
+    # a batch with mixed t: only the samples with t > 0 get noise
+    tmix = torch.tensor([0, 50, 0, 50])
+    m1 = p_sample_step(x, tmix, eps, s, noise=n)
+    m2 = p_sample_step(x, tmix, eps, s, noise=torch.zeros_like(x))
+    true(torch.allclose(m1[0::2], m2[0::2]) and not torch.allclose(m1[1::2], m2[1::2]),
+         "with t = [0, 50, 0, 50] only the two samples with t = 50 (x_t[1] and x_t[3]) may get noise: decide per sample with a (B, 1, 1, 1) 0/1 switch, "
+         "not with one if for the whole batch")
     # feed in the true noise: one reverse step should land close to x0
     x0 = torch.ones(1, 1, 2, 2)
     tt = torch.tensor([1])
@@ -1214,10 +1224,20 @@ def t12():
     shape_is(a, x.shape)
     b = p_sample_step(x, t50, eps, s, noise=torch.zeros_like(x))
     true(not torch.allclose(a, b), "for t > 0 you should add sqrt(beta_t) * noise")
+    want = (x - s["betas"][50] / (1 - s["alphas_cumprod"][50]).sqrt() * eps) / s["alphas"][50].sqrt()
+    eq(b, want, msg="with noise = 0 the result should be exactly mean = (x_t - beta_t / sqrt(1 - alpha_bar_t) * eps_pred) / sqrt(alpha_t). "
+                    "Check each coefficient: alpha_t and alpha_bar_t are different tables")
     t0 = torch.zeros(4, dtype=torch.long)
     c1 = p_sample_step(x, t0, eps, s, noise=n)
     c2 = p_sample_step(x, t0, eps, s, noise=torch.randn_like(x))
     eq(c1, c2, msg="the last step (t=0) must not add noise: it outputs the finished image, so a different noise must not change the result")
+    # a batch with mixed t: only the samples with t > 0 get noise
+    tmix = torch.tensor([0, 50, 0, 50])
+    m1 = p_sample_step(x, tmix, eps, s, noise=n)
+    m2 = p_sample_step(x, tmix, eps, s, noise=torch.zeros_like(x))
+    true(torch.allclose(m1[0::2], m2[0::2]) and not torch.allclose(m1[1::2], m2[1::2]),
+         "with t = [0, 50, 0, 50] only the two samples with t = 50 (x_t[1] and x_t[3]) may get noise: decide per sample with a (B, 1, 1, 1) 0/1 switch, "
+         "not with one if for the whole batch")
     # feed in the true noise: one reverse step should land close to x0
     x0 = torch.ones(1, 1, 2, 2)
     tt = torch.tensor([1])

@@ -250,7 +250,7 @@ title: 生成：每一步同时吐出 n_q 个码
 
 重复 n_new 次，得到 (1, n_q, T0 + n_new)。
 
-- 用 `@torch.no_grad()` 和 `model.eval()`：生成不需要梯度，省内存也更快。
+- 用 `@torch.no_grad()`：生成不需要梯度，省内存也更快。再调用 `model.eval()`：它关掉 dropout（不是关梯度），贪心生成才会每次结果一样。
 - argmax 是贪心，同样的输入每次结果一样。真实系统会用温度和 top-k 采样（Day 5）。
 - 这里每一步都把整个序列重新算一遍，简单但慢。真实系统用 KV cache（Day 5）。
 - 如果训练时用了 delay pattern，生成出来的是错开的序列：先 undo_delay 对齐，再交给 codec 的 decoder 变回波形。
@@ -766,6 +766,10 @@ def t10():
     true(out.dtype == torch.long and out.max() < 50 and out.min() >= 0,
          f"生成的码应该是 0～49 的整数（torch.long），你的 dtype 是 {out.dtype}")
     eq(out, generate_codes(m, p, 5, 50), msg="贪心生成必须确定性")
+    for t in range(6, 11):                             # 每个新时间步 = 前面整段序列最后一个时间步 logits 的 argmax
+        eq(out[:, :, t], m(out[:, :, :t])[:, :, -1].argmax(-1),
+           msg=f"第 {t} 个时间步不是「最后一个时间步 logits 的 argmax」。每一步要把当前整段序列"
+               "（不只是 prompt）喂给模型，再取 logits[:, :, -1]")
 --- hints
 - `logits[:, :, -1]` 取最后一个时间步，得到 (1, n_q, vocab)。
 - `.argmax(-1)` 得到 (1, n_q)；再 `.unsqueeze(-1)` 变成 (1, n_q, 1)，才能在 dim=-1 上 torch.cat。

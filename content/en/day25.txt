@@ -149,7 +149,7 @@ An alert has two jobs: fire **fast** when something is wrong, and stay **quiet**
 
 **Rolling window**: look only at the requests of the last stretch of time (say, the last 5 minutes).
 
-- The error rate "since launch" does not work. The service has run for a week at 0.5% errors; for the last 5 minutes it has been at 30%, and the all-time rate only moves from 0.5% to 0.6%. Nobody notices.
+- The error rate "since launch" does not work. The service has run for a week at 0.5% errors; for the last 5 minutes it has been at 30%, and the all-time rate only moves from 0.5% to about 0.51%. Nobody notices.
 - A window that is too short makes the number jump around; one that is too long fires long after the trouble started. A few minutes is a common choice.
 
 **Minimum count**: with too few requests in the window, the error rate means nothing. At 3 a.m. there may be only 2 requests in a minute; 1 fails, the error rate is 50%, and it is probably just one user sending bad data. So the rule is: fire only when **count ≥ min_count and error rate > threshold**.

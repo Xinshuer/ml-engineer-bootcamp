@@ -135,7 +135,7 @@ torch.onnx.export(model, (torch.randn(2, FEATURES),), "tinynet.onnx", dynamo=Tru
 - 示例输入只用来追踪计算图。它的 batch 是 2；不加 `dynamic_shapes`，导出的文件就只收 batch 2。
 - `dynamic_shapes` 的键是 `forward` 的参数名：`TinyNet.forward(self, x)` 里的 `x`。
 - 不加 `external_data=False`，权重会写进旁边另一个 `.onnx.data` 文件；部署时忘了拷它，模型就加载不了。
-- 导出后一定要对拍：同一批输入，比 onnxruntime 的输出和 eval 模式的 PyTorch 输出的最大绝对差。float32 下一般在 1e-7 到 1e-6 之间，容差取 1e-4。多试几个 batch 大小（1、5、64），证明 batch 维真的可变。
+- 导出后一定要对拍：同一批输入，比 onnxruntime 的输出和 eval 模式的 PyTorch 输出的最大绝对差。float32 下一般不超过 1e-6，容差取 1e-4。多试几个 batch 大小（1、5、64），证明 batch 维真的可变。
 
 导出要先追踪整个模型，要几秒钟：下面的例子点运行后要等一会儿，导出的两道题时间限制是 120 秒。
 --- code

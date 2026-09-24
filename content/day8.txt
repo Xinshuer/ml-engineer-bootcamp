@@ -924,10 +924,20 @@ def t12():
     shape_is(a, x.shape)
     b = p_sample_step(x, t50, eps, s, noise=torch.zeros_like(x))
     true(not torch.allclose(a, b), "t > 0 时应该加上 sqrt(beta_t) * noise")
+    want = (x - s["betas"][50] / (1 - s["alphas_cumprod"][50]).sqrt() * eps) / s["alphas"][50].sqrt()
+    eq(b, want, msg="noise = 0 时结果应该正好是 mean = (x_t - beta_t / sqrt(1 - alpha_bar_t) * eps_pred) / sqrt(alpha_t)。"
+                    "逐个检查系数：alpha_t 和 alpha_bar_t 是两张不同的表")
     t0 = torch.zeros(4, dtype=torch.long)
     c1 = p_sample_step(x, t0, eps, s, noise=n)
     c2 = p_sample_step(x, t0, eps, s, noise=torch.randn_like(x))
     eq(c1, c2, msg="最后一步（t=0）不能加噪声：它输出的就是成品图，换一个 noise 结果不该变")
+    # t 混在一起的 batch：只有 t > 0 的样本加噪声
+    tmix = torch.tensor([0, 50, 0, 50])
+    m1 = p_sample_step(x, tmix, eps, s, noise=n)
+    m2 = p_sample_step(x, tmix, eps, s, noise=torch.zeros_like(x))
+    true(torch.allclose(m1[0::2], m2[0::2]) and not torch.allclose(m1[1::2], m2[1::2]),
+         "t = [0, 50, 0, 50] 时只有 t = 50 的两个样本（x_t[1] 和 x_t[3]）可以加噪声：要用 (B, 1, 1, 1) 的 0/1 开关按样本决定，"
+         "不能对整个 batch 写一个 if")
     # 喂进真实的噪声，反向一步应该回到 x0 附近
     x0 = torch.ones(1, 1, 2, 2)
     tt = torch.tensor([1])
@@ -1214,10 +1224,20 @@ def t12():
     shape_is(a, x.shape)
     b = p_sample_step(x, t50, eps, s, noise=torch.zeros_like(x))
     true(not torch.allclose(a, b), "t > 0 时应该加上 sqrt(beta_t) * noise")
+    want = (x - s["betas"][50] / (1 - s["alphas_cumprod"][50]).sqrt() * eps) / s["alphas"][50].sqrt()
+    eq(b, want, msg="noise = 0 时结果应该正好是 mean = (x_t - beta_t / sqrt(1 - alpha_bar_t) * eps_pred) / sqrt(alpha_t)。"
+                    "逐个检查系数：alpha_t 和 alpha_bar_t 是两张不同的表")
     t0 = torch.zeros(4, dtype=torch.long)
     c1 = p_sample_step(x, t0, eps, s, noise=n)
     c2 = p_sample_step(x, t0, eps, s, noise=torch.randn_like(x))
     eq(c1, c2, msg="最后一步（t=0）不能加噪声：它输出的就是成品图，换一个 noise 结果不该变")
+    # t 混在一起的 batch：只有 t > 0 的样本加噪声
+    tmix = torch.tensor([0, 50, 0, 50])
+    m1 = p_sample_step(x, tmix, eps, s, noise=n)
+    m2 = p_sample_step(x, tmix, eps, s, noise=torch.zeros_like(x))
+    true(torch.allclose(m1[0::2], m2[0::2]) and not torch.allclose(m1[1::2], m2[1::2]),
+         "t = [0, 50, 0, 50] 时只有 t = 50 的两个样本（x_t[1] 和 x_t[3]）可以加噪声：要用 (B, 1, 1, 1) 的 0/1 开关按样本决定，"
+         "不能对整个 batch 写一个 if")
     # 喂进真实的噪声，反向一步应该回到 x0 附近
     x0 = torch.ones(1, 1, 2, 2)
     tt = torch.tensor([1])

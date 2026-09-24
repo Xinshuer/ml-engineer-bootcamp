@@ -135,7 +135,7 @@ torch.onnx.export(model, (torch.randn(2, FEATURES),), "tinynet.onnx", dynamo=Tru
 - The example input is only used to trace the graph. Its batch is 2; without `dynamic_shapes`, the exported file accepts batch 2 only.
 - The keys of `dynamic_shapes` are the argument names of `forward`: the `x` in `TinyNet.forward(self, x)`.
 - Without `external_data=False`, the weights go into a second file next to it, `.onnx.data`. Forget to copy it when you deploy, and the model will not load.
-- Always compare after exporting: feed the same inputs to onnxruntime and to the model in eval mode, and take the largest absolute difference. In float32 it is usually between 1e-7 and 1e-6; use a tolerance of 1e-4. Try several batch sizes (1, 5, 64) to prove the batch dimension really is dynamic.
+- Always compare after exporting: feed the same inputs to onnxruntime and to the model in eval mode, and take the largest absolute difference. In float32 it is usually 1e-6 or less; use a tolerance of 1e-4. Try several batch sizes (1, 5, 64) to prove the batch dimension really is dynamic.
 
 Exporting traces the whole model and takes a few seconds: after you press Run on the example below, wait a moment. The two export items have a 120-second time limit.
 --- code

@@ -801,6 +801,9 @@ def _():
 def _():
     r = best_run(sample_runs(), "val_acc")          # run-03 crashed; its metrics are empty
     true(_id(r) == "run-04", f"with the crashed run-03 included, the highest val_acc is still run-04; you returned {_id(r)!r}")
+    r = best_run(sample_runs(), "val_loss", higher_is_better=False)
+    true(_id(r) == "run-02", f"with the crashed run-03 included, the lowest val_loss is still run-02; you returned {_id(r)!r}. "
+         "run-03 has no val_loss: skip it. Counting a missing metric as 0 makes a crashed run the \"best\" when lower is better.")
     try:
         best_run(sample_runs(), "f1")
     except ValueError:

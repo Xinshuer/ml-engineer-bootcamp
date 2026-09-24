@@ -1,0 +1,2 @@
+# store text files with LF line endings (build.py on Windows writes CRLF; git converts it)
+* text=auto eol=lf

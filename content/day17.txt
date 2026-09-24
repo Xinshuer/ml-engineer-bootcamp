@@ -52,7 +52,7 @@ title: 数据泄漏：统计量只能来自训练集
 
 一个简单的检查（这就是一个不变量测试）：**只改测试集，训练集变换后的结果必须一模一样。** 变了，就说明有泄漏。
 
-tokenizer 的词表、特征选择、去重也是同一个道理：只能在训练集上「学」。
+tokenizer 的词表、特征选择、填补缺失值用的数也是同一个道理：只能在训练集上「学」。
 
 下面的例子里，测试集的分布偏了。泄漏版把这个偏移藏掉了一半：评估时看起来只偏了 1.74 个标准差，上线后模型面对的其实是 3.39 个。
 --- code
@@ -181,9 +181,9 @@ print("10 步后 LayerNorm 的 weight:", net[1].weight.data)
 @@ concept
 title: 学习率调度器每一步都要 step
 --- body
-学习率调度器（scheduler）按「`scheduler.step()` 被调用了几次」来决定当前学习率。warmup（开头几百步把学习率从很小慢慢升上去）、cosine 这些常用调度，都是按**优化器的步数**设计的。
+学习率调度器（scheduler）按「`scheduler.step()` 被调用了几次」来决定当前学习率。训练 Transformer 常用的 warmup（开头几百步把学习率从很小慢慢升上去）和 cosine，都是按**优化器的步数**设计的。（按 epoch 写的调度，比如「每 30 个 epoch 学习率除以 10」，才是每个 epoch step 一次：调度按什么单位设计，就按什么单位调用 `scheduler.step()`。）
 
-所以它的位置在内层循环里，紧跟在 `optimizer.step()` 后面：
+所以按步数设计的调度，调用位置在内层循环里，紧跟在 `optimizer.step()` 后面：
 
 ```
 for x, y in loader:
@@ -781,12 +781,22 @@ def _():
 
 @check("每一步的学习率都和计划一致")
 def _():
-    used = _run()
+    from torch.optim.optimizer import register_optimizer_step_pre_hook
+    seen = []                                    # 每次 opt.step() 真正用到的学习率
+    handle = register_optimizer_step_pre_hook(lambda opt, args, kwargs: seen.append(opt.param_groups[0]["lr"]))
+    try:
+        used = _run()
+    finally:
+        handle.remove()
     want = [0.1 * min(1.0, (s + 1) / 8) for s in range(12)]
     bad = [i for i in range(min(len(used), 12)) if not close(used[i], want[i], 1e-9)]
     true(len(used) == 12 and not bad,
          f"从下标 {bad[0] if bad else len(used)} 开始对不上。\n       计划: {[round(v, 4) for v in want]}\n       实际: {[round(v, 4) for v in used]}\n"
          "       scheduler.step() 要在每一步的 opt.step() 之后调用，不能放在 epoch 循环里，也不能放在 opt.step() 前面。")
+    bad = [i for i in range(min(len(seen), 12)) if not close(seen[i], want[i], 1e-9)]
+    true(len(seen) == 12 and not bad,
+         f"你记录的列表和计划一致，但 opt.step() 实际用的学习率是 {[round(v, 4) for v in seen]}。"
+         "多半是 sched.step() 放在了 opt.step() 前面，每一步都用上了下一步的学习率：要紧跟在 opt.step() 后面调用。")
 --- hints
 - `sched.step()` 现在在哪个循环里？一个 epoch 它被调用几次？
 - 把它移进内层循环，放在 `opt.step()` 的下一行。

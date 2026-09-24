@@ -652,6 +652,15 @@ def t06():
             p.zero_()
     eq(b(x), x, tol=1e-5,
        msg="子层输出清零后 Block 应该原样返回 x。不相等说明残差写错了（比如写成了 x = attn(ln(x))），或者 LN 放到了主干上（post-LN）")
+
+@check("每个子层的输入先过 LN")
+def t06b():
+    seed(3)
+    b = Block(32, 4, 16)
+    x = torch.randn(2, 7, 32) * 3 + 1
+    h = x + b.attn(b.ln1(x))
+    eq(b(x), h + b.mlp(b.ln2(h)), tol=1e-5,
+       msg="输出应该是 x + attn(ln1(x))，再 + mlp(ln2(...))。是不是漏了 ln1 / ln2，或者放错了地方？")
 --- hints
 - `__init__`：`self.ln1 = nn.LayerNorm(n_embd)`，`self.attn = CausalSelfAttention(n_embd, n_head, block_size)`，`ln2`、`mlp` 同理。
 - 「残差」= 把子层的输出**加回**输入：`x = x + 子层(...)`，不是 `x = 子层(...)`。
@@ -954,6 +963,15 @@ def t12():
         for p in b.mlp.parameters():
             p.zero_()
     eq(b(x), x, tol=1e-5, msg="两处：LN 应该在残差分支里面（pre-LN）；MLP 那一行漏了残差")
+
+@check("每个子层的输入先过 LN")
+def t12b():
+    seed(7)
+    b = BlockBuggy(32, 4, 16)
+    x = torch.randn(2, 7, 32) * 3 + 1
+    h = x + b.attn(b.ln1(x))
+    eq(b(x), h + b.mlp(b.ln2(h)), tol=1e-5,
+       msg="输出应该是 x + attn(ln1(x))，再 + mlp(ln2(...))。把 LN 删掉不算修好：要把它挪进分支里面")
 --- explain
 1. 第一行是 post-LN：LN 套在了 `x + attn(x)` 外面，attn 吃的还是没归一化的 x。改成 `x = x + self.attn(self.ln1(x))`。
 2. 第二行没有 `x +`：MLP 的输出直接替换了 x，残差没了。改成 `x = x + self.mlp(self.ln2(x))`。

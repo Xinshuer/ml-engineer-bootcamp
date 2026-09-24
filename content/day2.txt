@@ -225,7 +225,7 @@ title: 变长序列：padding 与 mask
 DataLoader 把几条样本拼成一个 batch 的那个函数叫 `collate_fn`，padding 通常就写在这里。几个有用的工具：
 - `torch.full((B, Tmax), pad_id, dtype=torch.long)`：先造一个全是 pad_id 的张量，再把真实 token 填进去
 - `x[i, :n] = s`：把长度为 n 的样本 s 填进第 i 行的前 n 个位置
-- token 下标必须是 `int64`（也就是 `torch.long`），因为 `nn.Embedding` 只接受整数下标
+- token 下标用 `int64`（也就是 `torch.long`）：`nn.Embedding` 只接受整数下标，而 `F.cross_entropy` 的类别标签用 int32 会报错，所以统一用 int64
 
 有了 padding，之后所有的统计都要记得 mask。比如求每个样本的平均向量：pad 位置的数不能算进分子，分母也只能数真实 token 的个数：
 
@@ -639,7 +639,7 @@ ref: day2
 - `my_layernorm(x, g, b, eps=1e-5)`：`(x - 均值) / sqrt(方差 + eps) * g + b`。方差用除以 N 的版本（`unbiased=False`）。结果要和 `F.layer_norm(x, (C,), g, b)` 一致
 - `my_rmsnorm(x, g, eps=1e-6)`：不减均值，没有 b：`x / sqrt(mean(x²) + eps) * g`
 
-用 mean、var、sqrt 这些基本运算写，不要调用 `F.layer_norm` 或 `F.rms_norm`。检查会看：g 全是 1 时，RMSNorm 之后每个向量的均方值约等于 1。
+用 mean、var、sqrt 这些基本运算写，不要调用 `F.layer_norm` 或 `F.rms_norm`。检查会看：g 全是 1 时，RMSNorm 之后每个向量的均方值约等于 1；还会用随机的 g，把你的 RMSNorm 和上面的公式逐个元素对比。
 --- starter
 def my_layernorm(x, g, b, eps=1e-5):
     """在最后一维上归一化。g, b 的 shape 都是 (C,)。"""
@@ -658,7 +658,7 @@ def my_rmsnorm(x, g, eps=1e-6):
     rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
     return x * rms * g
 --- tests
-@check("LayerNorm 和 F.layer_norm 一致；RMSNorm 之后均方值 ≈ 1")
+@check("LayerNorm 和 F.layer_norm 一致；RMSNorm 均方值 ≈ 1，且和公式一致")
 def t08():
     seed(3)
     x = torch.randn(2, 5, 8)
@@ -668,6 +668,8 @@ def t08():
     r = my_rmsnorm(x, torch.ones(8))
     eq(r.pow(2).mean(-1), torch.ones(2, 5), tol=1e-3,
        msg="RMSNorm 之后每个向量的均方值应该 ≈ 1")
+    eq(my_rmsnorm(x, g), x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * g,
+       msg="RMSNorm 和公式 x / sqrt(mean(x²) + eps) * g 对不上：不要减均值，最后要乘 g")
 --- hints
 - 均值和方差都用 `dim=-1, keepdim=True`，结果是 `(..., 1)`，才能和 x 广播
 - 方差：`x.var(-1, keepdim=True, unbiased=False)`；再用 `torch.sqrt(var + eps)`。g、b 是 `(C,)`，直接乘、加就会广播到每个向量
@@ -845,11 +847,11 @@ def t12():
     true(keys == {"weight", "running_max"}, f"state_dict 的 key 不对：{keys}（running_max 要用 register_buffer 注册）")
     true([n for n, _ in m.named_parameters()] == ["weight"],
          "running_max 不应该是 Parameter（它不该被优化器更新）")
-    x = torch.randn(8, 4)
+    x = torch.randn(8, 4, requires_grad=True)     # 像模型中间层的输入一样，x 需要梯度
     out = m(x)
     eq(out, x, msg="weight 初始是全 1，forward 应该原样返回 x")
     eq(m.running_max, x.max(0).values.clamp(min=0), msg="running_max 更新得不对")
-    true(not m.running_max.requires_grad, "buffer 不该需要梯度")
+    true(not m.running_max.requires_grad, "buffer 不该需要梯度：running_max 连进了计算图。更新它的那一行要放在 with torch.no_grad(): 里")
 --- hints
 - `__init__` 里：`self.weight = nn.Parameter(torch.ones(dim))`，`self.register_buffer("running_max", torch.zeros(dim))`
 - 沿 batch 维求最大值：`x.max(0).values`；两个张量逐元素取较大的：`torch.maximum(a, b)`
@@ -938,7 +940,7 @@ def t14():
     shape_is(x, (3, 3))
     eq(x, torch.tensor([[1, 2, 3], [4, 99, 99], [5, 6, 99]]))
     eq(mask, torch.tensor([[1, 1, 1], [1, 0, 0], [1, 1, 0]]))
-    true(x.dtype == torch.long, "x 的 dtype 必须是 int64，embedding 层只吃这个")
+    true(x.dtype == torch.long, "x 的 dtype 必须是 int64（torch.long）：token id 统一用 int64，是浮点数的话 embedding 层会直接报错")
 --- hints
 - `Tmax = max(s.numel() for s in samples)`；`torch.full((B, Tmax), pad_id, dtype=torch.long)` 先造一个全是 pad 的张量
 - mask 先用 `torch.zeros(B, Tmax, dtype=torch.long)`，然后一行一行地填

@@ -36,9 +36,11 @@ Prefer your editor? Every coding exercise has a **Work on it in VS Code** button
 | 24–25 | Operations: reproducible runs and a model registry; monitoring and drift |
 | 26 | Capstone: one model from training to a monitored service |
 
-Each day has knowledge cards with runnable examples, practice exercises (write code, fix bugs, fill in, order
-lines, predict output, choose), and a closed-book challenge. Exercises where you needed the answer go to a
-review list until you solve them again on your own.
+Each day has knowledge cards with runnable examples, practice exercises (write code, fix bugs, fill in the
+blanks, predict the output, multiple choice, self-check lists), and a closed-book challenge. A few exercises are
+local tasks you run in a terminal yourself, such as starting the server with uvicorn or building a Docker image
+(that one needs Docker Desktop). Exercises where you needed the answer go to a review list until you solve them
+again on your own.
 
 ## Folders
 
@@ -88,7 +90,7 @@ python serve.py                     # 自动打开 http://127.0.0.1:8765
 | 24–25 | 上线后的运维：实验可复现与模型登记；监控与漂移 |
 | 26 | 毕业项目：一个模型从训练走到有监控的线上服务 |
 
-每天有带可运行例子的知识卡片、练习题（写代码、修 bug、填空、排代码、预测输出、选择）和闭卷挑战。看过答案的题会进复习区，直到你不看答案再做对一次。
+每天有带可运行例子的知识卡片、练习题（写代码、修 bug、填空、预测输出、选择题、自评清单）和闭卷挑战。少数题是本机任务，要你自己在终端里运行，比如用 uvicorn 启动服务、构建 Docker 镜像（这一题需要装 Docker Desktop）。看过答案的题会进复习区，直到你不看答案再做对一次。
 
 ## 文件夹
 

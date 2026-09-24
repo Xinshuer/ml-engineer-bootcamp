@@ -172,7 +172,7 @@ Squeezing 513 frequency bins into 80 mel bands is a single matrix multiplication
 - `fb @ mag`: `(80, 513) @ (513, 63)` → `(80, 63)`
 - with a batch: `(80, 513) @ (B, 513, 63)` → `(B, 80, 63)`; `@` broadcasts over the batch
 
-Real projects build fb with a library function (`torchaudio.functional.melscale_fbanks` or `librosa.filters.mel`). The code below builds one by hand so you can see what it looks like.
+Real projects build fb with a library function (`torchaudio.functional.melscale_fbanks` or `librosa.filters.mel`). Watch the orientation: librosa returns `(n_mels, n_freq)` as here, but torchaudio returns the transpose `(n_freq, n_mels)`, so take `.T` before `fb @ mag`. The code below builds one by hand so you can see what it looks like.
 --- code
 def hz_to_mel(f):
     return 2595 * math.log10(1 + f / 700)
@@ -852,7 +852,7 @@ Production audio comes from all kinds of devices: phones often record at 48 kHz,
 A model was trained on log-mels of 16 kHz audio (n_fft=1024, hop=256, mel filterbank built for sr=16000). In production someone uploads a 44.1 kHz file, and the code computes the log-mel directly, without resampling, and feeds it to the model. What happens?
 --- options
 - An error: the shapes do not match, so the model cannot run
-- No error, but each frame now covers about 5.8 ms (16 ms in training), and every frequency bin stands for different Hz. The model hears something like slowed-down, lower-pitched audio, and quietly gets worse
+- No error, but the hop between frames is now only about 5.8 ms (16 ms in training), and every frequency bin stands for different Hz. The model hears something like slowed-down, lower-pitched audio, and quietly gets worse
 - Nothing: mel spectrograms do not depend on the sample rate
 - Better results: a higher sample rate carries more information
 answer: 2

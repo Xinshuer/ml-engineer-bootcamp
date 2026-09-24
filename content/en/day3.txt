@@ -127,7 +127,7 @@ Points to remember:
 
 - A `.bin` file does not store its dtype. You must read it with the same dtype you wrote it with, or every number comes out wrong (the code below reads it once with uint8 on purpose).
 - `mode="r"` is read-only, so a bug in the training code cannot damage the corpus.
-- A vocabulary larger than 65,536 (for example a 100k tokenizer) does not fit in uint16; use uint32. Numbers too big for uint16 raise no error; they quietly turn into other numbers.
+- A vocabulary larger than 65,536 (for example a 100k tokenizer) does not fit in uint16; use uint32. If a number too big for uint16 comes from a Python list, numpy raises an OverflowError; if it comes from an int64 numpy array (for example through `astype`), there is no error: it quietly turns into another number.
 - Before feeding the model, turn a slice into an int64 tensor: `torch.from_numpy(m[i:i+T].astype(np.int64))`.
 --- code
 import os, tempfile
@@ -775,7 +775,7 @@ def t10():
         except RuntimeError as e:
             true(False, f"it raised: {str(e)[:80]}. A start was too far to the right, the slice got shorter and torch.stack could not stack it; the upper bound should be len(data) - block_size")
         shape_is(x, (4, 16), "x should have shape (batch_size, block_size)")
-        true(x.dtype == torch.long and y.dtype == torch.long, f"the embedding layer only accepts int64; you return {x.dtype} / {y.dtype}")
+        true(x.dtype == torch.long and y.dtype == torch.long, f"x goes into the embedding layer and y is the label for cross_entropy: both must be int64, and floats raise an error. You return {x.dtype} / {y.dtype}")
         eq(y, x + 1, msg="y is not shifted: its slice should start at i + 1")
 --- hints
 - Mistake 1: the upper bound for the start. When i is `len(data) - 1`, how many elements does `data[i:i + block_size]` have?
@@ -876,7 +876,7 @@ title: When uint16 is too small
 level: 2
 cards: Big corpora: a uint16 .bin file and np.memmap
 --- context
-Storing token ids as uint16 in a .bin file uses 4 times less disk than int64. But uint16 stops at 65535. Force a bigger vocabulary into it and numpy raises no error; it quietly turns ids into other numbers, and your training data is broken.
+Storing token ids as uint16 in a .bin file uses 4 times less disk than int64. But uint16 stops at 65535. Cast the ids of a bigger vocabulary from an int64 array to uint16 and numpy raises no error; it quietly turns ids into other numbers, and your training data is broken.
 --- prompt
 Do not run it yet: write down the two lines this code prints. uint16 holds 0 to 65535; `.nbytes` is how many bytes an array takes in total.
 --- code
@@ -885,11 +885,11 @@ ids = np.array([50256, 65535, 65536, 70000], dtype=np.int64)
 print(ids.astype(np.uint16).tolist())
 print(np.array([1, 2, 3], dtype=np.uint16).nbytes, np.array([1, 2, 3], dtype=np.int64).nbytes)
 --- explain
-50256 and 65535 fit and stay as they are. 65536 becomes 0 and 70000 becomes 4464: when converting, numpy keeps only the lowest 16 bits, which is the remainder after dividing by 65536 (70000 - 65536 = 4464). No error, no warning. That is why a tokenizer with more than 65,536 tokens (a 100k vocabulary, for example) must be stored as uint32.
+50256 and 65535 fit and stay as they are. 65536 becomes 0 and 70000 becomes 4464: when `astype` converts, numpy keeps only the lowest 16 bits, which is the remainder after dividing by 65536 (70000 - 65536 = 4464). No error, no warning. That is why a tokenizer with more than 65,536 tokens (a 100k vocabulary, for example) must be stored as uint32.
 
 Second line: 3 uint16 values take 3 × 2 = 6 bytes, 3 int64 values take 3 × 8 = 24 bytes. That is why .bin files use uint16.
 --- hints
-- A number that does not fit in uint16 raises no error; only the remainder after dividing by 65536 is kept.
+- When `astype` converts to uint16, a number that does not fit raises no error; only the remainder after dividing by 65536 is kept.
 - 65536 % 65536 = 0 and 70000 % 65536 = 4464.
 - uint16 takes 2 bytes per element and int64 takes 8; both arrays have 3 elements.
 
