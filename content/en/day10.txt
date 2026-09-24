@@ -1,0 +1,1191 @@
+@@ day 10
+title: DiT + flow matching: an image generator is the Transformer you already wrote
+part: Image generation
+hours: 3–4 hours
+--- goal
+After today you can cut an image into patch tokens, feed a time condition into a Transformer block with adaLN-Zero, assemble a mini DiT, and write its rectified-flow training loss and Euler sampling loop.
+--- checklist
+- Empty your Review list first (redo from blank anything where you saw the answer earlier)
+- Read all 8 cards; run each example, change one number and run it again
+- Pass every practice exercise; DiTBlock and MiniDiT are the two that matter most today
+- Finish with the closed-book part: write DiTBlock and flow_loss from blank
+
+@@ concept
+title: patchify: cutting an image into tokens
+--- body
+A Transformer takes a sequence of tokens with shape (B, N, D). An image has shape (B, C, H, W). DiT (Diffusion Transformer) cuts the image into small p×p squares called patches. Each patch is flattened into one vector, and that vector is one token.
+
+Example: (B, C, H, W) = (2, 3, 8, 8) and p = 2.
+
+- 8/2 = 4 patches down and 4 across, so N = 4×4 = 16 patches
+- each patch holds C×p×p = 3×2×2 = 12 numbers
+- the result has shape (2, 16, 12)
+
+Three steps with only reshape and permute:
+
+1. `x.reshape(B, C, nh, p, nw, p)`: split H into (nh, p) and W into (nw, p). nh = H/p says "which row of patches"; the p after it says "which pixel row inside the patch"
+2. `permute(0, 2, 4, 1, 3, 5)` gives (B, nh, nw, C, p, p): the two "which patch" dimensions move to the front, the "inside the patch" dimensions go to the back
+3. `reshape(B, nh*nw, C*p*p)`: merge the first two into N and the last three into one vector
+
+Patches come in row-major order: token 0 is the top-left patch, token 1 is the one to its right, token nw is the first patch of the second row. Inside a patch the numbers go channel first, then row inside the patch, then column inside the patch.
+
+Why not just `x.reshape(B, N, C*p*p)`? In memory the numbers are stored one full pixel row after another. A plain reshape puts several neighbouring pixels of one row into the same token, which is not a square. The code below shows it.
+
+unpatchify goes backwards: reshape to (B, nh, nw, C, p, p), permute back to (B, C, nh, p, nw, p), then reshape to (B, C, H, W).
+--- code
+x = torch.arange(16.).reshape(1, 1, 4, 4)     # 1 image, 1 channel, 4×4 pixels
+print(x[0, 0])
+
+B, C, H, W = x.shape
+p = 2
+nh, nw = H // p, W // p                        # 2 patches down, 2 across
+t = x.reshape(B, C, nh, p, nw, p)              # split H into (nh, p) and W into (nw, p)
+t = t.permute(0, 2, 4, 1, 3, 5)                # (B, nh, nw, C, p, p)
+tok = t.reshape(B, nh * nw, C * p * p)
+print(tok.shape)                               # 4 patches, each 1*2*2 = 4 numbers
+print(tok[0])                                  # row 0 is the top-left patch: 0 1 4 5
+
+wrong = x.reshape(B, nh * nw, C * p * p)       # wrong: reshape without permute
+print(wrong[0, 0])                             # 0 1 2 3: one pixel row, not a square
+
+@@ concept
+title: 2D position embeddings: telling the model where each patch is
+--- body
+Attention by itself does not know the order of the tokens. Shuffle the input tokens and the output is just shuffled the same way (an exercise lets you see this). So every token gets a "position vector" added to it; only then can the model tell the top-left corner from the bottom-right.
+
+Start with the 1D sine embedding. It is the same idea as day 8's time embedding: describe a number with sines and cosines of different frequencies.
+
+- pick d/2 frequencies: `freqs = 1 / 10000 ** (arange(0, d, 2) / d)`
+- the embedding of position pos is `cat([sin(pos * freqs), cos(pos * freqs)])`, length d
+
+A position in an image is two numbers: (row, column). DiT's 2D version is simple: half of the dimensions encode the row, the other half encode the column, and the two are concatenated.
+
+- `row = pe_1d(dim/2, row index)`, `col = pe_1d(dim/2, column index)`
+- the embedding of position (i, j) is `cat([row[i], col[j]])`, length dim
+- tokens are in row-major order: token k sits in row `k // w`, column `k % w`
+
+Example: a 4×4 grid with dim = 64. Token 0 is at (0, 0), token 3 at (0, 3), token 12 at (3, 0). Tokens 0 and 3 share a row, so their first 32 numbers are equal. Tokens 0 and 12 share a column, so their last 32 numbers are equal.
+
+The table is fixed; it is not trained. A model stores it with `register_buffer`, so it moves with `.to(device)` but the optimizer never changes it.
+--- code
+def pe_1d(d, pos):
+    freqs = 1.0 / (10000 ** (torch.arange(0, d, 2).float() / d))   # d/2 frequencies
+    a = pos.float()[:, None] * freqs[None]                          # (len(pos), d/2)
+    return torch.cat([a.sin(), a.cos()], dim=-1)                    # (len(pos), d)
+
+print(pe_1d(4, torch.arange(3)))       # 3 positions, 4 numbers each; position 0 is [0, 0, 1, 1]
+
+h, w, dim = 2, 3, 8
+row = pe_1d(dim // 2, torch.arange(h))    # (2, 4): one per row
+col = pe_1d(dim // 2, torch.arange(w))    # (3, 4): one per column
+k = torch.arange(h * w)
+print("row:", k // w)                     # the row of each token
+print("col:", k % w)                      # the column of each token
+table = torch.stack([torch.cat([row[i // w], col[i % w]]) for i in range(h * w)])
+print(table.shape)                                  # (6, 8)
+print(torch.equal(table[0, :4], table[2, :4]))      # True: tokens 0 and 2 are both in row 0
+print(torch.equal(table[0, 4:], table[3, 4:]))      # True: tokens 0 and 3 are both in column 0
+
+@@ concept
+title: modulate: scale and shift by the condition
+--- body
+At every step a diffusion model must know "what time is it, how much noise is there" (the time t). When it draws a given class or follows a text prompt, it must know that too. All of this is first turned into one condition vector c with shape (B, D). The question is: how does c get into every token?
+
+Day 8's UNet used FiLM: `h * (1 + scale) + shift`, where scale and shift are computed from the condition. DiT uses the same formula, placed right after a LayerNorm, so it is called adaLN (adaptive LayerNorm):
+
+`modulate(x, shift, scale) = x * (1 + scale) + shift`
+
+The shapes must line up. x is (B, N, D): N tokens. shift and scale are (B, D): one set per image. `unsqueeze(1)` turns them into (B, 1, D) so they broadcast over all tokens of that image. All N tokens of one image use the same shift and scale.
+
+Why `1 + scale` and not `scale`? With scale = 0 and shift = 0, modulate does nothing (it is the identity). At the start of training the network outputs numbers near 0, so it starts from "change nothing". That is much more stable than starting from "multiply everything by 0".
+
+Why `elementwise_affine=False` on the LayerNorm? A normal LayerNorm has its own learnable γ (scale) and β (shift). adaLN's scale and shift already do that job, and they also change with the condition. So the LayerNorm's own copy is switched off.
+--- code
+x = torch.randn(2, 3, 4)          # 2 images, 3 tokens each, 4 numbers per token
+shift = torch.zeros(2, 4)
+scale = torch.zeros(2, 4)
+print(scale.shape, scale.unsqueeze(1).shape)
+
+y = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+print(torch.equal(y, x))          # True: all zeros means identity
+
+scale[0] = 1.0                    # scale = 1 for image 0 only
+y = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+print(torch.equal(y[0], 2 * x[0]), torch.equal(y[1], x[1]))   # True True: image 0 doubled, image 1 unchanged
+
+@@ concept
+title: adaLN-Zero: gates and zero init
+--- body
+Every DiT block has two residual branches: attention and MLP. Each branch needs three sets of numbers: shift, scale and gate. That makes 6 sets, all computed from the condition c:
+
+`SiLU → Linear(D, 6D)` gives (B, 6D). `chunk(6, dim=-1)` cuts it into 6 pieces of (B, D), in the order shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp (msa = multi-head self-attention).
+
+The gate multiplies the branch output: `x = x + gate * attn(...)`. With gate = 0 the branch has no effect at all.
+
+The "Zero" in adaLN-Zero: this Linear's weight and bias both start at 0. So at the start of training all 6 sets are 0:
+
+- shift = scale = 0, so modulate is the identity
+- gate = 0, so both branches are switched off
+- the whole block is the identity: output = input
+
+Why? When dozens of blocks are stacked and each one changes the signal a little at random, the signal gets more and more scrambled. Starting from the identity, every block first "does nothing", and training opens the gates slowly. The DiT paper compared several ways to add the condition, and adaLN-Zero worked best.
+
+Zero init does not mean "cannot learn". The gradient of the gate comes from the branch output, which is not 0, so after the first update the gate is no longer 0. The code below shows that the gate group does get a gradient.
+--- code
+D = 4
+lin = nn.Linear(D, 6 * D)
+nn.init.zeros_(lin.weight)
+nn.init.zeros_(lin.bias)
+
+c = torch.randn(2, D)                                 # condition vectors for 2 images
+groups = lin(F.silu(c)).chunk(6, dim=-1)
+print(len(groups), groups[0].shape)                   # 6 groups, each (2, 4)
+print(all(bool((g == 0).all()) for g in groups))      # True: all zero at the start
+
+x = torch.randn(2, 3, D)
+branch = nn.Linear(D, D)                              # any layer will do as the branch
+gate = groups[2]                                      # gate_msa
+y = x + gate.unsqueeze(1) * branch(x)
+print(torch.equal(y, x))                              # True: identity
+
+y.pow(2).sum().backward()
+print(lin.weight.grad[2 * D:3 * D].abs().sum() > 0)   # tensor(True): the gate group has a gradient
+
+@@ concept
+title: DiTBlock: day 4's Block with a new way in for the condition
+--- body
+First recall day 4's pre-LN Block:
+
+```
+x = x + attn(ln1(x))
+x = x + mlp(ln2(x))
+```
+
+DiTBlock changes only three things:
+
+1. The LayerNorms have no γ/β (`elementwise_affine=False`) and are followed by modulate
+2. Each branch output is multiplied by a gate
+3. The attention has no causal mask: every patch of the image can see every other patch; there is no "future"
+
+```
+s1, sc1, g1, s2, sc2, g2 = modulation(c)
+x = x + g1.unsqueeze(1) * attn(modulate(norm1(x), s1, sc1))
+x = x + g2.unsqueeze(1) * mlp(modulate(norm2(x), s2, sc2))
+```
+
+The MLP is the same as on day 4: `Linear(D, 4D) → GELU → Linear(4D, D)`. x comes in as (B, N, D) and leaves as (B, N, D); c is (B, D).
+
+The exercises already provide `SelfAttention(dim, n_head)`: it is the class in the code below, so just use it. It differs from day 4's CausalSelfAttention in only two ways: no causal mask, and so no block_size and no lower-triangular buffer. The `F.scaled_dot_product_attention` it calls computes the same thing as the softmax(QKᵀ/√d)·V you wrote by hand on day 4.
+--- code
+class SelfAttention(nn.Module):
+    def __init__(self, dim, n_head):
+        super().__init__()
+        self.n_head = n_head
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        hd = C // self.n_head
+        q, k, v = self.qkv(x).split(C, dim=-1)
+        q, k, v = (t.view(B, T, self.n_head, hd).transpose(1, 2) for t in (q, k, v))
+        o = F.scaled_dot_product_attention(q, k, v)     # no is_causal=True: every token sees every token
+        return self.proj(o.transpose(1, 2).reshape(B, T, C))
+
+
+torch.manual_seed(0)
+attn = SelfAttention(8, 2)
+x = torch.randn(1, 4, 8)          # 4 tokens
+x2 = x.clone()
+x2[0, 3] += 1.0                   # change only the last token
+with torch.no_grad():
+    diff = (attn(x)[0, 0] - attn(x2)[0, 0]).abs().max()
+print(f"{diff.item():.4f}")       # not 0: token 0 also "sees" the last token
+
+@@ concept
+title: Rectified flow: a straight line from noise to data
+--- body
+Day 8's DDPM adds noise step by step following a beta schedule, the model predicts the noise ε, the formulas are full of alpha and alpha_bar, and the original sampler takes 1000 steps.
+
+Flow matching takes a different view. Here we use its simplest form, called rectified flow:
+
+- take some noise x0 ~ N(0, I) and a real image x1
+- draw a straight line between them: `x_t = (1 - t) * x0 + t * x1`, with t going from 0 to 1
+- t = 0 is pure noise and t = 1 is clean data. This is the opposite of DDPM, where a larger t means more noise. Some papers and libraries (Stable Diffusion 3, for example) flip it again and put the noise at t = 1, so check the convention before reading someone's code
+- the speed along this line (the derivative of x_t with respect to t) is `v = x1 - x0`. It does not depend on t, because speed along a straight line is constant
+
+The model learns this velocity: it takes (x_t, t) and returns a v with the same shape as x_t. One training step is just four things:
+
+1. draw one t ~ U(0, 1) per sample: `torch.rand(B)`
+2. draw noise with the data's shape: `torch.randn_like(x1)`
+3. compute x_t
+4. loss = MSE(model(x_t, t), x1 - x0)
+
+A shape detail: t is (B,) and the images are (B, C, H, W). Reshape t to (B, 1, 1, 1) so each sample uses its own t. A general form is `t.reshape(-1, *([1] * (x.dim() - 1)))`; it works however many dimensions the data has.
+
+A handy check: if the model always outputs 0, the loss equals the variance of the target v. When the data is also standard normal, Var(x1 - x0) = 1 + 1 = 2, so the loss is about 2.
+--- code
+torch.manual_seed(0)
+x0 = torch.randn(3)                         # noise
+x1 = torch.tensor([2.0, -1.0, 0.5])         # "data"
+for t in [0.0, 0.5, 1.0]:
+    print(t, (1 - t) * x0 + t * x1)         # t=0 is noise, t=1 is data
+print("v:    ", x1 - x0)
+
+h = 1e-3                                    # numerical derivative: how fast x_t changes near t=0.3
+xa = (1 - 0.3) * x0 + 0.3 * x1
+xb = (1 - 0.3 - h) * x0 + (0.3 + h) * x1
+print("dx/dt:", (xb - xa) / h)              # almost exactly v
+
+img = torch.randn(4, 3, 8, 8)               # a batch of images
+t = torch.rand(4)                           # one t per image
+print(t.reshape(-1, *([1] * (img.dim() - 1))).shape)   # (4, 1, 1, 1)
+
+data, noise = torch.randn(100000), torch.randn(100000)
+print(((data - noise) ** 2).mean())         # about 2: the loss of a model that always outputs 0
+
+@@ concept
+title: Euler sampling: follow the velocity, step by step
+--- body
+A trained model tells you the velocity v(x, t) at position x and time t. Sampling means starting from pure noise and following the velocity in small steps until t = 1. The simplest way to do this is Euler's method:
+
+```
+x = pure noise;  dt = 1 / steps
+for i in range(steps):
+    t = i * dt
+    x = x + v(x, t) * dt
+```
+
+Points to get right:
+
+- time starts at t = 0; the last step uses t = 1 - dt and ends exactly at t = 1
+- the t you give the model is a (B,) tensor, `torch.full((B,), i * dt)`, one value per sample in the batch
+- sampling needs no gradients: put `@torch.no_grad()` on the function to save memory and time
+
+A good way to test the loop: use a fake model whose velocity is always 5. Starting from x and moving for 1 unit of time must give x + 5, whether steps is 4 or 100. If dt is wrong (for example `1 / (steps - 1)`), the result changes with the number of steps.
+
+Steps and path shape: when the velocity never changes (a straight path), Euler's method makes no error at all. The more the path bends, the bigger the error per step, and the more steps you need. In the code below, "velocity = x" is a bent path: starting at 1, the true end point is e ≈ 2.718, and 1 step only reaches 2.0. Rectified flow learns paths that are mostly straight (not perfectly: many noise-to-data lines cross, and the model learns their average velocity), so 20–50 steps are often enough, while the original DDPM sampler takes 1000.
+--- code
+def euler(v, x, steps):
+    dt = 1.0 / steps
+    for i in range(steps):
+        x = x + v(x, i * dt) * dt
+    return x
+
+const5 = lambda x, t: torch.full_like(x, 5.0)     # velocity is always 5
+x0 = torch.tensor([1.0, -2.0])
+print(euler(const5, x0, 4), euler(const5, x0, 100))   # both are x0 + 5
+
+curved = lambda x, t: x                           # velocity = x itself: a bent path
+for n in [1, 4, 100]:
+    print(n, round(euler(curved, torch.tensor([1.0]), n).item(), 4))   # true value e ≈ 2.7183
+
+@@ concept
+title: MiniDiT: putting the parts together
+ref: day8, day10
+--- body
+MiniDiT takes a noisy image x (B, C, H, W) and a time t (B,), and returns a velocity with the same shape as x. Follow the shapes with in_ch = 4, img = 8, patch = 2, dim = 64, B = 2:
+
+1. `patchify(x, 2)`: (2, 4, 8, 8) → (2, 16, 16). 16 patches of 2×2×4 = 16 numbers
+2. `Linear(16, 64)`: every token becomes 64 numbers, (2, 16, 64)
+3. add the 2D position table `pos_embed_2d(64, 4, 4)`, shape (16, 64); it broadcasts over the batch
+4. the time condition: `c = t_mlp(timestep_embedding(t, 64))`, shape (2, 64). timestep_embedding is day 8's sine time embedding; t_mlp is `Linear(64, 64) → SiLU → Linear(64, 64)`
+5. n_layer DiTBlocks: `h = block(h, c)`, the shape stays (2, 16, 64)
+6. the output layer: LayerNorm (no γ/β) → modulate → `Linear(64, 16)`, giving (2, 16, 16). This modulate needs only 2 sets, shift and scale: `Linear(64, 128)(silu(c))` then `chunk(2)`
+7. `unpatchify`: (2, 16, 16) → (2, 4, 8, 8)
+
+Zero init: in the output layer, the Linear that computes shift/scale and the final `Linear(64, 16)` get weight and bias set to 0. So before training, the whole network outputs 0 for any input. This is how the DiT paper does it, and it is not a bug: training starts from "predict velocity 0" and the gradients grow from a clean starting point.
+
+How do you check that the time condition is really connected? With zero init the output is all zeros, so you cannot tell. Add a little random noise to every parameter first (as if it had trained a few steps), then compare the outputs for t = 0 and t = 1. They should differ.
+
+The code below calls today's patchify, pos_embed_2d, DiTBlock and unpatchify (reference versions are loaded in the background; you write them in the exercises) and day 8's timestep_embedding. It only looks at shapes.
+--- code
+torch.manual_seed(0)
+B, C, H, p, dim = 2, 4, 8, 2, 64
+x = torch.randn(B, C, H, H)
+t = torch.rand(B)
+
+tok = patchify(x, p)
+print("patchify:   ", tuple(tok.shape))
+h = nn.Linear(p * p * C, dim)(tok) + pos_embed_2d(dim, H // p, H // p)
+print("embed + pos:", tuple(h.shape))
+t_mlp = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
+c = t_mlp(timestep_embedding(t, dim))
+print("condition c:", tuple(c.shape))
+h = DiTBlock(dim, 4)(h, c)
+print("DiTBlock:   ", tuple(h.shape))
+out = unpatchify(nn.Linear(dim, p * p * C)(h), p, H, H, C)
+print("output:     ", tuple(out.shape))
+
+@@ item d10-01
+type: code
+title: patchify / unpatchify round trip
+level: 2
+cards: patchify: cutting an image into tokens
+targets: patchify, unpatchify
+ref: day8, day10
+--- context
+ViT, DiT and similar models all cut the image (or its latent) into patches before the Transformer sees it. The patch size sets the number of tokens, and so the cost of attention. A wrong flattening order raises no error, but the "squares" the model sees are scrambled.
+--- prompt
+Write two functions.
+
+`patchify(x, p)`
+- x has shape (B, C, H, W); H and W are divisible by p
+- return (B, N, C*p*p), where N = (H/p) × (W/p)
+- patches in row-major order: left to right, then top to bottom
+- inside a patch, flatten channel first, then row inside the patch, then column inside the patch; that is, permute to (B, nh, nw, C, p, p) and then merge
+
+`unpatchify(tok, p, H, W, C)`
+- the inverse of patchify: (B, N, C*p*p) → (B, C, H, W)
+
+Checks: (2, 3, 8, 8) with p = 2 becomes (2, 16, 12) and must come back exactly; every token must really be a square patch, in row-major order.
+--- starter
+def patchify(x, p):
+    """x: (B, C, H, W) -> (B, N, C*p*p), N = (H/p) * (W/p), patches in row-major order."""
+    raise todo()
+
+
+def unpatchify(tok, p, H, W, C):
+    """The inverse of patchify: (B, N, C*p*p) -> (B, C, H, W)."""
+    raise todo()
+--- solution
+def patchify(x, p):
+    B, C, H, W = x.shape
+    nh, nw = H // p, W // p
+    x = x.reshape(B, C, nh, p, nw, p)
+    x = x.permute(0, 2, 4, 1, 3, 5)            # (B, nh, nw, C, p, p)
+    return x.reshape(B, nh * nw, C * p * p)
+
+
+def unpatchify(tok, p, H, W, C):
+    B = tok.size(0)
+    nh, nw = H // p, W // p
+    x = tok.reshape(B, nh, nw, C, p, p).permute(0, 3, 1, 4, 2, 5)   # (B, C, nh, p, nw, p)
+    return x.reshape(B, C, H, W)
+--- tests
+@check("patchify / unpatchify round trip")
+def t01():
+    x = torch.randn(2, 3, 8, 8)
+    tok = patchify(x, 2)
+    shape_is(tok, (2, 16, 12), "8/2=4, 4×4=16 patches, each 3×2×2=12 numbers")
+    eq(unpatchify(tok, 2, 8, 8, 3), x, msg="cutting and putting back must give exactly the original image")
+    # a 256×256 image becomes a (4, 32, 32) latent after the VAE; p=2 gives 256 tokens, DiT-XL/2's setting
+    shape_is(patchify(torch.randn(1, 4, 32, 32), 2), (1, 256, 16))
+
+
+@check("every token is a square patch, in row-major order")
+def t01b():
+    x = torch.arange(32.).reshape(1, 2, 4, 4)      # 2 channels, 4×4 each
+    tok = patchify(x, 2)
+    eq(tok[0, 0], torch.tensor([0., 1., 4., 5., 16., 17., 20., 21.]),
+       msg="token 0 should be the top-left 2×2 square: the 4 numbers of channel 0, then those of channel 1. "
+           "If it starts with 0, 1, 2, 3 you reshaped without permuting first")
+    eq(tok[0, 1], torch.tensor([2., 3., 6., 7., 18., 19., 22., 23.]),
+       msg="token 1 should be the top-right square (row-major: left to right first)")
+--- hints
+- First split H into (nh, p) and W into (nw, p): `x.reshape(B, C, nh, p, nw, p)` with nh = H // p.
+- Then `permute(0, 2, 4, 1, 3, 5)` gives (B, nh, nw, C, p, p); finish with `reshape(B, nh * nw, C * p * p)`.
+- unpatchify runs backwards: `tok.reshape(B, nh, nw, C, p, p).permute(0, 3, 1, 4, 2, 5).reshape(B, C, H, W)`.
+
+@@ item d10-02
+type: code
+title: 2D position embeddings
+level: 2
+cards: 2D position embeddings: telling the model where each patch is
+targets: pos_embed_2d
+ref: day8, day10
+--- context
+Attention cannot tell the order of tokens. Without position information the model does not know whether a patch is in the top-left or the bottom-right. DiT uses a fixed 2D sine table: computed, not trained, and stored in the model as a buffer.
+--- prompt
+Write `pos_embed_2d(dim, h, w)`. It returns a position table of shape (h*w, dim). Tokens are in row-major order: token k sits in row `k // w`, column `k % w`.
+
+How:
+
+1. First write the 1D embedding `_pe_1d(d, pos)`: pos is a 1D tensor of L integer positions; return (L, d). `freqs = 1 / 10000 ** (arange(0, d, 2) / d)`, `a = pos * freqs` (an outer product, shape (L, d/2)), and the result is `cat([sin(a), cos(a)], dim=-1)`
+2. Row table `row = _pe_1d(dim // 2, arange(h))`, column table `col = _pe_1d(dim // 2, arange(w))`
+3. The embedding of position (i, j) is `cat([row[i], col[j]])`: the first half depends only on the row, the second half only on the column
+
+dim is a multiple of 4, so dim/2 is even.
+
+Checks: (64, 4, 4) gives (16, 64); neighbouring tokens differ; tokens in the same row share their first 32 numbers, tokens in the same column share their last 32.
+--- starter
+def _pe_1d(d, pos):
+    """pos: integer positions (L,) -> (L, d)."""
+    raise todo()
+
+
+def pos_embed_2d(dim, h, w):
+    """-> (h*w, dim). First dim/2 numbers encode the row, last dim/2 the column; tokens in row-major order."""
+    raise todo()
+--- solution
+def _pe_1d(d, pos):
+    freqs = 1.0 / (10000 ** (torch.arange(0, d, 2).float() / d))
+    a = pos.float()[:, None] * freqs[None]         # (L, d/2)
+    return torch.cat([a.sin(), a.cos()], dim=-1)   # (L, d)
+
+
+def pos_embed_2d(dim, h, w):
+    half = dim // 2
+    row = _pe_1d(half, torch.arange(h))         # (h, half)
+    col = _pe_1d(half, torch.arange(w))         # (w, half)
+    r = row[:, None, :].expand(h, w, half)
+    c = col[None, :, :].expand(h, w, half)
+    return torch.cat([r, c], dim=-1).reshape(h * w, dim)
+--- tests
+@check("2D position embeddings")
+def t02():
+    pe = pos_embed_2d(64, 4, 4)
+    shape_is(pe, (16, 64))
+    true(not torch.allclose(pe[0], pe[1]), "two neighbouring tokens in the same row (0 and 1) must get different embeddings")
+    true(not torch.allclose(pe[0], pe[4]), "two neighbouring tokens in the same column (0 and 4) must get different embeddings")
+    # the first half depends only on the row, the second half only on the column
+    eq(pe[0, :32], pe[3, :32], msg="the first half should encode only the row: tokens 0 and 3 are both in row 0")
+    eq(pe[0, 32:], pe[12, 32:], msg="the second half should encode only the column: tokens 0 and 12 are both in column 0")
+--- hints
+- The 1D part: `a = pos.float()[:, None] * freqs[None]` has shape (L, d/2); sin and cos together give d numbers.
+- The plainest way to build the table is a loop: token k gets `torch.cat([row[k // w], col[k % w]])`; `torch.stack` them at the end.
+- Without a loop: cat `row[:, None, :].expand(h, w, half)` and `col[None, :, :].expand(h, w, half)` on the last dimension to get (h, w, dim), then `reshape(h * w, dim)`.
+
+@@ item d10-03
+type: code
+title: modulate
+level: 1
+cards: modulate: scale and shift by the condition
+targets: modulate
+ref: day8, day10
+--- context
+How the condition (time t, a class, a text prompt) reaches every layer is a central design choice in generative models. DiT, SD3 and Flux all use this one line: shift and scale computed from the condition adjust the normalized features.
+--- prompt
+Write `modulate(x, shift, scale)`:
+
+- x has shape (B, N, D); shift and scale have shape (B, D)
+- return `x * (1 + scale) + shift`; all N tokens of one image use the same shift and scale
+- mind the `1 +`: when scale and shift are both 0, x must come back unchanged
+
+Checks: all zeros is the identity; shift = 1 adds 1 everywhere; scale = 1 doubles everything.
+--- starter
+def modulate(x, shift, scale):
+    """x: (B, N, D)   shift, scale: (B, D)   ->  x * (1 + scale) + shift"""
+    raise todo()
+--- solution
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+--- tests
+@check("modulate")
+def t03():
+    x = torch.randn(2, 5, 8)
+    z = torch.zeros(2, 8)
+    eq(modulate(x, z, z), x, msg="with shift and scale both 0, x must come back unchanged")
+    eq(modulate(x, torch.ones(2, 8), z), x + 1, msg="with shift = 1 the result should be x + 1")
+    eq(modulate(x, z, torch.ones(2, 8)), x * 2, msg="with scale = 1 the result should be x * (1 + 1) = 2x")
+--- hints
+- shift and scale are missing the N dimension, so combining them directly with the (B, N, D) x broadcasts wrongly.
+- `scale.unsqueeze(1)` turns (B, D) into (B, 1, D); do the same for shift, and it is one line.
+
+@@ item d10-04
+type: code
+title: adaLN-Zero modulation parameters
+level: 1
+cards: adaLN-Zero: gates and zero init; modulate: scale and shift by the condition
+targets: AdaLNModulation
+ref: day8, day10
+--- context
+Zero init makes every layer of a very deep network start as the identity, which keeps training stable. "Initialize a newly added layer to zero" is a common trick in real work: LoRA's B matrix and ControlNet's zero convolutions use the same idea.
+--- prompt
+Write an nn.Module `AdaLNModulation(dim)`.
+
+- `__init__`: create an `nn.SiLU()` and an `nn.Linear(dim, 6 * dim)`; set that Linear's weight and bias to 0 with `nn.init.zeros_`
+- `forward(c)`: c has shape (B, dim). Apply SiLU, then the Linear, to get (B, 6*dim); cut it into 6 pieces of (B, dim) and return them (a tuple is fine). The order is shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+Checks: it returns 6 tensors of shape (B, dim), and right after construction they are all 0.
+--- starter
+class AdaLNModulation(nn.Module):
+    """c (B, dim) -> 6 tensors (B, dim): shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp"""
+
+    def __init__(self, dim):
+        super().__init__()
+        raise todo()
+
+    def forward(self, c):
+        raise todo()
+--- solution
+class AdaLNModulation(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.act = nn.SiLU()
+        self.lin = nn.Linear(dim, 6 * dim)
+        nn.init.zeros_(self.lin.weight)      # the "Zero" in adaLN-Zero
+        nn.init.zeros_(self.lin.bias)
+
+    def forward(self, c):
+        return self.lin(self.act(c)).chunk(6, dim=-1)
+--- tests
+@check("adaLN-Zero modulation parameters")
+def t04():
+    m = AdaLNModulation(16)
+    out = m(torch.randn(3, 16))
+    true(isinstance(out, (tuple, list)) and len(out) == 6, "should return 6 tensors (a tuple or a list)")
+    for i, o in enumerate(out):
+        shape_is(o, (3, 16), f"group {i} should have shape (B, dim)")
+    for o in out:
+        eq(o, torch.zeros(3, 16), msg="zero init: right after construction all 6 groups should be 0. Did you zero both weight and bias?")
+--- hints
+- You need both `nn.init.zeros_(self.lin.weight)` and `nn.init.zeros_(self.lin.bias)`: forget the bias and the output is not 0.
+- Split with `.chunk(6, dim=-1)`; it returns a tuple directly.
+
+@@ item d10-05
+type: code
+title: DiTBlock
+level: 2
+cards: DiTBlock: day 4's Block with a new way in for the condition; adaLN-Zero: gates and zero init; modulate: scale and shift by the condition
+targets: DiTBlock
+ref: day8, day10
+--- context
+This is the proof that "an image generator is the Transformer you already wrote": DiTBlock differs from day 4's Block only by modulate and the gates, plus dropping the causal mask. The backbones of SD3, Flux and similar models are stacks of blocks like this one.
+--- prompt
+Write `DiTBlock(dim, n_head)` with `forward(x, c)`: x is (B, N, dim), c is (B, dim), and it returns (B, N, dim).
+
+Build these layers in `__init__` (use these attribute names; the checks use `modulation`):
+
+- `norm1`, `norm2`: `nn.LayerNorm(dim, elementwise_affine=False)`
+- `attn`: `SelfAttention(dim, n_head)` (provided)
+- `mlp`: `Linear(dim, 4*dim) → GELU → Linear(4*dim, dim)`
+- `modulation`: `AdaLNModulation(dim)` (the previous exercise's class, provided)
+
+forward:
+
+```
+s1, sc1, g1, s2, sc2, g2 = modulation(c)
+x = x + g1 * attn(modulate(norm1(x), s1, sc1))
+x = x + g2 * mlp(modulate(norm2(x), s2, sc2))
+```
+
+A gate has shape (B, dim); make it (B, 1, dim) before multiplying. `modulate` is provided too.
+
+Checks: a freshly built block must be the identity (output = input); after the modulation parameters are set to non-zero values, the output must really change.
+--- starter
+class DiTBlock(nn.Module):
+    def __init__(self, dim, n_head):
+        super().__init__()
+        raise todo()
+
+    def forward(self, x, c):
+        raise todo()
+--- solution
+class DiTBlock(nn.Module):
+    def __init__(self, dim, n_head):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.attn = SelfAttention(dim, n_head)
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+        self.modulation = AdaLNModulation(dim)
+
+    def forward(self, x, c):
+        s1, sc1, g1, s2, sc2, g2 = self.modulation(c)
+        x = x + g1.unsqueeze(1) * self.attn(modulate(self.norm1(x), s1, sc1))
+        x = x + g2.unsqueeze(1) * self.mlp(modulate(self.norm2(x), s2, sc2))
+        return x
+--- tests
+@check("DiTBlock")
+def t05():
+    seed(0)
+    b = DiTBlock(32, 4)
+    x, c = torch.randn(2, 9, 32), torch.randn(2, 32)
+    shape_is(b(x, c), (2, 9, 32))
+    eq(b(x, c), x, tol=1e-5,
+       msg="zero-initialized gates should make the whole block the identity at the start. If not, a gate is "
+           "missing or the modulation Linear is not zero-initialized")
+    # once training has moved things (here: non-zero modulation parameters), the block is no longer the identity
+    with torch.no_grad():
+        for p in b.modulation.parameters():
+            p.normal_(0, 0.3)
+    true(not torch.allclose(b(x, c), x, atol=1e-4), "with non-zero gates the block should really change x")
+--- hints
+- The mlp can be `nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))`.
+- Identity check failing? Make sure both branches are multiplied by their gate, and that the gate is `unsqueeze(1)`-ed.
+- Compare with day 4: `x = x + attn(ln1(x))` becomes `x = x + g1.unsqueeze(1) * self.attn(modulate(self.norm1(x), s1, sc1))`; the mlp line is the same pattern.
+
+@@ item d10-06
+type: code
+title: Rectified flow interpolation and target
+level: 1
+cards: Rectified flow: a straight line from noise to data
+targets: flow_interpolate, flow_target
+ref: day8, day10
+--- context
+These two lines are all of flow matching's training-data construction. Compared with DDPM's beta schedule, alphas_cumprod and extract from day 8, this is simple and hard to get wrong, which is one reason newer models such as SD3 and Flux switched to flow.
+--- prompt
+Write two functions:
+
+- `flow_interpolate(x0_noise, x1_data, t)`: return `x_t = (1 - t) * noise + t * data`. x0_noise and x1_data have shape (B, C, H, W); t has shape (B,) with values in [0, 1], one per sample
+- `flow_target(x0_noise, x1_data)`: return the velocity target `v = data - noise`
+
+Make t broadcast per sample over data with any number of dimensions (do not assume 4).
+
+Checks: t = 0 returns the noise, t = 1 the data, t = 0.5 their average; the numerical derivative of x_t with respect to t equals flow_target; every sample in the batch uses its own t.
+--- starter
+def flow_interpolate(x0_noise, x1_data, t):
+    """x_t = (1 - t) * noise + t * data. x: (B, C, H, W), t: (B,)"""
+    raise todo()
+
+
+def flow_target(x0_noise, x1_data):
+    """Velocity target v = data - noise: a straight line from the noise to the data."""
+    raise todo()
+--- solution
+def flow_interpolate(x0_noise, x1_data, t):
+    tt = t.reshape(-1, *([1] * (x0_noise.dim() - 1)))    # (B,) -> (B, 1, 1, 1)
+    return (1 - tt) * x0_noise + tt * x1_data
+
+
+def flow_target(x0_noise, x1_data):
+    return x1_data - x0_noise
+--- tests
+@check("Rectified flow interpolation and target")
+def t06():
+    n, d = torch.randn(4, 1, 4, 4), torch.randn(4, 1, 4, 4)
+    eq(flow_interpolate(n, d, torch.zeros(4)), n, msg="t=0 should be pure noise")
+    eq(flow_interpolate(n, d, torch.ones(4)), d, msg="t=1 should be clean data")
+    eq(flow_interpolate(n, d, torch.full((4,), 0.5)), (n + d) / 2, msg="t=0.5 should be the average of noise and data")
+    eq(flow_target(n, d), d - n, msg="the target velocity is data - noise; check the direction")
+    # the key property: the derivative of x_t with respect to t is the target velocity everywhere
+    t1, t2 = torch.full((4,), 0.3), torch.full((4,), 0.3001)
+    num = (flow_interpolate(n, d, t2) - flow_interpolate(n, d, t1)) / 0.0001
+    eq(num, flow_target(n, d), tol=1e-2, msg="the derivative of x_t with respect to t should be exactly the target velocity")
+
+
+@check("every sample uses its own t")
+def t06b():
+    n, d = torch.randn(4, 1, 4, 4), torch.randn(4, 1, 4, 4)
+    t = torch.tensor([0.0, 0.25, 0.5, 1.0])
+    xt = flow_interpolate(n, d, t)
+    shape_is(xt, (4, 1, 4, 4))
+    for i in range(4):
+        eq(xt[i], (1 - t[i]) * n[i] + t[i] * d[i],
+           msg=f"sample {i} should use t[{i}] = {t[i].item()}. t is (B,): reshape it to (B, 1, 1, 1) before "
+               "multiplying. Otherwise it broadcasts along the last dimension (the image width): no error, wrong numbers")
+--- hints
+- t is (B,). Multiplied directly with (B, C, H, W) it broadcasts along the last dimension: no error, wrong result. Reshape it to (B, 1, 1, 1) first.
+- A version that works for any number of dimensions: `tt = t.reshape(-1, *([1] * (x0_noise.dim() - 1)))`.
+- flow_target is one line: `return x1_data - x0_noise`.
+
+@@ item d10-07
+type: code
+title: The flow training loss
+level: 2
+cards: Rectified flow: a straight line from noise to data
+targets: flow_loss
+ref: day8, day10
+--- context
+When you train a generative model, the loss function defines what the model learns. The flow training step is only a few lines and has exactly the shape of day 8's ddpm_loss; "predict the noise" just becomes "predict the velocity". Interviewers often ask you to write it on the spot.
+--- prompt
+Write `flow_loss(model, x1_data)`, returning a scalar loss:
+
+1. draw one t ~ U(0, 1) per sample, shape (B,)
+2. draw standard normal noise with the data's shape
+3. compute x_t with `flow_interpolate` (the previous exercise's function, provided; `flow_target` is there too)
+4. return `F.mse_loss(model(x_t, t), data - noise)`
+
+`model(x, t)` returns a tensor with the same shape as x. The random numbers must be on the same device as the data.
+
+Check: with a model that always outputs 0 and 4096 standard normal "data" samples, the loss should be about 2 (the card explains why).
+--- starter
+def flow_loss(model, x1_data):
+    """t ~ U(0,1) per sample; noise ~ N(0, I); x_t = interpolation; return mse(model(x_t, t), data - noise)."""
+    raise todo()
+--- solution
+def flow_loss(model, x1_data):
+    B = x1_data.size(0)
+    t = torch.rand(B, device=x1_data.device)
+    noise = torch.randn_like(x1_data)
+    xt = flow_interpolate(noise, x1_data, t)
+    return F.mse_loss(model(xt, t), flow_target(noise, x1_data))
+--- tests
+@check("The flow training loss")
+def t07():
+    seed(1)
+
+    class Zero(nn.Module):
+        def forward(self, x, t):
+            return torch.zeros_like(x)
+
+    # when the data is standard normal too, v = data - noise has variance 1 + 1 = 2
+    l = flow_loss(Zero(), torch.randn(4096, 1, 4, 4))
+    true(l.dim() == 0, "the loss should be a scalar (a 0-dim tensor): F.mse_loss averages by default")
+    true(abs(l.item() - 2.0) < 0.15,
+         f"for a model that always outputs 0 the loss should be about Var(data - noise) = 2, got {l.item():.3f}")
+--- hints
+- `t = torch.rand(B, device=x1_data.device)`, `noise = torch.randn_like(x1_data)`.
+- The target is `flow_target(noise, x1_data)`, i.e. data - noise; mind the argument order: noise first, then data.
+- Loss about 1 instead of 2? Your target uses only the data or only the noise, not their difference.
+
+@@ item d10-08
+type: code
+title: Euler sampling
+level: 2
+cards: Euler sampling: follow the velocity, step by step
+targets: flow_sample
+ref: day8, day10
+--- context
+Sampling is the code that actually runs once the model is deployed, and the number of steps decides how long one image takes (SD3 defaults to 28). Where time starts and what dt is are the easiest places for a silent bug in sampling code.
+--- prompt
+Write `flow_sample(model, shape, steps=20, device="cpu")`:
+
+- start from pure noise (t = 0): the first random call in the function is `x = torch.randn(shape, device=device)`
+- `dt = 1 / steps`; loop steps times: step i uses time `t = i * dt`, made into a tensor of shape (B,) (B = shape[0]), then `x = x + model(x, t) * dt`
+- return the final x (now at t = 1)
+- the function already has `@torch.no_grad()`
+
+Checks: with a model whose velocity is always 5, 4 steps and 100 steps must give the same result, exactly the starting noise + 5; the model is called steps times and receives t = 0, dt, 2dt, …. The checks set the random seed before calling, so do not draw any other random numbers before `torch.randn(shape)`.
+--- starter
+@torch.no_grad()
+def flow_sample(model, shape, steps=20, device="cpu"):
+    """Start from pure noise at t=0, integrate with Euler's method to t=1, return the final x."""
+    raise todo()
+--- solution
+@torch.no_grad()
+def flow_sample(model, shape, steps=20, device="cpu"):
+    x = torch.randn(shape, device=device)
+    dt = 1.0 / steps
+    for i in range(steps):
+        t = torch.full((shape[0],), i * dt, device=device)
+        x = x + model(x, t) * dt
+    return x
+--- tests
+@check("Euler sampling")
+def t08():
+    class ConstV(nn.Module):
+        """Velocity is always 5: integrating for 1 unit of time from x must give x + 5,
+        whatever the number of steps (a good way to test an integrator)."""
+        def forward(self, x, t):
+            return torch.full_like(x, 5.0)
+
+    m = ConstV()
+    torch.manual_seed(0)
+    a = flow_sample(m, (2, 1, 3, 3), steps=4)
+    torch.manual_seed(0)
+    b = flow_sample(m, (2, 1, 3, 3), steps=100)
+    eq(a, b, tol=1e-4, msg="with a constant velocity the result must not depend on the number of steps: dt or the loop count is wrong")
+    torch.manual_seed(0)
+    x0 = torch.randn(2, 1, 3, 3)
+    eq(a, x0 + 5.0, tol=1e-4, msg="after 1 unit of time the displacement should be exactly velocity × 1 = 5")
+
+
+@check("the t passed to the model")
+def t08b():
+    class Rec(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ts = []
+
+        def forward(self, x, t):
+            self.ts.append(torch.as_tensor(t).clone())
+            return torch.zeros_like(x)
+
+    r = Rec()
+    flow_sample(r, (3, 1, 2, 2), steps=4)
+    true(len(r.ts) == 4, f"steps=4 should call the model 4 times, it was called {len(r.ts)} times")
+    shape_is(r.ts[0], (3,), "t should be a tensor of shape (B,), one value per sample in the batch")
+    eq(torch.stack([t[0] for t in r.ts]), torch.tensor([0.0, 0.25, 0.5, 0.75]),
+       msg="with 4 steps the times should be 0, 0.25, 0.5, 0.75: start at t=0 (pure noise), the last step is 1 - dt")
+--- hints
+- The time tensor for each step: `t = torch.full((shape[0],), i * dt, device=device)`.
+- Result changes with the number of steps? Check that dt is `1.0 / steps` and that the loop runs exactly steps times.
+- Not equal to "noise + 5"? Make sure the function begins with `torch.randn(shape, device=device)` and nothing random runs before it.
+
+@@ item d10-09
+type: self
+title: Line count comparison (self-check)
+level: 1
+cards: Rectified flow: a straight line from noise to data; Euler sampling: follow the velocity, step by step
+--- context
+Shorter code is harder to get wrong and easier to debug. Count the lines yourself once and you will feel why newer image generators (SD3, Flux) moved from DDPM to flow matching.
+--- prompt
+No code for this one; just count lines (not blank lines, not comments):
+
+1. the bodies of day 8's `q_sample` and `p_sample_step`, as you wrote them, together
+2. the body of today's `flow_interpolate`, plus the one line of the Euler sampler that updates x (`x = x + model(x, t) * dt`)
+
+Then tick the list below honestly.
+--- checklist
+- I counted the DDPM side (the reference answer has 2 + 7 = 9 lines)
+- I counted the flow side (the reference answer has 2 + 1 = 3 lines); it is clearly shorter
+- I can say what flow drops: no beta schedule, no alphas_cumprod or extract, no chain of coefficients in the update, and no special case for the last step
+--- hints
+- q_sample is exercise d8-04 and p_sample_step is d8-11; look at your own versions.
+- The lines of p_sample_step: fetching three coefficients, the mean, handling noise, no noise at t = 0… flow needs none of them.
+
+@@ item d10-10
+type: code
+title: MiniDiT forward
+level: 3
+cards: MiniDiT: putting the parts together; patchify: cutting an image into tokens; 2D position embeddings: telling the model where each patch is
+targets: MiniDiT
+ref: day8, day10
+--- context
+This exercise turns today's parts into a trainable model with the same structure as in the DiT paper, only much smaller. Output-layer zero init and "is the condition really connected?" both deserve dedicated tests in real projects.
+--- prompt
+Write `MiniDiT(in_ch=4, img=8, patch=2, dim=64, n_layer=2, n_head=4)` with `forward(x, t)`: x is (B, in_ch, img, img), t is (B,), and it returns a tensor with the same shape as x (the predicted velocity).
+
+Structure:
+
+1. `patchify(x, patch)` → `nn.Linear(patch*patch*in_ch, dim)` → add `pos_embed_2d(dim, img // patch, img // patch)` (stored with `register_buffer`)
+2. the condition `c = t_mlp(timestep_embedding(t, dim))`, where t_mlp is `Linear(dim, dim) → SiLU → Linear(dim, dim)`
+3. n_layer `DiTBlock(dim, n_head)` in an `nn.ModuleList`, applied in turn: `h = block(h, c)`
+4. the output layer: `LayerNorm(dim, elementwise_affine=False)` → `modulate(·, shift, scale)` → `Linear(dim, patch*patch*in_ch)` → `unpatchify`, with `shift, scale = Linear(dim, 2*dim)(F.silu(c)).chunk(2, dim=-1)`
+5. zero-initialize the weight and bias of both output-layer Linears (the shift/scale one and the final one)
+
+Available to use: `patchify`, `unpatchify`, `pos_embed_2d`, `modulate`, `DiTBlock` (today's reference versions) and `timestep_embedding` (day 8).
+
+Checks: the output shape is right; before training the output is all zeros; after the parameters are perturbed, the outputs for t = 0 and t = 1 must differ.
+--- starter
+class MiniDiT(nn.Module):
+    """x (B, in_ch, img, img), t (B,) -> same shape as x.
+    patchify -> Linear -> + pos -> n_layer DiTBlock(h, c) -> LayerNorm -> modulate -> Linear -> unpatchify
+    c = t_mlp(timestep_embedding(t, dim)); both output-layer Linears are zero-initialized.
+    """
+
+    def __init__(self, in_ch=4, img=8, patch=2, dim=64, n_layer=2, n_head=4):
+        super().__init__()
+        raise todo()
+
+    def forward(self, x, t):
+        raise todo()
+--- solution
+class MiniDiT(nn.Module):
+    def __init__(self, in_ch=4, img=8, patch=2, dim=64, n_layer=2, n_head=4):
+        super().__init__()
+        self.in_ch, self.img, self.patch, self.dim = in_ch, img, patch, dim
+        pdim = patch * patch * in_ch
+        self.embed = nn.Linear(pdim, dim)
+        self.register_buffer("pos", pos_embed_2d(dim, img // patch, img // patch))
+        self.t_mlp = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
+        self.blocks = nn.ModuleList([DiTBlock(dim, n_head) for _ in range(n_layer)])
+        self.norm_out = nn.LayerNorm(dim, elementwise_affine=False)
+        self.mod_out = nn.Linear(dim, 2 * dim)
+        nn.init.zeros_(self.mod_out.weight)
+        nn.init.zeros_(self.mod_out.bias)
+        self.head = nn.Linear(dim, pdim)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, x, t):
+        h = self.embed(patchify(x, self.patch)) + self.pos        # (B, N, dim)
+        c = self.t_mlp(timestep_embedding(t, self.dim))           # (B, dim)
+        for b in self.blocks:
+            h = b(h, c)
+        shift, scale = self.mod_out(F.silu(c)).chunk(2, dim=-1)
+        h = self.head(modulate(self.norm_out(h), shift, scale))   # (B, N, patch*patch*in_ch)
+        return unpatchify(h, self.patch, self.img, self.img, self.in_ch)
+--- tests
+@check("MiniDiT forward")
+def t10():
+    seed(2)
+    m = MiniDiT(in_ch=4, img=8, patch=2, dim=64, n_layer=2)
+    x = torch.randn(2, 4, 8, 8)
+    t = torch.rand(2)
+    shape_is(m(x, t), (2, 4, 8, 8))
+    eq(m(x, t), torch.zeros(2, 4, 8, 8),
+       msg="with a zero-initialized output layer the untrained output should be all zeros (that is correct, not a bug). "
+           "Did you zero the weight and bias of both output Linears?")
+    # perturb every parameter a little, as if it had trained a few steps, then check that time is really connected
+    with torch.no_grad():
+        for p in m.parameters():
+            p.add_(torch.randn_like(p) * 0.1)
+    o1, o2 = m(x, torch.zeros(2)), m(x, torch.ones(2))
+    true(not torch.allclose(o1, o2, atol=1e-5), "changing t did not change the output: the time condition is not connected")
+--- hints
+- In `__init__`, store in_ch, img, patch and dim on self; forward needs them.
+- Position table: `self.register_buffer("pos", pos_embed_2d(dim, img // patch, img // patch))`; in forward just `+ self.pos`, and (N, dim) broadcasts to (B, N, dim).
+- The end of forward: `shift, scale = self.mod_out(F.silu(c)).chunk(2, dim=-1)`, then `self.head(modulate(self.norm_out(h), shift, scale))`, then unpatchify.
+
+@@ item d10-11
+type: self
+title: Reuse check (self-check)
+level: 1
+cards: DiTBlock: day 4's Block with a new way in for the condition
+--- context
+Interviewers often ask "how does DiT's Transformer differ from GPT's?" The answer: hardly at all. Compare them yourself once and you can carry what you learned on day 4 straight over to image, video and even audio models.
+--- prompt
+No code for this one. Open the `CausalSelfAttention` you wrote on day 4 (d4-03) and put it next to the `SelfAttention` in the card "DiTBlock: day 4's Block with a new way in for the condition". Compare them line by line: the qkv projection, splitting into heads, the attention itself, merging the heads, the output projection.
+
+Then tick the list. "An image generator is the Transformer you already wrote" is the one thing that really matters today.
+--- checklist
+- The qkv projection, splitting heads (view + transpose), merging heads and the proj output projection are identical
+- Difference (a): SelfAttention has no causal mask (no masked_fill, no is_causal=True), so every patch sees every patch
+- Difference (b): SelfAttention has no block_size argument and no lower-triangular buffer
+- I can say in one sentence: the backbone of an image generator is the Transformer I wrote; only the way the condition comes in changed, to adaLN
+--- hints
+- If on day 4 you wrote softmax(QKᵀ/√d)·V by hand and today uses `F.scaled_dot_product_attention`: they compute the same thing, and d4-02 already compared them.
+- Beyond attention, compare the Block too: day 4 has `x + attn(ln1(x))`, today has `x + g1 * attn(modulate(norm1(x), s1, sc1))`.
+
+@@ item d10-12
+type: fix
+title: Find the bugs: DiTBlockBuggy
+level: 2
+cards: adaLN-Zero: gates and zero init; DiTBlock: day 4's Block with a new way in for the condition; modulate: scale and shift by the condition
+targets: DiTBlockBuggy
+ref: day8, day10
+--- context
+None of these 4 bugs raises an error and all shapes are right. The model still trains, just less stably and to a worse result. That is the hardest kind of bug to find in real projects; only careful reading and targeted tests catch it.
+--- prompt
+`DiTBlockBuggy` should do exactly what DiTBlock does, but it has 4 bugs. The code runs without errors and the output shape is right.
+
+Find and fix all 4 (keep the class name; `modulation` can stay an `nn.Sequential(SiLU, Linear)`).
+
+Checks: a freshly built block must be the identity (output = input); neither LayerNorm may have a learnable γ/β.
+--- starter
+class DiTBlockBuggy(nn.Module):
+    def __init__(self, dim, n_head):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.attn = SelfAttention(dim, n_head)
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+        nn.init.normal_(self.modulation[1].weight, std=0.02)
+
+    def forward(self, x, c):
+        s1, sc1, g1, s2, sc2, g2 = self.modulation(c).chunk(6, dim=-1)
+        x = x + self.attn(self.norm1(x) * sc1.unsqueeze(1) + s1.unsqueeze(1))
+        x = x + g2.unsqueeze(1) * self.mlp(self.norm2(x) * (1 + sc2.unsqueeze(1)) + s2.unsqueeze(1))
+        return x
+--- solution
+class DiTBlockBuggy(nn.Module):
+    def __init__(self, dim, n_head):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)   # fix 4
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)   # fix 4
+        self.attn = SelfAttention(dim, n_head)
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+        nn.init.zeros_(self.modulation[1].weight)                  # fix 1: zero both weight and bias
+        nn.init.zeros_(self.modulation[1].bias)
+
+    def forward(self, x, c):
+        s1, sc1, g1, s2, sc2, g2 = self.modulation(c).chunk(6, dim=-1)
+        # fix 2: add the gate on the attn branch; fix 3: scale must be (1 + scale)
+        x = x + g1.unsqueeze(1) * self.attn(
+            self.norm1(x) * (1 + sc1.unsqueeze(1)) + s1.unsqueeze(1))
+        x = x + g2.unsqueeze(1) * self.mlp(
+            self.norm2(x) * (1 + sc2.unsqueeze(1)) + s2.unsqueeze(1))
+        return x
+--- tests
+@check("Find the bugs: DiTBlockBuggy")
+def t12():
+    seed(3)
+    b = DiTBlockBuggy(32, 4)
+    x, c = torch.randn(2, 9, 32), torch.randn(2, 32)
+    eq(b(x, c), x, tol=1e-5,
+       msg="a freshly built block should be the identity. Three bugs hide here: the modulation Linear must be "
+           "zero-initialized (weight and bias); the attn branch is missing its gate; the attn branch's scale must be (1 + scale)")
+    ln = [m for m in b.modules() if isinstance(m, nn.LayerNorm)]
+    true(all(m.elementwise_affine is False for m in ln),
+         "the fourth: adaLN already scales and shifts, so both LayerNorms should use elementwise_affine=False")
+--- hints
+- A freshly built DiT block should be the identity. What guarantees that? How the modulation Linear is initialized, and the gate on each branch.
+- Put the two branches side by side: what does the attn branch have less of than the mlp branch? Is scale written the same way?
+- The fourth bug is at the top of `__init__`: adaLN already scales and shifts, so the LayerNorm's own γ/β should be off.
+
+@@ item d10-13
+type: predict
+title: Patch size and token count
+level: 1
+cards: patchify: cutting an image into tokens
+ref: day8, day10
+--- context
+The token count N sets the cost of attention (proportional to N²). In the DiT paper, going from patch 8 to patch 2 means 16 times more tokens, much more compute, and much better images. It is the most common trade-off when choosing a model configuration.
+--- prompt
+Read the code and write the three lines it prints. `patchify` is the function you wrote in d10-01. Each line prints p, the shape of the tokens, and N² (the number of token pairs attention has to score).
+--- code
+x = torch.randn(1, 4, 32, 32)       # the latent of a 256×256 image after the VAE
+for p in [2, 4, 8]:
+    tok = patchify(x, p)
+    print(p, tuple(tok.shape), tok.shape[1] ** 2)
+--- explain
+N = (32 / p)², and each token holds 4·p·p numbers. p = 2: N = 16² = 256, 16 numbers per token, N² = 65536. p = 4: N = 64, 64 numbers each, N² = 4096. p = 8: N = 16, 256 numbers each, N² = 256.
+
+Every time p is halved, the token count goes up 4× and the number of pairs attention scores goes up 16×. Each token gets shorter, though: the total count of numbers is always 4×32×32 = 4096. patchify only cuts the same numbers differently and loses nothing.
+--- hints
+- N = (H / p) × (W / p), and each token has length C × p × p.
+- On every line, N × (token length) should equal 4 × 32 × 32 = 4096; use that to check yourself.
+
+@@ item d10-14
+type: predict
+title: Without position embeddings, attention cannot tell the order
+level: 2
+cards: 2D position embeddings: telling the model where each patch is; DiTBlock: day 4's Block with a new way in for the condition
+ref: day8, day10
+--- context
+Self-attention is "equivariant" to the order of tokens: shuffle the input and the output is shuffled the same way. It is a favourite interview question, and it is why a Transformer needs position embeddings added on top.
+--- prompt
+Read the code and write the two lines it prints (each is True or False). `SelfAttention` is the attention without a mask from the card, and `pos_embed_2d` is the function from d10-02. `perm` is one way to shuffle the 9 tokens.
+--- code
+torch.manual_seed(0)
+attn = SelfAttention(16, 4)
+x = torch.randn(1, 9, 16)              # 3×3 = 9 patches
+pe = pos_embed_2d(16, 3, 3)            # (9, 16)
+perm = torch.tensor([8, 3, 5, 0, 1, 7, 2, 6, 4])
+with torch.no_grad():
+    a = attn(x)[:, perm]               # compute, then shuffle
+    b = attn(x[:, perm])               # shuffle, then compute
+    print(torch.allclose(a, b, atol=1e-5))
+    a = attn(x + pe)[:, perm]          # compare again with position embeddings added
+    b = attn(x[:, perm] + pe)          # the position table itself is not shuffled
+    print(torch.allclose(a, b, atol=1e-5))
+--- explain
+Line one is True. In attention every token scores its similarity with every token and takes a weighted sum. A sum does not care about order, so "shuffle, then compute" equals "compute, then shuffle". The model has no way to know whether a patch was in the top-left or the bottom-right.
+
+Line two is False. Position embeddings are tied to positions: position k always gets pe[k]. When a token moves, the position vector added to it changes, so the output is no longer just a shuffled copy. That is exactly what pos_embed_2d is for: the same content at a different place looks different to the model.
+--- hints
+- Attention output = a softmax(similarity)-weighted sum of V. If you shuffle the tokens, does the set of tokens each one looks at change?
+- In the second comparison the content moves with perm but pe does not, so each token gets a different position vector.
+
+@@ item d10-15
+type: choice
+title: Why zero init?
+level: 1
+cards: adaLN-Zero: gates and zero init
+answer: 1
+--- context
+"Zero-initialize the new layer so the network starts as the identity" shows up in DiT, LoRA and ControlNet. Explaining what it does, and what it does not do, earns points in interviews.
+--- prompt
+DiT initializes the adaLN modulation Linear (weight and bias) to 0. What is the direct effect at the start of training?
+--- options
+- Every DiTBlock is the identity: gate = 0 switches off both branches, so the output equals the input
+- These parameters can never learn, because the parameters are 0 and so their gradients are 0 too
+- The model draws clean images right away
+- It saves the cost of the LayerNorm
+--- explain
+After zero init all 6 groups are 0: shift = scale = 0 makes modulate the identity, and gate = 0 switches off both the attention and the MLP branch, so x = x + 0 = x.
+
+Option 2 is wrong: a parameter being 0 does not make its gradient 0. The gate's gradient comes from the branch output, and after the first update the gate is no longer 0. Option 3 is wrong: an untrained MiniDiT predicts a velocity of 0 everywhere, so sampling returns the starting noise unchanged. Option 4 is wrong: the LayerNorm still runs; only its own γ/β are switched off.
+--- hints
+- With all 6 groups at 0, put gate = 0 into `x = x + gate * attn(...)`.
+- "The parameter is 0" and "the gradient is 0" are different things: the gradient depends on what the parameter multiplies.
+
+@@ item d10-16
+type: predict
+title: On a straight line, 1 step is enough
+level: 2
+cards: Euler sampling: follow the velocity, step by step; Rectified flow: a straight line from noise to data
+ref: day8, day10
+--- context
+The number of sampling steps is the inference latency. Once you see that "straighter paths need fewer steps", you see why rectified flow, and the few-step distilled models built on such models (FLUX.1 schnell draws in 1–4 steps), cut image generation time.
+--- prompt
+The velocity field below is the ideal one when there is only one data point, d = 3: at time t and position x it always points at d, with just the right size to reach d in the remaining time 1 - t. The start is -1. Write the three lines it prints.
+--- code
+d = torch.tensor([3.0])
+v = lambda x, t: (d - x) / (1 - t)
+
+for steps in [1, 2, 4]:
+    x = torch.tensor([-1.0])           # the start ("noise")
+    dt = 1.0 / steps
+    for i in range(steps):
+        x = x + v(x, i * dt) * dt
+    print(steps, x.item())
+--- explain
+All three lines end in 3.0. The first step, at t = 0, has v = (3 - (-1)) / 1 = 4. After moving dt, x lies exactly on the straight line from -1 to 3, and every later step stays on that line with velocity 4. A constant velocity means Euler's method makes no error, so 1, 2 and 4 steps all land exactly on 3.0. For example, 2 steps go -1 → 1 → 3.
+
+A real model faces many data points and learns an average velocity, so its paths bend a little and it still needs 20–50 steps. The bent path "velocity = x" from the card reaches only 2.0 in 1 step, far from the true e ≈ 2.718.
+--- hints
+- Start with steps = 1: a single step with t = 0 and dt = 1.
+- Then the first step of steps = 2: what is v at t = 0? Where is x after half a step? What is v there?
+
+@@ item d10-17
+type: code
+title: Closed book: DiTBlock
+level: 3
+exam: yes
+cards: DiTBlock: day 4's Block with a new way in for the condition; adaLN-Zero: gates and zero init
+targets: DiTBlock
+ref: day8, day10
+--- context
+DiTBlock is today's most important piece of code: day 4's pre-LN Block plus adaLN-Zero. If you can write it from blank, you can read the backbone of models like SD3 and Flux.
+--- prompt
+Closed book: write `DiTBlock(dim, n_head)` from blank, with `forward(x, c)`: x is (B, N, dim), c is (B, dim), and it returns (B, N, dim).
+
+- You may use the provided `SelfAttention(dim, n_head)`, `AdaLNModulation(dim)` (returns 6 groups of (B, dim): shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp) and `modulate(x, shift, scale)`
+- The modulation module's attribute must be named `modulation`
+- The MLP is `Linear(dim, 4*dim) → GELU → Linear(4*dim, dim)`
+
+Checks: a freshly built block must be the identity; once the modulation parameters are non-zero, the output must change.
+--- starter
+class DiTBlock(nn.Module):
+    def __init__(self, dim, n_head):
+        super().__init__()
+        raise todo()
+
+    def forward(self, x, c):
+        raise todo()
+--- solution
+class DiTBlock(nn.Module):
+    def __init__(self, dim, n_head):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.attn = SelfAttention(dim, n_head)
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+        self.modulation = AdaLNModulation(dim)
+
+    def forward(self, x, c):
+        s1, sc1, g1, s2, sc2, g2 = self.modulation(c)
+        x = x + g1.unsqueeze(1) * self.attn(modulate(self.norm1(x), s1, sc1))
+        x = x + g2.unsqueeze(1) * self.mlp(modulate(self.norm2(x), s2, sc2))
+        return x
+--- tests
+@check("DiTBlock")
+def t05():
+    seed(0)
+    b = DiTBlock(32, 4)
+    x, c = torch.randn(2, 9, 32), torch.randn(2, 32)
+    shape_is(b(x, c), (2, 9, 32))
+    eq(b(x, c), x, tol=1e-5,
+       msg="zero-initialized gates should make the whole block the identity at the start. If not, a gate is "
+           "missing or the modulation Linear is not zero-initialized")
+    with torch.no_grad():
+        for p in b.modulation.parameters():
+            p.normal_(0, 0.3)
+    true(not torch.allclose(b(x, c), x, atol=1e-4), "with non-zero gates the block should really change x")
+
+@@ item d10-18
+type: code
+title: Closed book: flow_loss
+level: 2
+exam: yes
+cards: Rectified flow: a straight line from noise to data
+targets: flow_loss
+ref: day8, day10
+--- context
+"Write the flow matching training loss" is a common question in generative-model interviews. The convention, the shapes and the direction of the target all have to be right.
+--- prompt
+Closed book: write `flow_loss(model, x1_data)` from blank, returning a scalar loss. Convention: t = 0 is pure noise and t = 1 is data; one t ~ U(0, 1) per sample; the model predicts the velocity; use MSE.
+
+Write the interpolation yourself; do not call `flow_interpolate` / `flow_target`. `model(x, t)` returns a tensor with the same shape as x, and t has shape (B,).
+
+Check: for a model that always outputs 0, the loss on standard normal data is about 2.
+--- starter
+def flow_loss(model, x1_data):
+    raise todo()
+--- solution
+def flow_loss(model, x1_data):
+    B = x1_data.size(0)
+    t = torch.rand(B, device=x1_data.device)
+    noise = torch.randn_like(x1_data)
+    tt = t.reshape(-1, *([1] * (x1_data.dim() - 1)))
+    xt = (1 - tt) * noise + tt * x1_data
+    return F.mse_loss(model(xt, t), x1_data - noise)
+--- tests
+@check("The flow training loss")
+def t07():
+    seed(1)
+
+    class Zero(nn.Module):
+        def forward(self, x, t):
+            return torch.zeros_like(x)
+
+    l = flow_loss(Zero(), torch.randn(4096, 1, 4, 4))
+    true(l.dim() == 0, "the loss should be a scalar (a 0-dim tensor): F.mse_loss averages by default")
+    true(abs(l.item() - 2.0) < 0.15,
+         f"for a model that always outputs 0 the loss should be about Var(data - noise) = 2, got {l.item():.3f}")

@@ -3,37 +3,281 @@ title: 读别人的代码，调别人的模型
 part: 大语言模型
 hours: 3–4 小时
 --- goal
-TODO: 一句话写今天学完能做什么。
+学完今天，你能看懂并亲手写出 LoRA 微调的核心代码（冻结原权重、低秩旁路、合并权重），能正确构造 SFT 的 labels 和对话模板，会写梯度累积和 warmup + cosine 学习率，还能估算一次微调要多少显存。
 --- checklist
-- 先清空复习区
-- 读完知识卡片并改动运行
-- 练习区全部通过
+- 先清空复习区（昨天看过答案的题从空白重做）
+- 读完 8 张知识卡片，每张都点「运行」，改一个数字再跑一次
+- 练习区全部通过（d6-01 到 d6-13）
+- 最后做闭卷：不看卡片，写出 LoRALinear 和梯度累积
+
+@@ concept
+title: LoRA：原权重不动，旁边加一条小路
+--- body
+微调（fine-tuning）就是拿别人训练好的模型，用自己的数据再训练一会儿。全量微调要更新每一个参数。一个 7B 模型有 70 亿个参数，普通显卡放不下（最后一张卡「显存账」会算给你看）。
+
+LoRA（Low-Rank Adaptation，低秩适配）的想法：原来的权重 `W`（形状 `(out, in)`）一个数都不改，只在旁边加一条小路：
+
+```
+y = base(x) + (x @ A.T @ B.T) * scaling
+```
+
+- `A` 的形状是 `(r, in)`，`B` 的形状是 `(out, r)`。
+- `r` 叫 rank（秩），很小，常见 4、8、16。
+- x 先乘 `A.T`，被压成 r 维；再乘 `B.T`，变回 out 维。所以旁路输出和 `base(x)` 形状一样，可以直接相加。
+- `B @ A` 的形状是 `(out, in)`，和 `W` 一样大，但它只由 `r*in + out*r` 个数决定。
+
+下面算一个 4096×4096 的层：原权重有 16,777,216 个参数；r = 8 时，A 和 B 加起来只有 65,536 个，占 0.39%。
+--- code
+in_f, out_f, r = 4096, 4096, 8
+full = in_f * out_f
+lora = r * in_f + out_f * r
+print("原权重参数量:", full)
+print("A + B 参数量:", lora)
+print(f"占比: {lora / full:.2%}")
+
+# 用小尺寸看看形状
+x = torch.randn(2, 16)     # 2 个样本，in = 16
+A = torch.randn(4, 16)     # (r, in)
+B = torch.randn(8, 4)      # (out, r)
+print("x @ A.T:", tuple((x @ A.T).shape))
+print("x @ A.T @ B.T:", tuple((x @ A.T @ B.T).shape))
+
+@@ concept
+title: LoRA 的三个细节：冻结、B 置 0、alpha / r
+--- body
+自己写或者读别人的 LoRA 代码，先查这三点。哪一点错了都不会报错，只会让微调效果变差。
+
+1. **冻结 base**：`for p in base.parameters(): p.requires_grad_(False)`。`requires_grad=False` 的参数，backward 之后 `.grad` 还是 `None`，优化器也不会改它。只有 A、B 在训练。检查方法：数一数可训练参数，应该正好等于 A 和 B 的大小。
+2. **B 初始化为全 0，A 用小随机数**（比如 `normal_(0, 0.01)`）：刚开始 `B @ A` 全是 0，旁路输出 0，模型和原模型一模一样。微调从原模型出发，而不是从「被随机噪声打乱的原模型」出发。
+3. **scaling = alpha / r**：alpha 是一个超参数（常取 r 的 1～2 倍）。除以 r 的好处：换一个 r，旁路输出的大小变化不大，学习率不用重调。alpha = 8、r = 4 时，scaling = 2.0。
+
+新加的矩阵要包成 `nn.Parameter`。这样模块才会把它算进 `parameters()`，优化器才会更新它。
+
+下面的代码还能看到梯度怎么流：第一步 B 有梯度（B 的梯度要乘上 `x @ A.T`，而 A 不是 0）；A 的梯度是 0（A 的梯度要乘上 B，而 B 是 0）。B 更新一步、不再是 0 之后，A 也就有梯度了。
+--- code
+torch.manual_seed(0)
+base = nn.Linear(16, 8)
+for p in base.parameters():
+    p.requires_grad_(False)                      # 1) 冻结 base
+A = nn.Parameter(torch.randn(4, 16) * 0.01)      # 2) A：小随机数
+B = nn.Parameter(torch.zeros(8, 4))              #    B：全 0
+scaling = 8 / 4                                  # 3) alpha / r
+
+x = torch.randn(3, 16)
+y = base(x) + (x @ A.T @ B.T) * scaling
+print("和原模型输出一样吗:", torch.allclose(y, base(x)))
+
+y.sum().backward()
+print("base.weight.grad:", base.weight.grad)
+print("B 有梯度吗:", bool(B.grad.abs().sum() > 0))
+print("A 有梯度吗:", bool(A.grad.abs().sum() > 0))
+
+@@ concept
+title: 合并 LoRA：上线时没有额外开销
+--- body
+训练完以后，A 和 B 就不再变了。上线时如果还留着旁路，每一层都要多做两次矩阵乘法。其实可以把旁路「合并」进原权重。
+
+矩阵乘法可以换括号，而且 `A.T @ B.T == (B @ A).T`，所以：
+
+```
+x @ A.T @ B.T * s  ==  x @ (s * B @ A).T
+```
+
+于是：
+
+```
+W_merged = W + s * (B @ A)     # 形状 (out, in)，和 W 一样
+bias 不变
+```
+
+合并后就是一个普通的 `nn.Linear`：参数量和速度都和原模型一样。注意顺序是 `B @ A`，写成 `A @ B` 形状就对不上。
+
+往 `nn.Linear` 的参数里写值，要放在 `with torch.no_grad():` 里，用 `.copy_()`。不这样做会报错：需要梯度的参数不能被原地修改。
+--- code
+torch.manual_seed(0)
+W = torch.randn(8, 16)
+A, B, s = torch.randn(4, 16), torch.randn(8, 4), 2.0
+x = torch.randn(3, 16)
+
+two_paths = x @ W.T + (x @ A.T @ B.T) * s        # 原权重 + 旁路
+W_merged = W + s * (B @ A)
+print("B @ A 的形状:", tuple((B @ A).shape))
+
+lin = nn.Linear(16, 8, bias=False)
+with torch.no_grad():
+    lin.weight.copy_(W_merged)
+print("合并后输出一样吗:", torch.allclose(lin(x), two_paths, atol=1e-4))
+print("合并后参数量:", sum(p.numel() for p in lin.parameters()))
+
+@@ concept
+title: SFT 的 labels：-100 的位置不算 loss
+--- body
+SFT（Supervised Fine-Tuning，监督微调）用「问题 + 标准回答」来训练模型。一条样本 = prompt 的 token 后面接上 answer 的 token，拼成一条 `input_ids`。
+
+我们只想让模型学「写回答」，不想让它学「复述问题」。做法：造一个和 `input_ids` 一样长的 `labels`，prompt 部分填 -100，answer 部分照抄 `input_ids`。
+
+- `F.cross_entropy` 有个参数 `ignore_index`，默认就是 -100。label 是 -100 的位置不算 loss，**也不算进平均的分母**。
+- labels 必须是 `torch.long`（整数）。
+- 「用第 t 个 token 预测第 t+1 个」需要错开一位。Hugging Face 的语言模型在算 loss 时会自己在内部错位，所以 labels 和 input_ids 对齐着写就行。
+- 写错了（忘了掩码，或者把 answer 也掩掉了），程序照样跑，loss 照样降，但模型学歪了。只能靠打印 labels 来检查。
+
+下面的 logits 是模型对每个词打的原始分数（还没过 softmax）。两个 loss 应该一样。
+--- code
+torch.manual_seed(0)
+input_ids = torch.tensor([11, 12, 13, 21, 22])   # 前 3 个是 prompt，后 2 个是 answer
+labels = input_ids.clone()
+labels[:3] = -100
+print("labels:", labels.tolist())
+
+logits = torch.randn(5, 30)                       # 5 个位置，每个位置 30 个词的分数
+masked = F.cross_entropy(logits, labels)          # -100 的位置被跳过
+answer_only = F.cross_entropy(logits[3:], input_ids[3:])
+print("带 -100 的 loss:", round(masked.item(), 4))
+print("只算 answer 的 loss:", round(answer_only.item(), 4))
+
+@@ concept
+title: chat template：把对话拼成模型认识的格式
+--- body
+聊天模型训练时看到的不是 Python 列表，而是一段带特殊标记的文字。把 `messages` 列表拼成这段文字的规则，叫 chat template（对话模板）。每个模型家族的模板都不一样。微调和推理都必须用模型训练时的那一套，差一个换行，模型就可能答非所问。
+
+Qwen 等很多模型用 ChatML 格式。每条消息拼成：
+
+```
+<|im_start|>{role}\n{content}<|im_end|>\n
+```
+
+- `<|im_start|>` 和 `<|im_end|>` 是特殊 token，标出一条消息从哪开始、到哪结束。
+- role 是 `system`（系统设定）、`user`（用户）或 `assistant`（模型）。
+- 推理时，最后再接一句 `<|im_start|>assistant\n`（参数 `add_generation_prompt=True`），意思是「轮到你说了」。模型接着往下写，写出 `<|im_end|>` 就停。
+- SFT 训练时不加这一句，因为 assistant 的回答已经在数据里了。上一张卡的 `prompt_len`，就是 assistant 回答正文之前那一段（包括 `<|im_start|>assistant\n`）的 token 数。
+
+用 `repr()` 打印字符串，能看清里面的换行符 `\n`。
+--- code
+m = {"role": "user", "content": "1+1=?"}
+one = f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"
+print(one)
+print(repr(one))
+print(repr("<|im_start|>assistant\n"))
+
+@@ concept
+title: 梯度累积：几个小 batch 凑成一个大 batch
+--- body
+显存只够一次喂 8 个样本，但你想要 batch = 32 的效果？可以每次喂 8 个，连做 4 次 forward + backward，然后才更新一次参数。这叫梯度累积（gradient accumulation）。
+
+它能成立，是因为 `.backward()` 会把梯度**加到** `.grad` 上，而不是覆盖。所以普通训练每一步都要先 `zero_grad()`；梯度累积则是故意攒几次再清。
+
+有一个坑：`F.cross_entropy` 默认对 batch 取**平均**。4 份各自的平均直接加起来，是大 batch 平均的 4 倍。所以每份的 loss 要先除以份数 `n_micro`：
+
+```
+model.zero_grad()
+for 每一份 (xb, yb):
+    loss = F.cross_entropy(model(xb), yb) / n_micro
+    loss.backward()          # 梯度加到 .grad 上
+optimizer.step()             # 攒够了才更新一次
+```
+
+忘了除，不会报错，只是梯度大了 n_micro 倍。用 SGD 时，这等于把学习率偷偷调大了 n_micro 倍；梯度裁剪和打印出来的 loss 也都会不对。
+--- code
+torch.manual_seed(0)
+model = nn.Linear(3, 2)
+xs, ys = torch.randn(8, 3), torch.randint(0, 2, (8,))
+
+model.zero_grad()
+F.cross_entropy(model(xs), ys).backward()           # 一次喂 8 个
+big = model.weight.grad.clone()
+
+model.zero_grad()
+F.cross_entropy(model(xs[:4]), ys[:4]).backward()   # 前 4 个
+F.cross_entropy(model(xs[4:]), ys[4:]).backward()   # 后 4 个：梯度加上去
+print("直接相加 == 大 batch ?", torch.allclose(model.weight.grad, big))
+print("相加后 / 2 == 大 batch ?", torch.allclose(model.weight.grad / 2, big))
+
+@@ concept
+title: warmup + cosine：学习率先升后降
+--- body
+学习率（lr）不是从头到尾不变的。训练大模型最常见的安排分三段：
+
+1. **warmup（预热）**：前 `warmup_iters` 步，lr 从很小线性升到 `max_lr`。刚开始模型和 Adam 的统计量都还不稳定，一上来就用大 lr 容易炸。
+2. **cosine decay（余弦衰减）**：然后沿着余弦曲线，从 `max_lr` 慢慢降到 `min_lr`。
+3. 过了 `max_iters`，一直保持 `min_lr`。
+
+公式（`it` 是第几步，从 0 开始）：
+
+```
+warmup:  lr = max_lr * (it + 1) / warmup_iters
+cosine:  progress = (it - warmup_iters) / (max_iters - warmup_iters)   # 0 → 1
+         coeff = 0.5 * (1 + cos(pi * progress))                        # 1 → 0
+         lr = min_lr + coeff * (max_lr - min_lr)
+```
+
+为什么是 `it + 1`：这样第 0 步的 lr 不是 0（lr 为 0 的那一步等于白跑），而 warmup 的最后一步 `it = warmup_iters - 1` 正好到 `max_lr`。progress = 0.5（余弦段的正中间）时 coeff = 0.5，lr 正好是 max_lr 和 min_lr 的平均。
+--- code
+for progress in [0, 0.25, 0.5, 0.75, 1.0]:
+    coeff = 0.5 * (1 + math.cos(math.pi * progress))
+    print("progress", progress, "-> coeff", round(coeff, 3))
+
+@@ concept
+title: 显存账：参数、梯度、优化器状态
+--- body
+训练时，显存里主要放 4 样东西：
+
+1. 参数（weights）
+2. 梯度：每个参数一个
+3. 优化器状态：AdamW 给每个参数存 2 个数（`exp_avg` 一阶动量、`exp_avg_sq` 二阶动量）；带动量的 SGD 存 1 个；普通 SGD 不存
+4. 激活值：forward 的中间结果，backward 要用。它和 batch 大小、序列长度有关，今天先不算
+
+前三样只和参数量有关，可以直接算。fp32 每个数占 4 字节。AdamW 是「参数 + 梯度 + 2 份状态」= 4 份，所以每个参数 16 字节（这里 1 GB 按 10^9 字节算）：
+
+- 10 亿（1B）参数 → 16 GB
+- 70 亿（7B）参数 → 112 GB，一张 80 GB 的卡都放不下，还没算激活值
+
+LoRA 省在哪：base 被冻结，没有梯度，也没有优化器状态，只剩参数本身。梯度和优化器状态只为 A、B 存，而 A、B 不到原参数量的 1%。
+
+下面的代码里，`step` 只是一个计数，不占什么地方；`exp_avg` 和 `exp_avg_sq` 都和权重一样大。
+--- code
+model = nn.Linear(100, 10)                       # 100*10 + 10 = 1010 个参数
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+model(torch.randn(4, 100)).sum().backward()
+opt.step()                                       # 第一次 step 时才建好状态
+
+state = opt.state[model.weight]
+print({k: tuple(v.shape) for k, v in state.items()})
+n = sum(p.numel() for p in model.parameters())
+print("参数量:", n)
+print("参数 + 梯度 + 2 份状态:", n * 4 * 4, "字节")
+print("7B 模型:", 7_000_000_000 * 4 * 4 / 1e9, "GB")
 
 @@ item d6-01
 type: code
 title: LoRALinear 结构
 level: 2
+cards: LoRA：原权重不动，旁边加一条小路; LoRA 的三个细节：冻结、B 置 0、alpha / r
 targets: LoRALinear
 ref: day6
-# merged checks: t02 初始等价性; t03 冻结 base
 --- context
-TODO
+开源大模型动辄几十亿参数，个人和小团队几乎都用 LoRA 来微调。读 Hugging Face PEFT 这类库的代码，核心就是这样一个小类：冻住原来的 Linear，只训练旁边两个小矩阵。
 --- prompt
-01  LoRALinear
+写 `LoRALinear(base, r=4, alpha=8)`。它包住一个已经训练好的 `nn.Linear`，在旁边加一条低秩（low-rank）小路。
+
+`__init__` 里：
+- `self.base = base`，并把 base 的**所有参数**冻结（`requires_grad_(False)`）
+- `self.A`：形状 `(r, in_features)` 的 `nn.Parameter`，用 `normal_(0, 0.01)` 初始化
+- `self.B`：形状 `(out_features, r)` 的 `nn.Parameter`，**全 0**
+- `self.scaling = alpha / r`
+
+`forward(x)`：返回 `base(x) + (x @ A.T @ B.T) * scaling`。x 的形状可以是 `(N, in)`，也可以是 `(B, T, in)`。
+
+`in_features` 和 `out_features` 可以从 `base.in_features`、`base.out_features` 读到。
 --- starter
 class LoRALinear(nn.Module):
-    """包住一个已有的 nn.Linear，加上低秩旁路。
-        y = base(x) + (x @ A^T @ B^T) * (alpha / r)
-    要求:
-      - self.base 是传进来的那个 Linear，**参数全部冻结**（requires_grad=False）
-      - self.A: (r, in_features)，用 normal_(0, 0.01) 初始化
-      - self.B: (out_features, r)，**初始化为全 0**
-      - self.scaling = alpha / r
-    """
-
     def __init__(self, base: nn.Linear, r=4, alpha=8):
         super().__init__()
-        # --- TODO 01 ---
+        # 1) 保存 base，并冻结它的所有参数
+        # 2) A: (r, in_features)，normal_(0, 0.01)；B: (out_features, r)，全 0
+        # 3) scaling = alpha / r
+        raise todo()
+
+    def forward(self, x):
         raise todo()
 --- solution
 class LoRALinear(nn.Module):
@@ -54,10 +298,10 @@ def t01():
     seed(0)
     base = nn.Linear(16, 8)
     m = LoRALinear(base, r=4, alpha=8)
-    shape_is(m(torch.randn(2, 5, 16)), (2, 5, 8))
-    true(close(m.scaling, 2.0), f"scaling 应为 alpha/r = 2.0, 你的 {m.scaling}")
-    shape_is(m.A, (4, 16), "A")
-    shape_is(m.B, (8, 4), "B")
+    shape_is(m(torch.randn(2, 5, 16)), (2, 5, 8), "forward 的输出形状应该和 base(x) 一样")
+    true(close(m.scaling, 2.0), f"scaling 应为 alpha/r = 2.0，你的是 {m.scaling}")
+    shape_is(m.A, (4, 16), "A 的形状应为 (r, in_features)")
+    shape_is(m.B, (8, 4), "B 的形状应为 (out_features, r)")
 
 @check("初始等价性")
 def t02():
@@ -71,29 +315,35 @@ def t02():
 @check("冻结 base")
 def t03():
     m = LoRALinear(nn.Linear(16, 8), r=4)
-    true(trainable(m) == 4 * 16 + 8 * 4, f"可训练参数应为 A+B = 96, 实际 {trainable(m)}")
-    true(params(m) == 16 * 8 + 8 + 96, f"总参数量不对: {params(m)}")
+    true(trainable(m) == 4 * 16 + 8 * 4, f"可训练参数应为 A + B = 96，实际是 {trainable(m)}")
+    true(params(m) == 16 * 8 + 8 + 96, f"总参数量应为 base 136 + A、B 96 = 232，实际是 {params(m)}")
     names = {n for n, p in m.named_parameters() if p.requires_grad}
-    true(all("base" not in n for n in names), f"base 没冻住: {names}")
+    true(all("base" not in n for n in names), f"base 没冻住，这些 base 参数还能训练: {names}")
 --- hints
-- TODO
+- 冻结：`for p in self.base.parameters(): p.requires_grad_(False)`。
+- 新矩阵要包成 `nn.Parameter`：`nn.Parameter(torch.empty(r, base.in_features).normal_(0, 0.01))`；B 用 `torch.zeros(base.out_features, r)`。
+- forward 只有一行：`return self.base(x) + (x @ self.A.T @ self.B.T) * self.scaling`。
 
 @@ item d6-02
 type: code
 title: 合并 LoRA 权重
 level: 2
+cards: 合并 LoRA：上线时没有额外开销; LoRA：原权重不动，旁边加一条小路
 targets: merge_lora
 ref: day6
 --- context
-TODO
+训练好的 LoRA 通常会先「合并」进原权重再上线（PEFT 里叫 merge_and_unload）。合并后就是普通的 Linear，推理速度和原模型一样，部署时也不用再带着 LoRA 的代码。
 --- prompt
-04  合并权重 —— 部署时 LoRA 不该有额外开销
+写 `merge_lora(m)`。输入一个训练过的 `LoRALinear`（这个类已经为你准备好了），返回一个**新的** `nn.Linear`：
+- `weight = m.base.weight + m.scaling * (m.B @ m.A)`
+- bias 和 `m.base.bias` 一样（base 没有 bias 时，新层也不要 bias）
+- 对同样的输入，输出和 `m(x)` 一样（误差在 1e-5 以内）
+- 新层只有 weight 和 bias，不带 A、B
+
+往参数里写值，要放在 `with torch.no_grad():` 里，用 `.copy_(...)`。
 --- starter
 def merge_lora(m: LoRALinear) -> nn.Linear:
-    """把 LoRA 合并回一个普通 nn.Linear: W' = W + scaling * B @ A，bias 不变。
-    返回一个新的 nn.Linear，输出必须和 m 完全一致。
-    """
-    # --- TODO 04 ---
+    """把 LoRA 合并回一个普通 nn.Linear：W' = W + scaling * B @ A，bias 不变。"""
     raise todo()
 --- solution
 def merge_lora(m):
@@ -113,26 +363,33 @@ def t04():
         m.B.normal_(0, 0.5)
     x = torch.randn(3, 16)
     merged = merge_lora(m)
-    true(isinstance(merged, nn.Linear), "要返回普通 nn.Linear")
-    eq(merged(x), m(x), tol=1e-5, msg="合并后输出变了 —— 检查 B@A 的顺序和 scaling")
-    true(params(merged) == 16 * 8 + 8, "合并后不该还带着 A/B")
+    true(isinstance(merged, nn.Linear), "要返回一个普通的 nn.Linear")
+    eq(merged(x), m(x), tol=1e-5, msg="合并后输出变了 —— 检查 B @ A 的顺序、scaling 和 bias")
+    true(params(merged) == 16 * 8 + 8, "合并后的层只该有 weight 和 bias，不该还带着 A、B")
 --- hints
-- TODO
+- 先建一个同样大小的层：`nn.Linear(m.base.in_features, m.base.out_features, bias=m.base.bias is not None)`。
+- 对形状：`B` 是 `(out, r)`，`A` 是 `(r, in)`，`B @ A` 是 `(out, in)`，和 weight 一样。
+- `with torch.no_grad():` 里写 `lin.weight.copy_(m.base.weight + m.scaling * (m.B @ m.A))`，bias 也用 `copy_` 抄过去。
 
 @@ item d6-03
 type: code
 title: LoRA 参数量占比
-level: 2
+level: 1
+cards: LoRA：原权重不动，旁边加一条小路; 显存账：参数、梯度、优化器状态
 targets: lora_ratio
 ref: day6
 --- context
-TODO
+面试常问「LoRA 为什么省」。回答要能落到数字上：一个 4096×4096 的层，r = 8 时，LoRA 只训练原来不到 0.5% 的参数。
 --- prompt
-05  参数量占比 —— 为什么 LoRA 能省
+写 `lora_ratio(in_f, out_f, r)`，返回「LoRA 的参数量 / 原权重的参数量」（都不算 bias）。
+
+- 原权重 W：形状 `(out_f, in_f)`
+- A：形状 `(r, in_f)`；B：形状 `(out_f, r)`
+
+例：`lora_ratio(4096, 4096, 8)` 约等于 0.0039。
 --- starter
 def lora_ratio(in_f, out_f, r):
     """返回 LoRA 参数量 / 原权重参数量（不含 bias）。"""
-    # --- TODO 05 ---
     raise todo()
 --- solution
 def lora_ratio(in_f, out_f, r):
@@ -141,30 +398,35 @@ def lora_ratio(in_f, out_f, r):
 @check("LoRA 参数量占比")
 def t05():
     true(close(lora_ratio(4096, 4096, 8), 2 * 8 / 4096, 1e-9),
-         f"你算出 {lora_ratio(4096, 4096, 8)}")
-    true(lora_ratio(4096, 4096, 8) < 0.005, "r=8 时应该不到 0.5%")
+         f"应为 (8*4096 + 4096*8) / (4096*4096) ≈ 0.0039，你算出 {lora_ratio(4096, 4096, 8)}")
+    true(lora_ratio(4096, 4096, 8) < 0.005, "r = 8 时应该不到 0.5%")
 --- hints
-- TODO
+- 一个矩阵的参数量 = 行数 × 列数。
+- 分子是 A 和 B 加起来：`r * in_f + out_f * r`；分母是 W：`in_f * out_f`。
 
 @@ item d6-04
 type: code
 title: SFT labels 的 -100 掩码
-level: 2
+level: 1
+cards: SFT 的 labels：-100 的位置不算 loss
 targets: build_sft_labels
 ref: day6
 --- context
-TODO
+SFT 时只该让模型学「怎么回答」，不该学「怎么复述问题」。labels 写错了，训练照样跑，loss 照样降，模型却会变差，而且一点报错都没有。
 --- prompt
-06  SFT 的 labels：只在 assistant 段回传梯度
+写 `build_sft_labels(input_ids, prompt_len, ignore_index=-100)`。
+
+- `input_ids`：形状 `(T,)` 的整数 tensor，是 prompt 和 answer 拼起来的一整条 token。
+- 返回 `labels`：形状 `(T,)`，类型 `torch.long`。
+  - 前 `prompt_len` 个位置填 `ignore_index`
+  - 其余位置等于 `input_ids`
+- 不要改动传进来的 `input_ids`（先 clone 一份）。
+
+例：`input_ids = [5, 6, 7, 8, 9]`，`prompt_len = 3` → `[-100, -100, -100, 8, 9]`。
 --- starter
 def build_sft_labels(input_ids, prompt_len, ignore_index=-100):
-    """input_ids: (T,) 一整条 "prompt + answer" 的 token。
-    返回 labels: (T,)，其中:
-      - 前 prompt_len 个位置填 ignore_index（不算 loss）
-      - 其余位置等于 input_ids 本身
-    这个细节写错模型会变傻，而且**完全不报错**。
-    """
-    # --- TODO 06 ---
+    """input_ids: (T,)，prompt + answer 的全部 token。
+    返回 labels: (T,)，前 prompt_len 个是 ignore_index，其余等于 input_ids。"""
     raise todo()
 --- solution
 def build_sft_labels(input_ids, prompt_len, ignore_index=-100):
@@ -176,8 +438,9 @@ def build_sft_labels(input_ids, prompt_len, ignore_index=-100):
 def t06():
     ids = torch.tensor([5, 6, 7, 8, 9])
     lab = build_sft_labels(ids, prompt_len=3)
-    eq(lab, torch.tensor([-100, -100, -100, 8, 9]))
-    true(lab.dtype == torch.long)
+    eq(lab, torch.tensor([-100, -100, -100, 8, 9]), msg="前 3 个应该是 -100，后面照抄 input_ids")
+    true(lab.dtype == torch.long, f"labels 必须是 torch.long，你的是 {lab.dtype}")
+    true(ids.tolist() == [5, 6, 7, 8, 9], "你改掉了传进来的 input_ids —— 先 clone() 一份再改")
     # 验证 -100 真的被 cross_entropy 忽略
     logits = torch.randn(5, 20)
     l_all = F.cross_entropy(logits, ids)
@@ -186,26 +449,33 @@ def t06():
     eq(l_ans, l_manual, msg="-100 应该被完全忽略，且分母只数有效位")
     true(not close(l_all, l_ans), "掩码没起作用")
 --- hints
-- TODO
+- `labels = input_ids.clone().long()`：复制一份，同时保证是 long。
+- 切片赋值：`labels[:prompt_len] = ignore_index`，然后 return。
 
 @@ item d6-05
 type: code
 title: chat template 拼接
-level: 2
+level: 1
+cards: chat template：把对话拼成模型认识的格式
 targets: apply_chat_template
 ref: day6
 --- context
-TODO
+对话模型只认识它训练时见过的格式，模板差一个换行，模型就可能答非所问。微调和推理之前都要先把 messages 拼成这段文字。读别人的推理代码时，这里也是最常出 bug 的地方之一。
 --- prompt
-07  chat template
+写 `apply_chat_template(messages, add_generation_prompt=True)`，按 ChatML 格式把对话拼成一个字符串。
+
+- `messages` 是一个列表，每个元素像 `{"role": "user", "content": "Hi"}`。role 可以是 system、user 或 assistant。
+- 每条消息变成：`<|im_start|>` + role + 换行 + content + `<|im_end|>` + 换行。按顺序连起来。
+- `add_generation_prompt=True` 时，最后再加上 `<|im_start|>assistant` + 换行，让模型接着写回答。
+
+例：user 说 Hi、assistant 回 Hello，`add_generation_prompt=False` 时，结果（用 repr 显示）是：
+
+```
+'<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello<|im_end|>\n'
+```
 --- starter
 def apply_chat_template(messages, add_generation_prompt=True):
-    """messages: [{"role": "user"/"assistant"/"system", "content": str}, ...]
-    输出格式（每段结尾都有换行）:
-        <|im_start|>user\\nHi<|im_end|>\\n<|im_start|>assistant\\nHello<|im_end|>\\n
-    add_generation_prompt=True 时，末尾再追加 "<|im_start|>assistant\\n"（让模型接着写）。
-    """
-    # --- TODO 07 ---
+    """messages: [{"role": ..., "content": ...}, ...] -> 一个 ChatML 格式的字符串。"""
     raise todo()
 --- solution
 def apply_chat_template(messages, add_generation_prompt=True):
@@ -219,30 +489,36 @@ def t07():
     msgs = [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}]
     s = apply_chat_template(msgs, add_generation_prompt=False)
     true(s == "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello<|im_end|>\n",
-         f"\n       你的: {s!r}")
+         f"拼出来的字符串不对（注意每段结尾的换行）。\n       你的: {s!r}")
     s2 = apply_chat_template([msgs[0]], add_generation_prompt=True)
-    true(s2.endswith("<|im_start|>assistant\n"), f"\n       你的: {s2!r}")
+    true(s2.endswith("<|im_start|>assistant\n"),
+         f"add_generation_prompt=True 时，结尾应该是 '<|im_start|>assistant\\n'。\n       你的: {s2!r}")
 --- hints
-- TODO
+- 一条消息：`f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"`。
+- 用 `"".join(...)` 把所有消息连起来，再看 `add_generation_prompt`，决定要不要加 `"<|im_start|>assistant\n"`。
 
 @@ item d6-06
 type: code
 title: 梯度累积 == 大 batch
 level: 2
+cards: 梯度累积：几个小 batch 凑成一个大 batch
 targets: grad_accum_step
 ref: day6
 --- context
-TODO
+显存只够 batch = 8，论文却用 batch = 32？几乎所有微调脚本都靠梯度累积解决。写错了（比如忘了除以份数）不会报错，只会让梯度悄悄变大几倍。
 --- prompt
-08  梯度累积必须和大 batch 等价
+写 `grad_accum_step(model, xs, ys, n_micro)`。
+
+- `xs`：`(N, ...)` 的输入；`ys`：`(N,)` 的类别标签。N 能被 `n_micro` 整除。
+- 先清空旧梯度。然后把这个大 batch 按顺序平均切成 `n_micro` 份（每份叫一个 micro-batch），每份做一次 forward、算 `F.cross_entropy`、backward。
+- 累积出的梯度必须和「一次把 N 个都喂进去」算出的梯度一样（误差在 1e-5 以内）。
+- 返回字典 `{参数名: 梯度的 clone}`，用 `model.named_parameters()` 遍历。
+
+不需要优化器，也不要更新参数。
 --- starter
 def grad_accum_step(model, xs, ys, n_micro):
-    """把 (N, ...) 的一个大 batch 切成 n_micro 份依次 forward/backward，
-    使得累积出的梯度与"一次性喂整个大 batch"完全相同。
-    返回累积完成后的梯度字典 {参数名: grad.clone()}。函数内部自己负责 zero_grad。
-    提示: F.cross_entropy 默认对 batch 取平均，所以每份的 loss 要除以 n_micro。
-    """
-    # --- TODO 08 ---
+    """把大 batch 切成 n_micro 份，依次 forward/backward，累积出和大 batch 一样的梯度。
+    返回 {参数名: grad.clone()}。"""
     raise todo()
 --- solution
 def grad_accum_step(model, xs, ys, n_micro):
@@ -267,30 +543,35 @@ def t08():
     got = grad_accum_step(model, xs, ys, n_micro=4)
     for n in ref:
         eq(got[n], ref[n], tol=1e-5,
-           msg=f"参数 {n} 的梯度对不上。忘了除以 n_micro 的话会大 4 倍")
+           msg=f"参数 {n} 的梯度对不上。正好大 4 倍：忘了除以 n_micro；差得更多：可能没先清空旧梯度")
 --- hints
-- TODO
+- 开头 `model.zero_grad()`。每份的大小 `n = xs.size(0) // n_micro`，第 i 份是 `xs[i*n:(i+1)*n]`。
+- `cross_entropy` 默认对这一份取平均。n_micro 份的平均直接加起来会大 n_micro 倍，所以每份的 loss 先除以 `n_micro` 再 backward。
+- 最后：`return {k: p.grad.clone() for k, p in model.named_parameters()}`。
 
 @@ item d6-07
 type: code
 title: warmup + cosine schedule
 level: 2
+cards: warmup + cosine：学习率先升后降
 targets: get_lr
 ref: day6
 --- context
-TODO
+nanoGPT、Llama 这类大模型的训练脚本几乎都用 warmup + cosine。读别人的脚本要能一眼看出 lr 曲线；自己写错了，训练可能一开始就炸，或者该收尾时 lr 还很大。
 --- prompt
-09  warmup + cosine 学习率
+写 `get_lr(it, warmup_iters, max_iters, max_lr, min_lr)`，返回第 `it` 步（从 0 开始数）的学习率。分三段：
+
+1. `it < warmup_iters`：线性升温，`max_lr * (it + 1) / warmup_iters`
+2. `warmup_iters <= it <= max_iters`：余弦下降
+   - `progress = (it - warmup_iters) / (max_iters - warmup_iters)`（从 0 走到 1）
+   - `coeff = 0.5 * (1 + cos(pi * progress))`（从 1 走到 0）
+   - 返回 `min_lr + coeff * (max_lr - min_lr)`
+3. `it > max_iters`：一直是 `min_lr`
+
+可以用 `math.cos` 和 `math.pi`。
 --- starter
 def get_lr(it, warmup_iters, max_iters, max_lr, min_lr):
-    """三段:
-      it < warmup_iters              : 从 0 线性升到 max_lr，公式 max_lr * (it+1)/warmup_iters
-      warmup_iters <= it <= max_iters: 余弦从 max_lr 降到 min_lr
-                                       coeff = 0.5 * (1 + cos(pi * progress))
-                                       progress = (it - warmup) / (max_iters - warmup)
-      it > max_iters                 : 恒为 min_lr
-    """
-    # --- TODO 09 ---
+    """第 it 步的学习率：warmup 线性升 -> cosine 降 -> 保持 min_lr。"""
     raise todo()
 --- solution
 def get_lr(it, warmup_iters, max_iters, max_lr, min_lr):
@@ -305,34 +586,37 @@ def get_lr(it, warmup_iters, max_iters, max_lr, min_lr):
 @check("warmup + cosine schedule")
 def t09():
     f = lambda it: get_lr(it, 100, 1000, 6e-4, 6e-5)
-    true(close(f(0), 6e-6, 1e-9), f"第 0 步应为 max_lr/warmup, 你的 {f(0)}")
-    true(close(f(99), 6e-4, 1e-9), "warmup 最后一步应该正好到 max_lr")
-    true(close(f(100), 6e-4, 1e-9), "衔接点不该跳变")
-    true(close(f(550), (6e-4 + 6e-5) / 2, 1e-7), "中点应该是两端的平均")
-    true(close(f(1000), 6e-5, 1e-9))
-    true(close(f(5000), 6e-5, 1e-9), "超出 max_iters 后应该恒定")
+    true(close(f(0), 6e-6, 1e-9), f"第 0 步应为 max_lr / warmup_iters = 6e-6，你的是 {f(0)}")
+    true(close(f(99), 6e-4, 1e-9), f"warmup 最后一步（it = 99）应该正好到 max_lr，你的是 {f(99)}")
+    true(close(f(100), 6e-4, 1e-9), f"余弦段第一步（it = 100）应该还是 max_lr，衔接处不该跳变，你的是 {f(100)}")
+    true(close(f(550), (6e-4 + 6e-5) / 2, 1e-7), f"余弦段中点（it = 550）应该是 max_lr 和 min_lr 的平均，你的是 {f(550)}")
+    true(close(f(1000), 6e-5, 1e-9), f"第 max_iters 步应该正好降到 min_lr，你的是 {f(1000)}")
+    true(close(f(5000), 6e-5, 1e-9), f"超出 max_iters 后应该一直是 min_lr，你的是 {f(5000)}")
 --- hints
-- TODO
+- 用 `if` 分三段：先处理 `it < warmup_iters`，再处理 `it > max_iters`，剩下的就是余弦段。
+- 余弦段：`progress = (it - warmup_iters) / (max_iters - warmup_iters)`，`coeff = 0.5 * (1.0 + math.cos(math.pi * progress))`，`return min_lr + coeff * (max_lr - min_lr)`。
 
 @@ item d6-08
 type: code
 title: 优化器显存估算
-level: 2
+level: 1
+cards: 显存账：参数、梯度、优化器状态
 targets: optimizer_memory_bytes
 ref: day6
 --- context
-TODO
+工作和面试都会遇到这个问题：「这个模型我的卡能不能训？」先把参数、梯度、优化器状态这三块算清楚，就能马上判断全量微调行不行，要不要换 LoRA。
 --- prompt
-10  显存估算 —— 决定你的 batch 能开多大
+写 `optimizer_memory_bytes(n_params, dtype_bytes=4, optimizer="adamw")`，返回训练时「参数 + 梯度 + 优化器状态」一共占多少字节（不算激活值）。
+
+每个数占 `dtype_bytes` 字节（fp32 是 4）。每个参数要存几份，取决于优化器：
+- `"adamw"`：参数、梯度、一阶动量、二阶动量 → 4 份
+- `"sgd"`：参数、梯度 → 2 份
+- `"sgd_momentum"`：参数、梯度、动量 → 3 份
+
+例：10 亿参数、fp32、AdamW → 16,000,000,000 字节（16 GB）。
 --- starter
 def optimizer_memory_bytes(n_params, dtype_bytes=4, optimizer="adamw"):
-    """只算"参数 + 梯度 + 优化器状态"，不算激活值。
-      adamw: 参数 + 梯度 + 一阶动量 + 二阶动量 = 4 份
-      sgd  : 参数 + 梯度 = 2 份
-      sgd_momentum: 3 份
-    返回字节数。
-    """
-    # --- TODO 10 ---
+    """参数 + 梯度 + 优化器状态 一共多少字节（不算激活值）。"""
     raise todo()
 --- solution
 def optimizer_memory_bytes(n_params, dtype_bytes=4, optimizer="adamw"):
@@ -343,21 +627,30 @@ def optimizer_memory_bytes(n_params, dtype_bytes=4, optimizer="adamw"):
 def t10():
     true(optimizer_memory_bytes(1_000_000_000) == 16_000_000_000,
          "1B 参数用 fp32 AdamW 需要 16GB —— 这就是为什么 7B 模型全量微调单卡跑不动")
-    true(optimizer_memory_bytes(1_000_000, optimizer="sgd") == 8_000_000)
-    true(optimizer_memory_bytes(1_000_000, optimizer="sgd_momentum") == 12_000_000)
+    true(optimizer_memory_bytes(1_000_000, optimizer="sgd") == 8_000_000,
+         "sgd 只有参数 + 梯度 2 份：1,000,000 × 4 字节 × 2 = 8,000,000")
+    true(optimizer_memory_bytes(1_000_000, optimizer="sgd_momentum") == 12_000_000,
+         "sgd_momentum 是参数 + 梯度 + 动量 3 份：1,000,000 × 4 字节 × 3 = 12,000,000")
 --- hints
-- TODO
+- 字节数 = 参数量 × 每个数的字节数 × 份数。
+- 用字典查份数：`{"adamw": 4, "sgd": 2, "sgd_momentum": 3}[optimizer]`。
 
 @@ item d6-09
 type: fix
 title: 找 bug: LoRABuggy
 level: 2
+cards: LoRA 的三个细节：冻结、B 置 0、alpha / r; LoRA：原权重不动，旁边加一条小路
 targets: LoRABuggy
 ref: day6
 --- context
-TODO
+「读别人的代码」最常见的场景：同事的 LoRA 训练效果很差，代码却不报错。这种 bug 只能靠知道「正确的 LoRA 应该满足什么」来找。
 --- prompt
-11  找 bug —— 这个 LoRA 有 3 处错
+下面的 `LoRABuggy` 能跑，但有 **3 处错误**，每一处都会让微调变差却不报错。找出来改好，不要改类名和参数。
+
+修好以后应该满足：
+- 刚创建时，输出和 `base` 的输出完全一样
+- 只有 A 和 B 可训练（base 被冻结）
+- `scaling == alpha / r`
 --- starter
 class LoRABuggy(nn.Module):
     def __init__(self, base, r=4, alpha=8):
@@ -390,7 +683,240 @@ def t11():
     x = torch.randn(3, 16)
     before = base(x).clone()
     m = LoRABuggy(base, r=4, alpha=8)
-    eq(m(x), before, msg="三处: B 必须初始化为 0 / scaling 是 alpha/r 不是 alpha*r / base 要冻结")
-    true(trainable(m) == 4 * 16 + 8 * 4, f"base 没冻结，可训练参数 {trainable(m)}")
+    eq(m(x), before, msg="刚创建时输出就和 base 不一样 —— B 应该初始化为全 0")
+    true(trainable(m) == 4 * 16 + 8 * 4, f"base 没冻结：可训练参数有 {trainable(m)} 个，应该只有 A + B = 96 个")
+
+@check("scaling = alpha / r")
+def t11b():
+    m = LoRABuggy(nn.Linear(16, 8), r=4, alpha=8)
+    true(close(m.scaling, 2.0), f"scaling 应为 alpha / r = 8 / 4 = 2.0，你的是 {m.scaling}")
 --- hints
-- TODO
+- 对照「LoRA 的三个细节」一条条查：base 冻结了吗？B 是全 0 吗？scaling 怎么算？
+- 要改三处：加一个冻结 base 的 for 循环；B 改成 `torch.zeros(base.out_features, r)`；`alpha * r` 改成 `alpha / r`。
+
+@@ item d6-10
+type: predict
+title: 不清空梯度会怎样
+level: 1
+cards: 梯度累积：几个小 batch 凑成一个大 batch
+--- context
+训练循环里忘了 `zero_grad()`，是新手最常见的 bug 之一：不报错，梯度却越积越大。梯度累积用的正是同一个机制，只不过是故意不清空。
+--- prompt
+这段代码会打印什么？每个 print 占一行。
+--- code
+w = torch.tensor(1.0, requires_grad=True)
+for step in range(3):
+    loss = 2 * w
+    loss.backward()
+    print(w.grad.item())
+--- explain
+`.backward()` 不是把梯度「写进」`.grad`，而是「加到」`.grad` 上。`loss = 2 * w` 对 w 的导数是 2。
+
+- 第 1 次 backward 后：0 + 2 = 2.0
+- 没有清零，第 2 次：2 + 2 = 4.0
+- 第 3 次：4 + 2 = 6.0
+
+正常训练每一步都要 `optimizer.zero_grad()`；梯度累积则是故意攒几次再清。
+--- hints
+- `loss = 2 * w`，loss 对 w 的导数是多少？
+- 每次 backward 都把新的梯度加到 `w.grad` 上，旧的没有被清掉。
+
+@@ item d6-11
+type: predict
+title: 读懂学习率曲线
+level: 2
+cards: warmup + cosine：学习率先升后降
+--- context
+接手别人的训练脚本时，要能从 schedule 的几个参数直接看出每一步的 lr。loss 在某一步突然变化时，先查那一步的 lr 是多少。
+--- prompt
+下面的 `get_lr` 和 d6-07 的答案一样：warmup 5 步，第 15 步降到底，`max_lr = 1.0`，`min_lr = 0.0`。这段代码会打印什么？每个 print 占一行。
+--- code
+def get_lr(it, warmup_iters, max_iters, max_lr, min_lr):
+    if it < warmup_iters:
+        return max_lr * (it + 1) / warmup_iters
+    if it > max_iters:
+        return min_lr
+    progress = (it - warmup_iters) / (max_iters - warmup_iters)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + coeff * (max_lr - min_lr)
+
+for it in [0, 4, 5, 10, 15, 20]:
+    print(it, round(get_lr(it, 5, 15, 1.0, 0.0), 2))
+--- explain
+- it = 0：warmup 段，1.0 × (0 + 1) / 5 = 0.2
+- it = 4：warmup 最后一步，1.0 × 5 / 5 = 1.0
+- it = 5：余弦段开头，progress = 0，coeff = 1，lr = 1.0（和上一步衔接，不跳变）
+- it = 10：progress = (10 − 5) / (15 − 5) = 0.5，cos(0.5π) = 0，coeff = 0.5，lr = 0.5
+- it = 15：progress = 1，cos(π) = −1，coeff = 0，lr = min_lr = 0.0
+- it = 20：超过 max_iters，一直是 min_lr = 0.0
+--- hints
+- warmup_iters = 5：第 0～4 步在升温，公式是 `1.0 * (it + 1) / 5`。
+- 第 10 步：progress = (10 - 5) / (15 - 5) = 0.5，而 cos(0.5π) = 0。
+
+@@ item d6-12
+type: choice
+title: 7B 模型做 LoRA 要多少显存
+level: 2
+cards: 显存账：参数、梯度、优化器状态; LoRA：原权重不动，旁边加一条小路
+--- context
+「我的卡能不能用 LoRA 微调这个模型？」是实际工作里天天要答的问题。关键是分清 LoRA 省下的是哪一块。
+--- prompt
+一个 7B（70 亿参数）的模型，用 fp32 + AdamW 做 LoRA 微调。LoRA 的 A、B 加起来是原参数量的 0.5%。只算「参数 + 梯度 + 优化器状态」（不算激活值），大约需要多少显存？（1 GB 按 10^9 字节算）
+--- options
+- 约 112 GB：和全量微调一样
+- 约 28.6 GB
+- 约 0.56 GB：只需要存 LoRA 那一部分
+- 约 56 GB
+answer: 2
+--- explain
+冻结的 base 仍然要放在显存里做 forward，但它没有梯度，也没有 AdamW 状态：70 亿 × 4 字节 = 28 GB。
+
+LoRA 参数有 70 亿 × 0.5% = 3500 万个。它们要存「参数 + 梯度 + 2 份状态」= 4 份：3500 万 × 4 字节 × 4 = 0.56 GB。
+
+加起来约 28.6 GB。全量微调是 70 亿 × 16 字节 = 112 GB。所以 LoRA 省下的是梯度和优化器状态，base 本身一个字节都没省。想再省，就要把 base 存成更少的字节（比如 QLoRA 把 base 量化成 4 bit）。
+--- hints
+- base 被冻结了。它还要不要放在显存里？它需要梯度和 AdamW 状态吗？
+- base：70 亿 × 4 字节；LoRA 部分：3500 万个参数 × 4 字节 × 4 份。
+
+@@ item d6-13
+type: choice
+title: A 和 B 都初始化成 0
+level: 2
+cards: LoRA 的三个细节：冻结、B 置 0、alpha / r
+--- context
+读别人的 LoRA 代码时，初始化是最值得看一眼的地方。初始化错了不报错，loss 就是不降，很难从日志里看出原因。
+--- prompt
+同事为了「保证一开始输出不变」，把 LoRA 的 A 和 B **都**初始化成了全 0（base 已冻结）。训练起来会怎样？
+--- options
+- 没问题，和只把 B 置 0 的效果一样
+- 一开始输出就和原模型不同
+- A 和 B 的梯度一直是 0，LoRA 什么也学不到，loss 停在原模型的水平
+- PyTorch 报错：参数不能全是 0
+answer: 3
+--- explain
+旁路是 `x @ A.T @ B.T`。
+
+- B 的梯度要乘上 `x @ A.T`。A = 0 时，它是 0。
+- A 的梯度要乘上 B。B = 0 时，它也是 0。
+
+两个梯度都是 0，优化器什么也不改（AdamW 的 weight decay 作用在 0 上还是 0），下一步还是一样，永远卡住。只把 B 置 0 时，A 是随机的，所以 B 第一步就有梯度；B 一旦不是 0，A 也就有梯度了。这种 bug 不报错，只表现为 loss 不降。
+--- hints
+- 回看卡片里的例子：B = 0 时，A 的梯度是多少？
+- 反过来：A = 0 时，B 的梯度要乘上 `x @ A.T`，那是多少？
+
+@@ item d6-14
+type: code
+title: 闭卷：LoRALinear
+level: 2
+exam: yes
+cards: LoRA：原权重不动，旁边加一条小路; LoRA 的三个细节：冻结、B 置 0、alpha / r
+targets: LoRALinear
+ref: day6
+--- context
+LoRA 是今天最重要的结构，面试里常被要求当场手写。不看卡片，从空白写出来。
+--- prompt
+从空白写出 `LoRALinear(base, r=4, alpha=8)`：
+
+- 保存 `self.base`，并冻结它的所有参数
+- `self.A`：`(r, in_features)`，用 `normal_(0, 0.01)` 初始化
+- `self.B`：`(out_features, r)`，全 0
+- `self.scaling = alpha / r`
+- `forward(x)` 返回 `base(x) + (x @ A.T @ B.T) * scaling`
+--- starter
+class LoRALinear(nn.Module):
+    def __init__(self, base, r=4, alpha=8):
+        raise todo()
+
+    def forward(self, x):
+        raise todo()
+--- solution
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, r=4, alpha=8):
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad_(False)
+        self.A = nn.Parameter(torch.empty(r, base.in_features).normal_(0, 0.01))
+        self.B = nn.Parameter(torch.zeros(base.out_features, r))   # 必须是 0
+        self.scaling = alpha / r
+
+    def forward(self, x):
+        return self.base(x) + (x @ self.A.T @ self.B.T) * self.scaling
+--- tests
+@check("LoRALinear 结构")
+def t01():
+    seed(0)
+    base = nn.Linear(16, 8)
+    m = LoRALinear(base, r=4, alpha=8)
+    shape_is(m(torch.randn(2, 5, 16)), (2, 5, 8), "forward 的输出形状应该和 base(x) 一样")
+    true(close(m.scaling, 2.0), f"scaling 应为 alpha/r = 2.0，你的是 {m.scaling}")
+    shape_is(m.A, (4, 16), "A 的形状应为 (r, in_features)")
+    shape_is(m.B, (8, 4), "B 的形状应为 (out_features, r)")
+
+@check("初始等价性")
+def t02():
+    seed(1)
+    base = nn.Linear(16, 8)
+    x = torch.randn(3, 16)
+    before = base(x).clone()
+    m = LoRALinear(base, r=4, alpha=8)
+    eq(m(x), before, msg="B 初始化不是 0 —— 微调刚开始模型输出就变了，等于白白破坏了预训练权重")
+
+@check("冻结 base")
+def t03():
+    m = LoRALinear(nn.Linear(16, 8), r=4)
+    true(trainable(m) == 4 * 16 + 8 * 4, f"可训练参数应为 A + B = 96，实际是 {trainable(m)}")
+    true(params(m) == 16 * 8 + 8 + 96, f"总参数量应为 base 136 + A、B 96 = 232，实际是 {params(m)}")
+    names = {n for n, p in m.named_parameters() if p.requires_grad}
+    true(all("base" not in n for n in names), f"base 没冻住，这些 base 参数还能训练: {names}")
+--- hints
+- 别忘了 `super().__init__()`，新矩阵要包成 `nn.Parameter`。
+- 三个细节：冻结 base、B 全 0、scaling = alpha / r。
+
+@@ item d6-15
+type: code
+title: 闭卷：梯度累积
+level: 2
+exam: yes
+cards: 梯度累积：几个小 batch 凑成一个大 batch
+targets: grad_accum_step
+ref: day6
+--- context
+梯度累积是微调脚本里最常见、也最容易悄悄写错的几行代码。不看卡片，从空白写出来，并保证和大 batch 完全等价。
+--- prompt
+从空白写出 `grad_accum_step(model, xs, ys, n_micro)`：
+
+- 先清空旧梯度
+- 把 `(N, ...)` 的大 batch 按顺序平均切成 `n_micro` 份，每份 forward、算 `F.cross_entropy`、backward
+- 累积出的梯度要和一次喂整个大 batch 的梯度一样
+- 返回 `{参数名: grad.clone()}`
+--- starter
+def grad_accum_step(model, xs, ys, n_micro):
+    raise todo()
+--- solution
+def grad_accum_step(model, xs, ys, n_micro):
+    model.zero_grad(set_to_none=True)
+    n = xs.size(0) // n_micro
+    for i in range(n_micro):
+        xb, yb = xs[i * n:(i + 1) * n], ys[i * n:(i + 1) * n]
+        # 每份内部已经对自己的 batch 求了平均，再除以份数才等于整体平均
+        (F.cross_entropy(model(xb), yb) / n_micro).backward()
+    return {k: p.grad.clone() for k, p in model.named_parameters()}
+--- tests
+@check("梯度累积 == 大 batch")
+def t08():
+    seed(3)
+    model = nn.Linear(6, 4)
+    xs, ys = torch.randn(32, 6), torch.randint(0, 4, (32,))
+
+    model.zero_grad()
+    F.cross_entropy(model(xs), ys).backward()
+    ref = {n: p.grad.clone() for n, p in model.named_parameters()}
+
+    got = grad_accum_step(model, xs, ys, n_micro=4)
+    for n in ref:
+        eq(got[n], ref[n], tol=1e-5,
+           msg=f"参数 {n} 的梯度对不上。正好大 4 倍：忘了除以 n_micro；差得更多：可能没先清空旧梯度")
+--- hints
+- 每份的 loss 要先除以 `n_micro` 再 backward。
+- 开头要清空旧梯度，结尾用 `named_parameters()` 收集 `p.grad.clone()`。

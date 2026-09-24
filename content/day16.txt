@@ -1,0 +1,1266 @@
+@@ day 16
+title: 调试二：形状、设备、数据类型
+part: 调试与排错
+hours: 3–4 小时
+--- goal
+看到 PyTorch 报错，知道先看哪两处，能从报错里的数字定位到出错的那一层。能抓住三类最常见的 bug：形状（包括不报错的广播）、设备、数据类型。最后给自己写两个随身工具：逐层追踪输出 shape 的 trace_shapes，和把嵌套 batch 搬到设备上的 move_to。
+--- checklist
+- 先清空复习区（昨天看过答案的题从空白重做）
+- 读完 8 张知识卡片，每张都点「运行」，再改一个数字重跑
+- 练习区全部通过
+- 闭卷区从空白写出 trace_shapes 和 move_to
+
+@@ concept
+title: 读懂 PyTorch 报错：最后一行 + 你代码的最后一帧
+error_demo: yes
+--- body
+报错时 Python 会打印一长串 traceback（调用记录：谁调用了谁，一层一层往下，最近的一层在最下面）。不用从头读，只看两处：
+
+1. **最后一行**：错误类型 + 说明。形状、设备、dtype 的错几乎都是 `RuntimeError`，有用的信息在冒号后面。
+2. **你自己代码的最后一帧**：从下往上找，第一个 `File "..."` 是你自己文件的那一段。它指出是你的哪一行把「错的东西」交给了 PyTorch。
+
+把这张卡片代码里的模型写成一个 net.py 文件（开头有 import，没有那行 print），在终端里运行，会看到下面这个 traceback（路径缩短了，删掉了 `~~~^^^` 标记行）：
+
+```
+Traceback (most recent call last):
+  File "net.py", line 17, in <module>
+    out = model(torch.randn(4, 8))
+  File ".../torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File ".../torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "net.py", line 13, in forward
+    return self.fc2(h)
+  File ".../torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File ".../torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File ".../torch/nn/modules/linear.py", line 134, in forward
+    return F.linear(input, self.weight, self.bias)
+RuntimeError: mat1 and mat2 shapes cannot be multiplied (4x10 and 12x3)
+```
+
+- 最后一行：`mat1` 是进入这层 Linear 的输入，4 行 10 列（4 个样本，每个 10 个特征）。`mat2` 是这层的权重（转置后），12 行 3 列。矩阵乘法要求中间两个数相等：10 ≠ 12。
+- 你代码的最后一帧：net.py 第 13 行 `return self.fc2(h)`。所以是 fc2 要 12 个输入特征，实际只来了 10 个。
+- 中间的 `module.py`、`linear.py` 是 PyTorch 内部在转手，先跳过。
+
+这张卡片的代码会真的报这个错，点「运行」看看。页面只显示你代码里的帧和最后一行。
+
+常见报错里的关键词：
+- `mat1 and mat2 shapes cannot be multiplied`：Linear 的 in_features 和输入的最后一维不一样。
+- `The size of tensor a (3) must match the size of tensor b (4) at non-singleton dimension 1`：两个张量逐元素运算，第 1 维一个是 3、一个是 4，又都不是 1，没法广播。
+- `view size is not compatible with input tensor's size and stride`：对不连续的张量用了 view（见「view、reshape 和 contiguous」）。
+- `Expected all tensors to be on the same device`：一个在 GPU，一个在 CPU。
+- `mat1 and mat2 must have the same dtype, but got Double and Float`：float64 的输入进了 float32 的模型。
+- `expected target dtype to be Long or Byte, but got Float`：cross_entropy 的标签不是整数。
+--- code
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(8, 10)
+        self.fc2 = nn.Linear(12, 3)   # 写错了：fc1 只输出 10 个特征
+
+    def forward(self, x):
+        h = torch.relu(self.fc1(x))
+        print("进 fc2 之前 h 的 shape:", tuple(h.shape))
+        return self.fc2(h)
+
+
+model = Net()
+out = model(torch.randn(4, 8))
+
+@@ concept
+title: 不报错的广播：(B,) 和 (B, 1)
+--- body
+广播（broadcasting）：两个 shape 不同的张量做逐元素运算时，PyTorch 会自动把它们「撑」成同一个 shape。规则是从最右边一维开始对齐，每一对维度要么相等，要么其中一个是 1（缺的维度当成 1）。
+
+这很方便，也很危险。最经典的坑：
+
+- 回归模型最后一层是 `nn.Linear(..., 1)`，输出 `pred` 的 shape 是 (B, 1)。
+- 标签 `target` 的 shape 是 (B,)。
+- `pred - target`：两边右对齐，(B,) 被当成 (1, B)，结果是 **(B, B)**。第 i 行第 j 列是 pred_i − target_j。
+- 再 `.mean()` 一下，还是一个标量。不报错，loss 照样下降，只是算的是错的东西：模型最后只能学到「所有标签的平均值」。
+
+卡片代码的例子里，预测**完全正确**，错的写法却算出 loss = 2.5。
+
+怎么防：
+- 算 loss 之前让两边 shape 一样：`pred.squeeze(-1)` 或 `target.unsqueeze(-1)`。用 `squeeze(-1)`，不要用不带参数的 `squeeze()`：B = 1 时 `squeeze()` 会把 batch 那一维也挤掉。
+- 加一行断言：`assert pred.shape == target.shape, (pred.shape, target.shape)`。
+- 更进一步：把期望的 shape 写成规格，比如 "B,T,C"。同一个字母在所有张量里必须是同一个数，写数字的维度必须正好是那个数。
+- `F.mse_loss` 遇到这种情况会打一条 UserWarning（很容易淹没在日志里）；手写的 `((pred - target) ** 2).mean()` 连警告都没有。
+--- code
+pred = torch.tensor([[1.0], [2.0], [3.0], [4.0]])   # (4, 1)：Linear(..., 1) 的输出
+target = torch.tensor([1.0, 2.0, 3.0, 4.0])         # (4,)：标签
+diff = pred - target
+print("pred - target 的 shape:", tuple(diff.shape))
+print(diff)
+print("错的 loss:", (diff ** 2).mean().item())
+print("对的 loss:", ((pred.squeeze(-1) - target) ** 2).mean().item())
+
+@@ concept
+title: view、reshape 和 contiguous
+--- body
+一个张量 = 一块连续的内存 + shape + stride（步长：沿某一维走一步，要在内存里跳过几个元素）。
+
+- `torch.arange(6).view(2, 3)` 的 stride 是 (3, 1)：换一行跳 3 个，换一列跳 1 个。这叫 contiguous（连续）：一行一行从左往右读，正好就是内存里的顺序。
+- `.t()`、`.transpose()`、`.permute()` **不搬数据**，只交换 stride。转置之后 stride 是 (1, 3)，不再连续。
+- `view` 也不搬数据，只是换一种方式读同一块内存。张量不连续时，很多 view 做不到，就报 `view size is not compatible with input tensor's size and stride`。
+- `reshape`：能 view 就 view，不能就复制一份。`.contiguous()`：复制成一个连续的新张量（本来就连续就什么都不做）。
+
+所以这个报错的修法是 `x.contiguous().view(...)`，或者直接 `x.reshape(...)`。
+
+**更危险的是不报错的那种。** reshape 和 view 永远按「逻辑顺序」（一行一行）读元素，**不会**帮你调换维度。想把 (B, C, H, W) 变成 (B, H*W, C)，直接写 `reshape(B, H*W, C)` 不会报错，但每个位置装的都是错位的数。调换维度要用 transpose / permute；reshape 只负责把**相邻**的维度合并或拆开。
+--- code
+x = torch.arange(6).view(2, 3)
+print(x.tolist(), "stride", x.stride(), "连续?", x.is_contiguous())
+t = x.t()                       # (3, 2)，没有搬数据
+print(t.tolist(), "stride", t.stride(), "连续?", t.is_contiguous())
+try:
+    t.view(6)
+except RuntimeError as e:
+    print("t.view(6) 报错:", e)
+print("t.reshape(6):", t.reshape(6).tolist())
+print("t.contiguous().view(6):", t.contiguous().view(6).tolist())
+print("x.reshape(3, 2):", x.reshape(3, 2).tolist(), " 不等于转置", t.tolist())
+
+@@ concept
+title: 设备：新建的张量要跟着输入走
+--- body
+一次运算里的张量必须在同一个设备（device）上：都在 CPU，或者都在同一块 GPU（比如 `cuda:0`）。模型的参数、输入，还有 forward 里**临时新建**的张量，都算。
+
+最常见的 bug：forward 里的 `torch.arange(T)`、`torch.zeros(...)`、`torch.ones(...)` 没写 device，于是永远建在 CPU 上。在只有 CPU 的笔记本上一切正常，一上 GPU 服务器就报 `Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!`。
+
+修法：让新张量「跟着输入走」。
+- `torch.arange(T, device=x.device)`
+- `torch.zeros(B, T, device=x.device, dtype=x.dtype)`，或者更短的 `x.new_zeros(B, T)`、`torch.zeros_like(x)`
+- 已经存在的张量：`other.to(x.device)`
+
+不要写死 `.cuda()`：没有 GPU 的机器会直接报错；`.cuda()` 默认去当前的 GPU（通常是 `cuda:0`），模型放在 `cuda:1` 上时又对不上。
+
+一个例外：0 维的 CPU 张量（比如 `torch.tensor(2.0)`）可以直接和 GPU 张量运算，PyTorch 把它当成普通数字。
+
+**没有 GPU 怎么测？** 用 meta 设备。它是一个「假设备」：张量只有 shape 和 dtype，没有真实数据，所以在哪台机器上都能用。CPU 张量和 meta 张量混在一起，会报同一类错：`Tensor on device cpu is not on the expected device meta!`。今天有几道题的检查就是这么测的。
+--- code
+def add_positions(x):                   # x: (B, T)
+    pos = torch.arange(x.shape[1])      # bug：没写 device，永远在 CPU 上
+    return x + pos
+
+def add_positions_fixed(x):
+    pos = torch.arange(x.shape[1], device=x.device)
+    return x + pos
+
+x = torch.zeros(2, 5, device="meta")    # 假装这是 GPU 上的输入
+for fn in (add_positions, add_positions_fixed):
+    try:
+        out = fn(x)
+        print(fn.__name__, "OK:", out.device, tuple(out.shape))
+    except RuntimeError as e:
+        print(fn.__name__, "报错:", e)
+
+@@ concept
+title: register_buffer：跟着模块一起搬家
+--- body
+`model.to("cuda")`、`model.cuda()`、`model.double()`、`model.half()` 只处理模块「认识」的张量：
+- 参数：`nn.Parameter`，会被优化器更新（比如 Linear 的 weight）。
+- buffer：用 `self.register_buffer("名字", 张量)` 登记过的张量。不参与训练，但跟着模块走：换设备、换 dtype、存进 `state_dict`。
+
+普通属性 `self.mask = torch.tril(...)` 模块**看不见**。模型搬到 GPU，它还留在 CPU，forward 一用就报设备错。每次在 forward 里现建一个也不好：默认建在 CPU、float32，还白白重复计算。
+
+所以固定的辅助张量（因果 mask、位置编码表、归一化用的均值和方差）都在 `__init__` 里建一次，用 `register_buffer` 登记。加 `persistent=False` 表示「不存进 state_dict」：它随时能重新算出来，不存能让 checkpoint 小一点，max_len 改了也不会加载失败。
+
+**没有 GPU 怎么测「会不会跟着走」？** 换 dtype。`.double()` 和 `.to("cuda")` 走的是模块里同一段代码（`Module._apply`）：buffer 会从 float32 变成 float64，普通属性不变。注意 `.double()`、`.half()` 只改浮点张量，bool 和整数的 buffer 保持原来的 dtype（但换设备时照样跟着走）。
+--- code
+class M(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lin = nn.Linear(3, 3)
+        self.plain = torch.ones(3)                                    # 普通属性：模块不知道它
+        self.register_buffer("buf", torch.ones(3))                    # buffer：跟着走
+        self.register_buffer("tmp", torch.ones(3), persistent=False)  # 跟着走，但不存
+
+m = M().double()
+print("lin.weight:", m.lin.weight.dtype)
+print("buf:       ", m.buf.dtype)
+print("tmp:       ", m.tmp.dtype)
+print("plain:     ", m.plain.dtype, " <- 没变")
+print("buffers:   ", [name for name, _ in m.named_buffers()])
+print("state_dict:", list(m.state_dict().keys()))
+m = m.to("meta")
+print("to(meta) 之后: buf 在", m.buf.device, "，plain 在", m.plain.device)
+
+@@ concept
+title: dtype：long 标签、numpy 的 float64、整数除法
+--- body
+dtype（数据类型）决定张量里每个数怎么存。三个最常见的坑：
+
+**1. numpy 默认是 float64。** PyTorch 默认的浮点是 float32，模型参数也是 float32。`torch.from_numpy(a)` 和 `torch.tensor(a)` 都会保留 float64，喂进模型就报 `mat1 and mat2 must have the same dtype, but got Double and Float`。修法：`.float()`。逐元素运算倒是不报错：float32 + float64 会被悄悄「提升」成 float64，内存翻倍。
+
+**2. 类别标签必须是 long（int64）。** `F.cross_entropy` 的标签、`nn.Embedding` 的 token id、用来索引的下标，都要是整数。标签写成 float 会报 `expected target dtype to be Long or Byte, but got Float`。反过来，回归任务（MSE）的目标要是 float。
+
+**3. 整数除法。** Python 的 `//` 是整除：`3 // 4 == 0`。用 `correct // total` 算准确率，除非全对，结果永远是 0。要用 `/`。PyTorch 里整数张量用 `/` 会得到浮点（真除法），`//` 才是整除。整数张量不能直接 `.mean()`（报 `mean(): could not infer output dtype`），先 `.float()`。
+
+另外：`pred == y` 是 bool 张量，`.sum()` 之后变成 int64。
+--- code
+import numpy as np
+
+a = np.array([0.5, 1.5])
+print("numpy:", a.dtype, "-> torch.from_numpy:", torch.from_numpy(a).dtype)
+print("torch.tensor([1, 2]):", torch.tensor([1, 2]).dtype)
+print("torch.tensor([1.0, 2.0]):", torch.tensor([1.0, 2.0]).dtype)
+try:
+    nn.Linear(2, 1)(torch.from_numpy(a).view(1, 2))
+except RuntimeError as e:
+    print("float64 进 Linear:", e)
+try:
+    F.cross_entropy(torch.randn(2, 3), torch.tensor([0.0, 2.0]))
+except RuntimeError as e:
+    print("float 标签:", e)
+correct, total = 3, 4
+print("3 // 4 =", correct // total, "   3 / 4 =", correct / total)
+y = torch.tensor([7, 8])
+print("整数张量 / 2:", y / 2, "   // 2:", y // 2)
+
+@@ concept
+title: forward hook：让每一层报出输出 shape
+--- body
+模型一报 shape 错，最想知道的就是：**每一层输出的 shape 到底是多少**。一层层手动加 print 很麻烦。forward hook（钩子）不用改模型代码就能做到。
+
+- `handle = layer.register_forward_hook(fn)`：之后 layer 每跑完一次 forward，就调用一次 `fn(module, inputs, output)`。`inputs` 是一个 tuple（这一层收到的所有输入），`output` 是这一层的输出。
+- `handle.remove()`：把钩子取下来。忘了取，它会一直挂着，之后每次 forward 都会触发。
+- `model.named_modules()`：依次给出 `(名字, 模块)`，包括整个模型自己（名字是空字符串 `''`）和中间的容器（比如 `nn.Sequential`）。嵌套的名字用点连起来，比如 `'2.0'`、`'enc.0'`。
+- 只想看「真正干活的层」：挑叶子模块，也就是没有子模块的模块：`len(list(m.children())) == 0`。
+- 同一个模块可以被调用好几次（比如一个 `nn.ReLU` 用了两次），它的钩子也就触发好几次。
+
+用完一定要取下钩子，就算 forward 中途报错也要取。写法是 try / finally，`finally` 里的代码不管有没有报错都会执行：
+
+```
+handles = [...]
+try:
+    model(x)
+finally:
+    for h in handles:
+        h.remove()
+```
+
+如果还想在报错时继续往下走，就在中间加一段 `except Exception as e:`，把错误存起来，而不是让它抛出去。
+
+模型崩溃时，最后打印出来的那一层就是「最后一个成功跑完的层」，崩的是它后面那一层。
+
+算卷积层的输出边长：`(输入 + 2·padding − kernel) // stride + 1`。
+--- code
+model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Sequential(nn.Linear(8, 8), nn.Tanh()), nn.Linear(8, 2))
+
+for name, mod in model.named_modules():
+    leaf = len(list(mod.children())) == 0
+    print(repr(name), type(mod).__name__, "叶子" if leaf else "容器")
+
+def show(module, inputs, output):
+    print("  ", type(module).__name__, tuple(inputs[0].shape), "->", tuple(output.shape))
+
+handles = [m.register_forward_hook(show) for m in model.modules() if len(list(m.children())) == 0]
+try:
+    model(torch.randn(5, 4))
+finally:
+    for h in handles:
+        h.remove()
+print("钩子取下以后再跑一次，不再打印：")
+model(torch.randn(5, 4))
+
+@@ concept
+title: 嵌套的 batch：递归走一遍 dict / list / tuple
+--- body
+真实项目里的 batch 很少只是一个张量。DataLoader 给出来的常常是这样的：
+
+```
+{"input_ids": (B, T) long, "attention_mask": (B, T) bool,
+ "pixels": (B, 3, H, W) float, "meta": {"lengths": [...], "ids": ("a", "b")}}
+```
+
+要把它整个搬到 GPU，或者打印出每个张量的 shape，就要「走遍」这个嵌套结构。这是递归（函数调用它自己）的经典用法：
+- 是张量：处理它，返回结果。
+- 是 dict：对每个 value 递归，key 不变，拼回一个 dict。
+- 是 list / tuple：对每个元素递归，拼回**同一种**容器（tuple 还是 tuple）。
+- 其他东西（字符串、数字、None）：原样返回。
+
+判断类型用 `isinstance(obj, torch.Tensor)`、`isinstance(obj, dict)`、`isinstance(obj, (list, tuple))`。`type(obj)(...)` 能用原来的容器类型再造一个：`type((1, 2))([3, 4])` 得到 `(3, 4)`。
+
+换 dtype 时要小心：只有浮点张量（`t.is_floating_point()` 为 True）才该转成 float16、float64 之类。token id 和标签是 long，mask 是 bool，把它们也转成浮点，下游的 Embedding 和 cross_entropy 就会报错。
+--- code
+def describe(obj):
+    """把嵌套 batch 里的每个张量换成一句说明，其余原样保留。"""
+    if isinstance(obj, torch.Tensor):
+        kind = "浮点" if obj.is_floating_point() else "非浮点"
+        return f"{tuple(obj.shape)} {obj.dtype} {kind}"
+    if isinstance(obj, dict):
+        return {k: describe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(describe(v) for v in obj)
+    return obj
+
+batch = {
+    "input_ids": torch.randint(0, 100, (2, 6)),
+    "attention_mask": torch.ones(2, 6, dtype=torch.bool),
+    "pixels": torch.randn(2, 3, 8, 8),
+    "meta": {"lengths": [6, 4], "ids": ("a", "b")},
+}
+for key, value in describe(batch).items():
+    print(key, "->", value)
+
+@@ item d16-01
+type: choice
+title: 读报错：mat1 and mat2 shapes cannot be multiplied
+level: 1
+cards: 读懂 PyTorch 报错：最后一行 + 你代码的最后一帧
+--- context
+形状报错是写模型时最常见的报错。能从最后一行的数字直接定位到哪一层、差在哪里，就不用瞎猜着改。面试里现场调试也常考这个。
+--- prompt
+下面的 train.py 运行后得到这个 traceback（路径缩短了，删掉了 `~~~^^^` 标记行）：
+
+```
+Traceback (most recent call last):
+  File "train.py", line 17, in <module>
+    logits = model(torch.randn(8, 16))
+  File ".../torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File ".../torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "train.py", line 13, in forward
+    return self.head(h)
+  File ".../torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File ".../torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File ".../torch/nn/modules/linear.py", line 134, in forward
+    return F.linear(input, self.weight, self.bias)
+RuntimeError: mat1 and mat2 shapes cannot be multiplied (8x20 and 32x10)
+```
+
+哪个改法是对的？
+--- code
+import torch
+import torch.nn as nn
+
+
+class Classifier(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.body = nn.Sequential(nn.Linear(16, 20), nn.ReLU())
+        self.head = nn.Linear(32, 10)
+
+    def forward(self, x):
+        h = self.body(x)
+        return self.head(h)
+
+
+model = Classifier()
+logits = model(torch.randn(8, 16))
+--- options
+- 把 `self.head` 改成 `nn.Linear(20, 10)`
+- 把输入改成 `torch.randn(8, 32)`
+- 在 `return self.head(h)` 前面加一行 `h = h.contiguous()`
+- 把 batch size 从 8 改成 32
+answer: 1
+--- explain
+最后一行 `(8x20 and 32x10)`：mat1 是进入这层 Linear 的输入 h，8 个样本、每个 20 个特征；mat2 是这层的权重（转置后），32 行 10 列，表示它要 32 个输入特征。中间两个数 20 ≠ 32。
+
+你代码的最后一帧是第 13 行 `return self.head(h)`，所以出问题的是 head：body 输出 20 个特征，head 却按 32 个来建。改成 `nn.Linear(20, 10)`。
+
+- 输入改成 (8, 32)：第一层 `Linear(16, 20)` 马上报 `(8x32 and 16x20)`，问题只是往前挪了一层。
+- `contiguous()` 只管内存排布，不改 shape。
+- batch size 是 mat1 的第一个数 8，和对不上的那两个数无关。
+--- hints
+- 先看最后一行的四个数：`8x20` 是进入这一层的输入 h，`32x10` 是这一层的权重。哪两个数应该相等？
+- 再看你自己代码的最后一帧：是哪一层？它的 in_features 应该等于上一层输出的特征数。
+
+@@ item d16-02
+type: predict
+title: (B, 1) 减 (B,) 是什么 shape？
+level: 1
+cards: 不报错的广播：(B,) 和 (B, 1)
+--- context
+回归、打分、奖励模型的输出常是 (B, 1)，标签常是 (B,)。两者直接相减不会报错，只会悄悄得到 (B, B)。这是训练「能跑但学不好」的经典原因之一。
+--- prompt
+先在脑子里算出每一行打印什么，再写下来，一个 print 一行。tuple 的写法和 Python 打印的一样，比如 `(4,)`、`()`。
+--- code
+pred = torch.zeros(4, 1)      # 模型输出：Linear(..., 1)
+target = torch.zeros(4)       # 标签
+print(tuple((pred - target).shape))
+print(tuple((pred.squeeze(-1) - target).shape))
+print(tuple((pred - target.unsqueeze(-1)).shape))
+print(tuple(torch.zeros(1, 1).squeeze().shape))
+--- explain
+- `(4, 1)` 和 `(4,)` 从右对齐：(4,) 被当成 (1, 4)，每一维取大的，得到 (4, 4)。16 个差值，不报错。
+- `squeeze(-1)` 去掉最后那个 1，两边都是 (4,)。
+- `unsqueeze(-1)` 让标签变成 (4, 1)，两边都是 (4, 1)。这也是对的写法。
+- 不带参数的 `squeeze()` 会去掉**所有**大小为 1 的维度。B = 1 时 (1, 1) 直接变成 ()，连 batch 维也没了。所以要写 `squeeze(-1)`。
+--- hints
+- 广播从最右边一维开始对齐，缺的维度当成 1。
+- (4, 1) 对上 (1, 4)：每一维取大的那个。
+
+@@ item d16-03
+type: fix
+title: 回归 loss 里的静默广播
+level: 1
+targets: regression_loss
+cards: 不报错的广播：(B,) 和 (B, 1)
+--- context
+这个 bug 不报错，loss 也在下降，只是模型永远学不会：它被训练去预测「所有标签的平均值」。很多人要花几天才发现。修它只要一行，难的是想到去看 shape。
+--- prompt
+`regression_loss(model, x, y)`：`model(x)` 输出 (B, 1)，`y` 是 (B,)。要返回一个标量：每个样本的预测减去**它自己的**标签，平方，再取平均（MSE）。
+
+现在的代码能跑，但算错了。改好它。建议顺手加一行 assert，让 shape 不一样时直接报错。
+--- starter
+def regression_loss(model, x, y):
+    """model(x): (B, 1)   y: (B,)   返回标量 MSE"""
+    pred = model(x)
+    return ((pred - y) ** 2).mean()
+--- solution
+def regression_loss(model, x, y):
+    """model(x): (B, 1)   y: (B,)   返回标量 MSE"""
+    pred = model(x).squeeze(-1)          # (B, 1) -> (B,)
+    assert pred.shape == y.shape, (pred.shape, y.shape)
+    return ((pred - y) ** 2).mean()
+--- tests
+@check("loss 的数值")
+def _():
+    seed(0)
+    model = nn.Linear(3, 1)
+    x, y = torch.randn(5, 3), torch.randn(5)
+    loss = regression_loss(model, x, y)
+    shape_is(loss, (), "loss 应该是一个标量")
+    want = ((model(x)[:, 0] - y) ** 2).mean()
+    eq(loss, want, msg="打印 (pred - y).shape 看看：如果是 (5, 5)，就是 (5, 1) 和 (5,) 广播出了 25 个差值")
+
+@check("B = 1 也对")
+def _():
+    seed(1)
+    model = nn.Linear(3, 1)
+    x, y = torch.randn(1, 3), torch.randn(1)
+    eq(regression_loss(model, x, y), (model(x)[0, 0] - y[0]) ** 2,
+       msg="B = 1 时结果不对：不带参数的 squeeze() 会把 batch 维也挤掉")
+
+@check("真能学会：训练 200 步后误差接近 0")
+def _():
+    seed(0)
+    w = torch.tensor([[1.0], [-2.0], [0.5]])
+    x = torch.randn(64, 3)
+    y = (x @ w).squeeze(-1)
+    model = nn.Linear(3, 1)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    for _ in range(200):
+        loss = regression_loss(model, x, y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    with torch.no_grad():
+        final = ((model(x)[:, 0] - y) ** 2).mean().item()
+    true(final < 1e-3,
+         f"训练后真实的 MSE 是 {final:.3f}，模型没学会。广播 bug 让它去拟合「所有标签的平均值」，"
+         f"误差就卡在 y 的方差（{y.var().item():.2f}）附近")
+--- hints
+- 在 return 前面加一行 `print(pred.shape, y.shape, (pred - y).shape)` 看看。
+- 让两边都是 (B,)：`model(x).squeeze(-1)`。不要用不带参数的 `squeeze()`，B = 1 时会出问题。
+
+@@ item d16-04
+type: code
+title: 形状守卫 assert_shape
+level: 2
+targets: assert_shape
+cards: 不报错的广播：(B,) 和 (B, 1); 读懂 PyTorch 报错：最后一行 + 你代码的最后一帧
+--- context
+在关键位置写下「这里应该是什么 shape」，bug 会在它出现的那一行就报出来，而不是 200 步以后变成一条奇怪的 loss 曲线。报错信息写清楚，下一个读代码的人（包括一周后的你）一眼就知道哪里不对。
+--- prompt
+写 `assert_shape(x, spec, sizes)`：
+
+- `spec` 是用逗号分开的维度说明，比如 `"B,T,C"` 或 `"B,1"`，允许有空格（`"B, T"`）。
+- 数字（`"1"`、`"3"`）：这一维必须正好等于这个数。
+- 名字（`"B"`、`"T"`）：`sizes` 字典里还没有这个名字，就把实际大小记进去；已经有了，就必须相等。同一个 spec 里一个名字出现两次（`"N,N"`）也必须相等。
+- 维数（`x.dim()`）和 spec 里的项数不一样，也不行。
+- 符合就返回 `x` 本身；不符合就 `raise ValueError(...)`。报错信息里要有 spec 原文和 `tuple(x.shape)`；名字对不上时，还要有那个名字。
+
+`sizes` 在多次调用之间共用，这样不同张量里的 B 就能对上：
+
+```
+sizes = {}
+assert_shape(logits, "B,T,V", sizes)
+assert_shape(labels, "B,T", sizes)   # 这里的 B 和 T 必须和 logits 的一样
+```
+--- starter
+def assert_shape(x, spec, sizes):
+    """检查 x.shape 符合 spec（比如 "B,T,C"）：符合就返回 x，否则 raise ValueError。
+    sizes: dict，名字 -> 大小。第一次见到时记下，之后必须一致。"""
+    raise todo()
+--- solution
+def assert_shape(x, spec, sizes):
+    """检查 x.shape 符合 spec（比如 "B,T,C"）：符合就返回 x，否则 raise ValueError。
+    sizes: dict，名字 -> 大小。第一次见到时记下，之后必须一致。"""
+    dims = [d.strip() for d in spec.split(",")]
+    shape = tuple(x.shape)
+    if len(dims) != len(shape):
+        raise ValueError(f"shape {shape} 不符合 {spec!r}：应该有 {len(dims)} 维，实际 {len(shape)} 维")
+    for i, (d, n) in enumerate(zip(dims, shape)):
+        if d.isdigit():
+            if n != int(d):
+                raise ValueError(f"shape {shape} 不符合 {spec!r}：第 {i} 维应为 {d}，实际是 {n}")
+        elif d in sizes and sizes[d] != n:
+            raise ValueError(f"shape {shape} 不符合 {spec!r}：{d} 之前是 {sizes[d]}，这里是 {n}")
+        else:
+            sizes[d] = n
+    return x
+--- tests
+def _raises(fn):
+    """调用 fn()：抛出 ValueError 就返回它的信息，没抛就返回 None。"""
+    try:
+        fn()
+    except ValueError as e:
+        return str(e)
+    return None
+
+@check("符合时返回 x，并把名字记进 sizes")
+def _():
+    sizes = {}
+    x = torch.zeros(4, 7, 16)
+    out = assert_shape(x, "B,T,C", sizes)
+    true(out is x, "符合时要把 x 原样返回，这样才能写 h = assert_shape(layer(x), \"B,T,C\", sizes)")
+    true(sizes == {"B": 4, "T": 7, "C": 16}, f"sizes 应为 {{'B': 4, 'T': 7, 'C': 16}}，你的是 {sizes}")
+    assert_shape(torch.zeros(4, 7), "B, T", sizes)
+    assert_shape(torch.zeros(4, 1), "B,1", sizes)
+    assert_shape(torch.zeros(3, 3), "N,N", sizes)
+    true(sizes.get("N") == 3, f"N 应该被记成 3，sizes 现在是 {sizes}")
+
+@check("(B,) 冒充 (B, 1)：维数不对要报错")
+def _():
+    msg = _raises(lambda: assert_shape(torch.zeros(4), "B,1", {"B": 4}))
+    true(msg is not None, "shape (4,) 只有 1 维，'B,1' 要 2 维，应该 raise ValueError")
+    true("B,1" in msg.replace(" ", "") and "(4,)" in msg,
+         f"报错信息里要有 spec 'B,1' 和实际 shape (4,)，你的是：{msg}")
+
+@check("写数字的维度必须正好相等")
+def _():
+    msg = _raises(lambda: assert_shape(torch.zeros(4, 2), "B,1", {}))
+    true(msg is not None, "(4, 2) 的第 1 维是 2，不是 1，应该 raise ValueError")
+    true("(4, 2)" in msg, f"报错信息里要有实际 shape (4, 2)，你的是：{msg}")
+
+@check("同名维度前后必须一致")
+def _():
+    sizes = {}
+    assert_shape(torch.zeros(4, 3), "B,C", sizes)
+    msg = _raises(lambda: assert_shape(torch.zeros(5, 3), "B,C", sizes))
+    true(msg is not None, "B 之前记的是 4，这次是 5，应该 raise ValueError")
+    true("B" in msg, f"报错信息里要说出是哪个名字（B）对不上，你的是：{msg}")
+    true(_raises(lambda: assert_shape(torch.zeros(3, 4), "N,N", {})) is not None,
+         "'N,N' 要求两维相等，(3, 4) 应该报错")
+--- hints
+- 先拆 spec：`[d.strip() for d in spec.split(",")]`，再和 `tuple(x.shape)` 比项数。
+- 用 `zip` 一维一维地比：`d.isdigit()` 为 True 就和 `int(d)` 比；否则查 `sizes`，没有就记下，有就比较。
+- 报错信息可以写成 `f"shape {tuple(x.shape)} 不符合 {spec!r}：..."`。
+
+@@ item d16-05
+type: predict
+title: permute 之后：stride、连续性和 reshape 的顺序
+level: 2
+cards: view、reshape 和 contiguous
+--- context
+多头注意力、图像转 token 时到处都是 transpose / permute。能在脑子里算出 stride 和元素顺序，才能看懂 view 为什么报错，reshape 为什么「不报错却错了」。
+--- prompt
+先脑算，再写下 5 行输出。提示：`x` 的 stride 是 (12, 4, 1)；permute 只调换 shape 和 stride 的顺序，不动数据。
+--- code
+x = torch.arange(24).view(2, 3, 4)
+y = x.permute(0, 2, 1)
+print(tuple(y.shape))
+print(y.stride())
+print(y.is_contiguous())
+print(y[0, 1].tolist())
+print(y.reshape(2, 12)[0, :4].tolist())
+--- explain
+- permute(0, 2, 1) 把第 1、2 维对调：shape (2, 3, 4) → (2, 4, 3)，stride (12, 4, 1) → (12, 1, 4)。
+- 最后一维的 stride 不是 1，一行一行读就不是内存里的顺序了，所以不连续：False。
+- `y[0, 1]` 就是 `x[0, :, 1]`。x[0] 的三行是 0–3、4–7、8–11，每行取第 1 个：[1, 5, 9]。
+- reshape 按 y 的逻辑顺序一行一行读：y[0] 的第一行是 [0, 4, 8]，第二行从 1 开始，所以前 4 个是 [0, 4, 8, 1]。reshape 的顺序跟着 y 走，不跟着内存走，它也不会帮你把维度换回来。
+--- hints
+- y 的第 (i, j, k) 个元素就是 x 的第 (i, k, j) 个元素。
+- x[0] 是 [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]]，y[0] 是它的转置。
+
+@@ item d16-06
+type: fix
+title: 特征图摊成 token：一个不报错的 bug，一个报错的 bug
+level: 2
+targets: image_to_tokens, flatten_tokens
+cards: view、reshape 和 contiguous
+--- context
+ViT、DiT 这类模型要把特征图 (B, C, H, W) 摊成 token 序列 (B, H*W, C)。这里一个 reshape 写错不会报错，模型照样训练，只是每个 token 里装的是错位的数。修好它以后，后面的 view 又可能开始报错。
+--- prompt
+两个函数：
+
+- `image_to_tokens(x)`：(B, C, H, W) → (B, H*W, C)。第 `h*W + w` 个 token 应该是像素 (h, w) 的 C 个通道，也就是 `x[:, :, h, w]`。现在不报错，但数是错位的。
+- `flatten_tokens(t)`：(B, N, C) → (B*N, C)，把所有 token 排成一行一个（比如要给每个 token 单独算 loss 时）。第 `b*N + n` 行是 `t[b, n]`。
+
+现在两个函数连起来用不报错，因为 reshape 出来的张量是连续的。等你修好 `image_to_tokens`，它的输出就不连续了，`flatten_tokens` 里的 view 会开始报错。两个都改好。
+--- starter
+def image_to_tokens(x):
+    """(B, C, H, W) -> (B, H*W, C)"""
+    B, C, H, W = x.shape
+    return x.reshape(B, H * W, C)
+
+
+def flatten_tokens(t):
+    """(B, N, C) -> (B*N, C)"""
+    B, N, C = t.shape
+    return t.view(B * N, C)
+--- solution
+def image_to_tokens(x):
+    """(B, C, H, W) -> (B, H*W, C)"""
+    B, C, H, W = x.shape
+    return x.flatten(2).transpose(1, 2)    # (B, C, H*W) -> (B, H*W, C)，结果不连续
+
+
+def flatten_tokens(t):
+    """(B, N, C) -> (B*N, C)"""
+    B, N, C = t.shape
+    return t.reshape(B * N, C)             # t 可能不连续：view 会报错，reshape 不会
+--- tests
+@check("image_to_tokens：第 h*W+w 个 token 是像素 (h, w) 的通道")
+def _():
+    x = torch.randn(2, 3, 4, 5)          # B=2, C=3, H=4, W=5
+    t = image_to_tokens(x)
+    shape_is(t, (2, 20, 3))
+    for h, w in ((0, 1), (2, 3), (3, 4)):
+        eq(t[:, h * 5 + w], x[:, :, h, w],
+           msg=f"第 {h * 5 + w} 个 token 应该是 x[:, :, {h}, {w}]。reshape 不会调换维度，只会把同一串数重新分组；"
+               "要先把 C 挪到最后（transpose / permute）")
+
+@check("flatten_tokens：不连续的输入也能处理")
+def _():
+    t = torch.randn(2, 3, 20).transpose(1, 2)    # (2, 20, 3)，和 transpose 出来的 token 一样不连续
+    try:
+        rows = flatten_tokens(t)
+    except RuntimeError as e:
+        true(False, f"报错了：{e} —— t 不连续，不能直接 view 成 (B*N, C)：用 reshape，或者先 .contiguous() 再 view")
+    shape_is(rows, (40, 3))
+    eq(rows[1 * 20 + 7], t[1, 7], msg="第 b*N + n 行应该是 t[b, n]")
+
+@check("连起来用：样本 b、像素 (h, w) 在第 b*H*W + h*W + w 行")
+def _():
+    x = torch.randn(2, 3, 4, 5)
+    rows = flatten_tokens(image_to_tokens(x))
+    shape_is(rows, (40, 3))
+    eq(rows[1 * 20 + 2 * 5 + 3], x[1, :, 2, 3], msg="样本 1、像素 (2, 3) 的 3 个通道没有出现在第 33 行")
+--- hints
+- 调换维度只能靠 transpose / permute；reshape 和 view 只负责合并或拆开**相邻**的维度。
+- image_to_tokens：先 `x.flatten(2)` 得到 (B, C, H*W)，再 `.transpose(1, 2)`。
+- flatten_tokens：把 `.view` 换成 `.reshape`（或者先 `.contiguous()` 再 view）。
+
+@@ item d16-07
+type: choice
+title: 读报错：一个在 cuda:0，一个在 cpu
+level: 1
+cards: 设备：新建的张量要跟着输入走; register_buffer：跟着模块一起搬家; 读懂 PyTorch 报错：最后一行 + 你代码的最后一帧
+--- context
+设备报错往往在你的笔记本上不出现，一到 GPU 服务器才出现。修法有好有坏：有的只是让这台机器暂时不报错，换一台机器又坏了。
+--- prompt
+下面的 pos.py 在 GPU 机器上报错，traceback 是这样的（路径缩短了，删掉了 `~~~^^^` 标记行，`...` 处省略了 PyTorch 内部的几帧）：
+
+```
+Traceback (most recent call last):
+  File "pos.py", line 16, in <module>
+    out = model(torch.randn(2, 10, 64, device="cuda"))
+  ...
+  File "pos.py", line 12, in forward
+    return x + self.table(pos)
+  ...
+  File ".../torch/nn/functional.py", line 2567, in embedding
+    return torch.embedding(weight, input, padding_idx, scale_grad_by_freq, sparse)
+RuntimeError: Expected all tensors to be on the same device, but got index is on cpu, different from other tensors on cuda:0 (when checking argument in method wrapper_CUDA__index_select)
+```
+
+哪些改法是好的修法（在只有 CPU 的机器、单卡、多卡上都对）？可以多选。
+--- code
+import torch
+import torch.nn as nn
+
+
+class PosEmbed(nn.Module):
+    def __init__(self, max_len, dim):
+        super().__init__()
+        self.table = nn.Embedding(max_len, dim)
+
+    def forward(self, x):                      # x: (B, T, dim)
+        pos = torch.arange(x.shape[1])
+        return x + self.table(pos)
+
+
+model = PosEmbed(128, 64).cuda()
+out = model(torch.randn(2, 10, 64, device="cuda"))
+--- options
+- 改成 `pos = torch.arange(x.shape[1], device=x.device)`
+- 改成 `pos = torch.arange(x.shape[1]).cuda()`
+- 去掉 `.cuda()`，模型和输入都放在 CPU 上
+- 在 `__init__` 里加 `self.register_buffer("pos_ids", torch.arange(max_len), persistent=False)`，forward 里改用 `self.table(self.pos_ids[:x.shape[1]])`
+- 在 forward 第一行加 `x = x.cpu()`
+answer: 1,4
+--- explain
+最后一行说：`index is on cpu`，其他张量在 `cuda:0`。你代码的最后一帧是第 12 行 `self.table(pos)`：Embedding 的权重跟着模型去了 GPU，下标 `pos` 却是在 forward 里用 `torch.arange` 新建的，没写 device，留在了 CPU。
+
+- 选项 1：新张量跟着输入走，在哪都对。
+- 选项 4：buffer 会跟着 `model.cuda()` / `model.to(...)` 一起搬家，也对，而且只建一次。
+- 选项 2：这台机器上不报错了，但没有 GPU 的机器会直接报错；模型放在 `cuda:1` 上时又对不上。
+- 选项 3：能跑，但放弃了 GPU，并没有修好 bug。
+- 选项 5：x 到了 CPU，Embedding 的权重还在 GPU 上，照样报错（何况 x 本来就没问题）。
+--- hints
+- 最后一行说谁在 CPU 上？是 index（下标），也就是 `pos`。
+- 好的修法不写死任何设备名：要么跟着输入（`x.device`），要么跟着模块（buffer）。
+
+@@ item d16-08
+type: fix
+title: forward 里现建的 mask 改成 buffer
+level: 2
+targets: CausalMask
+cards: register_buffer：跟着模块一起搬家; 设备：新建的张量要跟着输入走
+--- context
+因果 mask、位置编码表这类固定张量，如果在 forward 里现建，默认就是 CPU、float32：上 GPU 报设备错，用 bf16 训练时又把激活悄悄变回 float32。做成 buffer，模块搬到哪它就跟到哪。
+--- prompt
+`CausalMask(max_len)` 给 attention 分数加上因果 mask：`scores` 是 (B, T, T)，T ≤ max_len；返回同样 shape 的张量，未来的位置（列 j > 行 i）变成 -inf，其余不变。
+
+现在的写法在 CPU + float32 上结果是对的，但每次 forward 都在 CPU 上新建一个 float32 的 mask。改成：在 `__init__` 里按 max_len 建一次，用 `register_buffer` 登记（建议加 `persistent=False`），forward 里切出 `[:T, :T]` 来用。
+
+检查会把模块换成 float64、bfloat16，再搬到 meta 设备（代替 GPU）上跑。
+--- starter
+class CausalMask(nn.Module):
+    def __init__(self, max_len):
+        super().__init__()
+        self.max_len = max_len
+
+    def forward(self, scores):                     # scores: (B, T, T)
+        T = scores.shape[-1]
+        mask = torch.triu(torch.full((T, T), float("-inf")), diagonal=1)
+        return scores + mask
+--- solution
+class CausalMask(nn.Module):
+    def __init__(self, max_len):
+        super().__init__()
+        self.max_len = max_len
+        bias = torch.triu(torch.full((max_len, max_len), float("-inf")), diagonal=1)
+        self.register_buffer("bias", bias, persistent=False)   # 跟着 .to() / .double() 走
+
+    def forward(self, scores):                     # scores: (B, T, T)
+        T = scores.shape[-1]
+        return scores + self.bias[:T, :T]
+--- tests
+@check("数值：未来位置是 -inf，其余不变")
+def _():
+    m = CausalMask(6)
+    s = torch.randn(2, 4, 4)
+    out = m(s)
+    shape_is(out, (2, 4, 4))
+    future = torch.triu(torch.ones(4, 4, dtype=torch.bool), diagonal=1)
+    true(bool((out[:, future] == float("-inf")).all()), "列 j > 行 i 的位置应该是 -inf")
+    eq(out[:, ~future], s[:, ~future], msg="j <= i 的位置应该保持原值")
+
+@check("mask 是登记过的 buffer，.double() 时跟着变")
+def _():
+    m = CausalMask(6)
+    names = [n for n, _ in m.named_buffers()]
+    true(len(names) > 0,
+         "模块里没有 buffer。mask 要在 __init__ 里用 self.register_buffer(...) 登记。"
+         "普通属性和 forward 里新建的张量，.to() / .double() 都管不到")
+    m.double()
+    for n, b in m.named_buffers():
+        if b.is_floating_point():        # bool 的 mask 会保持 bool，这是正常的
+            true(b.dtype == torch.float64, f"buffer {n} 在 .double() 之后是 {b.dtype}")
+    out = m(torch.randn(1, 3, 3, dtype=torch.float64))
+    true(out.dtype == torch.float64, f"模块和输入都是 float64，输出却是 {out.dtype}")
+
+@check("换成 bfloat16：输出也还是 bfloat16")
+def _():
+    m = CausalMask(6).to(torch.bfloat16)
+    out = m(torch.randn(2, 4, 4).to(torch.bfloat16))
+    true(out.dtype == torch.bfloat16,
+         f"输出变成了 {out.dtype}：float32 的 mask 把 bf16 的分数「提升」成了 float32。"
+         "混合精度训练里这会悄悄多占显存、变慢。mask 做成 buffer，模块换 dtype 它就跟着换")
+
+@check("搬到另一个设备也能跑（meta 设备，代替 GPU）")
+def _():
+    m = CausalMask(6).to("meta")
+    s = torch.zeros(2, 4, 4, device="meta")
+    try:
+        out = m(s)
+    except RuntimeError as e:
+        true(False, f"模块搬到 meta 以后 forward 报错：{e} —— 在 GPU 上这就是 'Expected all tensors to be on the same device'："
+                    "forward 用到的张量留在了 CPU 上")
+    true(out.device.type == "meta", f"输出在 {out.device} 上，应该在 meta 上")
+--- hints
+- 在 `__init__` 里建一个 (max_len, max_len) 的 mask，然后 `self.register_buffer("bias", mask, persistent=False)`。
+- forward 里用 `self.bias[:T, :T]`，不要再调用 `torch.full` / `torch.triu`。
+
+@@ item d16-09
+type: predict
+title: 这些 dtype 是什么？
+level: 2
+cards: dtype：long 标签、numpy 的 float64、整数除法
+--- context
+dtype 的 bug 一半会报错（容易修），另一半不报错：准确率永远是 0、内存悄悄翻倍。能一眼看出每一步的 dtype，这些 bug 就藏不住。
+--- prompt
+先脑算，再写下 6 行输出。
+--- code
+import numpy as np
+
+labels = torch.tensor([2, 0, 1, 1])
+preds = torch.tensor([2, 1, 1, 1])
+correct = (preds == labels).sum()
+print(correct.dtype)
+print(correct.item() // len(labels))
+print(correct.item() / len(labels))
+print((preds == labels).float().mean().item())
+feats = torch.from_numpy(np.array([[0.1, 0.2]]))
+print(feats.dtype)
+print((feats + torch.ones(1, 2)).dtype)
+--- explain
+- `preds == labels` 是 bool 张量，`.sum()` 把 True 当 1 加起来，结果是 int64。
+- 对了 3 个。`3 // 4` 是整除，得 0：准确率这样算，除非全对，永远是 0。
+- `3 / 4` 是 0.75。
+- 先 `.float()` 再 `.mean()`：0.75。（直接对整数张量 `.mean()` 会报错。）
+- numpy 的默认浮点是 float64，`torch.from_numpy` 原样保留。
+- float64 + float32：不报错，结果被提升成 float64。
+--- hints
+- bool 张量 sum 之后是整数；Python 的 `//` 是整除。
+- numpy 和 PyTorch 的默认浮点类型不一样。
+
+@@ item d16-10
+type: fix
+title: 数据管道里的三个 dtype bug
+level: 2
+targets: make_batch, accuracy
+cards: dtype：long 标签、numpy 的 float64、整数除法; 读懂 PyTorch 报错：最后一行 + 你代码的最后一帧
+--- context
+数据常常从 numpy、pandas 来，dtype 在这里最容易出错：float64 的特征、float 的类别标签，还有一个永远是 0 的准确率。前两个让训练第一步就报错，第三个不报错，只会让你以为模型什么都没学到。
+--- prompt
+- `make_batch(features, labels)`：`features` 是 numpy 数组 (B, D)，float64；`labels` 是 Python list（类别编号）。返回 `(x, y)`：`x` 是 float32 的 (B, D)，`y` 是 long 的 (B,)，能直接喂给 `nn.Linear` 和 `F.cross_entropy`。
+- `accuracy(logits, y)`：`logits` 是 (B, C)，`y` 是 (B,)。返回 Python float：预测对的比例，在 0 到 1 之间。
+
+一共三处 bug，都改好。
+--- starter
+def make_batch(features, labels):
+    x = torch.from_numpy(features)
+    y = torch.tensor(labels, dtype=torch.float32)
+    return x, y
+
+
+def accuracy(logits, y):
+    correct = (logits.argmax(-1) == y).sum().item()
+    return correct // len(y)
+--- solution
+def make_batch(features, labels):
+    x = torch.from_numpy(features).float()        # numpy 默认 float64 -> float32
+    y = torch.tensor(labels, dtype=torch.long)    # 类别标签必须是 long
+    return x, y
+
+
+def accuracy(logits, y):
+    correct = (logits.argmax(-1) == y).sum().item()
+    return correct / len(y)                       # / 是真除法，// 是整除
+--- tests
+import numpy as np
+
+@check("dtype：x 是 float32，y 是 long")
+def _():
+    feats = np.array([[0.1, 0.2, 0.3], [1.0, 2.0, 3.0]])
+    x, y = make_batch(feats, [2, 0])
+    true(x.dtype == torch.float32,
+         f"x 是 {x.dtype}。numpy 默认 float64，进 float32 的 nn.Linear 会报 'mat1 and mat2 must have the same dtype'")
+    true(y.dtype == torch.long,
+         f"y 是 {y.dtype}。类别标签要是 long，否则 cross_entropy 会报 'expected target dtype to be Long or Byte'")
+    eq(x, torch.tensor([[0.1, 0.2, 0.3], [1.0, 2.0, 3.0]]))
+    eq(y, torch.tensor([2, 0]))
+
+@check("这个 batch 能直接训练一步")
+def _():
+    feats = np.random.default_rng(0).normal(size=(4, 3))
+    x, y = make_batch(feats, [0, 1, 2, 1])
+    model = nn.Linear(3, 3)
+    try:
+        loss = F.cross_entropy(model(x), y)
+        loss.backward()
+    except RuntimeError as e:
+        true(False, f"训练第一步就报错：{e}")
+
+@check("accuracy：4 个对 3 个是 0.75")
+def _():
+    logits = torch.tensor([[2.0, 0.1], [0.3, 1.0], [5.0, 1.0], [0.0, 3.0]])
+    acc = accuracy(logits, torch.tensor([0, 1, 1, 1]))
+    true(isinstance(acc, float), f"要返回 Python float，你返回了 {type(acc).__name__}（{acc}）")
+    true(close(acc, 0.75), f"4 个里对了 3 个，应为 0.75，你的是 {acc}。注意 3 // 4 是整除，结果是 0")
+    true(close(accuracy(logits, torch.tensor([0, 1, 0, 1])), 1.0), "全对的时候应该是 1.0")
+--- hints
+- 一个一个来：先看 `x.dtype`、`y.dtype` 各是什么，再想 `3 // 4` 等于多少。
+- `x` 加 `.float()`；`y` 用 `dtype=torch.long`；准确率用 `/`。
+
+@@ item d16-11
+type: code
+title: move_to：把嵌套的 batch 搬到设备上
+level: 2
+targets: move_to
+ref: day16
+cards: 嵌套的 batch：递归走一遍 dict / list / tuple; 设备：新建的张量要跟着输入走; dtype：long 标签、numpy 的 float64、整数除法
+--- context
+训练循环的第一行几乎都是「把 batch 搬到 GPU」。batch 是嵌套的 dict、list 时，漏掉一个张量就是一条设备报错；把标签也转成 float16，就是一条 dtype 报错。写一个通用的 move_to，以后每个项目都能用。
+--- prompt
+写 `move_to(batch, device, float_dtype=None)`：
+
+- `batch` 可以是张量、dict、list、tuple，任意嵌套。
+- 张量：`.to(device)`。给了 `float_dtype` 时，**只有浮点张量**转成这个 dtype；整数张量（token id、标签）和 bool 张量（mask）保持原来的 dtype。
+- dict 还是 dict（key 不变），list 还是 list，tuple 还是 tuple。
+- 其他东西（字符串、数字、None）原样返回。
+- 返回一个新的结构，不要改动传进来的 `batch`。
+
+检查用 meta 设备代替 GPU，所以没有 GPU 也能测。
+--- starter
+def move_to(batch, device, float_dtype=None):
+    """把嵌套 batch 里的每个张量搬到 device；给了 float_dtype 时只转换浮点张量。"""
+    raise todo()
+--- solution
+def move_to(batch, device, float_dtype=None):
+    """把嵌套 batch 里的每个张量搬到 device；给了 float_dtype 时只转换浮点张量。"""
+    if isinstance(batch, torch.Tensor):
+        if float_dtype is not None and batch.is_floating_point():
+            return batch.to(device=device, dtype=float_dtype)
+        return batch.to(device)
+    if isinstance(batch, dict):
+        return {k: move_to(v, device, float_dtype) for k, v in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        return type(batch)(move_to(v, device, float_dtype) for v in batch)
+    return batch
+--- tests
+@check("每个张量都搬到了 device 上")
+def _():
+    out = move_to(_nested_batch(), "meta")
+    found = list(_tensors(out))
+    true(len(found) == 6, f"batch 里有 6 个张量，结果里只找到 {len(found)} 个")
+    for path, t in found:
+        true(t.device.type == "meta", f"{path} 还在 {t.device} 上")
+
+@check("容器类型不变，非张量原样保留")
+def _():
+    out = move_to(_nested_batch(), "cpu")
+    true(isinstance(out, dict) and set(out) == set(_nested_batch()), "最外层应该还是 key 一样的 dict")
+    true(isinstance(out["views"], list), f"batch['views'] 原来是 list，现在是 {type(out['views']).__name__}")
+    true(isinstance(out["pair"], tuple), f"batch['pair'] 原来是 tuple，现在是 {type(out['pair']).__name__}")
+    true(out["extra"]["names"] == ("a", "b"), "字符串组成的 tuple 应该原样保留")
+    true(out["extra"]["lengths"] == [5, 3], "数字组成的 list 应该原样保留")
+    true(out["views"][1] is None and out["views"][2] == 7 and out["pair"][1] == "text",
+         "None、数字、字符串应该原样返回")
+
+@check("float_dtype 只改浮点张量，id、标签、mask 保持原样")
+def _():
+    batch = _nested_batch()
+    out = move_to(batch, "cpu", float_dtype=torch.float64)
+    true(out["pixels"].dtype == torch.float64, f"pixels 应该变成 float64，现在是 {out['pixels'].dtype}")
+    true(out["views"][0].dtype == torch.float64, "嵌套在 list 里的浮点张量也要转")
+    eq(out["pixels"], batch["pixels"], msg="换 dtype 不应该改变数值")
+    true(out["input_ids"].dtype == torch.long,
+         f"input_ids 应该保持 long，现在是 {out['input_ids'].dtype}。token id 变成浮点，Embedding 就会报错")
+    true(out["labels"].dtype == torch.long, f"labels 应该保持 long，现在是 {out['labels'].dtype}")
+    true(out["extra"]["mask"].dtype == torch.bool, f"mask 应该保持 bool，现在是 {out['extra']['mask'].dtype}")
+
+@check("不改动传进来的 batch")
+def _():
+    batch = _nested_batch()
+    move_to(batch, "meta")
+    true(batch["pixels"].device.type == "cpu" and batch["extra"]["mask"].device.type == "cpu",
+         "原来的 batch 被改了：要新建 dict / list 返回，而不是往原来的 dict 里赋值")
+--- hints
+- 递归：先处理「是张量」的情况；dict、list/tuple 就对里面的每个元素再调用一次 move_to。
+- 判断浮点用 `t.is_floating_point()`；重建 list / tuple 可以用 `type(batch)(... for v in batch)`。
+- 别忘了最后一种情况：其他东西原样 `return batch`。
+
+@@ item d16-12
+type: predict
+title: 钩子打印出的每层 shape
+level: 2
+cards: forward hook：让每一层报出输出 shape
+--- context
+CNN 里算错一次输出边长，Flatten 之后的 Linear 就会报 mat1 and mat2 的错。能照着模型定义一层层算出 shape，是看懂这类报错、定对 in_features 的基本功。
+--- prompt
+先一层层算出 shape，再写下 6 行输出。卷积层的输出边长 = (输入 + 2·padding − kernel) // stride + 1；`MaxPool2d(2)` 把边长减半。
+--- code
+model = nn.Sequential(
+    nn.Conv2d(3, 8, kernel_size=3, padding=1),
+    nn.ReLU(),
+    nn.MaxPool2d(2),
+    nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1),
+    nn.Flatten(),
+    nn.Linear(16 * 8 * 8, 10),
+)
+
+def show(module, inputs, output):
+    print(type(module).__name__, tuple(output.shape))
+
+for layer in model:
+    layer.register_forward_hook(show)
+
+out = model(torch.randn(2, 3, 32, 32))
+--- explain
+- Conv2d(3, 8, k=3, padding=1)：(32 + 2 − 3) // 1 + 1 = 32，通道变成 8：(2, 8, 32, 32)。
+- ReLU 不改 shape。
+- MaxPool2d(2)：32 → 16。
+- Conv2d(8, 16, k=3, stride=2, padding=1)：(16 + 2 − 3) // 2 + 1 = 7 + 1 = 8：(2, 16, 8, 8)。
+- Flatten 把 batch 以外的维度摊平：16 × 8 × 8 = 1024。
+- Linear(1024, 10)：(2, 10)。钩子挂在每一层上，没挂在整个 Sequential 上，所以一共 6 行。
+--- hints
+- 钩子在每一层 forward 结束后打印，顺序就是层的顺序。
+- 第二个卷积：(16 + 2·1 − 3) // 2 + 1。
+
+@@ item d16-13
+type: code
+title: trace_shapes：逐层 shape 追踪器
+level: 3
+targets: trace_shapes
+ref: day16
+cards: forward hook：让每一层报出输出 shape; 读懂 PyTorch 报错：最后一行 + 你代码的最后一帧
+--- context
+模型一报 shape 错，第一件事就是看每一层到底输出了什么。一个不用改模型代码、崩了也能告诉你「崩在哪一层后面」的追踪器，是调试新模型时最常用的工具之一。
+--- prompt
+写 `trace_shapes(model, x)`，返回 `(records, error)`：
+
+- 给 `model` 的每个**叶子模块**（没有子模块的模块）挂一个 forward hook，然后跑一次 `model(x)`。
+- `records`：一个 list，每条是 `(name, shape)`。`name` 是这个模块在 `model.named_modules()` 里的名字（比如 `"enc.0"`），`shape` 是输出的 `tuple(output.shape)`。按实际运行的顺序；同一个模块跑了两次就记两次。
+- `error`：forward 正常结束就是 `None`；报错了就是那个异常对象（**接住它，不要往外抛**）。这时 `records` 里是崩溃前跑完的那些层。
+- 不管成功还是报错，返回前都要把所有 hook 取下来。
+
+（输出不是张量的层今天不考虑。）
+--- starter
+def trace_shapes(model, x):
+    """跑一次 model(x)，返回 (records, error)。
+    records: [(name, shape), ...]，叶子模块的输出 shape，按运行顺序
+    error: 正常时是 None；forward 报错时是那个异常对象
+    返回前取下所有 hook。"""
+    records = []
+    raise todo()
+--- solution
+def trace_shapes(model, x):
+    """跑一次 model(x)，返回 (records, error)。
+    records: [(name, shape), ...]，叶子模块的输出 shape，按运行顺序
+    error: 正常时是 None；forward 报错时是那个异常对象
+    返回前取下所有 hook。"""
+    names = {mod: name for name, mod in model.named_modules()}
+    records = []
+
+    def hook(module, inputs, output):
+        records.append((names[module], tuple(output.shape)))
+
+    handles = [m.register_forward_hook(hook) for m in model.modules() if len(list(m.children())) == 0]
+    error = None
+    try:
+        model(x)
+    except Exception as e:          # 接住，作为结果返回
+        error = e
+    finally:
+        for h in handles:           # 成功、失败都要取下
+            h.remove()
+    return records, error
+--- tests
+@check("Sequential：每层一条记录")
+def _():
+    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
+    records, error = trace_shapes(model, torch.randn(3, 4))
+    true(error is None, f"forward 正常结束时 error 应该是 None，你返回了 {error!r}")
+    got = [(n, tuple(s)) for n, s in records]
+    want = [("0", (3, 8)), ("1", (3, 8)), ("2", (3, 2))]
+    true(got == want, f"应为 {want}，你的是 {got}")
+
+@check("嵌套模块：完整名字、运行顺序、跑两次记两次")
+def _():
+    records, error = trace_shapes(_Twice(), torch.randn(5, 4))
+    got = [(n, tuple(s)) for n, s in records]
+    want = [("enc.0", (5, 6)), ("enc.1", (5, 6)), ("act", (5, 6)), ("head", (5, 2)), ("act", (5, 2))]
+    names = [n for n, _ in got]
+    true("" not in names and "enc" not in names,
+         f"只记叶子模块：整个模型（名字是 ''）和容器 enc 不要记。你记下的名字：{names}")
+    true(got == want, f"应为 {want}\n       你的是 {got}\n       （act 被调用了两次，所以要记两次：记录要在 hook 里做）")
+
+@check("forward 报错：接住错误，留下崩溃前的记录")
+def _():
+    try:
+        records, error = trace_shapes(_Broken(), torch.randn(3, 4))
+    except NotImplementedError:
+        raise
+    except RuntimeError as e:
+        true(False, f"错误被抛了出来：{e} —— 要用 try / except 接住它，作为第二个返回值返回")
+    true(isinstance(error, RuntimeError), f"error 应该是 forward 抛出的 RuntimeError，你返回了 {error!r}")
+    got = [(n, tuple(s)) for n, s in records]
+    want = [("body", (3, 6)), ("act", (3, 6))]
+    true(got == want, f"崩溃前跑完的是 body 和 act，应为 {want}，你的是 {got}。最后一条是 act，所以崩在它后面的 head")
+
+@check("用完以后 hook 全部取下（成功和报错时都要）")
+def _():
+    for model in (_Twice(), _Broken()):
+        try:
+            trace_shapes(model, torch.randn(2, 4))
+        except NotImplementedError:
+            raise
+        except RuntimeError:
+            pass                    # 上一项检查已经说过这个问题
+        left = sum(len(m._forward_hooks) for m in model.modules())
+        true(left == 0, f"{type(model).__name__[1:]} 上还挂着 {left} 个 hook。"
+                        "用 try / finally，在 finally 里对每个 handle 调用 .remove()")
+--- hints
+- 先做一个「模块 → 名字」的字典：`names = {mod: name for name, mod in model.named_modules()}`，hook 里用 `names[module]` 查名字。
+- 叶子模块：`len(list(m.children())) == 0`。每次 `register_forward_hook` 都会返回一个 handle，存进一个 list。
+- 结构：`try:` 里跑 `model(x)`；`except Exception as e:` 里 `error = e`；`finally:` 里对每个 handle 调用 `.remove()`。
+
+@@ item d16-14
+type: code
+title: 闭卷：trace_shapes
+level: 3
+targets: trace_shapes
+ref: day16
+exam: yes
+cards: forward hook：让每一层报出输出 shape
+--- context
+逐层追踪 shape 是调试新模型时最先用上的工具。能不看资料写出来，说明你真的懂了 hook、named_modules 和 try / finally。
+--- prompt
+不看卡片，从空白写出 `trace_shapes(model, x)`，返回 `(records, error)`：
+
+- `records`：每个叶子模块每跑一次记一条 `(name, tuple(output.shape))`，`name` 来自 `model.named_modules()`，按运行顺序。
+- `error`：正常时是 `None`；forward 报错时是那个异常对象（接住，不要抛出）。
+- 返回前取下所有 hook，报错时也要取。
+--- starter
+def trace_shapes(model, x):
+    raise todo()
+--- solution
+def trace_shapes(model, x):
+    names = {mod: name for name, mod in model.named_modules()}
+    records = []
+
+    def hook(module, inputs, output):
+        records.append((names[module], tuple(output.shape)))
+
+    handles = [m.register_forward_hook(hook) for m in model.modules() if len(list(m.children())) == 0]
+    error = None
+    try:
+        model(x)
+    except Exception as e:
+        error = e
+    finally:
+        for h in handles:
+            h.remove()
+    return records, error
+--- tests
+@check("Sequential：每层一条记录")
+def _():
+    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
+    records, error = trace_shapes(model, torch.randn(3, 4))
+    true(error is None, f"forward 正常结束时 error 应该是 None，你返回了 {error!r}")
+    got = [(n, tuple(s)) for n, s in records]
+    want = [("0", (3, 8)), ("1", (3, 8)), ("2", (3, 2))]
+    true(got == want, f"应为 {want}，你的是 {got}")
+
+@check("嵌套模块：完整名字、运行顺序、跑两次记两次")
+def _():
+    records, error = trace_shapes(_Twice(), torch.randn(5, 4))
+    got = [(n, tuple(s)) for n, s in records]
+    want = [("enc.0", (5, 6)), ("enc.1", (5, 6)), ("act", (5, 6)), ("head", (5, 2)), ("act", (5, 2))]
+    names = [n for n, _ in got]
+    true("" not in names and "enc" not in names,
+         f"只记叶子模块：整个模型（名字是 ''）和容器 enc 不要记。你记下的名字：{names}")
+    true(got == want, f"应为 {want}\n       你的是 {got}\n       （act 被调用了两次，所以要记两次：记录要在 hook 里做）")
+
+@check("forward 报错：接住错误，留下崩溃前的记录")
+def _():
+    try:
+        records, error = trace_shapes(_Broken(), torch.randn(3, 4))
+    except NotImplementedError:
+        raise
+    except RuntimeError as e:
+        true(False, f"错误被抛了出来：{e} —— 要用 try / except 接住它，作为第二个返回值返回")
+    true(isinstance(error, RuntimeError), f"error 应该是 forward 抛出的 RuntimeError，你返回了 {error!r}")
+    got = [(n, tuple(s)) for n, s in records]
+    want = [("body", (3, 6)), ("act", (3, 6))]
+    true(got == want, f"崩溃前跑完的是 body 和 act，应为 {want}，你的是 {got}。最后一条是 act，所以崩在它后面的 head")
+
+@check("用完以后 hook 全部取下（成功和报错时都要）")
+def _():
+    for model in (_Twice(), _Broken()):
+        try:
+            trace_shapes(model, torch.randn(2, 4))
+        except NotImplementedError:
+            raise
+        except RuntimeError:
+            pass                    # 上一项检查已经说过这个问题
+        left = sum(len(m._forward_hooks) for m in model.modules())
+        true(left == 0, f"{type(model).__name__[1:]} 上还挂着 {left} 个 hook。"
+                        "用 try / finally，在 finally 里对每个 handle 调用 .remove()")
+--- hints
+- 「模块 → 名字」的字典 + 一个往 records 里 append 的 hook + 只挂在叶子模块上。
+- try 跑 model(x)，except 存下错误，finally 里 remove 每个 handle。
+
+@@ item d16-15
+type: code
+title: 闭卷：move_to
+level: 2
+targets: move_to
+ref: day16
+exam: yes
+cards: 嵌套的 batch：递归走一遍 dict / list / tuple
+--- context
+几乎每个训练脚本和推理服务里都有一个 move_to。能不看资料写对（尤其是「只转浮点张量」这一条），面试和工作里都用得上。
+--- prompt
+不看卡片，从空白写出 `move_to(batch, device, float_dtype=None)`：
+
+- 张量 `.to(device)`；给了 `float_dtype` 时只转换浮点张量，整数和 bool 张量保持原 dtype。
+- dict / list / tuple 任意嵌套，容器类型不变；其他东西原样返回。
+- 返回新的结构，不改动传进来的 `batch`。
+--- starter
+def move_to(batch, device, float_dtype=None):
+    raise todo()
+--- solution
+def move_to(batch, device, float_dtype=None):
+    if isinstance(batch, torch.Tensor):
+        if float_dtype is not None and batch.is_floating_point():
+            return batch.to(device=device, dtype=float_dtype)
+        return batch.to(device)
+    if isinstance(batch, dict):
+        return {k: move_to(v, device, float_dtype) for k, v in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        return type(batch)(move_to(v, device, float_dtype) for v in batch)
+    return batch
+--- tests
+@check("每个张量都搬到了 device 上")
+def _():
+    out = move_to(_nested_batch(), "meta")
+    found = list(_tensors(out))
+    true(len(found) == 6, f"batch 里有 6 个张量，结果里只找到 {len(found)} 个")
+    for path, t in found:
+        true(t.device.type == "meta", f"{path} 还在 {t.device} 上")
+
+@check("容器类型不变，非张量原样保留")
+def _():
+    out = move_to(_nested_batch(), "cpu")
+    true(isinstance(out, dict) and set(out) == set(_nested_batch()), "最外层应该还是 key 一样的 dict")
+    true(isinstance(out["views"], list), f"batch['views'] 原来是 list，现在是 {type(out['views']).__name__}")
+    true(isinstance(out["pair"], tuple), f"batch['pair'] 原来是 tuple，现在是 {type(out['pair']).__name__}")
+    true(out["extra"]["names"] == ("a", "b"), "字符串组成的 tuple 应该原样保留")
+    true(out["extra"]["lengths"] == [5, 3], "数字组成的 list 应该原样保留")
+    true(out["views"][1] is None and out["views"][2] == 7 and out["pair"][1] == "text",
+         "None、数字、字符串应该原样返回")
+
+@check("float_dtype 只改浮点张量，id、标签、mask 保持原样")
+def _():
+    batch = _nested_batch()
+    out = move_to(batch, "cpu", float_dtype=torch.float64)
+    true(out["pixels"].dtype == torch.float64, f"pixels 应该变成 float64，现在是 {out['pixels'].dtype}")
+    true(out["views"][0].dtype == torch.float64, "嵌套在 list 里的浮点张量也要转")
+    eq(out["pixels"], batch["pixels"], msg="换 dtype 不应该改变数值")
+    true(out["input_ids"].dtype == torch.long,
+         f"input_ids 应该保持 long，现在是 {out['input_ids'].dtype}。token id 变成浮点，Embedding 就会报错")
+    true(out["labels"].dtype == torch.long, f"labels 应该保持 long，现在是 {out['labels'].dtype}")
+    true(out["extra"]["mask"].dtype == torch.bool, f"mask 应该保持 bool，现在是 {out['extra']['mask'].dtype}")
+
+@check("不改动传进来的 batch")
+def _():
+    batch = _nested_batch()
+    move_to(batch, "meta")
+    true(batch["pixels"].device.type == "cpu" and batch["extra"]["mask"].device.type == "cpu",
+         "原来的 batch 被改了：要新建 dict / list 返回，而不是往原来的 dict 里赋值")
+--- hints
+- 四种情况：张量、dict、list/tuple、其他。前三种里 dict 和 list/tuple 要递归。
+- 浮点判断：`t.is_floating_point()`。

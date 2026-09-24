@@ -1,0 +1,1267 @@
+@@ day 16
+title: Debugging 2: shapes, devices and dtypes
+part: Debugging
+hours: 3–4 hours
+--- goal
+When PyTorch raises an error, you know which two places to read, and you can use the numbers in the message to find the layer that broke. You can catch the three most common kinds of bugs: shapes (including broadcasting that raises no error), devices and dtypes. You also write two tools to keep: trace_shapes, which reports every layer's output shape, and move_to, which moves a nested batch to a device.
+--- checklist
+- Clear the review queue first (redo yesterday's items whose answers you looked at, from a blank editor)
+- Read all 8 cards; press Run on each one, then change a number and run it again
+- Pass every practice item
+- On the closed-book tab, write trace_shapes and move_to from a blank editor
+
+@@ concept
+title: Reading a PyTorch traceback: the last line and your last frame
+error_demo: yes
+--- body
+When an error happens, Python prints a long traceback (a record of the calls: who called whom, one level after another, with the most recent call at the bottom). Do not read it from the top. Read two places:
+
+1. **The last line**: the error type and the message. Shape, device and dtype errors are almost always `RuntimeError`; the useful part comes after the colon.
+2. **The last frame in your own code**: go up from the bottom and find the first `File "..."` that is your own file. It shows which of your lines handed the wrong thing to PyTorch.
+
+Write the model from this card's code as a file net.py (with the imports at the top and without the print line) and run it in a terminal. You get this traceback (paths shortened, the `~~~^^^` marker lines removed):
+
+```
+Traceback (most recent call last):
+  File "net.py", line 17, in <module>
+    out = model(torch.randn(4, 8))
+  File ".../torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File ".../torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "net.py", line 13, in forward
+    return self.fc2(h)
+  File ".../torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File ".../torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File ".../torch/nn/modules/linear.py", line 134, in forward
+    return F.linear(input, self.weight, self.bias)
+RuntimeError: mat1 and mat2 shapes cannot be multiplied (4x10 and 12x3)
+```
+
+- The last line: `mat1` is the input to this Linear layer, 4 rows and 10 columns (4 samples, 10 features each). `mat2` is the layer's weight (transposed), 12 rows and 3 columns. A matrix product needs the two inner numbers to be equal: 10 ≠ 12.
+- The last frame in your code: net.py line 13, `return self.fc2(h)`. So fc2 wants 12 input features, but only 10 arrive.
+- The `module.py` and `linear.py` frames in between are PyTorch passing the call along inside. Skip them at first.
+
+This card's code really raises this error; press Run to see it. The page shows only the frames in your code and the last line.
+
+Keywords in common error messages:
+- `mat1 and mat2 shapes cannot be multiplied`: the Linear layer's in_features differs from the last dimension of its input.
+- `The size of tensor a (3) must match the size of tensor b (4) at non-singleton dimension 1`: an element-wise operation on two tensors whose dimension 1 is 3 in one and 4 in the other; neither is 1, so they cannot broadcast.
+- `view size is not compatible with input tensor's size and stride`: view on a tensor that is not contiguous (see "view, reshape and contiguous").
+- `Expected all tensors to be on the same device`: one tensor is on the GPU, another on the CPU.
+- `mat1 and mat2 must have the same dtype, but got Double and Float`: a float64 input went into a float32 model.
+- `expected target dtype to be Long or Byte, but got Float`: the cross_entropy labels are not integers.
+--- code
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(8, 10)
+        self.fc2 = nn.Linear(12, 3)   # wrong: fc1 outputs only 10 features
+
+    def forward(self, x):
+        h = torch.relu(self.fc1(x))
+        print("shape of h before fc2:", tuple(h.shape))
+        return self.fc2(h)
+
+
+model = Net()
+out = model(torch.randn(4, 8))
+
+@@ concept
+title: Silent broadcasting: (B,) vs (B, 1)
+--- body
+Broadcasting: when you combine two tensors of different shapes element by element, PyTorch stretches them to one common shape. The rule: line the shapes up from the rightmost dimension; each pair of sizes must be equal, or one of them must be 1 (a missing dimension counts as 1).
+
+This is handy, and it is dangerous. The classic trap:
+
+- A regression model ends with `nn.Linear(..., 1)`, so its output `pred` has shape (B, 1).
+- The labels `target` have shape (B,).
+- `pred - target`: aligned from the right, (B,) is treated as (1, B), and the result is **(B, B)**. Row i, column j holds pred_i − target_j.
+- Then `.mean()` still gives one number. No error, and the loss still goes down. It just measures the wrong thing: the best the model can learn is the average of all labels.
+
+In this card's code the predictions are **perfect**, yet the wrong version gives a loss of 2.5.
+
+How to protect yourself:
+- Make both shapes equal before computing the loss: `pred.squeeze(-1)` or `target.unsqueeze(-1)`. Use `squeeze(-1)`, not `squeeze()` without an argument: with B = 1, `squeeze()` also removes the batch dimension.
+- Add an assertion: `assert pred.shape == target.shape, (pred.shape, target.shape)`.
+- One step further: write the expected shape as a spec such as "B,T,C". The same letter must mean the same size in every tensor, and a number must match exactly.
+- `F.mse_loss` prints a UserWarning in this case (easy to miss in a long log); the hand-written `((pred - target) ** 2).mean()` gives no warning at all.
+--- code
+pred = torch.tensor([[1.0], [2.0], [3.0], [4.0]])   # (4, 1): output of Linear(..., 1)
+target = torch.tensor([1.0, 2.0, 3.0, 4.0])         # (4,): labels
+diff = pred - target
+print("shape of pred - target:", tuple(diff.shape))
+print(diff)
+print("wrong loss:", (diff ** 2).mean().item())
+print("right loss:", ((pred.squeeze(-1) - target) ** 2).mean().item())
+
+@@ concept
+title: view, reshape and contiguous
+--- body
+A tensor = one block of memory + a shape + a stride (for each dimension: how many elements to skip in memory to move one step along it).
+
+- `torch.arange(6).view(2, 3)` has stride (3, 1): the next row is 3 elements further, the next column 1 element further. This is called contiguous: reading row by row, left to right, follows the order in memory exactly.
+- `.t()`, `.transpose()` and `.permute()` **do not move data**; they only swap strides. After a transpose the stride is (1, 3), and the tensor is no longer contiguous.
+- `view` does not move data either; it just reads the same memory in a different way. When the tensor is not contiguous, many views are impossible, and you get `view size is not compatible with input tensor's size and stride`.
+- `reshape`: a view when possible, otherwise a copy. `.contiguous()`: a contiguous copy (or the tensor itself if it already is contiguous).
+
+So the fix for that error is `x.contiguous().view(...)`, or simply `x.reshape(...)`.
+
+**The more dangerous case raises no error.** reshape and view always read elements in logical order (row by row); they **never** reorder dimensions for you. To turn (B, C, H, W) into (B, H*W, C), writing `reshape(B, H*W, C)` raises nothing, but every position now holds shuffled numbers. Reordering dimensions needs transpose / permute; reshape only merges or splits **neighbouring** dimensions.
+--- code
+x = torch.arange(6).view(2, 3)
+print(x.tolist(), "stride", x.stride(), "contiguous?", x.is_contiguous())
+t = x.t()                       # (3, 2), no data moved
+print(t.tolist(), "stride", t.stride(), "contiguous?", t.is_contiguous())
+try:
+    t.view(6)
+except RuntimeError as e:
+    print("t.view(6) fails:", e)
+print("t.reshape(6):", t.reshape(6).tolist())
+print("t.contiguous().view(6):", t.contiguous().view(6).tolist())
+print("x.reshape(3, 2):", x.reshape(3, 2).tolist(), " is not the transpose", t.tolist())
+
+@@ concept
+title: Devices: new tensors follow the input
+--- body
+All tensors in one operation must be on the same device: all on the CPU, or all on the same GPU (for example `cuda:0`). That includes the model's parameters, the input, and any tensor you **create inside** forward.
+
+The most common bug: `torch.arange(T)`, `torch.zeros(...)` or `torch.ones(...)` inside forward without a device, so they are always created on the CPU. On a laptop with only a CPU everything works; on the GPU server you get `Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!`.
+
+The fix: make new tensors follow the input.
+- `torch.arange(T, device=x.device)`
+- `torch.zeros(B, T, device=x.device, dtype=x.dtype)`, or the shorter `x.new_zeros(B, T)` and `torch.zeros_like(x)`
+- for a tensor that already exists: `other.to(x.device)`
+
+Do not hard-code `.cuda()`: it fails on a machine without a GPU, and `.cuda()` goes to the current GPU (usually `cuda:0`), so it no longer matches when the model is on `cuda:1`.
+
+One exception: a 0-dimensional CPU tensor (such as `torch.tensor(2.0)`) can be combined with GPU tensors; PyTorch treats it like a plain number.
+
+**How do you test this without a GPU?** Use the meta device. It is a "fake device": its tensors have a shape and a dtype but no real data, so it works on any machine. Mixing a CPU tensor with a meta tensor raises the same kind of error: `Tensor on device cpu is not on the expected device meta!`. Several checks today test devices this way.
+--- code
+def add_positions(x):                   # x: (B, T)
+    pos = torch.arange(x.shape[1])      # bug: no device, always on the CPU
+    return x + pos
+
+def add_positions_fixed(x):
+    pos = torch.arange(x.shape[1], device=x.device)
+    return x + pos
+
+x = torch.zeros(2, 5, device="meta")    # pretend this input is on the GPU
+for fn in (add_positions, add_positions_fixed):
+    try:
+        out = fn(x)
+        print(fn.__name__, "OK:", out.device, tuple(out.shape))
+    except RuntimeError as e:
+        print(fn.__name__, "fails:", e)
+
+@@ concept
+title: register_buffer: tensors that move with the module
+--- body
+`model.to("cuda")`, `model.cuda()`, `model.double()` and `model.half()` only handle the tensors the module knows about:
+- parameters: `nn.Parameter`, updated by the optimizer (for example a Linear layer's weight).
+- buffers: tensors registered with `self.register_buffer("name", tensor)`. They are not trained, but they go wherever the module goes: to another device, to another dtype, and into the `state_dict`.
+
+A plain attribute `self.mask = torch.tril(...)` is **invisible** to the module. Move the model to the GPU and the mask stays on the CPU; forward then raises a device error. Creating the mask anew in every forward is not good either: by default it lands on the CPU as float32, and you recompute it for nothing.
+
+So fixed helper tensors (causal masks, position tables, normalisation means and variances) are created once in `__init__` and registered with `register_buffer`. `persistent=False` means "do not save it in the state_dict": it can always be recomputed, leaving it out keeps checkpoints a little smaller, and changing max_len then does not break loading.
+
+**How do you test "does it move along" without a GPU?** Change the dtype. `.double()` and `.to("cuda")` run the same code inside the module (`Module._apply`): a buffer goes from float32 to float64, a plain attribute does not change. Note that `.double()` and `.half()` only change floating-point tensors; bool and integer buffers keep their dtype (but they still move to a new device).
+--- code
+class M(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lin = nn.Linear(3, 3)
+        self.plain = torch.ones(3)                                    # plain attribute: the module does not know it
+        self.register_buffer("buf", torch.ones(3))                    # buffer: moves along
+        self.register_buffer("tmp", torch.ones(3), persistent=False)  # moves along, not saved
+
+m = M().double()
+print("lin.weight:", m.lin.weight.dtype)
+print("buf:       ", m.buf.dtype)
+print("tmp:       ", m.tmp.dtype)
+print("plain:     ", m.plain.dtype, " <- unchanged")
+print("buffers:   ", [name for name, _ in m.named_buffers()])
+print("state_dict:", list(m.state_dict().keys()))
+m = m.to("meta")
+print("after to(meta): buf is on", m.buf.device, ", plain is on", m.plain.device)
+
+@@ concept
+title: dtypes: long labels, float64 from numpy, integer division
+--- body
+The dtype (data type) decides how each number in a tensor is stored. The three most common traps:
+
+**1. numpy defaults to float64.** PyTorch's default float is float32, and so are the model's parameters. `torch.from_numpy(a)` and `torch.tensor(a)` both keep float64; feed that to the model and you get `mat1 and mat2 must have the same dtype, but got Double and Float`. The fix: `.float()`. Element-wise operations do not fail: float32 + float64 is quietly promoted to float64, which doubles the memory.
+
+**2. Class labels must be long (int64).** The labels of `F.cross_entropy`, the token ids of `nn.Embedding` and index tensors must all be integers. Float labels give `expected target dtype to be Long or Byte, but got Float`. The other way round, regression targets (MSE) must be float.
+
+**3. Integer division.** Python's `//` is floor division: `3 // 4 == 0`. Accuracy computed as `correct // total` is always 0 unless every prediction is right. Use `/`. In PyTorch, `/` on integer tensors gives floats (true division); `//` is floor division. An integer tensor cannot call `.mean()` directly (`mean(): could not infer output dtype`); call `.float()` first.
+
+Also: `pred == y` is a bool tensor, and its `.sum()` is int64.
+--- code
+import numpy as np
+
+a = np.array([0.5, 1.5])
+print("numpy:", a.dtype, "-> torch.from_numpy:", torch.from_numpy(a).dtype)
+print("torch.tensor([1, 2]):", torch.tensor([1, 2]).dtype)
+print("torch.tensor([1.0, 2.0]):", torch.tensor([1.0, 2.0]).dtype)
+try:
+    nn.Linear(2, 1)(torch.from_numpy(a).view(1, 2))
+except RuntimeError as e:
+    print("float64 into Linear:", e)
+try:
+    F.cross_entropy(torch.randn(2, 3), torch.tensor([0.0, 2.0]))
+except RuntimeError as e:
+    print("float labels:", e)
+correct, total = 3, 4
+print("3 // 4 =", correct // total, "   3 / 4 =", correct / total)
+y = torch.tensor([7, 8])
+print("integer tensor / 2:", y / 2, "   // 2:", y // 2)
+
+@@ concept
+title: Forward hooks: every layer reports its output shape
+--- body
+When a model raises a shape error, what you want to know is **the output shape of every layer**. Adding a print to each layer by hand is tedious. A forward hook does it without changing the model's code.
+
+- `handle = layer.register_forward_hook(fn)`: from now on, every time layer finishes a forward pass, `fn(module, inputs, output)` is called. `inputs` is a tuple (everything the layer received), and `output` is what the layer returned.
+- `handle.remove()`: takes the hook off again. If you forget, it stays attached and fires on every later forward pass.
+- `model.named_modules()`: yields `(name, module)` pairs, including the whole model itself (its name is the empty string `''`) and containers in between (such as `nn.Sequential`). Nested names are joined with dots, like `'2.0'` or `'enc.0'`.
+- To see only the layers that do the work, pick the leaf modules, the ones without children: `len(list(m.children())) == 0`.
+- One module can be called several times (for example one `nn.ReLU` used twice); its hook then fires several times too.
+
+Always take the hooks off when you are done, even when forward crashes halfway. Use try / finally; the code in `finally` runs whether or not there was an error:
+
+```
+handles = [...]
+try:
+    model(x)
+finally:
+    for h in handles:
+        h.remove()
+```
+
+If you want to carry on after an error, add an `except Exception as e:` part in between that stores the error instead of letting it escape.
+
+When the model crashes, the last layer that printed is the last one that finished; the crash is in the layer after it.
+
+The output size of a convolution: `(input + 2·padding − kernel) // stride + 1`.
+--- code
+model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Sequential(nn.Linear(8, 8), nn.Tanh()), nn.Linear(8, 2))
+
+for name, mod in model.named_modules():
+    leaf = len(list(mod.children())) == 0
+    print(repr(name), type(mod).__name__, "leaf" if leaf else "container")
+
+def show(module, inputs, output):
+    print("  ", type(module).__name__, tuple(inputs[0].shape), "->", tuple(output.shape))
+
+handles = [m.register_forward_hook(show) for m in model.modules() if len(list(m.children())) == 0]
+try:
+    model(torch.randn(5, 4))
+finally:
+    for h in handles:
+        h.remove()
+print("hooks removed; running again prints nothing:")
+model(torch.randn(5, 4))
+
+@@ concept
+title: Nested batches: walk dicts, lists and tuples recursively
+--- body
+In real projects a batch is rarely a single tensor. A DataLoader often gives you something like this:
+
+```
+{"input_ids": (B, T) long, "attention_mask": (B, T) bool,
+ "pixels": (B, 3, H, W) float, "meta": {"lengths": [...], "ids": ("a", "b")}}
+```
+
+To move all of it to the GPU, or to print every tensor's shape, you have to walk through this nested structure. That is a classic use of recursion (a function that calls itself):
+- a tensor: handle it and return the result.
+- a dict: recurse into every value, keep the keys, build a dict again.
+- a list / tuple: recurse into every element and build **the same kind** of container (a tuple stays a tuple).
+- anything else (strings, numbers, None): return it unchanged.
+
+Check the type with `isinstance(obj, torch.Tensor)`, `isinstance(obj, dict)` and `isinstance(obj, (list, tuple))`. `type(obj)(...)` builds a new container of the original type: `type((1, 2))([3, 4])` gives `(3, 4)`.
+
+Be careful when changing the dtype: only floating-point tensors (`t.is_floating_point()` is True) should become float16, float64 and so on. Token ids and labels are long, masks are bool; turn them into floats and the Embedding or cross_entropy further on raises an error.
+--- code
+def describe(obj):
+    """Replace every tensor in a nested batch with a short description; keep everything else."""
+    if isinstance(obj, torch.Tensor):
+        kind = "float" if obj.is_floating_point() else "not float"
+        return f"{tuple(obj.shape)} {obj.dtype} {kind}"
+    if isinstance(obj, dict):
+        return {k: describe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(describe(v) for v in obj)
+    return obj
+
+batch = {
+    "input_ids": torch.randint(0, 100, (2, 6)),
+    "attention_mask": torch.ones(2, 6, dtype=torch.bool),
+    "pixels": torch.randn(2, 3, 8, 8),
+    "meta": {"lengths": [6, 4], "ids": ("a", "b")},
+}
+for key, value in describe(batch).items():
+    print(key, "->", value)
+
+@@ item d16-01
+type: choice
+title: Read the error: mat1 and mat2 shapes cannot be multiplied
+level: 1
+cards: Reading a PyTorch traceback: the last line and your last frame
+--- context
+Shape errors are the most common errors when you write a model. If the numbers in the last line take you straight to the layer and the mismatch, you stop changing things at random. Debugging on the spot like this is also a common interview task.
+--- prompt
+Running train.py (below) gives this traceback (paths shortened, the `~~~^^^` marker lines removed):
+
+```
+Traceback (most recent call last):
+  File "train.py", line 17, in <module>
+    logits = model(torch.randn(8, 16))
+  File ".../torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File ".../torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "train.py", line 13, in forward
+    return self.head(h)
+  File ".../torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File ".../torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File ".../torch/nn/modules/linear.py", line 134, in forward
+    return F.linear(input, self.weight, self.bias)
+RuntimeError: mat1 and mat2 shapes cannot be multiplied (8x20 and 32x10)
+```
+
+Which change is the right fix?
+--- code
+import torch
+import torch.nn as nn
+
+
+class Classifier(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.body = nn.Sequential(nn.Linear(16, 20), nn.ReLU())
+        self.head = nn.Linear(32, 10)
+
+    def forward(self, x):
+        h = self.body(x)
+        return self.head(h)
+
+
+model = Classifier()
+logits = model(torch.randn(8, 16))
+--- options
+- Change `self.head` to `nn.Linear(20, 10)`
+- Change the input to `torch.randn(8, 32)`
+- Add `h = h.contiguous()` before `return self.head(h)`
+- Change the batch size from 8 to 32
+answer: 1
+--- explain
+The last line, `(8x20 and 32x10)`: mat1 is the input h of this Linear layer, 8 samples with 20 features each; mat2 is the layer's weight (transposed), 32 rows and 10 columns, so the layer expects 32 input features. The two inner numbers differ: 20 ≠ 32.
+
+The last frame in your code is line 13, `return self.head(h)`, so the problem is head: body outputs 20 features, but head was built for 32. Make it `nn.Linear(20, 10)`.
+
+- An input of (8, 32): the first layer `Linear(16, 20)` immediately fails with `(8x32 and 16x20)`; the problem just moves one layer earlier.
+- `contiguous()` changes the memory layout, not the shape.
+- The batch size is the first number of mat1, 8; it has nothing to do with the two numbers that disagree.
+--- hints
+- Look at the four numbers in the last line: `8x20` is the input h of this layer, `32x10` is the layer's weight. Which two numbers must be equal?
+- Then look at the last frame in your own code: which layer is it? Its in_features must equal the number of features the previous layer outputs.
+
+@@ item d16-02
+type: predict
+title: What shape is (B, 1) minus (B,)?
+level: 1
+cards: Silent broadcasting: (B,) vs (B, 1)
+--- context
+Regression, scoring and reward models often output (B, 1), while the labels are often (B,). Subtracting them raises no error; you quietly get (B, B). This is one of the classic reasons a model "trains but does not learn".
+--- prompt
+Work out what each line prints before you run anything, then write it down, one line per print. Write tuples the way Python prints them, for example `(4,)` and `()`.
+--- code
+pred = torch.zeros(4, 1)      # model output: Linear(..., 1)
+target = torch.zeros(4)       # labels
+print(tuple((pred - target).shape))
+print(tuple((pred.squeeze(-1) - target).shape))
+print(tuple((pred - target.unsqueeze(-1)).shape))
+print(tuple(torch.zeros(1, 1).squeeze().shape))
+--- explain
+- `(4, 1)` and `(4,)` are aligned from the right: (4,) is treated as (1, 4); taking the larger size in each dimension gives (4, 4). Sixteen differences, no error.
+- `squeeze(-1)` removes the trailing 1, so both sides are (4,).
+- `unsqueeze(-1)` makes the labels (4, 1), so both sides are (4, 1). This is also a correct fix.
+- `squeeze()` without an argument removes **every** dimension of size 1. With B = 1, (1, 1) becomes (), and the batch dimension is gone too. That is why you write `squeeze(-1)`.
+--- hints
+- Broadcasting aligns shapes from the rightmost dimension; a missing dimension counts as 1.
+- (4, 1) against (1, 4): take the larger size in each dimension.
+
+@@ item d16-03
+type: fix
+title: Silent broadcasting in a regression loss
+level: 1
+targets: regression_loss
+cards: Silent broadcasting: (B,) vs (B, 1)
+--- context
+This bug raises no error and the loss goes down, but the model never learns: it is trained to predict the average of all labels. People can spend days before they find it. The fix is one line; the hard part is thinking of looking at the shapes.
+--- prompt
+`regression_loss(model, x, y)`: `model(x)` outputs (B, 1) and `y` is (B,). Return one number: for each sample, its prediction minus **its own** label, squared, then averaged (MSE).
+
+The current code runs but computes the wrong thing. Fix it. Consider adding an assert so that different shapes raise an error right away.
+--- starter
+def regression_loss(model, x, y):
+    """model(x): (B, 1)   y: (B,)   returns the scalar MSE"""
+    pred = model(x)
+    return ((pred - y) ** 2).mean()
+--- solution
+def regression_loss(model, x, y):
+    """model(x): (B, 1)   y: (B,)   returns the scalar MSE"""
+    pred = model(x).squeeze(-1)          # (B, 1) -> (B,)
+    assert pred.shape == y.shape, (pred.shape, y.shape)
+    return ((pred - y) ** 2).mean()
+--- tests
+@check("the value of the loss")
+def _():
+    seed(0)
+    model = nn.Linear(3, 1)
+    x, y = torch.randn(5, 3), torch.randn(5)
+    loss = regression_loss(model, x, y)
+    shape_is(loss, (), "the loss should be a single number")
+    want = ((model(x)[:, 0] - y) ** 2).mean()
+    eq(loss, want, msg="print (pred - y).shape: if it is (5, 5), broadcasting (5, 1) with (5,) produced 25 differences")
+
+@check("also right for B = 1")
+def _():
+    seed(1)
+    model = nn.Linear(3, 1)
+    x, y = torch.randn(1, 3), torch.randn(1)
+    eq(regression_loss(model, x, y), (model(x)[0, 0] - y[0]) ** 2,
+       msg="wrong for B = 1: squeeze() without an argument also removes the batch dimension")
+
+@check("it really learns: error close to 0 after 200 steps")
+def _():
+    seed(0)
+    w = torch.tensor([[1.0], [-2.0], [0.5]])
+    x = torch.randn(64, 3)
+    y = (x @ w).squeeze(-1)
+    model = nn.Linear(3, 1)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    for _ in range(200):
+        loss = regression_loss(model, x, y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    with torch.no_grad():
+        final = ((model(x)[:, 0] - y) ** 2).mean().item()
+    true(final < 1e-3,
+         f"after training the real MSE is {final:.3f}: the model did not learn. The broadcasting bug makes it fit "
+         f"the average of all labels, so the error stays near the variance of y ({y.var().item():.2f})")
+--- hints
+- Add `print(pred.shape, y.shape, (pred - y).shape)` before the return and look.
+- Make both sides (B,): `model(x).squeeze(-1)`. Do not use `squeeze()` without an argument; it breaks for B = 1.
+
+@@ item d16-04
+type: code
+title: A shape guard: assert_shape
+level: 2
+targets: assert_shape
+cards: Silent broadcasting: (B,) vs (B, 1); Reading a PyTorch traceback: the last line and your last frame
+--- context
+Write down "this should have shape ..." at the key places, and a bug is reported on the line where it happens, not 200 steps later as a strange loss curve. With a clear message, the next person who reads the code (including you in a week) sees at once what is wrong.
+--- prompt
+Write `assert_shape(x, spec, sizes)`:
+
+- `spec` lists the dimensions separated by commas, such as `"B,T,C"` or `"B,1"`; spaces are allowed (`"B, T"`).
+- A number (`"1"`, `"3"`): this dimension must be exactly that number.
+- A name (`"B"`, `"T"`): if the `sizes` dict does not have the name yet, store the actual size; if it does, the sizes must be equal. A name that appears twice in one spec (`"N,N"`) must also match.
+- The number of dimensions (`x.dim()`) must equal the number of entries in the spec.
+- If everything matches, return `x` itself; otherwise `raise ValueError(...)`. The message must contain the spec as written and `tuple(x.shape)`; when a name does not match, also that name.
+
+`sizes` is shared between calls, so that B means the same number in different tensors:
+
+```
+sizes = {}
+assert_shape(logits, "B,T,V", sizes)
+assert_shape(labels, "B,T", sizes)   # B and T must match the ones from logits
+```
+--- starter
+def assert_shape(x, spec, sizes):
+    """Check that x.shape matches spec (such as "B,T,C"): return x if it does, else raise ValueError.
+    sizes: dict, name -> size. Stored the first time a name is seen; must match after that."""
+    raise todo()
+--- solution
+def assert_shape(x, spec, sizes):
+    """Check that x.shape matches spec (such as "B,T,C"): return x if it does, else raise ValueError.
+    sizes: dict, name -> size. Stored the first time a name is seen; must match after that."""
+    dims = [d.strip() for d in spec.split(",")]
+    shape = tuple(x.shape)
+    if len(dims) != len(shape):
+        raise ValueError(f"shape {shape} does not match {spec!r}: expected {len(dims)} dimensions, got {len(shape)}")
+    for i, (d, n) in enumerate(zip(dims, shape)):
+        if d.isdigit():
+            if n != int(d):
+                raise ValueError(f"shape {shape} does not match {spec!r}: dimension {i} should be {d}, got {n}")
+        elif d in sizes and sizes[d] != n:
+            raise ValueError(f"shape {shape} does not match {spec!r}: {d} was {sizes[d]} before, here it is {n}")
+        else:
+            sizes[d] = n
+    return x
+--- tests
+def _raises(fn):
+    """Call fn(): return the message if it raises ValueError, None if it raises nothing."""
+    try:
+        fn()
+    except ValueError as e:
+        return str(e)
+    return None
+
+@check("returns x when it matches and stores the names in sizes")
+def _():
+    sizes = {}
+    x = torch.zeros(4, 7, 16)
+    out = assert_shape(x, "B,T,C", sizes)
+    true(out is x, "return x itself when it matches, so you can write h = assert_shape(layer(x), \"B,T,C\", sizes)")
+    true(sizes == {"B": 4, "T": 7, "C": 16}, f"sizes should be {{'B': 4, 'T': 7, 'C': 16}}, yours is {sizes}")
+    assert_shape(torch.zeros(4, 7), "B, T", sizes)
+    assert_shape(torch.zeros(4, 1), "B,1", sizes)
+    assert_shape(torch.zeros(3, 3), "N,N", sizes)
+    true(sizes.get("N") == 3, f"N should be stored as 3; sizes is now {sizes}")
+
+@check("(B,) posing as (B, 1): a wrong number of dimensions raises")
+def _():
+    msg = _raises(lambda: assert_shape(torch.zeros(4), "B,1", {"B": 4}))
+    true(msg is not None, "shape (4,) has 1 dimension, 'B,1' needs 2: this should raise ValueError")
+    true("B,1" in msg.replace(" ", "") and "(4,)" in msg,
+         f"the message should contain the spec 'B,1' and the actual shape (4,); yours is: {msg}")
+
+@check("a number must match exactly")
+def _():
+    msg = _raises(lambda: assert_shape(torch.zeros(4, 2), "B,1", {}))
+    true(msg is not None, "dimension 1 of (4, 2) is 2, not 1: this should raise ValueError")
+    true("(4, 2)" in msg, f"the message should contain the actual shape (4, 2); yours is: {msg}")
+
+@check("a name must keep the same size")
+def _():
+    sizes = {}
+    assert_shape(torch.zeros(4, 3), "B,C", sizes)
+    msg = _raises(lambda: assert_shape(torch.zeros(5, 3), "B,C", sizes))
+    true(msg is not None, "B was stored as 4 and is 5 now: this should raise ValueError")
+    true("B" in msg, f"the message should say which name (B) does not match; yours is: {msg}")
+    true(_raises(lambda: assert_shape(torch.zeros(3, 4), "N,N", {})) is not None,
+         "'N,N' needs both dimensions to be equal, so (3, 4) should raise")
+--- hints
+- Split the spec first: `[d.strip() for d in spec.split(",")]`, then compare its length with `tuple(x.shape)`.
+- Compare one dimension at a time with `zip`: if `d.isdigit()`, compare with `int(d)`; otherwise look it up in `sizes`, store it if it is missing, compare if it is there.
+- A message could look like `f"shape {tuple(x.shape)} does not match {spec!r}: ..."`.
+
+@@ item d16-05
+type: predict
+title: After permute: stride, contiguity and the order of reshape
+level: 2
+cards: view, reshape and contiguous
+--- context
+Multi-head attention and turning images into tokens are full of transpose / permute. If you can work out strides and element order in your head, you can see why view fails and why reshape "raises no error but is wrong".
+--- prompt
+Work it out first, then write down the 5 output lines. Hint: `x` has stride (12, 4, 1); permute only reorders the shape and the stride, it does not move data.
+--- code
+x = torch.arange(24).view(2, 3, 4)
+y = x.permute(0, 2, 1)
+print(tuple(y.shape))
+print(y.stride())
+print(y.is_contiguous())
+print(y[0, 1].tolist())
+print(y.reshape(2, 12)[0, :4].tolist())
+--- explain
+- permute(0, 2, 1) swaps dimensions 1 and 2: shape (2, 3, 4) → (2, 4, 3), stride (12, 4, 1) → (12, 1, 4).
+- The last dimension's stride is not 1, so reading row by row no longer follows memory order: not contiguous, False.
+- `y[0, 1]` is `x[0, :, 1]`. The three rows of x[0] are 0–3, 4–7 and 8–11; take element 1 of each: [1, 5, 9].
+- reshape reads y in its logical order, row by row: the first row of y[0] is [0, 4, 8] and the second starts with 1, so the first 4 are [0, 4, 8, 1]. reshape follows y's order, not memory order, and it does not swap the dimensions back for you.
+--- hints
+- Element (i, j, k) of y is element (i, k, j) of x.
+- x[0] is [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]], and y[0] is its transpose.
+
+@@ item d16-06
+type: fix
+title: Feature map to tokens: one silent bug, one loud bug
+level: 2
+targets: image_to_tokens, flatten_tokens
+cards: view, reshape and contiguous
+--- context
+Models like ViT and DiT turn a feature map (B, C, H, W) into a token sequence (B, H*W, C). A wrong reshape here raises no error and the model still trains; each token just holds shuffled numbers. And once you fix it, a view further on may start to fail.
+--- prompt
+Two functions:
+
+- `image_to_tokens(x)`: (B, C, H, W) → (B, H*W, C). Token number `h*W + w` should hold the C channels of pixel (h, w), that is `x[:, :, h, w]`. Right now it raises no error, but the numbers are shuffled.
+- `flatten_tokens(t)`: (B, N, C) → (B*N, C), one token per row (for example to compute a loss for each token). Row `b*N + n` is `t[b, n]`.
+
+Used together, the two functions raise no error now, because the reshape output is contiguous. Once you fix `image_to_tokens`, its output is no longer contiguous, and the view in `flatten_tokens` starts to fail. Fix both.
+--- starter
+def image_to_tokens(x):
+    """(B, C, H, W) -> (B, H*W, C)"""
+    B, C, H, W = x.shape
+    return x.reshape(B, H * W, C)
+
+
+def flatten_tokens(t):
+    """(B, N, C) -> (B*N, C)"""
+    B, N, C = t.shape
+    return t.view(B * N, C)
+--- solution
+def image_to_tokens(x):
+    """(B, C, H, W) -> (B, H*W, C)"""
+    B, C, H, W = x.shape
+    return x.flatten(2).transpose(1, 2)    # (B, C, H*W) -> (B, H*W, C), not contiguous
+
+
+def flatten_tokens(t):
+    """(B, N, C) -> (B*N, C)"""
+    B, N, C = t.shape
+    return t.reshape(B * N, C)             # t may not be contiguous: view fails, reshape does not
+--- tests
+@check("image_to_tokens: token h*W+w holds the channels of pixel (h, w)")
+def _():
+    x = torch.randn(2, 3, 4, 5)          # B=2, C=3, H=4, W=5
+    t = image_to_tokens(x)
+    shape_is(t, (2, 20, 3))
+    for h, w in ((0, 1), (2, 3), (3, 4)):
+        eq(t[:, h * 5 + w], x[:, :, h, w],
+           msg=f"token {h * 5 + w} should be x[:, :, {h}, {w}]. reshape does not reorder dimensions, it only regroups "
+               "the same sequence of numbers; move C to the end first (transpose / permute)")
+
+@check("flatten_tokens: works on an input that is not contiguous")
+def _():
+    t = torch.randn(2, 3, 20).transpose(1, 2)    # (2, 20, 3), not contiguous, like tokens made with transpose
+    try:
+        rows = flatten_tokens(t)
+    except RuntimeError as e:
+        true(False, f"it raised: {e} -- t is not contiguous, so it cannot be viewed as (B*N, C): use reshape, "
+                    "or call .contiguous() before view")
+    shape_is(rows, (40, 3))
+    eq(rows[1 * 20 + 7], t[1, 7], msg="row b*N + n should be t[b, n]")
+
+@check("used together: sample b, pixel (h, w) is row b*H*W + h*W + w")
+def _():
+    x = torch.randn(2, 3, 4, 5)
+    rows = flatten_tokens(image_to_tokens(x))
+    shape_is(rows, (40, 3))
+    eq(rows[1 * 20 + 2 * 5 + 3], x[1, :, 2, 3], msg="the 3 channels of sample 1, pixel (2, 3) are not in row 33")
+--- hints
+- Only transpose / permute reorder dimensions; reshape and view only merge or split **neighbouring** dimensions.
+- image_to_tokens: `x.flatten(2)` gives (B, C, H*W), then `.transpose(1, 2)`.
+- flatten_tokens: replace `.view` with `.reshape` (or call `.contiguous()` before view).
+
+@@ item d16-07
+type: choice
+title: Read the error: one tensor on cuda:0, one on cpu
+level: 1
+cards: Devices: new tensors follow the input; register_buffer: tensors that move with the module; Reading a PyTorch traceback: the last line and your last frame
+--- context
+Device errors often do not show up on your laptop, only on the GPU server. Some fixes are good; others only silence the error on this machine and break again on the next one.
+--- prompt
+pos.py (below) fails on a GPU machine. This is the traceback (paths shortened, the `~~~^^^` marker lines removed, and a few PyTorch-internal frames left out where you see `...`):
+
+```
+Traceback (most recent call last):
+  File "pos.py", line 16, in <module>
+    out = model(torch.randn(2, 10, 64, device="cuda"))
+  ...
+  File "pos.py", line 12, in forward
+    return x + self.table(pos)
+  ...
+  File ".../torch/nn/functional.py", line 2567, in embedding
+    return torch.embedding(weight, input, padding_idx, scale_grad_by_freq, sparse)
+RuntimeError: Expected all tensors to be on the same device, but got index is on cpu, different from other tensors on cuda:0 (when checking argument in method wrapper_CUDA__index_select)
+```
+
+Which changes are good fixes (correct on a CPU-only machine, with one GPU and with several GPUs)? Pick every one that is.
+--- code
+import torch
+import torch.nn as nn
+
+
+class PosEmbed(nn.Module):
+    def __init__(self, max_len, dim):
+        super().__init__()
+        self.table = nn.Embedding(max_len, dim)
+
+    def forward(self, x):                      # x: (B, T, dim)
+        pos = torch.arange(x.shape[1])
+        return x + self.table(pos)
+
+
+model = PosEmbed(128, 64).cuda()
+out = model(torch.randn(2, 10, 64, device="cuda"))
+--- options
+- Change it to `pos = torch.arange(x.shape[1], device=x.device)`
+- Change it to `pos = torch.arange(x.shape[1]).cuda()`
+- Remove `.cuda()` and keep the model and the input on the CPU
+- In `__init__`, add `self.register_buffer("pos_ids", torch.arange(max_len), persistent=False)`, and in forward use `self.table(self.pos_ids[:x.shape[1]])`
+- Add `x = x.cpu()` as the first line of forward
+answer: 1,4
+--- explain
+The last line says `index is on cpu` while the other tensors are on `cuda:0`. The last frame in your code is line 12, `self.table(pos)`: the Embedding's weight moved to the GPU with the model, but the index `pos` was created in forward with `torch.arange`, without a device, so it stayed on the CPU.
+
+- Option 1: the new tensor follows the input; correct everywhere.
+- Option 4: a buffer moves with `model.cuda()` / `model.to(...)`, so this is correct too, and it is created only once.
+- Option 2: no error on this machine, but it fails on a machine without a GPU, and it no longer matches when the model is on `cuda:1`.
+- Option 3: it runs, but it gives up the GPU instead of fixing the bug.
+- Option 5: x moves to the CPU while the Embedding's weight stays on the GPU, so it still fails (and x was never the problem).
+--- hints
+- Who is on the CPU according to the last line? The index, which is `pos`.
+- A good fix does not hard-code any device name: it follows the input (`x.device`) or the module (a buffer).
+
+@@ item d16-08
+type: fix
+title: A mask built inside forward becomes a buffer
+level: 2
+targets: CausalMask
+cards: register_buffer: tensors that move with the module; Devices: new tensors follow the input
+--- context
+Fixed tensors such as causal masks and position tables, when built inside forward, are CPU float32 by default: on a GPU they raise a device error, and in bf16 training they quietly turn activations back into float32. As a buffer, they go wherever the module goes.
+--- prompt
+`CausalMask(max_len)` adds a causal mask to attention scores: `scores` is (B, T, T) with T ≤ max_len; return a tensor of the same shape in which future positions (column j > row i) are -inf and everything else is unchanged.
+
+The current code gives the right numbers on the CPU in float32, but every forward builds a new float32 mask on the CPU. Change it: build the mask once in `__init__` for max_len, register it with `register_buffer` (`persistent=False` is a good idea), and slice `[:T, :T]` in forward.
+
+The checks convert the module to float64 and bfloat16, and move it to the meta device (standing in for a GPU).
+--- starter
+class CausalMask(nn.Module):
+    def __init__(self, max_len):
+        super().__init__()
+        self.max_len = max_len
+
+    def forward(self, scores):                     # scores: (B, T, T)
+        T = scores.shape[-1]
+        mask = torch.triu(torch.full((T, T), float("-inf")), diagonal=1)
+        return scores + mask
+--- solution
+class CausalMask(nn.Module):
+    def __init__(self, max_len):
+        super().__init__()
+        self.max_len = max_len
+        bias = torch.triu(torch.full((max_len, max_len), float("-inf")), diagonal=1)
+        self.register_buffer("bias", bias, persistent=False)   # follows .to() / .double()
+
+    def forward(self, scores):                     # scores: (B, T, T)
+        T = scores.shape[-1]
+        return scores + self.bias[:T, :T]
+--- tests
+@check("values: future positions are -inf, the rest unchanged")
+def _():
+    m = CausalMask(6)
+    s = torch.randn(2, 4, 4)
+    out = m(s)
+    shape_is(out, (2, 4, 4))
+    future = torch.triu(torch.ones(4, 4, dtype=torch.bool), diagonal=1)
+    true(bool((out[:, future] == float("-inf")).all()), "positions with column j > row i should be -inf")
+    eq(out[:, ~future], s[:, ~future], msg="positions with j <= i should keep their values")
+
+@check("the mask is a registered buffer and follows .double()")
+def _():
+    m = CausalMask(6)
+    names = [n for n, _ in m.named_buffers()]
+    true(len(names) > 0,
+         "the module has no buffer. Register the mask in __init__ with self.register_buffer(...). "
+         ".to() / .double() do not touch plain attributes or tensors created inside forward")
+    m.double()
+    for n, b in m.named_buffers():
+        if b.is_floating_point():        # a bool mask stays bool, which is fine
+            true(b.dtype == torch.float64, f"buffer {n} is {b.dtype} after .double()")
+    out = m(torch.randn(1, 3, 3, dtype=torch.float64))
+    true(out.dtype == torch.float64, f"the module and the input are float64, but the output is {out.dtype}")
+
+@check("in bfloat16 the output stays bfloat16")
+def _():
+    m = CausalMask(6).to(torch.bfloat16)
+    out = m(torch.randn(2, 4, 4).to(torch.bfloat16))
+    true(out.dtype == torch.bfloat16,
+         f"the output became {out.dtype}: the float32 mask promoted the bf16 scores to float32. "
+         "In mixed-precision training this quietly costs memory and speed. As a buffer, the mask changes dtype with the module")
+
+@check("runs after moving to another device (the meta device, standing in for a GPU)")
+def _():
+    m = CausalMask(6).to("meta")
+    s = torch.zeros(2, 4, 4, device="meta")
+    try:
+        out = m(s)
+    except RuntimeError as e:
+        true(False, f"forward fails after moving the module to meta: {e} -- on a GPU this is 'Expected all tensors to be "
+                    "on the same device': a tensor used in forward stayed on the CPU")
+    true(out.device.type == "meta", f"the output is on {out.device}, it should be on meta")
+--- hints
+- In `__init__`, build a (max_len, max_len) mask, then `self.register_buffer("bias", mask, persistent=False)`.
+- In forward, use `self.bias[:T, :T]`; do not call `torch.full` / `torch.triu` there any more.
+
+@@ item d16-09
+type: predict
+title: What are these dtypes?
+level: 2
+cards: dtypes: long labels, float64 from numpy, integer division
+--- context
+Half of all dtype bugs raise an error (easy to fix). The other half do not: an accuracy that is always 0, memory that quietly doubles. If you can see the dtype of every step at a glance, these bugs have nowhere to hide.
+--- prompt
+Work it out first, then write down the 6 output lines.
+--- code
+import numpy as np
+
+labels = torch.tensor([2, 0, 1, 1])
+preds = torch.tensor([2, 1, 1, 1])
+correct = (preds == labels).sum()
+print(correct.dtype)
+print(correct.item() // len(labels))
+print(correct.item() / len(labels))
+print((preds == labels).float().mean().item())
+feats = torch.from_numpy(np.array([[0.1, 0.2]]))
+print(feats.dtype)
+print((feats + torch.ones(1, 2)).dtype)
+--- explain
+- `preds == labels` is a bool tensor; `.sum()` counts True as 1 and gives int64.
+- 3 are right. `3 // 4` is floor division and gives 0: computed this way, accuracy is always 0 unless all are right.
+- `3 / 4` is 0.75.
+- `.float()` first, then `.mean()`: 0.75. (Calling `.mean()` on an integer tensor raises an error.)
+- numpy's default float is float64, and `torch.from_numpy` keeps it.
+- float64 + float32: no error; the result is promoted to float64.
+--- hints
+- The sum of a bool tensor is an integer; Python's `//` is floor division.
+- numpy and PyTorch have different default float types.
+
+@@ item d16-10
+type: fix
+title: Three dtype bugs in a data pipeline
+level: 2
+targets: make_batch, accuracy
+cards: dtypes: long labels, float64 from numpy, integer division; Reading a PyTorch traceback: the last line and your last frame
+--- context
+Data often comes from numpy or pandas, and that is where dtypes go wrong most: float64 features, float class labels, and an accuracy that is always 0. The first two make the very first training step fail; the third raises nothing and makes you think the model learned nothing.
+--- prompt
+- `make_batch(features, labels)`: `features` is a numpy array (B, D) in float64; `labels` is a Python list of class numbers. Return `(x, y)`: `x` is float32 with shape (B, D), `y` is long with shape (B,), ready for `nn.Linear` and `F.cross_entropy`.
+- `accuracy(logits, y)`: `logits` is (B, C), `y` is (B,). Return a Python float: the fraction of correct predictions, between 0 and 1.
+
+There are three bugs. Fix them all.
+--- starter
+def make_batch(features, labels):
+    x = torch.from_numpy(features)
+    y = torch.tensor(labels, dtype=torch.float32)
+    return x, y
+
+
+def accuracy(logits, y):
+    correct = (logits.argmax(-1) == y).sum().item()
+    return correct // len(y)
+--- solution
+def make_batch(features, labels):
+    x = torch.from_numpy(features).float()        # numpy defaults to float64 -> float32
+    y = torch.tensor(labels, dtype=torch.long)    # class labels must be long
+    return x, y
+
+
+def accuracy(logits, y):
+    correct = (logits.argmax(-1) == y).sum().item()
+    return correct / len(y)                       # / is true division, // is floor division
+--- tests
+import numpy as np
+
+@check("dtypes: x is float32, y is long")
+def _():
+    feats = np.array([[0.1, 0.2, 0.3], [1.0, 2.0, 3.0]])
+    x, y = make_batch(feats, [2, 0])
+    true(x.dtype == torch.float32,
+         f"x is {x.dtype}. numpy defaults to float64; in a float32 nn.Linear that raises 'mat1 and mat2 must have the same dtype'")
+    true(y.dtype == torch.long,
+         f"y is {y.dtype}. Class labels must be long, or cross_entropy raises 'expected target dtype to be Long or Byte'")
+    eq(x, torch.tensor([[0.1, 0.2, 0.3], [1.0, 2.0, 3.0]]))
+    eq(y, torch.tensor([2, 0]))
+
+@check("the batch can go straight into a training step")
+def _():
+    feats = np.random.default_rng(0).normal(size=(4, 3))
+    x, y = make_batch(feats, [0, 1, 2, 1])
+    model = nn.Linear(3, 3)
+    try:
+        loss = F.cross_entropy(model(x), y)
+        loss.backward()
+    except RuntimeError as e:
+        true(False, f"the first training step fails: {e}")
+
+@check("accuracy: 3 right out of 4 is 0.75")
+def _():
+    logits = torch.tensor([[2.0, 0.1], [0.3, 1.0], [5.0, 1.0], [0.0, 3.0]])
+    acc = accuracy(logits, torch.tensor([0, 1, 1, 1]))
+    true(isinstance(acc, float), f"return a Python float; you returned {type(acc).__name__} ({acc})")
+    true(close(acc, 0.75), f"3 of 4 are right, so it should be 0.75; yours is {acc}. Note that 3 // 4 is floor division and gives 0")
+    true(close(accuracy(logits, torch.tensor([0, 1, 0, 1])), 1.0), "when all are right it should be 1.0")
+--- hints
+- One at a time: look at `x.dtype` and `y.dtype` first, then think about what `3 // 4` is.
+- Add `.float()` to `x`; use `dtype=torch.long` for `y`; use `/` for the accuracy.
+
+@@ item d16-11
+type: code
+title: move_to: move a nested batch to a device
+level: 2
+targets: move_to
+ref: day16
+cards: Nested batches: walk dicts, lists and tuples recursively; Devices: new tensors follow the input; dtypes: long labels, float64 from numpy, integer division
+--- context
+The first line of almost every training loop moves the batch to the GPU. When the batch is a nested dict or list, one forgotten tensor means a device error, and turning the labels into float16 means a dtype error. Write a general move_to once and reuse it in every project.
+--- prompt
+Write `move_to(batch, device, float_dtype=None)`:
+
+- `batch` can be a tensor, a dict, a list or a tuple, nested in any way.
+- A tensor: `.to(device)`. When `float_dtype` is given, **only floating-point tensors** get this dtype; integer tensors (token ids, labels) and bool tensors (masks) keep theirs.
+- A dict stays a dict (same keys), a list stays a list, a tuple stays a tuple.
+- Anything else (strings, numbers, None) comes back unchanged.
+- Return a new structure; do not change the `batch` you were given.
+
+The checks use the meta device instead of a GPU, so you can test this without one.
+--- starter
+def move_to(batch, device, float_dtype=None):
+    """Move every tensor in a nested batch to device; with float_dtype, convert only floating-point tensors."""
+    raise todo()
+--- solution
+def move_to(batch, device, float_dtype=None):
+    """Move every tensor in a nested batch to device; with float_dtype, convert only floating-point tensors."""
+    if isinstance(batch, torch.Tensor):
+        if float_dtype is not None and batch.is_floating_point():
+            return batch.to(device=device, dtype=float_dtype)
+        return batch.to(device)
+    if isinstance(batch, dict):
+        return {k: move_to(v, device, float_dtype) for k, v in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        return type(batch)(move_to(v, device, float_dtype) for v in batch)
+    return batch
+--- tests
+@check("every tensor is on the device")
+def _():
+    out = move_to(_nested_batch(), "meta")
+    found = list(_tensors(out))
+    true(len(found) == 6, f"the batch has 6 tensors, but the result has only {len(found)}")
+    for path, t in found:
+        true(t.device.type == "meta", f"{path} is still on {t.device}")
+
+@check("container types are kept, other things come back unchanged")
+def _():
+    out = move_to(_nested_batch(), "cpu")
+    true(isinstance(out, dict) and set(out) == set(_nested_batch()), "the outer level should still be a dict with the same keys")
+    true(isinstance(out["views"], list), f"batch['views'] was a list, now it is a {type(out['views']).__name__}")
+    true(isinstance(out["pair"], tuple), f"batch['pair'] was a tuple, now it is a {type(out['pair']).__name__}")
+    true(out["extra"]["names"] == ("a", "b"), "a tuple of strings should come back unchanged")
+    true(out["extra"]["lengths"] == [5, 3], "a list of numbers should come back unchanged")
+    true(out["views"][1] is None and out["views"][2] == 7 and out["pair"][1] == "text",
+         "None, numbers and strings should come back unchanged")
+
+@check("float_dtype changes only float tensors; ids, labels and masks keep their dtype")
+def _():
+    batch = _nested_batch()
+    out = move_to(batch, "cpu", float_dtype=torch.float64)
+    true(out["pixels"].dtype == torch.float64, f"pixels should become float64, it is {out['pixels'].dtype}")
+    true(out["views"][0].dtype == torch.float64, "float tensors inside a list must be converted too")
+    eq(out["pixels"], batch["pixels"], msg="changing the dtype should not change the values")
+    true(out["input_ids"].dtype == torch.long,
+         f"input_ids should stay long, it is {out['input_ids'].dtype}. Float token ids make Embedding raise an error")
+    true(out["labels"].dtype == torch.long, f"labels should stay long, it is {out['labels'].dtype}")
+    true(out["extra"]["mask"].dtype == torch.bool, f"mask should stay bool, it is {out['extra']['mask'].dtype}")
+
+@check("the batch you pass in is not changed")
+def _():
+    batch = _nested_batch()
+    move_to(batch, "meta")
+    true(batch["pixels"].device.type == "cpu" and batch["extra"]["mask"].device.type == "cpu",
+         "the original batch was changed: build and return a new dict / list instead of assigning into the old dict")
+--- hints
+- Recursion: handle the "it is a tensor" case first; for a dict or a list/tuple, call move_to again on each element.
+- Check for floats with `t.is_floating_point()`; rebuild a list / tuple with `type(batch)(... for v in batch)`.
+- Do not forget the last case: return anything else unchanged with `return batch`.
+
+@@ item d16-12
+type: predict
+title: The shapes the hooks print
+level: 2
+cards: Forward hooks: every layer reports its output shape
+--- context
+Get one output size wrong in a CNN, and the Linear layer after Flatten raises the mat1 and mat2 error. Working out the shapes layer by layer from the model definition is the basic skill behind reading those errors and choosing the right in_features.
+--- prompt
+Work out the shapes layer by layer, then write down the 6 output lines. Output size of a convolution = (input + 2·padding − kernel) // stride + 1; `MaxPool2d(2)` halves the size.
+--- code
+model = nn.Sequential(
+    nn.Conv2d(3, 8, kernel_size=3, padding=1),
+    nn.ReLU(),
+    nn.MaxPool2d(2),
+    nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1),
+    nn.Flatten(),
+    nn.Linear(16 * 8 * 8, 10),
+)
+
+def show(module, inputs, output):
+    print(type(module).__name__, tuple(output.shape))
+
+for layer in model:
+    layer.register_forward_hook(show)
+
+out = model(torch.randn(2, 3, 32, 32))
+--- explain
+- Conv2d(3, 8, k=3, padding=1): (32 + 2 − 3) // 1 + 1 = 32, with 8 channels: (2, 8, 32, 32).
+- ReLU does not change the shape.
+- MaxPool2d(2): 32 → 16.
+- Conv2d(8, 16, k=3, stride=2, padding=1): (16 + 2 − 3) // 2 + 1 = 7 + 1 = 8: (2, 16, 8, 8).
+- Flatten flattens everything except the batch: 16 × 8 × 8 = 1024.
+- Linear(1024, 10): (2, 10). The hooks are on each layer, not on the Sequential itself, so there are 6 lines.
+--- hints
+- Each hook prints when its layer's forward finishes, so the order is the order of the layers.
+- The second convolution: (16 + 2·1 − 3) // 2 + 1.
+
+@@ item d16-13
+type: code
+title: trace_shapes: a layer-by-layer shape tracer
+level: 3
+targets: trace_shapes
+ref: day16
+cards: Forward hooks: every layer reports its output shape; Reading a PyTorch traceback: the last line and your last frame
+--- context
+When a model raises a shape error, the first thing to look at is what every layer actually output. A tracer that needs no change to the model, and still tells you "it crashed after this layer" when it crashes, is one of the most used tools when debugging a new model.
+--- prompt
+Write `trace_shapes(model, x)`, which returns `(records, error)`:
+
+- Attach a forward hook to every **leaf module** of `model` (a module without children), then run `model(x)` once.
+- `records`: a list of `(name, shape)` pairs. `name` is the module's name in `model.named_modules()` (such as `"enc.0"`), `shape` is `tuple(output.shape)`. In the order the modules actually ran; a module that runs twice is recorded twice.
+- `error`: `None` if forward finished normally; otherwise the exception object (**catch it, do not let it escape**). `records` then holds the layers that finished before the crash.
+- Whether it worked or failed, remove every hook before returning.
+
+(Layers whose output is not a tensor are not part of today's task.)
+--- starter
+def trace_shapes(model, x):
+    """Run model(x) once and return (records, error).
+    records: [(name, shape), ...], output shapes of the leaf modules, in the order they ran
+    error: None normally; the exception object when forward raised one
+    Remove every hook before returning."""
+    records = []
+    raise todo()
+--- solution
+def trace_shapes(model, x):
+    """Run model(x) once and return (records, error).
+    records: [(name, shape), ...], output shapes of the leaf modules, in the order they ran
+    error: None normally; the exception object when forward raised one
+    Remove every hook before returning."""
+    names = {mod: name for name, mod in model.named_modules()}
+    records = []
+
+    def hook(module, inputs, output):
+        records.append((names[module], tuple(output.shape)))
+
+    handles = [m.register_forward_hook(hook) for m in model.modules() if len(list(m.children())) == 0]
+    error = None
+    try:
+        model(x)
+    except Exception as e:          # catch it and return it
+        error = e
+    finally:
+        for h in handles:           # remove them after success and after failure
+            h.remove()
+    return records, error
+--- tests
+@check("Sequential: one record per layer")
+def _():
+    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
+    records, error = trace_shapes(model, torch.randn(3, 4))
+    true(error is None, f"error should be None when forward finishes normally; you returned {error!r}")
+    got = [(n, tuple(s)) for n, s in records]
+    want = [("0", (3, 8)), ("1", (3, 8)), ("2", (3, 2))]
+    true(got == want, f"expected {want}, yours is {got}")
+
+@check("nested modules: full names, running order, twice means two records")
+def _():
+    records, error = trace_shapes(_Twice(), torch.randn(5, 4))
+    got = [(n, tuple(s)) for n, s in records]
+    want = [("enc.0", (5, 6)), ("enc.1", (5, 6)), ("act", (5, 6)), ("head", (5, 2)), ("act", (5, 2))]
+    names = [n for n, _ in got]
+    true("" not in names and "enc" not in names,
+         f"record only leaf modules: not the whole model (name '') and not the container enc. Your names: {names}")
+    true(got == want, f"expected {want}\n       yours is {got}\n       (act is called twice, so it needs two records: record inside the hook)")
+
+@check("forward raises: catch the error, keep the records from before the crash")
+def _():
+    try:
+        records, error = trace_shapes(_Broken(), torch.randn(3, 4))
+    except NotImplementedError:
+        raise
+    except RuntimeError as e:
+        true(False, f"the error escaped: {e} -- catch it with try / except and return it as the second value")
+    true(isinstance(error, RuntimeError), f"error should be the RuntimeError forward raised; you returned {error!r}")
+    got = [(n, tuple(s)) for n, s in records]
+    want = [("body", (3, 6)), ("act", (3, 6))]
+    true(got == want, f"body and act finished before the crash, so expected {want}; yours is {got}. The last record is act, so the crash is in head, after it")
+
+@check("every hook is removed afterwards (after success and after an error)")
+def _():
+    for model in (_Twice(), _Broken()):
+        try:
+            trace_shapes(model, torch.randn(2, 4))
+        except NotImplementedError:
+            raise
+        except RuntimeError:
+            pass                    # the previous check already reports this
+        left = sum(len(m._forward_hooks) for m in model.modules())
+        true(left == 0, f"{left} hook(s) are still attached to {type(model).__name__[1:]}. "
+                        "Use try / finally and call .remove() on every handle in finally")
+--- hints
+- First build a "module → name" dict: `names = {mod: name for name, mod in model.named_modules()}`; inside the hook, look the name up with `names[module]`.
+- Leaf modules: `len(list(m.children())) == 0`. Each `register_forward_hook` call returns a handle; keep them in a list.
+- Structure: run `model(x)` in `try:`; in `except Exception as e:` set `error = e`; in `finally:` call `.remove()` on every handle.
+
+@@ item d16-14
+type: code
+title: Closed book: trace_shapes
+level: 3
+targets: trace_shapes
+ref: day16
+exam: yes
+cards: Forward hooks: every layer reports its output shape
+--- context
+Tracing shapes layer by layer is the first tool you reach for when a new model breaks. Writing it without notes shows that you really understand hooks, named_modules and try / finally.
+--- prompt
+Without looking at the cards, write `trace_shapes(model, x)` from scratch. It returns `(records, error)`:
+
+- `records`: one `(name, tuple(output.shape))` entry each time a leaf module runs, with `name` from `model.named_modules()`, in running order.
+- `error`: `None` normally; the exception object when forward raises one (catch it, do not let it escape).
+- Remove every hook before returning, also after an error.
+--- starter
+def trace_shapes(model, x):
+    raise todo()
+--- solution
+def trace_shapes(model, x):
+    names = {mod: name for name, mod in model.named_modules()}
+    records = []
+
+    def hook(module, inputs, output):
+        records.append((names[module], tuple(output.shape)))
+
+    handles = [m.register_forward_hook(hook) for m in model.modules() if len(list(m.children())) == 0]
+    error = None
+    try:
+        model(x)
+    except Exception as e:
+        error = e
+    finally:
+        for h in handles:
+            h.remove()
+    return records, error
+--- tests
+@check("Sequential: one record per layer")
+def _():
+    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
+    records, error = trace_shapes(model, torch.randn(3, 4))
+    true(error is None, f"error should be None when forward finishes normally; you returned {error!r}")
+    got = [(n, tuple(s)) for n, s in records]
+    want = [("0", (3, 8)), ("1", (3, 8)), ("2", (3, 2))]
+    true(got == want, f"expected {want}, yours is {got}")
+
+@check("nested modules: full names, running order, twice means two records")
+def _():
+    records, error = trace_shapes(_Twice(), torch.randn(5, 4))
+    got = [(n, tuple(s)) for n, s in records]
+    want = [("enc.0", (5, 6)), ("enc.1", (5, 6)), ("act", (5, 6)), ("head", (5, 2)), ("act", (5, 2))]
+    names = [n for n, _ in got]
+    true("" not in names and "enc" not in names,
+         f"record only leaf modules: not the whole model (name '') and not the container enc. Your names: {names}")
+    true(got == want, f"expected {want}\n       yours is {got}\n       (act is called twice, so it needs two records: record inside the hook)")
+
+@check("forward raises: catch the error, keep the records from before the crash")
+def _():
+    try:
+        records, error = trace_shapes(_Broken(), torch.randn(3, 4))
+    except NotImplementedError:
+        raise
+    except RuntimeError as e:
+        true(False, f"the error escaped: {e} -- catch it with try / except and return it as the second value")
+    true(isinstance(error, RuntimeError), f"error should be the RuntimeError forward raised; you returned {error!r}")
+    got = [(n, tuple(s)) for n, s in records]
+    want = [("body", (3, 6)), ("act", (3, 6))]
+    true(got == want, f"body and act finished before the crash, so expected {want}; yours is {got}. The last record is act, so the crash is in head, after it")
+
+@check("every hook is removed afterwards (after success and after an error)")
+def _():
+    for model in (_Twice(), _Broken()):
+        try:
+            trace_shapes(model, torch.randn(2, 4))
+        except NotImplementedError:
+            raise
+        except RuntimeError:
+            pass                    # the previous check already reports this
+        left = sum(len(m._forward_hooks) for m in model.modules())
+        true(left == 0, f"{left} hook(s) are still attached to {type(model).__name__[1:]}. "
+                        "Use try / finally and call .remove() on every handle in finally")
+--- hints
+- A "module → name" dict + a hook that appends to records + hooks only on leaf modules.
+- try runs model(x), except stores the error, finally removes every handle.
+
+@@ item d16-15
+type: code
+title: Closed book: move_to
+level: 2
+targets: move_to
+ref: day16
+exam: yes
+cards: Nested batches: walk dicts, lists and tuples recursively
+--- context
+Almost every training script and inference service has a move_to. Getting it right without notes (especially "convert only floating-point tensors") pays off in interviews and at work.
+--- prompt
+Without looking at the cards, write `move_to(batch, device, float_dtype=None)` from scratch:
+
+- Tensors: `.to(device)`; when `float_dtype` is given, convert only floating-point tensors; integer and bool tensors keep their dtype.
+- Dicts / lists / tuples nested in any way, with container types kept; anything else comes back unchanged.
+- Return a new structure; do not change the `batch` you were given.
+--- starter
+def move_to(batch, device, float_dtype=None):
+    raise todo()
+--- solution
+def move_to(batch, device, float_dtype=None):
+    if isinstance(batch, torch.Tensor):
+        if float_dtype is not None and batch.is_floating_point():
+            return batch.to(device=device, dtype=float_dtype)
+        return batch.to(device)
+    if isinstance(batch, dict):
+        return {k: move_to(v, device, float_dtype) for k, v in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        return type(batch)(move_to(v, device, float_dtype) for v in batch)
+    return batch
+--- tests
+@check("every tensor is on the device")
+def _():
+    out = move_to(_nested_batch(), "meta")
+    found = list(_tensors(out))
+    true(len(found) == 6, f"the batch has 6 tensors, but the result has only {len(found)}")
+    for path, t in found:
+        true(t.device.type == "meta", f"{path} is still on {t.device}")
+
+@check("container types are kept, other things come back unchanged")
+def _():
+    out = move_to(_nested_batch(), "cpu")
+    true(isinstance(out, dict) and set(out) == set(_nested_batch()), "the outer level should still be a dict with the same keys")
+    true(isinstance(out["views"], list), f"batch['views'] was a list, now it is a {type(out['views']).__name__}")
+    true(isinstance(out["pair"], tuple), f"batch['pair'] was a tuple, now it is a {type(out['pair']).__name__}")
+    true(out["extra"]["names"] == ("a", "b"), "a tuple of strings should come back unchanged")
+    true(out["extra"]["lengths"] == [5, 3], "a list of numbers should come back unchanged")
+    true(out["views"][1] is None and out["views"][2] == 7 and out["pair"][1] == "text",
+         "None, numbers and strings should come back unchanged")
+
+@check("float_dtype changes only float tensors; ids, labels and masks keep their dtype")
+def _():
+    batch = _nested_batch()
+    out = move_to(batch, "cpu", float_dtype=torch.float64)
+    true(out["pixels"].dtype == torch.float64, f"pixels should become float64, it is {out['pixels'].dtype}")
+    true(out["views"][0].dtype == torch.float64, "float tensors inside a list must be converted too")
+    eq(out["pixels"], batch["pixels"], msg="changing the dtype should not change the values")
+    true(out["input_ids"].dtype == torch.long,
+         f"input_ids should stay long, it is {out['input_ids'].dtype}. Float token ids make Embedding raise an error")
+    true(out["labels"].dtype == torch.long, f"labels should stay long, it is {out['labels'].dtype}")
+    true(out["extra"]["mask"].dtype == torch.bool, f"mask should stay bool, it is {out['extra']['mask'].dtype}")
+
+@check("the batch you pass in is not changed")
+def _():
+    batch = _nested_batch()
+    move_to(batch, "meta")
+    true(batch["pixels"].device.type == "cpu" and batch["extra"]["mask"].device.type == "cpu",
+         "the original batch was changed: build and return a new dict / list instead of assigning into the old dict")
+--- hints
+- Four cases: a tensor, a dict, a list/tuple, anything else. The dict and list/tuple cases recurse.
+- Checking for floats: `t.is_floating_point()`.

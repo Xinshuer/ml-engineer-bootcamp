@@ -1,0 +1,1332 @@
+@@ day 23
+title: 部署三：生成式模型的推理服务
+part: 部署
+hours: 3–4 小时
+--- goal
+学完能算出一个 LLM 服务的 KV cache 要占多少显存；用生成器写出「prefill 一次、decode 一步一个 token」的流式生成循环，并处理好 eos、max_new_tokens 和跨 token 的 stop 字符串；在请求进 GPU 之前校验采样参数；模拟 continuous batching，用数字说明它为什么比静态 batching 快；按延迟预算选扩散模型的步数；写出一个合格的 GPU 推理镜像 Dockerfile。
+--- checklist
+- 先清空复习区（昨天看过答案的题从空白重做）
+- 读完 8 张知识卡片，每张的代码都改一个数再运行一次
+- 练习区全部通过；KV cache 的账能不看代码在纸上算出来
+- 闭卷区两题不看答案写出来
+
+@@ concept
+title: 生成分两段：prefill 和 decode
+ref: day23
+--- body
+LLM 生成一段回答，分成两个阶段：
+
+1. **prefill**（预填充）：把整个 prompt 一次送进模型，一次 forward 算完所有位置。顺手把每一层的 k、v 存进 KV cache（第 5 天讲过：旧 token 的 k/v 存起来，以后不再重算）。最后一个位置的 logits 给出第 1 个新 token。
+2. **decode**（解码）：每一步只把上一步生成的 **1 个** token 送进模型，带上 KV cache，得到下一个 token。要 100 个新 token，就是 1 次 prefill（给出第 1 个）加 99 次 decode。
+
+两个阶段的瓶颈不一样：
+
+- prefill 一次处理几百、几千个 token，矩阵乘法很大，瓶颈是 GPU 的算力（compute-bound）。
+- decode 每步只算 1 个 token，却要把全部权重和 KV cache 从显存里读一遍。算得少、读得多，瓶颈是显存带宽（memory-bound）。所以把很多请求的 decode 放在同一步里做很划算：权重读一遍，分给所有请求用。
+
+用户能感觉到的两个延迟：
+
+- **TTFT**（time to first token，首 token 延迟）：主要是 prefill 的时间。prompt 越长，越慢。
+- **TPOT**（time per output token，每个输出 token 的时间）：decode 一步的时间，决定字「蹦出来」的速度。
+
+总时间 ≈ TTFT + (输出 token 数 - 1) × TPOT。
+
+今天的小模型 `TinyLM`（随机权重，词表 32 个 token）的接口是 `logits, cache = model(ids, cache)`：cache 传 `None` 就是 prefill；把上一次返回的 cache 传回去，就是 decode。`model.calls` 记下每次调用处理了几个 token。
+--- code
+model = make_tiny_lm()
+prompt = torch.tensor([[12, 15, 21, 0, 3, 27]])          # 6 个 token 的 prompt
+with torch.inference_mode():
+    logits, cache = model(prompt)                        # prefill：6 个 token 一次算完
+    tok = logits[0, -1].argmax().item()                  # 最后一个位置 -> 第 1 个新 token
+    out = [tok]
+    for _ in range(4):                                   # decode：每步只喂 1 个新 token
+        logits, cache = model(torch.tensor([[tok]]), cache)
+        tok = logits[0, -1].argmax().item()
+        out.append(tok)
+print("每次调用处理的 token 数:", model.calls)
+print("生成的 5 个 token:", out)
+print("第 0 层 cache 里 k 的形状:", tuple(cache[0][0].shape), "= (B, KV head 数, 已有 token 数, head_dim)")
+n = sum(p.numel() for p in model.parameters())
+print(f"每次调用都要把 {n} 个参数读一遍：prefill 分给 6 个 token 用，decode 只给 1 个 token 用")
+
+@@ concept
+title: KV cache 的显存账
+ref: day23
+--- body
+KV cache 存的是：每一层、每个 KV head、每个已有 token 的 k 向量和 v 向量。所以它的大小就是几个数直接相乘：
+
+```
+字节数 = 2 × 层数 × KV head 数 × head_dim × 序列长度 × batch × 每个数的字节数
+```
+
+- 开头的 2：K 和 V 各存一份。
+- KV head 数：用了 GQA 的模型（第 5 天：几个 q head 共用一组 k/v），这里是 KV head 的个数，不是 q head 的个数。
+- 每个数的字节数：fp32 是 4，fp16 / bf16 是 2，fp8 / int8 是 1。PyTorch 里 `torch.float16.itemsize` 直接给出 2。
+
+算两个真实模型（fp16，每个数 2 字节；1 KiB = 1024 字节，1 GiB = 1024³ 字节）：
+
+- Llama-2-7B：32 层，32 个 KV head，head_dim 128。每个 token 占 2 × 32 × 32 × 128 × 2 = 524,288 字节 = 512 KiB。一条 4096 token 的序列就是 2 GiB，同时服务 8 条就是 16 GiB。
+- Llama-3-8B：也是 32 层、head_dim 128，但只有 8 个 KV head（GQA）。每个 token 128 KiB，只有前者的 1/4。
+
+这就是为什么 KV cache 常常比权重更早把显存吃光：权重大小是固定的，KV cache 随「同时服务的请求数 × 长度」一起涨。一张卡能同时服务几条序列，基本就是「放完权重后剩下的显存 ÷ 每条序列的 KV cache」。
+--- code
+def per_token_bytes(layers, kv_heads, head_dim, bytes_per_number):
+    return 2 * layers * kv_heads * head_dim * bytes_per_number
+
+llama2 = per_token_bytes(32, 32, 128, torch.float16.itemsize)
+llama3 = per_token_bytes(32, 8, 128, torch.float16.itemsize)
+print("Llama-2-7B:", llama2 // 1024, "KiB / token，4096 个 token:", llama2 * 4096 / 1024**3, "GiB")
+print("Llama-3-8B:", llama3 // 1024, "KiB / token，4096 个 token:", llama3 * 4096 / 1024**3, "GiB")
+
+model = make_tiny_lm()                                   # 2 层，2 个 KV head，head_dim 8，fp32
+with torch.inference_mode():
+    _, cache = model(torch.randint(0, 32, (3, 5)))       # batch 3，每条 5 个 token
+real = sum(k.numel() * k.element_size() + v.numel() * v.element_size() for k, v in cache)
+print("TinyLM 的 cache 实际占:", real, "字节；公式:", 2 * 2 * 2 * 8 * 5 * 3 * torch.float32.itemsize, "字节")
+
+@@ concept
+title: 流式输出：生成器一次吐一个 token
+--- body
+聊天界面里，字是一个一个「蹦」出来的：服务每生成一个 token 就马上发给用户，不等整段写完。用户等第一个字只要 TTFT，不用等整段回答。
+
+Python 里写这种「边算边交」的函数，用**生成器**（generator）：函数体里只要有 `yield`，调用它就不会马上执行，而是得到一个生成器对象。
+
+- 每次 `next(gen)`（或者 `for` 循环取下一个），函数从上次停下的地方接着跑，跑到下一个 `yield` 交出一个值，然后暂停。
+- 函数 `return` 了（或者跑到结尾），循环就结束。
+- 调用方不取，它就不算。用户断开连接、不再取了，生成就停了，不浪费 GPU。
+
+FastAPI 的 `StreamingResponse` 可以直接接收这样一个生成器，每 yield 一段就发一段给浏览器（服务本身是第 22 天的内容）。
+
+生成循环一定要有两个停止条件：
+
+1. **eos**（end of sequence，结束 token）：模型生成它，表示「我说完了」。eos 本身不发给用户。
+2. **max_new_tokens**：最多生成几个新 token。这是硬上限：模型一直不生成 eos，也不能让一个请求永远占着 GPU。
+
+OpenAI 风格的 API 会在结束时告诉你是哪一种：`finish_reason` 是 `"stop"`（遇到了 eos 或 stop 字符串）还是 `"length"`（到了 max_new_tokens）。
+
+还有一个细节：生成器里要关掉梯度，就把 `@torch.inference_mode()` 当装饰器写在函数定义上面。不要在函数体里写 `with torch.inference_mode():` 再 yield：生成器暂停的时候，这个模式会「漏」到调用方的代码里。下面的代码两种都试了一下。
+--- code
+def count_up(n):
+    print("  (函数体开始跑了)")
+    for i in range(n):
+        print(f"  算出 {i}")
+        yield i
+    print("  (函数体跑完了)")
+
+gen = count_up(3)
+print("调用之后，函数体还没跑，得到的是:", type(gen).__name__)
+print("取第一个:", next(gen))
+for x in gen:                                            # 接着上次停下的地方跑
+    print("for 取到:", x)
+
+@torch.inference_mode()
+def good():
+    yield torch.is_grad_enabled()
+
+def leaky():
+    with torch.inference_mode():
+        yield torch.is_grad_enabled()
+
+for name, make in [("装饰器", good), ("函数体里用 with", leaky)]:
+    g = make()
+    inside = next(g)
+    print(f"{name}: 生成器里记梯度吗 {inside}；它暂停时，调用方记梯度吗 {torch.is_grad_enabled()}")
+    g.close()                                            # 关掉生成器，with 这才退出
+
+@@ concept
+title: stop 字符串会跨 token
+--- body
+第三种停止条件是 **stop 字符串**：比如「生成到 `\nUser:` 就停」（聊天模板里，这是下一轮用户发言的开头，不停的话模型会替用户说话）。
+
+难点在于：模型吐的是 token，不是字符。一个 stop 字符串常常被切在好几个 token 里，比如 `"\n"`、`"User"`、`":"`。所以只看「这一个 token 是不是 stop」，永远抓不到它。
+
+正确做法：把已经生成的文字拼起来，在**拼起来的文字**里找 stop。找到了，只要 stop 前面的部分，stop 本身不要。有好几个 stop 时，谁在文字里最先出现，就按谁截。
+
+流式输出还多一个麻烦：字发给用户了，就收不回来。假设已经发出了 `"Bye.\n"`，接下来来了 `"User"` 和 `":"`，这时才发现那个 `\n` 是 stop 的开头，可它已经在用户屏幕上了。
+
+办法是**先扣住一小段**：每次拼好文字，看末尾有没有一段「可能是某个 stop 的开头」。有，就先扣住这段不发，前面的照常发出去。等下一段文字来了再看：
+
+- 凑成了完整的 stop：扣住的丢掉，结束。
+- 凑不成了（比如 `"\n"` 后面来的是 `"Thanks"`）：扣住的和新文字一起发出去。
+- 流结束了还扣着一段：它不是 stop，发出去。
+
+扣住的最多是「stop 长度 - 1」个字符，用户几乎感觉不到。下面代码里的 `held(text, stop)` 就是在算「末尾要扣住几个字符」。
+--- code
+pieces = ["Sure", "!", " Bye", ".\n", "User", ":", " next"]
+stop = "\nUser:"
+print("有哪一段正好等于 stop:", any(p == stop for p in pieces))
+
+def held(text, stop):
+    """text 末尾最长的、可能是 stop 开头的那一段有几个字符"""
+    for k in range(min(len(stop) - 1, len(text)), 0, -1):
+        if text.endswith(stop[:k]):
+            return k
+    return 0
+
+text = ""
+for p in pieces:
+    text += p
+    if stop in text:
+        print(f"拼上 {p!r} 后找到了 stop，最后返回 {text[:text.find(stop)]!r}")
+        break
+    print(f"拼上 {p!r:8} 末尾要扣住 {held(text, stop)} 个字符")
+
+@@ concept
+title: 采样参数：先校验，再上 GPU
+--- body
+temperature、top-k、top-p 各自做什么，第 5 天讲过。服务端要多做一件事：**请求里的参数，进 GPU 之前先检查**。坏参数往往不会让服务崩溃，而是悄悄变成怪结果，或者让一个请求一直占着 GPU：
+
+- `temperature = 0` 如果直接拿去除 logits，得到的是 inf 和 nan。0 应该当成「贪心」（直接取 argmax）单独处理。负数和特别大的数都不合理，常见的合法范围是 0 到 2。
+- `top_p` 必须在 (0, 1] 里。`top_p = 0` 会把所有 token 都过滤掉。
+- `top_k` 是非负整数，0 表示不用 top-k。
+- `max_new_tokens` 是正整数，而且「prompt 长度 + max_new_tokens」不能超过模型的上下文长度（context length），不然生成到一半就会出错或者被截断。
+
+Python 里有两个坑：
+
+1. **NaN**：Python 的 `json.loads` 能读出 `NaN` 和 `Infinity`。NaN 和任何数比较都是 False，所以 `if t < 0 or t > 2` 拦不住它。要先用 `math.isfinite(t)` 挡掉 NaN 和 inf（或者写成「合法条件」`if not (0 <= t <= 2)`，NaN 让整个条件为 False，也会被挡住）。
+2. **bool 也是 int**：`isinstance(True, int)` 是 True，JSON 里的 `true` 会被当成 1。要写 `isinstance(x, int) and not isinstance(x, bool)`。
+
+还有一个：拼错的参数名（`"temprature": 0.2`）如果被默默忽略，用户以为自己设了温度，其实用的是默认值。不认识的参数名要报错。
+
+校验失败时，把所有错误一次告诉用户（HTTP 400 或 422），不要只报第一个，让用户改一次、错一次。
+--- code
+import json
+t = json.loads('{"temperature": NaN}')["temperature"]
+print("json.loads 读出了:", t)
+print("nan < 0:", t < 0, "  nan > 2:", t > 2, "  -> t < 0 or t > 2 放过了它")
+print("math.isfinite(nan):", math.isfinite(t))
+print("isinstance(True, int):", isinstance(True, int))
+logits = torch.tensor([2.0, 1.0, 0.5])
+print("temperature=0 直接相除再 softmax:", (logits / 0.0).softmax(-1).tolist())
+print("temperature=0 当成贪心:", logits.argmax().item())
+
+@@ concept
+title: continuous batching：谁做完谁走
+ref: day23
+--- body
+一张 GPU 同时只能 decode 有限几条序列（KV cache 的显存有限）。我们把这些位置叫做 **slot**（槽位）。请求很多时，怎么排？
+
+**静态 batching**：凑齐一批（比如 4 条）一起生成，要等这一批里最长的那条做完，才一起返回，再开始下一批。问题是：
+
+- 一批的时间由最长的那条决定。只要 3 个 token 的短请求，也得陪着要 500 个 token 的长请求等。
+- 短的做完以后，它的 slot 就空着，可队列里还有人在等。
+
+**continuous batching**（连续批处理，也叫 iteration-level scheduling；vLLM、TGI 这些推理框架都用它）：按「每一个 decode 步」来调度。
+
+1. 每一步开始时，有空 slot 且队列里有人，就让排在最前面的请求进来。
+2. 这一步里，slot 里的每个请求各生成 1 个 token。
+3. 谁生成够了，谁就马上离开、返回结果；空出来的 slot 下一步就给别人用。
+
+结果：短请求很快就能返回，slot 几乎不空转，总步数也更少。
+
+今天的模拟做了两个简化：时间只按 decode 的步数算，每一步不管 slot 里有几个请求，都算 1 个单位时间（decode 的瓶颈是显存带宽，这个近似还不错）；新请求进来时的 prefill 不算时间。
+
+下面的 `continuous_timeline` 打印每一步 slot 里是谁；`simulate_continuous` 和 `simulate_static` 返回每个请求在第几步做完。
+--- code
+lengths = [4, 1, 1, 3]                                   # 每个请求要生成几个 token
+for step, running, waiting, finished in continuous_timeline(lengths, n_slots=2):
+    print(f"第 {step} 步: slot 里 {running}  排队 {waiting}  做完 {finished}")
+print("continuous，每个请求在第几步返回:", simulate_continuous(lengths, 2))
+print("静态 batching，每个请求在第几步返回:", simulate_static(lengths, 2))
+
+@@ concept
+title: 扩散模型：步数就是延迟
+ref: day23
+--- body
+扩散模型（第 8、9 天）生成一张图，要把去噪网络调用很多次：采样有多少步，就调用多少次。所以延迟大致是：
+
+```
+总时间 ≈ 固定开销 + 步数 × 每步时间 × (用 CFG 时再 × 2)
+```
+
+- **固定开销**：和步数无关的部分。比如文字编码器处理 prompt，VAE 把 latent 解码成图片。
+- **每步时间**：去噪网络 forward 一次的时间。分辨率越高、batch 越大，越慢。
+- **CFG**（classifier-free guidance，第 9 天）：每一步要算「有条件」和「无条件」两次（或者拼成 batch 2 算一次），粗略按 2 倍估。
+
+服务有延迟预算时（比如「一张图 2 秒内返回」），就反过来算：预算减去固定开销，再除以每步的时间，就是最多能跑几步。步数少了画质会降，所以要配合少步数也能出好图的采样器（比如第 9 天的 DDIM）。连 1 步都放不下时，只能换更小的分辨率、更小的模型，或者拒绝这个请求。
+
+下面的代码真的计时。小网络每一步都很快，每次运行的数字也会有些不同，但能看出步数翻倍，时间也差不多翻倍。CFG 那一列多出来的时间可能远不到一倍：网络太小，每次调用的固定开销占了大头，batch 从 1 变成 2 多花的时间不多。大模型、高分辨率时，就接近 2 倍了。
+--- code
+import time
+torch.manual_seed(0)
+net = TinyDenoiser().eval()
+x = torch.randn(1, 4, 32, 32)
+
+def sample_ms(steps, cfg):
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        z = x
+        for _ in range(steps):
+            if cfg:                                      # 有条件 + 无条件拼成 batch 2（这个小网络没有条件输入，只为计时）
+                e = net(torch.cat([z, z]))
+                eps = e[1:] + 3.0 * (e[:1] - e[1:])
+            else:
+                eps = net(z)
+            z = z - 0.1 * eps
+    return (time.perf_counter() - t0) * 1000
+
+sample_ms(5, False)                                      # 先热身一次：第一次调用总是偏慢
+for steps in (10, 20, 40):
+    print(f"{steps:2d} 步: {sample_ms(steps, False):6.1f} ms    加 CFG: {sample_ms(steps, True):6.1f} ms")
+
+@@ concept
+title: GPU 推理镜像的 Dockerfile
+--- body
+Docker 把「代码 + 依赖 + 系统库」打包成一个**镜像**（image），在任何装了 Docker 的机器上都能一模一样地跑起来。镜像跑起来就是一个**容器**（container）。镜像由一个叫 `Dockerfile` 的文本文件描述，每行一条指令：
+
+- `FROM`：从哪个现成的镜像开始，比如装好了 PyTorch 和 CUDA 的官方镜像。
+- `WORKDIR`：之后的命令在哪个目录里执行。
+- `COPY`：把本机的文件拷进镜像。`RUN`：build 时执行一条命令，比如 `pip install`。
+- `ENV`：设置环境变量。`USER`：之后用哪个用户运行。
+- `EXPOSE`：说明服务用哪个端口。`CMD`：容器启动时执行的命令。
+
+GPU 推理镜像的四条规矩：
+
+1. **版本写死。** `FROM pytorch/pytorch:latest` 今天和下个月可能是两个不同的镜像：CUDA 版本变了，可能和机器上的显卡驱动不配；PyTorch 变了，数值也可能变。写成具体的 tag，比如 `pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime`；`requirements.txt` 里每个包都写 `==版本号`。
+2. **模型文件不进镜像。** 几个 GB 的权重 COPY 进镜像，镜像又大又慢，换一次模型就要重新 build、重新推送。代码进镜像；权重在运行时用 `docker run -v 本机目录:/models:ro` 挂进去。`:ro` 是只读，服务改不了、也删不了模型文件。
+3. **不用 root 运行。** 容器里默认是 root。服务万一被攻破，root 能做的事多得多。先建一个普通用户（`RUN useradd ...`），再用 `USER` 切过去。
+4. **一张 GPU 一个 worker。** `uvicorn --workers 4` 会起 4 个进程，每个进程都加载一份完整的模型、各自占一份 KV cache 的显存，4 个进程抢同一张卡。正确做法：一个容器一个进程（`--workers 1`），用 `docker run --gpus device=0` 只给它一张卡；并发靠进程内部的 batching（比如今天的 continuous batching）。要用两张卡，就起两个容器。
+
+下面的代码检查一个「反面教材」Dockerfile，把违反规矩的行挑出来。
+--- code
+dockerfile = """FROM pytorch/pytorch:latest
+WORKDIR /app
+COPY requirements.txt server.py ./
+COPY weights/ /app/weights/
+RUN pip install -r requirements.txt
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--workers", "4"]"""
+
+lines = dockerfile.splitlines()
+for line in lines:
+    if line.startswith("FROM") and (":" not in line or line.endswith(":latest")):
+        print("版本没写死      ->", line)
+    if line.startswith("COPY") and "weights" in line:
+        print("权重进了镜像    ->", line)
+    if '"--workers", "4"' in line:
+        print("一张卡 4 个进程 ->", line)
+print("有 USER 指令吗:", any(l.startswith("USER") for l in lines), "-> 没有的话，容器用 root 运行")
+
+@@ item d23-01
+type: code
+title: KV cache 要占多少字节
+level: 1
+cards: KV cache 的显存账
+targets: kv_cache_bytes
+ref: day23
+--- context
+「这张 24 GB 的卡能同时服务多少个用户？」是 LLM 部署面试和容量规划里最常见的问题。答案的一半就是 KV cache 的账：每条序列要占多少显存。
+--- prompt
+写 `kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype)`，返回 KV cache 占的**字节数**（Python int）。
+
+- `dtype` 是 PyTorch 的数据类型，比如 `torch.float16`。每个数占几个字节用 `dtype.itemsize`（float32 → 4，bfloat16 → 2，float8 → 1）。
+- 别忘了 K 和 V 各存一份。
+
+测试会拿真实模型的配置核对（Llama-2-7B：32 层、32 个 KV head、head_dim 128），还会和 `TinyLM` 的 cache 实际占的字节数对比。
+--- starter
+def kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype):
+    bytes_per_number = dtype.itemsize
+    raise todo()
+--- solution
+def kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype):
+    bytes_per_number = dtype.itemsize                    # fp16 / bf16 -> 2，fp32 -> 4
+    return 2 * n_layers * n_kv_heads * head_dim * seq_len * batch * bytes_per_number   # 2 = K 和 V
+--- tests
+GiB = 1024 ** 3
+
+@check("Llama-2-7B：一条 4096 token 的序列占 2 GiB")
+def _():
+    got = kv_cache_bytes(32, 32, 128, 4096, 1, torch.float16)
+    true(isinstance(got, int), f"要返回 Python int，你返回的是 {type(got).__name__}")
+    true(got != GiB, "得到 1 GiB，正好少了一半：K 和 V 各存一份，要乘 2")
+    true(got == 2 * GiB, f"应该是 2 GiB = {2 * GiB} 字节，你的是 {got}（{got / GiB:.3g} GiB）")
+
+@check("GQA：按 KV head 数算，不按 q head 数")
+def _():
+    got = kv_cache_bytes(32, 8, 128, 8192, 1, torch.bfloat16)     # Llama-3-8B：8 个 KV head
+    true(got == GiB, f"Llama-3-8B 的 8192 个 token 应该是 1 GiB，你的是 {got / GiB:.3g} GiB")
+
+@check("batch 和 dtype 都算进去")
+def _():
+    base = kv_cache_bytes(4, 2, 64, 100, 1, torch.float16)
+    true(base == 204800, f"4 层、2 个 KV head、head_dim 64、100 个 token、fp16：应该是 204800 字节，你的是 {base}")
+    true(kv_cache_bytes(4, 2, 64, 100, 8, torch.float16) == 8 * base, "batch 从 1 变成 8，字节数应该变成 8 倍")
+    true(kv_cache_bytes(4, 2, 64, 100, 1, torch.float32) == 2 * base, "fp32 每个数 4 字节，应该是 fp16 的 2 倍")
+    true(kv_cache_bytes(4, 2, 64, 100, 1, torch.float8_e4m3fn) == base // 2,
+         "fp8 每个数 1 字节，应该是 fp16 的一半：用 dtype.itemsize，别自己写死字节数")
+
+@check("和 TinyLM 的 cache 实际大小一样")
+def _():
+    model = make_tiny_lm().to(torch.bfloat16)
+    with torch.inference_mode():
+        _, cache = model(torch.randint(0, 32, (3, 5)))            # batch 3，prefill 5 个 token
+        _, cache = model(torch.randint(0, 32, (3, 2)), cache)     # 再喂 2 个：一共 7 个
+    real = cache_bytes(cache)
+    want = kv_cache_bytes(model.n_layers, model.n_kv_heads, model.head_dim, 7, 3, torch.bfloat16)
+    true(want == real, f"TinyLM 的 cache 实际占 {real} 字节，你的公式算出 {want}")
+--- hints
+- 公式就是几个数相乘：层数、KV head 数、head_dim、序列长度、batch、每个数的字节数。还差哪个因子？
+- 开头还要乘 2（K 和 V）：`return 2 * n_layers * n_kv_heads * head_dim * seq_len * batch * bytes_per_number`。
+
+@@ item d23-02
+type: predict
+title: 一张卡能放几条长序列
+level: 2
+cards: KV cache 的显存账
+ref: day23
+--- context
+容量规划时要能心算：换成 GQA 能省多少，剩下的显存能放几条长序列。先在纸上算，再看答案。
+--- prompt
+`kv_cache_bytes` 就是上一题的函数（参考答案已经准备好）。写出下面代码打印的 3 行。
+--- code
+KiB, GiB = 1024, 1024 ** 3
+mha = kv_cache_bytes(32, 32, 128, 1, 1, torch.float16)     # Llama-2-7B，1 个 token
+gqa = kv_cache_bytes(32, 8, 128, 1, 1, torch.float16)      # Llama-3-8B，1 个 token
+print(mha // KiB, gqa // KiB)
+free = 8 * GiB                                             # 放完权重后还剩 8 GiB
+print(free // kv_cache_bytes(32, 8, 128, 4096, 1, torch.float16))
+print(free // kv_cache_bytes(32, 8, 128, 4096, 1, torch.float32))
+--- explain
+第一行：每个 token 是 2 × 32 × 32 × 128 × 2 = 524,288 字节 = 512 KiB。GQA 只有 8 个 KV head，是 1/4：128 KiB。所以打印 `512 128`。
+
+第二行：一条 4096 token 的序列是 128 KiB × 4096 = 512 MiB，也就是半个 GiB。8 GiB 能放 16 条。
+
+第三行：换成 fp32，每个数 4 字节，每条序列变成 1 GiB，只能放 8 条。
+
+实际服务里还要给激活值和显存碎片留一些空间，能放的会再少一点。
+--- hints
+- 1 KiB = 1024 字节。先算一个 token：2 × 层数 × KV head 数 × head_dim × 2 字节。
+- 128 KiB × 4096 = 512 MiB，也就是半个 GiB。
+
+@@ item d23-03
+type: choice
+title: prefill 和 decode，哪些说法对
+level: 2
+cards: 生成分两段：prefill 和 decode
+--- context
+优化 LLM 服务之前，要先知道慢在哪个阶段。prefill 和 decode 的瓶颈不一样，优化的办法也不一样。
+--- prompt
+关于 prefill 和 decode，哪些说法是**对的**？（可多选）
+--- options
+- prefill 一次处理整个 prompt，矩阵乘法很大，瓶颈通常是 GPU 的算力
+- decode 每步只算 1 个 token，却要把全部权重和 KV cache 读一遍，瓶颈通常是显存带宽
+- 用户等第一个字的时间（TTFT）主要由 max_new_tokens 决定
+- 把很多请求的 decode 放在同一步里一起算很划算：权重读一遍，分给所有请求用
+- 用了 KV cache 以后，decode 一步的时间和序列已经有多长完全无关
+answer: 1,2,4
+--- explain
+第 1、2 个说的是两个阶段的本质区别。第 4 个正是 continuous batching 的出发点。
+
+第 3 个不对：TTFT 主要是 prefill 的时间，由 prompt 的长度决定。max_new_tokens 影响的是总时间（要走多少步 decode），不影响第一个字什么时候出来。
+
+第 5 个不对：KV cache 让每一步不用重算旧 token 的 k 和 v，但新 token 的 attention 还是要和所有旧 token 的 k、v 一起算，而且要把它们从显存里读出来。序列越长，每步越慢，只是比不用 cache 慢得少多了。
+--- hints
+- 「第一个字」出来之前，模型做完了哪个阶段？
+- decode 一步要从显存读哪些数据？KV cache 会随长度变大吗？
+
+@@ item d23-04
+type: code
+title: 流式生成：prefill 一次，之后每步一个 token
+level: 2
+cards: 生成分两段：prefill 和 decode; 流式输出：生成器一次吐一个 token
+targets: stream_tokens
+ref: day23
+--- context
+每个 LLM 推理服务的核心都是这个循环：prefill 一次，然后一个 token 一个 token 地 decode，每出一个就马上交给用户，遇到 eos 或者到了上限就停。写对它，就把 TTFT、KV cache 和流式输出串起来了。
+--- prompt
+写**生成器** `stream_tokens(model, prompt_ids, max_new_tokens, eos_id)`，用贪心解码（每步取 logits 最大的 token），一个一个地 yield 新 token。
+
+- `prompt_ids`：(1, T) 的 long 张量。`model` 的接口和 `TinyLM` 一样：`logits, cache = model(ids, cache)`，logits 的形状是 (1, 这次喂的 token 数, V)。
+- 第一次调用：把整个 prompt 喂进去，cache 传 `None`（prefill）。之后每次只喂上一步生成的那 1 个 token（形状 (1, 1)），带上 cache（decode）。
+- 下一个 token 看 `logits[0, -1]`（最后一个位置）。yield 的是 Python int（用 `.item()`），因为要转成 JSON 发给用户。
+- 生成出 `eos_id` 就停，eos 本身不 yield。最多 yield `max_new_tokens` 个。
+- 不做多余的 forward：最后一个 token yield 出去之后，不要再调用模型。`max_new_tokens=0` 时一次都不调用。
+--- starter
+def stream_tokens(model, prompt_ids, max_new_tokens, eos_id):
+    ids, cache = prompt_ids, None
+    for _ in range(max_new_tokens):
+        raise todo()
+--- solution
+@torch.inference_mode()                                  # 装饰器写法：生成器暂停时不影响调用方
+def stream_tokens(model, prompt_ids, max_new_tokens, eos_id):
+    ids, cache = prompt_ids, None
+    for _ in range(max_new_tokens):
+        logits, cache = model(ids, cache)                # 第一次：prefill 整个 prompt；之后：decode 1 个 token
+        tok = logits[0, -1].argmax().item()              # 贪心：取最大的；.item() 变成 Python int
+        if tok == eos_id:
+            return                                       # eos 不发给用户
+        yield tok
+        ids = torch.tensor([[tok]], device=prompt_ids.device)   # 下一步只喂这 1 个新 token
+--- tests
+import inspect
+PROMPT = torch.tensor([[12, 15, 21, 0, 3, 27]])
+
+@check("是生成器：第一个 token 出来时只做了 prefill")
+def _():
+    model = make_tiny_lm()
+    gen = stream_tokens(model, PROMPT, 5, eos_id=-1)
+    true(inspect.isgenerator(gen), "stream_tokens 要用 yield 写成生成器，而不是全部算完再 return 一个 list")
+    true(model.calls == [], f"还没取任何 token，模型就被调用了：{model.calls}")
+    first = next(gen, None)
+    true(first is not None, "max_new_tokens=5、没有 eos，生成器却一个 token 都没给")
+    true(model.calls == [6], f"取到第一个 token 时，调用记录应该是 [6]（prefill 一次喂进 6 个 token），你的是 {model.calls}")
+    true(type(first) is int, f"要 yield Python int（用 .item()），你 yield 的是 {type(first).__name__}")
+
+@check("prefill 一次，之后每步只喂 1 个 token，不多算")
+def _():
+    model = make_tiny_lm()
+    out = list(stream_tokens(model, PROMPT, 5, eos_id=-1))
+    true(len(out) == 5, f"max_new_tokens=5、没有 eos，应该正好 5 个 token，你给了 {len(out)} 个")
+    calls = model.calls
+    true(calls[:1] == [6], f"第一次调用要把整个 prompt（6 个 token）喂进去，你的调用记录是 {calls}")
+    true(all(c == 1 for c in calls[1:]),
+         f"调用记录 {calls}：decode 时每步只该喂 1 个新 token。每步都喂整个序列，就是没用上 KV cache")
+    true(len(calls) == 5,
+         f"调用了 {len(calls)} 次，应该是 5 次（1 次 prefill + 4 次 decode）。最后一个 token 发出去之后，不用再 forward")
+
+@check("结果和「每步从头重算」一模一样")
+def _():
+    for prompt in (PROMPT, torch.tensor([[5, 11, 12, 8, 31, 9, 2]])):
+        want = greedy_no_cache(make_tiny_lm(), prompt, 8)
+        got = list(stream_tokens(make_tiny_lm(), prompt, 8, eos_id=-1))
+        true(got == want, f"prompt {prompt.tolist()}：应该生成 {want}，你的是 {got}。decode 时要把上一次返回的 cache 传回去")
+
+@check("遇到 eos 就停，eos 不发出去")
+def _():
+    model = ScriptedLM([5, 7, 0, 9])                     # 第 3 次调用会生成 eos（id 0）
+    out = list(stream_tokens(model, PROMPT, 10, eos_id=0))
+    true(out == [5, 7], f"脚本是 5, 7, eos, 9：应该得到 [5, 7]，你的是 {out}")
+    true(len(model.calls) == 3, f"生成 eos 的那一步之后就该停：模型应该被调用 3 次，你的是 {len(model.calls)} 次")
+    out = list(stream_tokens(ScriptedLM([0, 4]), PROMPT, 10, eos_id=0))
+    true(out == [], f"第一个 token 就是 eos 时，什么都不发，你的是 {out}")
+
+@check("max_new_tokens 是硬上限")
+def _():
+    model = ScriptedLM([3])                              # 永远不生成 eos
+    out = list(stream_tokens(model, PROMPT, 4, eos_id=0))
+    true(out == [3, 3, 3, 3], f"max_new_tokens=4：应该正好 4 个 token，你的是 {out}")
+    model = ScriptedLM([3])
+    out = list(stream_tokens(model, PROMPT, 0, eos_id=0))
+    true(out == [] and model.calls == [], f"max_new_tokens=0：什么都不生成，也不调用模型。你得到 {out}，调用记录 {model.calls}")
+--- hints
+- 循环里只有一种调用：`logits, cache = model(ids, cache)`。第一次 ids 是整个 prompt、cache 是 None；之后 ids 换成新 token。
+- 顺序：调用模型 → `tok = logits[0, -1].argmax().item()` → 是 eos 就 `return` → `yield tok` → `ids = torch.tensor([[tok]])`。
+- 把「调用模型」放在循环体的开头，yield 之后只准备下一步的输入。这样最后一个 token 发出去以后，循环结束，不会多算一步。
+
+@@ item d23-05
+type: fix
+title: stop 字符串被切在几个 token 里
+level: 2
+cards: stop 字符串会跨 token
+targets: text_until_stop
+ref: day23
+--- context
+聊天服务常用 stop 字符串（比如 `\nUser:`）防止模型替用户说话。只检查单个 token 的写法，测试时 stop 恰好是一个 token 所以能过；上线后 stop 被切开，模型就开始自问自答。
+--- prompt
+`text_until_stop(pieces, stops)`：`pieces` 是模型一段一段吐出来的文字（每段是一个 token 解码出来的字符串），`stops` 是 stop 字符串的 list。
+
+返回第一个 stop 出现之前的全部文字（stop 本身不要）：
+
+- 有好几个 stop 时，按在文字里最先出现的那个截。
+- 没遇到 stop，就返回全部文字。
+- 找到 stop 就马上返回，不要再读后面的段（真实服务里，每多读一段就要多算一步 GPU）。
+
+现在的代码只看「这一段是不是 stop」。修好它。
+--- starter
+def text_until_stop(pieces, stops):
+    text = ""
+    for piece in pieces:
+        if piece in stops:                               # 这一段正好是 stop 吗？
+            break
+        text += piece
+    return text
+--- solution
+def text_until_stop(pieces, stops):
+    text = ""
+    for piece in pieces:
+        text += piece
+        hits = [text.find(s) for s in stops if s in text]    # 在拼起来的文字里找
+        if hits:
+            return text[:min(hits)]                      # 最先出现的那个 stop 之前的部分
+    return text
+--- tests
+@check("stop 被切在几段里")
+def _():
+    pieces = ["Sure", "!", " Bye", ".\n", "User", ":", " next"]
+    got = text_until_stop(pieces, ["\nUser:"])
+    true(got == "Sure! Bye.", f"应该返回 'Sure! Bye.'，你的是 {got!r}。stop 被切成了 '.\\n'、'User'、':'，没有哪一段正好等于它")
+
+@check("stop 和别的文字在同一段里")
+def _():
+    got = text_until_stop(["Hi", " there\nUser: more"], ["\nUser:"])
+    true(got == "Hi there", f"应该返回 'Hi there'，你的是 {got!r}。stop 前面的 ' there' 也要留下")
+    got = text_until_stop(["Hi", "\nUser:"], ["\nUser:"])
+    true(got == "Hi", f"应该返回 'Hi'，你的是 {got!r}")
+
+@check("好几个 stop：按最先出现的截")
+def _():
+    got = text_until_stop(["a\nUs", "er:", " b###"], ["###", "\nUser:"])
+    true(got == "a", f"应该返回 'a'，你的是 {got!r}")
+    got = text_until_stop(["x#", "#", "#\nUser:"], ["\nUser:", "###"])
+    true(got == "x", f"'###' 在文字里比 '\\nUser:' 先出现，应该返回 'x'，你的是 {got!r}")
+
+@check("没有 stop 时返回全部文字")
+def _():
+    got = text_until_stop(["a", "\nUs", "b"], ["\nUser:"])
+    true(got == "a\nUsb", f"没有完整的 stop，应该返回全部文字 'a\\nUsb'，你的是 {got!r}")
+    got = text_until_stop(["a", "\nUser:"], [])
+    true(got == "a\nUser:", f"stops 是空的，应该返回全部文字，你的是 {got!r}")
+
+@check("找到 stop 就不再往下读")
+def _():
+    pieces = CountingIter(["Hi", "\n", "User", ":", " a", " b", " c"])
+    got = text_until_stop(pieces, ["\nUser:"])
+    true(got == "Hi", f"应该返回 'Hi'，你的是 {got!r}")
+    true(pieces.taken == 4, f"读到第 4 段就凑齐了 stop，应该只读 4 段，你读了 {pieces.taken} 段。每多读一段，真实服务就多算一步 GPU")
+--- hints
+- stop 可能跨好几段。该在哪里找它：这一段里，还是到目前为止拼起来的全部文字里？
+- 每读一段，先拼到 `text` 上，再对每个 stop 用 `text.find(s)`。找到的位置取最小的，返回 `text[:位置]`。
+
+@@ item d23-06
+type: code
+title: 流式输出时，先扣住可能是 stop 开头的字
+level: 3
+cards: stop 字符串会跨 token; 流式输出：生成器一次吐一个 token
+targets: stream_until_stop
+ref: day23
+--- context
+流式输出时，发出去的字收不回来。vLLM 这类推理框架会先扣住末尾一小段可能是 stop 开头的文字，确认不是 stop 再发。少了这一步，用户屏幕上会闪出半截 stop。
+--- prompt
+写**生成器** `stream_until_stop(pieces, stops)`：一段一段地读 `pieces`，一有确定安全的文字就 yield 出去；遇到任何一个 stop 就停。
+
+要求：
+
+1. 所有 yield 出去的文字拼起来，等于第一个 stop 之前的全部文字（和上一题 `text_until_stop` 的结果一样）。stop 的任何一部分都不能发出去。
+2. 不拖延：一段文字读进来以后，末尾不可能是 stop 开头的部分，要马上发出去。
+3. 找到 stop 就停，不再读后面的段。流结束时还扣着文字，就把它发出去。
+4. 不要 yield 空字符串。
+
+卡片里的 `held(text, stop)` 算的是「末尾要扣住几个字符」。这里有好几个 stop，要对每个都算，取最大的。
+--- starter
+def stream_until_stop(pieces, stops):
+    buf = ""                                             # 还没发出去的文字
+    for piece in pieces:
+        buf += piece
+        raise todo()
+    if buf:
+        yield buf                                        # 流结束了：扣着的不是 stop，发出去
+--- solution
+def stream_until_stop(pieces, stops):
+    buf = ""                                             # 还没发出去的文字
+    for piece in pieces:
+        buf += piece
+        hits = [buf.find(s) for s in stops if s in buf]
+        if hits:                                         # 凑齐了一个 stop：发出它前面的部分，结束
+            if buf[:min(hits)]:
+                yield buf[:min(hits)]
+            return
+        keep = 0                                         # 末尾最长的「可能是某个 stop 开头」的一段
+        for s in stops:
+            for k in range(min(len(s) - 1, len(buf)), 0, -1):
+                if buf.endswith(s[:k]):
+                    keep = max(keep, k)
+                    break
+        if len(buf) > keep:                              # 前面的都安全，发出去
+            yield buf[:len(buf) - keep]
+            buf = buf[len(buf) - keep:]
+    if buf:
+        yield buf                                        # 流结束了：扣着的不是 stop，发出去
+--- tests
+import inspect
+
+def _run(pieces, stops):
+    """把生成器跑完，记下每次 yield 时已经读了几段。"""
+    it = CountingIter(pieces)
+    gen = stream_until_stop(it, stops)
+    true(inspect.isgenerator(gen), "stream_until_stop 要写成生成器（用 yield）")
+    return [(chunk, it.taken) for chunk in gen], it
+
+CASES = [
+    (["Hello", " world"], ["\nUser:"], "Hello world"),
+    (["Hi", "\n", "there"], ["\nUser:"], "Hi\nthere"),
+    (["Sure", "!", " Bye", ".\n", "User", ":", " next"], ["\nUser:"], "Sure! Bye."),
+    (["Hi", "\nUs"], ["\nUser:"], "Hi\nUs"),
+    (["a#", "#b", "##", "#", "c"], ["###", "\nUser:"], "a##b"),
+    (["ok\nUser: hi"], ["\nUser:"], "ok"),
+]
+
+@check("拼起来等于 stop 之前的文字，stop 一个字都不漏")
+def _():
+    for pieces, stops, want in CASES:
+        out, _ = _run(pieces, stops)
+        got = "".join(c for c, _ in out)
+        true(got == want, f"pieces={pieces}：发出去的文字拼起来应该是 {want!r}，你的是 {got!r}")
+        true(all(isinstance(c, str) and c for c, _ in out), f"pieces={pieces}：不要 yield 空字符串或者别的类型：{[c for c, _ in out]}")
+
+@check("安全的文字读到就发，不拖到最后")
+def _():
+    out, _ = _run(["Hello", " world", "!"], ["\nUser:"])
+    true(out == [("Hello", 1), (" world", 2), ("!", 3)],
+         f"这 3 段都不可能是 stop 的开头，每段读完就该马上发出去。你的 (发出的文字, 当时已读段数) 是 {out}")
+    out, _ = _run(["Hi", "\n", "there"], ["\nUser:"])
+    true(out[:1] == [("Hi", 1)], f"'Hi' 不可能是 stop 的开头，读完第 1 段就该发出去。你的记录是 {out}")
+
+@check("可能是 stop 开头的文字先扣住")
+def _():
+    out, _ = _run(["Hi", "\n", "there"], ["\nUser:"])
+    early = "".join(c for c, t in out if t <= 2)
+    true("\n" not in early, f"读到第 2 段 '\\n' 时，还不知道它是不是 stop 的开头，不能发出去。你的记录是 {out}")
+    true("".join(c for c, _ in out) == "Hi\nthere", f"后来发现不是 stop，'\\n' 要和 'there' 一起发出去。你的记录是 {out}")
+
+@check("找到 stop 就停，不再往下读")
+def _():
+    out, it = _run(["Hi", "\n", "User", ":", " a", " b"], ["\nUser:"])
+    true("".join(c for c, _ in out) == "Hi", f"应该只发出 'Hi'，你的记录是 {out}")
+    true(it.taken == 4, f"第 4 段凑齐了 stop，应该只读 4 段，你读了 {it.taken} 段")
+--- hints
+- 每读一段，先像上一题那样在 `buf` 里找完整的 stop。找到了：发出 stop 前面的部分（不是空的才发），然后 `return`。
+- 没找到：对每个 stop `s`，让 `k` 从 `len(s) - 1` 往小试，看 `buf.endswith(s[:k])`。所有 stop 里最大的那个 k，就是要扣住的字符数 keep。
+- 发出 `buf[:len(buf) - keep]`（不是空的才发），然后 `buf` 只留下末尾 keep 个字符。
+
+@@ item d23-07
+type: code
+title: 请求进 GPU 之前，先校验采样参数
+level: 2
+cards: 采样参数：先校验，再上 GPU
+targets: validate_sampling
+ref: day23
+--- context
+坏参数不会让服务崩溃，而是悄悄出怪结果：temperature 是 NaN 时输出一堆乱码，拼错的参数名被忽略，max_new_tokens 超过上下文长度时生成到一半出错。在进 GPU 之前拦下它们，还能一次告诉用户所有错误。
+--- prompt
+写 `validate_sampling(params, prompt_len, context_len)`。`params` 是从请求 JSON 里读出来的 dict，可能只有其中几个参数（没给的用服务的默认值，不用检查）。
+
+返回错误信息的 **list**，每条错误以参数名开头，比如 `"temperature: must be a number from 0 to 2"`。全部合法就返回空 list `[]`。
+
+规则：
+
+- 只认 4 个参数名：`temperature`、`top_p`、`top_k`、`max_new_tokens`。别的名字（比如拼错的 `temprature`）要报错，错误以这个名字开头。
+- `temperature`：数字（int 或 float，不能是 bool），有限（不是 NaN、inf），0 ≤ t ≤ 2。
+- `top_p`：数字，有限，0 < p ≤ 1。
+- `top_k`：整数（不能是 bool，也不能是 5.0 这样的 float），≥ 0。
+- `max_new_tokens`：整数（不能是 bool），≥ 1，而且 `prompt_len + max_new_tokens <= context_len`。
+- 每个参数最多报一条错误；所有有问题的参数都要报出来。
+--- starter
+def validate_sampling(params, prompt_len, context_len):
+    errors = []
+    if "temperature" in params:
+        t = params["temperature"]
+        if t < 0 or t > 2:
+            errors.append(f"temperature: must be a number from 0 to 2, got {t!r}")
+    raise todo()
+--- solution
+def validate_sampling(params, prompt_len, context_len):
+    def is_number(x):                                    # bool 也是 int，要单独排除
+        return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+    def is_int(x):
+        return isinstance(x, int) and not isinstance(x, bool)
+
+    errors = []
+    for key in params:
+        if key not in ("temperature", "top_p", "top_k", "max_new_tokens"):
+            errors.append(f"{key}: unknown parameter")
+    if "temperature" in params:
+        t = params["temperature"]
+        if not (is_number(t) and math.isfinite(t) and 0 <= t <= 2):     # isfinite 挡住 NaN 和 inf
+            errors.append(f"temperature: must be a number from 0 to 2, got {t!r}")
+    if "top_p" in params:
+        p = params["top_p"]
+        if not (is_number(p) and math.isfinite(p) and 0 < p <= 1):
+            errors.append(f"top_p: must be a number in (0, 1], got {p!r}")
+    if "top_k" in params:
+        k = params["top_k"]
+        if not (is_int(k) and k >= 0):
+            errors.append(f"top_k: must be an integer >= 0, got {k!r}")
+    if "max_new_tokens" in params:
+        n = params["max_new_tokens"]
+        if not (is_int(n) and n >= 1):
+            errors.append(f"max_new_tokens: must be an integer >= 1, got {n!r}")
+        elif prompt_len + n > context_len:
+            errors.append(f"max_new_tokens: prompt ({prompt_len}) + {n} > context length {context_len}")
+    return errors
+--- tests
+GOOD = [{}, {"temperature": 0}, {"temperature": 0.7, "top_p": 0.9, "top_k": 50, "max_new_tokens": 100},
+        {"temperature": 2, "top_p": 1, "top_k": 0, "max_new_tokens": 1}]
+
+def _errs(params, prompt_len=10, context_len=2048):
+    errors = validate_sampling(dict(params), prompt_len, context_len)
+    true(isinstance(errors, list), f"要返回 list，你返回的是 {type(errors).__name__}")
+    return errors
+
+def _must_flag(params, field, why, **kw):
+    errors = _errs(params, **kw)
+    true(any(isinstance(e, str) and e.startswith(field) for e in errors),
+         f"{params}：{why}。应该有一条以 {field!r} 开头的错误，你返回的是 {errors}")
+
+@check("合法的参数：一条错误都没有")
+def _():
+    for p in GOOD:
+        errors = _errs(p)
+        true(errors == [], f"{p} 是合法的，你却返回了 {errors}")
+    _must_flag({"temperature": -0.5}, "temperature", "负的温度不合法")
+
+@check("超出范围的值要报错")
+def _():
+    for p, field, why in [
+        ({"temperature": -0.1}, "temperature", "温度不能是负数"),
+        ({"temperature": 2.5}, "temperature", "温度最大是 2"),
+        ({"top_p": 0}, "top_p", "top_p=0 会把所有 token 都过滤掉"),
+        ({"top_p": 1.5}, "top_p", "top_p 最大是 1"),
+        ({"top_k": -1}, "top_k", "top_k 不能是负数"),
+        ({"max_new_tokens": 0}, "max_new_tokens", "至少要生成 1 个 token"),
+    ]:
+        _must_flag(p, field, why)
+
+@check("NaN、inf、bool、字符串、小数都要挡住")
+def _():
+    for p, field, why in [
+        ({"temperature": float("nan")}, "temperature", "NaN 和谁比都是 False，t < 0 or t > 2 挡不住它，要用 math.isfinite"),
+        ({"temperature": float("inf")}, "temperature", "inf 不是有限的数"),
+        ({"temperature": "0.7"}, "temperature", "字符串不是数字（直接拿 '0.7' 和 0 比大小会抛 TypeError）"),
+        ({"top_p": float("nan")}, "top_p", "NaN 不合法"),
+        ({"top_k": 5.0}, "top_k", "top_k 要整数"),
+        ({"max_new_tokens": True}, "max_new_tokens", "bool 也是 int：isinstance(True, int) 是 True，要单独排除"),
+        ({"max_new_tokens": 10.0}, "max_new_tokens", "max_new_tokens 要整数"),
+    ]:
+        _must_flag(p, field, why)
+
+@check("prompt + max_new_tokens 不能超过上下文长度")
+def _():
+    errors = _errs({"max_new_tokens": 48}, prompt_len=2000, context_len=2048)
+    true(errors == [], f"2000 + 48 = 2048，刚好放得下，不该报错，你返回的是 {errors}")
+    _must_flag({"max_new_tokens": 49}, "max_new_tokens", "2000 + 49 > 2048，放不下", prompt_len=2000, context_len=2048)
+
+@check("拼错的参数名要报错，所有错误一次报完")
+def _():
+    _must_flag({"temprature": 0.2}, "temprature", "拼错的参数名如果被忽略，用户以为设了温度，其实没有")
+    errors = _errs({"temperature": -1, "top_p": 2, "top_k": 3})
+    true(len(errors) == 2, f"temperature 和 top_p 有错（top_k=3 是合法的），应该正好 2 条错误，你返回的是 {errors}")
+--- hints
+- 先写两个小函数：`is_number(x)` 是 `isinstance(x, (int, float)) and not isinstance(x, bool)`；`is_int(x)` 类似，只是不包括 float。
+- 用「合法条件」来写：`if not (is_number(t) and math.isfinite(t) and 0 <= t <= 2): errors.append(...)`。`and` 会短路：不是数字时，后面的比大小根本不会执行，也就不会抛 TypeError。
+- 未知参数名：`for key in params: if key not in (...)`。max_new_tokens 先检查类型和范围，合法了再用 `elif` 检查上下文长度。
+
+@@ item d23-08
+type: code
+title: 模拟 continuous batching 调度器
+level: 3
+cards: continuous batching：谁做完谁走
+targets: simulate_continuous
+ref: day23
+--- context
+continuous batching 是 vLLM 这类推理框架吞吐高的主要原因之一，面试常让你说清它和静态 batching 的区别。自己写一遍调度的模拟，就能用数字说明：短请求为什么不用再陪长请求等。
+--- prompt
+写 `simulate_continuous(lengths, n_slots)`：`lengths[i]` 是请求 i 要生成的 token 数（≥ 1）。所有请求一开始就按 0, 1, 2… 的顺序排在队列里。GPU 有 `n_slots` 个 slot。
+
+返回一个 list：`finish[i]` 是请求 i 做完（生成完最后一个 token）的那一步是第几步。
+
+时间按 decode 步数算，从第 1 步开始。每一步：
+
+1. 有空 slot 且队列里有人，就按队列顺序把请求放进 slot，直到 slot 满了或者队列空了。
+2. slot 里的每个请求各生成 1 个 token。
+3. 生成够 `lengths[i]` 个 token 的请求，这一步做完，离开 slot。空出来的 slot 从下一步开始可以用。
+
+例子：`lengths = [8, 2, 3, 2, 6, 1]`，2 个 slot → `[8, 2, 5, 7, 13, 9]`。（静态 batching 是 `[8, 8, 11, 11, 17, 17]`，一共 17 步。）
+--- starter
+def simulate_continuous(lengths, n_slots):
+    queue = list(range(len(lengths)))                    # 排队的请求（按顺序）
+    slots = []                                           # 正在生成的请求
+    made = [0] * len(lengths)                            # 每个请求已经生成了几个 token
+    finish = [0] * len(lengths)
+    step = 0
+    while queue or slots:
+        step += 1
+        raise todo()
+    return finish
+--- solution
+def simulate_continuous(lengths, n_slots):
+    queue = list(range(len(lengths)))                    # 排队的请求（按顺序）
+    slots = []                                           # 正在生成的请求
+    made = [0] * len(lengths)                            # 每个请求已经生成了几个 token
+    finish = [0] * len(lengths)
+    step = 0
+    while queue or slots:
+        step += 1
+        while queue and len(slots) < n_slots:            # 1. 有空 slot 就放人进来
+            slots.append(queue.pop(0))
+        for i in slots:                                  # 2. 每个请求生成 1 个 token
+            made[i] += 1
+        done = [i for i in slots if made[i] == lengths[i]]
+        for i in done:                                   # 3. 做完的这一步离开
+            finish[i] = step
+        slots = [i for i in slots if i not in done]
+    return finish
+--- tests
+EXAMPLE = [8, 2, 3, 2, 6, 1]
+
+@check("题目里的例子")
+def _():
+    got = simulate_continuous(list(EXAMPLE), 2)
+    true(got == [8, 2, 5, 7, 13, 9], f"应该是 [8, 2, 5, 7, 13, 9]，你的是 {got}")
+
+@check("slot 足够多，或者只有 1 个 slot")
+def _():
+    got = simulate_continuous(list(EXAMPLE), 10)
+    true(got == EXAMPLE, f"slot 比请求多时谁都不用排队，finish 就等于 lengths {EXAMPLE}，你的是 {got}")
+    got = simulate_continuous(list(EXAMPLE), 1)
+    true(got == [8, 10, 13, 15, 21, 22], f"只有 1 个 slot 时一个接一个做，应该是 [8, 10, 13, 15, 21, 22]，你的是 {got}")
+
+@check("slot 不超员、先来先服务、有空 slot 就不让人干等")
+def _():
+    lengths, n_slots = [3, 1, 4, 1, 5, 9, 2, 6], 3
+    finish = simulate_continuous(list(lengths), n_slots)
+    true(isinstance(finish, list) and len(finish) == len(lengths), f"要返回长度为 {len(lengths)} 的 list，你的是 {finish}")
+    spans = [(f - n, f) for n, f in zip(lengths, finish)]    # 请求 i 在第 start+1 到第 finish 步生成
+    starts = [s for s, _ in spans]
+    true(all(s >= 0 for s in starts), f"有请求在第 1 步之前就开始了：{finish}")
+    true(starts == sorted(starts), f"请求开始的顺序应该和排队的顺序一样（先来先服务），各请求开始前的步数是 {starts}")
+    for step in range(1, max(finish) + 1):
+        busy = sum(s < step <= f for s, f in spans)
+        true(busy <= n_slots, f"第 {step} 步有 {busy} 个请求在生成，超过了 {n_slots} 个 slot")
+        waiting = sum(s >= step for s, _ in spans)
+        true(busy == n_slots or waiting == 0, f"第 {step} 步只用了 {busy} 个 slot，可还有 {waiting} 个请求在排队")
+    true(finish == [3, 1, 4, 2, 7, 12, 6, 12], f"应该是 [3, 1, 4, 2, 7, 12, 6, 12]，你的是 {finish}")
+
+@check("和静态 batching 比：短的先回来，总步数更少")
+def _():
+    cont = simulate_continuous(list(EXAMPLE), 2)
+    stat = simulate_static(list(EXAMPLE), 2)
+    true(isinstance(cont, list) and len(cont) == len(EXAMPLE), f"要返回长度为 {len(EXAMPLE)} 的 list，你的是 {cont}")
+    order = sorted(range(len(EXAMPLE)), key=lambda i: (cont[i], i))
+    true(order == [1, 2, 3, 0, 5, 4], f"做完的顺序应该是 [1, 2, 3, 0, 5, 4]（短的先回来），你的是 {order}")
+    true(max(cont) < max(stat), f"continuous 一共 {max(cont)} 步，应该比静态 batching 的 {max(stat)} 步少")
+--- hints
+- 每一步分三小步：放人进 slot（`while queue and len(slots) < n_slots`），slot 里每人 `made[i] += 1`，把 `made[i] == lengths[i]` 的记下 `finish[i] = step` 再移出 slot。
+- 移出 slot 要放在这一步生成完之后，这样空出来的 slot 下一步才能用。别在遍历 `slots` 的同时删它的元素：先把做完的收集到一个 list，再重建 `slots`。
+
+@@ item d23-09
+type: predict
+title: 静态和 continuous：谁先回来
+level: 2
+cards: continuous batching：谁做完谁走
+ref: day23
+--- context
+用数字比较两种调度：平均等多久、总共几步。能在白板上画出这张时间表，面试官就知道你真懂了。
+--- prompt
+`simulate_static` 和 `simulate_continuous` 就是卡片里用过的两个模拟（返回每个请求在第几步做完）。写出下面代码打印的 2 行。
+--- code
+lengths = [5, 1, 2, 1]
+for name, sim in [("static", simulate_static), ("continuous", simulate_continuous)]:
+    finish = sim(lengths, 2)
+    print(name, finish, "total", max(finish), "mean", sum(finish) / len(finish))
+--- explain
+静态：请求 0、1 是第一批，最长的要 5 步，两个都在第 5 步返回。请求 2、3 是第二批，从第 6 步开始，最长的要 2 步，第 7 步返回。
+
+continuous：第 1 步 0、1 进 slot，1 只要 1 个 token，第 1 步就做完。第 2 步 2 进来，要 2 步，第 3 步做完。第 4 步 3 进来，当步就做完。0 一直在跑，第 5 步做完。
+
+总步数从 7 变成 5，平均返回时间从 6.0 变成 3.25：短请求不用再陪长请求等。
+--- hints
+- 静态：每批的返回时间 = 上一批结束的那一步 + 这一批里最长的请求要的步数。
+- continuous：一步一步画出两个 slot 里是谁。slot 在第 s 步空出来，第 s+1 步就能放下一个请求。
+
+@@ item d23-10
+type: code
+title: 按延迟预算选扩散模型的步数
+level: 1
+cards: 扩散模型：步数就是延迟
+targets: pick_steps
+ref: day23
+--- context
+图像生成服务常有延迟要求（比如 2 秒内出图）。步数是最直接的旋钮：多一步，画质好一点，也慢一点。能算出「预算内最多几步」，才能在画质和延迟之间做有依据的取舍。
+--- prompt
+写 `pick_steps(budget_ms, step_ms, overhead_ms, cfg, max_steps=50)`，返回预算内能跑的**最多步数**（int）：
+
+- 总时间 = `overhead_ms + 步数 × step_ms × (2 if cfg else 1)`，要 ≤ `budget_ms`（刚好等于也算放得下）。
+- 步数不超过 `max_steps`（再多，画质也不会更好了）。
+- 连 1 步都放不下时返回 0（不能是负数）。调用方看到 0，就知道要换小分辨率或者拒绝请求。
+--- starter
+def pick_steps(budget_ms, step_ms, overhead_ms, cfg, max_steps=50):
+    per_step = step_ms * (2 if cfg else 1)
+    raise todo()
+--- solution
+def pick_steps(budget_ms, step_ms, overhead_ms, cfg, max_steps=50):
+    per_step = step_ms * (2 if cfg else 1)                     # CFG：每步算两次
+    steps = math.floor((budget_ms - overhead_ms) / per_step)   # 剩下的时间放得下几步（向下取整）
+    return int(max(0, min(max_steps, steps)))                  # 不超过上限，也不能是负数
+--- tests
+@check("2 秒预算：带 CFG 和不带")
+def _():
+    got = pick_steps(2000, 30, 400, cfg=True)
+    true(got == 26, f"(2000 - 400) / (30 × 2) = 26.7，向下取整是 26，你的是 {got}")
+    got = pick_steps(2000, 30, 400, cfg=False, max_steps=100)
+    true(got == 53, f"不带 CFG：(2000 - 400) / 30 = 53.3，向下取整是 53，你的是 {got}")
+    true(type(got) is int, f"要返回 int，你返回的是 {type(got).__name__}")
+
+@check("不超过 max_steps")
+def _():
+    got = pick_steps(2000, 30, 400, cfg=False)
+    true(got == 50, f"预算够跑 53 步，但 max_steps=50，应该返回 50，你的是 {got}")
+    got = pick_steps(10000, 5, 0, cfg=True, max_steps=20)
+    true(got == 20, f"预算够跑 1000 步，应该返回 max_steps=20，你的是 {got}")
+
+@check("刚好等于预算也算放得下")
+def _():
+    got = pick_steps(1000, 40, 200, cfg=False)
+    true(got == 20, f"200 + 20 × 40 = 1000，刚好放下 20 步，你的是 {got}")
+    got = pick_steps(1000, 40, 200, cfg=True)
+    true(got == 10, f"带 CFG：200 + 10 × 80 = 1000，应该是 10，你的是 {got}")
+
+@check("一步都放不下时返回 0")
+def _():
+    for budget, want in [(300, 0), (450, 0), (460, 1)]:
+        got = pick_steps(budget, 30, 400, cfg=True)
+        true(got == want, f"预算 {budget} ms、固定开销 400 ms、每步 60 ms：应该是 {want}，你的是 {got}")
+--- hints
+- 剩下的时间是 `budget_ms - overhead_ms`；每步的时间是 `per_step`。相除，再向下取整：`math.floor(...)`。
+- 最后夹一下：`max(0, min(max_steps, steps))`。
+
+@@ item d23-11
+type: fill
+title: 填好 GPU 推理镜像的 Dockerfile
+level: 2
+cards: GPU 推理镜像的 Dockerfile
+targets: DOCKERFILE, REQUIREMENTS, RUN_COMMAND
+--- context
+「我这能跑，服务器上跑不了」多半是环境不一样。版本写死、模型挂载进来、不用 root、一张卡一个进程，这样的镜像在哪台机器上都一样跑，出了事也好查。
+--- prompt
+下面是一个 LLM 推理服务的 `Dockerfile`、`requirements.txt` 和启动命令（都写成 Python 字符串，测试会检查文字）。把空填上，做到：
+
+1. 基础镜像写死版本：不能是 `latest`，tag 里要有版本号。
+2. `requirements.txt` 里每个包都用 `==` 写死版本。
+3. 模型文件不进镜像：`MODEL_DIR` 是容器里的一个绝对路径；`docker run` 用 `-v` 把本机的模型目录**只读**挂载到同一个路径。
+4. 用 `useradd` 建的那个普通用户运行，不用 root。
+5. 一个容器一个 worker，只用一张 GPU（`--gpus` 后面写 `device=0` 这种形式，不写 `all`）。
+--- template
+DOCKERFILE = """
+# 1. 基础镜像：tag 里写死 PyTorch / CUDA / cuDNN 的版本
+FROM pytorch/pytorch:[[2.7.0-cuda12.8-cudnn9-runtime]]
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY server.py .
+
+# 2. 模型文件不 COPY 进来：运行时挂载到这个目录
+ENV MODEL_DIR=[[/models]]
+
+# 3. 建一个普通用户，用它运行
+RUN useradd --create-home app
+USER [[app]]
+
+EXPOSE 8000
+# 4. 一个容器只起一个 worker 进程
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "[[1]]"]
+"""
+
+REQUIREMENTS = """
+fastapi[[==0.115.6]]
+uvicorn[[==0.32.1]]
+safetensors[[==0.4.5]]
+"""
+
+RUN_COMMAND = "docker run --gpus [[device=0]] -v /srv/models/tiny-lm:[[/models:ro]] -p 8000:8000 tiny-lm:0.1"
+--- tests
+import re
+
+def _lines(text):
+    return [l.strip() for l in text.strip().splitlines() if l.strip() and not l.strip().startswith("#")]
+
+@check("基础镜像写死了版本")
+def _():
+    froms = [l for l in _lines(DOCKERFILE) if l.startswith("FROM")]
+    true(len(froms) == 1, f"应该正好有一行 FROM，你的是 {froms}")
+    image = froms[0].split()[1] if len(froms[0].split()) > 1 else ""
+    true(":" in image, f"{image!r} 没写 tag，等于用 latest")
+    tag = image.split(":", 1)[1]
+    true(tag != "latest", "latest 不是版本：今天和下个月 build 出来的，可能是两个不同的镜像")
+    true(re.search(r"\d+\.\d+", tag) is not None, f"tag {tag!r} 里要有版本号，比如 2.7.0-cuda12.8-cudnn9-runtime")
+
+@check("requirements 里每个包都用 == 写死版本")
+def _():
+    reqs = _lines(REQUIREMENTS)
+    true(len(reqs) == 3, f"应该有 3 个包，你的是 {reqs}")
+    for r in reqs:
+        true(re.fullmatch(r"[A-Za-z0-9_.\-\[\]]+==\d+(\.\d+)*", r) is not None, f"{r!r} 没有用 == 写死版本，应该像 fastapi==0.115.6")
+
+@check("模型文件挂载进来，而且是只读")
+def _():
+    lines = _lines(DOCKERFILE)
+    copies = [l for l in lines if l.split()[0] in ("COPY", "ADD")]
+    true(not any(re.search(r"model|weight|\.safetensors|\.bin|\.pt\b", l, re.I) for l in copies), f"模型文件不该 COPY 进镜像：{copies}")
+    env = [l for l in lines if l.startswith("ENV MODEL_DIR=")]
+    true(len(env) == 1, "要有一行 ENV MODEL_DIR=...")
+    model_dir = env[0].split("=", 1)[1].strip()
+    true(model_dir.startswith("/") and len(model_dir) > 1, f"MODEL_DIR 要是容器里的绝对路径（比如 /models），你的是 {model_dir!r}")
+    m = re.search(r"-v\s+(\S+)", RUN_COMMAND)
+    true(m is not None, "docker run 里要有 -v 本机目录:容器目录:ro")
+    parts = m.group(1).split(":")
+    true(len(parts) == 3 and parts[2] == "ro", f"挂载 {m.group(1)!r} 要以 :ro 结尾（只读）：服务不该改动模型文件")
+    true(parts[1] == model_dir, f"挂载到了 {parts[1]!r}，可 MODEL_DIR 是 {model_dir!r}：服务会在一个空目录里找模型")
+
+@check("不用 root 运行")
+def _():
+    users = [l.split(None, 1)[1].strip() if len(l.split()) > 1 else "" for l in _lines(DOCKERFILE) if l.split()[0] == "USER"]
+    true(len(users) == 1 and users[0] != "", "要有一行 USER 用户名")
+    true(users[0] not in ("root", "0"), "USER root 等于没切换：服务被攻破时，攻击者拿到的是 root")
+    created = re.findall(r"useradd\b.*?\s(\w+)\s*$", DOCKERFILE, flags=re.M)
+    true(users[0] in created, f"USER {users[0]} 这个用户不存在：useradd 建的是 {created}")
+
+@check("一个容器一个 worker、一张 GPU")
+def _():
+    cmd = [l for l in _lines(DOCKERFILE) if l.startswith("CMD")]
+    true(len(cmd) == 1, "要有一行 CMD")
+    m = re.search(r'"--workers",\s*"(\d+)"', cmd[0])
+    true(m is not None, f"CMD 里 --workers 后面要写一个数字：{cmd[0]}")
+    true(m.group(1) == "1", f"--workers {m.group(1)}：每个 worker 都会加载一份模型、占一份 KV cache 显存，抢同一张卡。一个进程一张卡")
+    g = re.search(r"--gpus\s+(\S+)", RUN_COMMAND)
+    gpus = g.group(1) if g else None
+    true(gpus is not None and re.fullmatch(r'"?device=\d+"?', gpus) is not None,
+         f"--gpus 后面写 device=0 这种形式，只给这个容器一张卡；你写的是 {gpus!r}")
+--- hints
+- 基础镜像的 tag 形如 `2.7.0-cuda12.8-cudnn9-runtime`；包的版本形如 `==0.115.6`。
+- `MODEL_DIR` 和 `-v` 冒号后面的容器路径要是同一个，最后再加 `:ro`；`USER` 后面写 `useradd` 建的那个名字。
+- `--workers` 写 1；`--gpus` 写 `device=0`。
+
+@@ item d23-12
+type: choice
+title: 镜像和进程数，哪些说法对
+level: 1
+cards: GPU 推理镜像的 Dockerfile; KV cache 的显存账
+--- context
+这几条是部署评审时常被问到的。每一条背后都有人踩过坑：驱动不配、镜像 20 GB、一张卡开 4 个 worker 直接 OOM。
+--- prompt
+一台机器有 1 张 24 GB 的 GPU，模型权重 14 GB。下面哪些说法是**对的**？（可多选）
+--- options
+- 把 uvicorn 改成 `--workers 4`，吞吐就能变成 4 倍
+- 权重不进镜像、运行时挂载：换模型不用重新 build，镜像小，推送和拉取都快
+- `FROM pytorch/pytorch:latest` 最省心：永远是最新版，不会有兼容问题
+- 容器里用普通用户运行：服务万一被攻破，攻击者能做的事更少
+answer: 2,4
+--- explain
+第 1 个不对：每个 worker 是一个独立的进程，都要加载一份 14 GB 的权重。4 份就是 56 GB，这张 24 GB 的卡直接 OOM。就算放得下，每个进程也只剩很少的显存给 KV cache，还要抢同一张卡。正确做法是一个进程占一张卡，并发靠进程内部的 batching。
+
+第 3 个不对：`latest` 会变。下个月重新 build，CUDA 或 PyTorch 的版本可能就变了：可能和驱动不配，数值也可能变，出了问题还很难查。
+
+第 2、4 个是今天的规矩。
+--- hints
+- 每个 worker 都是一个独立的进程。它们会共用 GPU 上的同一份权重吗？
+- `latest` 指向的镜像，下个月还是同一个吗？
+
+@@ item d23-13
+type: local
+title: 在本机 build 并运行镜像（需要 Docker Desktop）
+level: 2
+cards: GPU 推理镜像的 Dockerfile
+verify: user=app[\s\S]*files=\[[^\]]*'tiny\.safetensors'[\s\S]*can write to MODEL_DIR: no
+placeholder: 把 docker run 打印的 3 行粘贴到这里
+--- context
+上一题的 Dockerfile 只是文字。亲手 build 一次、运行一次，看到只读挂载和非 root 用户真的生效，下次写部署文件时心里就有底了。
+--- prompt
+这道题在你自己的电脑上做，需要先安装并启动 **Docker Desktop**（Windows / macOS；Linux 装 Docker Engine）。没有 Docker 的话可以先跳过。
+
+为了下载快，这里用很小的 `python:3.12.7-slim` 镜像代替几个 GB 的 PyTorch 镜像。规矩和上一题一样：版本写死、模型挂载进来、不用 root。
+
+1. 新建一个文件夹 `tiny-serve`，在里面放两个文件。
+
+`Dockerfile`：
+
+```
+FROM python:3.12.7-slim
+WORKDIR /app
+COPY check.py .
+ENV MODEL_DIR=/models
+RUN useradd --create-home app
+USER app
+CMD ["python", "check.py"]
+```
+
+`check.py`：
+
+```
+import os, pwd
+d = os.environ["MODEL_DIR"]
+print(f"user={pwd.getpwuid(os.getuid()).pw_name} uid={os.getuid()}")
+print(f"MODEL_DIR={d} files={sorted(os.listdir(d))}")
+try:
+    open(os.path.join(d, "hack.txt"), "w").close()
+    print("can write to MODEL_DIR: yes (mount it with :ro)")
+except OSError as e:
+    print(f"can write to MODEL_DIR: no ({e.strerror})")
+```
+
+2. 在 `tiny-serve` 里建一个 `models` 文件夹，放一个假的模型文件：
+
+```
+python -c "import os; os.makedirs('models', exist_ok=True); open('models/tiny.safetensors', 'wb').write(b'0')"
+```
+
+3. 在 `tiny-serve` 里 build 镜像：
+
+```
+docker build -t tiny-check:0.1 .
+```
+
+4. 运行它，把 `models` 只读挂载到 `/models`。Windows PowerShell：
+
+```
+docker run --rm -v "${PWD}\models:/models:ro" tiny-check:0.1
+```
+
+macOS / Linux：
+
+```
+docker run --rm -v "$PWD/models:/models:ro" tiny-check:0.1
+```
+
+5. 把打印的 3 行粘贴到下面。应该看到：用户是 `app`，能看到 `tiny.safetensors`，写不进去（Read-only file system）。
+
+可选：如果你有 NVIDIA 显卡，Docker 也配好了 GPU 支持，可以再试 `docker run --rm --gpus device=0 tiny-check:0.1 nvidia-smi -L`。能列出显卡，说明容器能用这张 GPU。报错也不影响这道题。
+--- hints
+- `docker build` 最后那个 `.` 表示「用当前文件夹」，要在 `tiny-serve` 里运行。
+- 看到 `files=[]`：挂载的本机路径不对，检查 `-v` 冒号前面的路径是不是真的指向 `models` 文件夹。
+- 看到 `can write to MODEL_DIR: yes`：`-v` 的最后忘了写 `:ro`。
+
+@@ item d23-14
+type: code
+title: 闭卷：KV cache 的字节数
+level: 1
+exam: yes
+cards: KV cache 的显存账
+targets: kv_cache_bytes
+ref: day23
+--- context
+KV cache 的公式是 LLM 部署面试里出现最多的一道计算题。能不看任何资料写出来、说清每个因子，你就能当场估出一张卡能服务多少请求。
+--- prompt
+写 `kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype)`，返回 KV cache 占的字节数（Python int）。`dtype` 是 PyTorch 的数据类型，比如 `torch.float16`。
+--- starter
+def kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype):
+    raise todo()
+--- solution
+def kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype):
+    bytes_per_number = dtype.itemsize                    # fp16 / bf16 -> 2，fp32 -> 4
+    return 2 * n_layers * n_kv_heads * head_dim * seq_len * batch * bytes_per_number   # 2 = K 和 V
+--- tests
+GiB = 1024 ** 3
+
+@check("Llama-2-7B：一条 4096 token 的序列占 2 GiB")
+def _():
+    got = kv_cache_bytes(32, 32, 128, 4096, 1, torch.float16)
+    true(isinstance(got, int), f"要返回 Python int，你返回的是 {type(got).__name__}")
+    true(got != GiB, "得到 1 GiB，正好少了一半：K 和 V 各存一份，要乘 2")
+    true(got == 2 * GiB, f"应该是 2 GiB = {2 * GiB} 字节，你的是 {got}（{got / GiB:.3g} GiB）")
+
+@check("GQA：按 KV head 数算，不按 q head 数")
+def _():
+    got = kv_cache_bytes(32, 8, 128, 8192, 1, torch.bfloat16)     # Llama-3-8B：8 个 KV head
+    true(got == GiB, f"Llama-3-8B 的 8192 个 token 应该是 1 GiB，你的是 {got / GiB:.3g} GiB")
+
+@check("batch 和 dtype 都算进去")
+def _():
+    base = kv_cache_bytes(4, 2, 64, 100, 1, torch.float16)
+    true(base == 204800, f"4 层、2 个 KV head、head_dim 64、100 个 token、fp16：应该是 204800 字节，你的是 {base}")
+    true(kv_cache_bytes(4, 2, 64, 100, 8, torch.float16) == 8 * base, "batch 从 1 变成 8，字节数应该变成 8 倍")
+    true(kv_cache_bytes(4, 2, 64, 100, 1, torch.float32) == 2 * base, "fp32 每个数 4 字节，应该是 fp16 的 2 倍")
+    true(kv_cache_bytes(4, 2, 64, 100, 1, torch.float8_e4m3fn) == base // 2,
+         "fp8 每个数 1 字节，应该是 fp16 的一半：用 dtype.itemsize，别自己写死字节数")
+
+@check("和 TinyLM 的 cache 实际大小一样")
+def _():
+    model = make_tiny_lm().to(torch.bfloat16)
+    with torch.inference_mode():
+        _, cache = model(torch.randint(0, 32, (3, 5)))            # batch 3，prefill 5 个 token
+        _, cache = model(torch.randint(0, 32, (3, 2)), cache)     # 再喂 2 个：一共 7 个
+    real = cache_bytes(cache)
+    want = kv_cache_bytes(model.n_layers, model.n_kv_heads, model.head_dim, 7, 3, torch.bfloat16)
+    true(want == real, f"TinyLM 的 cache 实际占 {real} 字节，你的公式算出 {want}")
+--- hints
+- 每一层、每个 KV head、每个 token 都存一个 k 向量和一个 v 向量，每个向量 head_dim 个数。
+- 每个数的字节数用 `dtype.itemsize`。
+
+@@ item d23-15
+type: code
+title: 闭卷：流式生成循环
+level: 2
+exam: yes
+cards: 生成分两段：prefill 和 decode; 流式输出：生成器一次吐一个 token
+targets: stream_tokens
+ref: day23
+--- context
+prefill + decode + 流式 + 停止条件，是所有 LLM 推理服务的骨架。不看答案写出来，你就能看懂任何推理框架的生成循环，也能在面试里当场写。
+--- prompt
+写生成器 `stream_tokens(model, prompt_ids, max_new_tokens, eos_id)`：贪心解码，一个一个地 yield 新 token（Python int）。
+
+- `prompt_ids`：(1, T) long。模型接口：`logits, cache = model(ids, cache)`。
+- 第一次把整个 prompt 喂进去（cache 为 `None`），之后每次只喂上一个新 token（形状 (1, 1)）并带上 cache。
+- 生成出 `eos_id` 就停，eos 不 yield；最多 yield `max_new_tokens` 个；最后一个 token 之后不再调用模型。
+--- starter
+def stream_tokens(model, prompt_ids, max_new_tokens, eos_id):
+    raise todo()
+--- solution
+@torch.inference_mode()                                  # 装饰器写法：生成器暂停时不影响调用方
+def stream_tokens(model, prompt_ids, max_new_tokens, eos_id):
+    ids, cache = prompt_ids, None
+    for _ in range(max_new_tokens):
+        logits, cache = model(ids, cache)                # 第一次：prefill 整个 prompt；之后：decode 1 个 token
+        tok = logits[0, -1].argmax().item()              # 贪心：取最大的；.item() 变成 Python int
+        if tok == eos_id:
+            return                                       # eos 不发给用户
+        yield tok
+        ids = torch.tensor([[tok]], device=prompt_ids.device)   # 下一步只喂这 1 个新 token
+--- tests
+import inspect
+PROMPT = torch.tensor([[12, 15, 21, 0, 3, 27]])
+
+@check("是生成器：第一个 token 出来时只做了 prefill")
+def _():
+    model = make_tiny_lm()
+    gen = stream_tokens(model, PROMPT, 5, eos_id=-1)
+    true(inspect.isgenerator(gen), "stream_tokens 要用 yield 写成生成器，而不是全部算完再 return 一个 list")
+    true(model.calls == [], f"还没取任何 token，模型就被调用了：{model.calls}")
+    first = next(gen, None)
+    true(first is not None, "max_new_tokens=5、没有 eos，生成器却一个 token 都没给")
+    true(model.calls == [6], f"取到第一个 token 时，调用记录应该是 [6]（prefill 一次喂进 6 个 token），你的是 {model.calls}")
+    true(type(first) is int, f"要 yield Python int（用 .item()），你 yield 的是 {type(first).__name__}")
+
+@check("prefill 一次，之后每步只喂 1 个 token，不多算")
+def _():
+    model = make_tiny_lm()
+    out = list(stream_tokens(model, PROMPT, 5, eos_id=-1))
+    true(len(out) == 5, f"max_new_tokens=5、没有 eos，应该正好 5 个 token，你给了 {len(out)} 个")
+    calls = model.calls
+    true(calls[:1] == [6], f"第一次调用要把整个 prompt（6 个 token）喂进去，你的调用记录是 {calls}")
+    true(all(c == 1 for c in calls[1:]),
+         f"调用记录 {calls}：decode 时每步只该喂 1 个新 token。每步都喂整个序列，就是没用上 KV cache")
+    true(len(calls) == 5,
+         f"调用了 {len(calls)} 次，应该是 5 次（1 次 prefill + 4 次 decode）。最后一个 token 发出去之后，不用再 forward")
+
+@check("结果和「每步从头重算」一模一样")
+def _():
+    for prompt in (PROMPT, torch.tensor([[5, 11, 12, 8, 31, 9, 2]])):
+        want = greedy_no_cache(make_tiny_lm(), prompt, 8)
+        got = list(stream_tokens(make_tiny_lm(), prompt, 8, eos_id=-1))
+        true(got == want, f"prompt {prompt.tolist()}：应该生成 {want}，你的是 {got}。decode 时要把上一次返回的 cache 传回去")
+
+@check("遇到 eos 就停，eos 不发出去")
+def _():
+    model = ScriptedLM([5, 7, 0, 9])                     # 第 3 次调用会生成 eos（id 0）
+    out = list(stream_tokens(model, PROMPT, 10, eos_id=0))
+    true(out == [5, 7], f"脚本是 5, 7, eos, 9：应该得到 [5, 7]，你的是 {out}")
+    true(len(model.calls) == 3, f"生成 eos 的那一步之后就该停：模型应该被调用 3 次，你的是 {len(model.calls)} 次")
+    out = list(stream_tokens(ScriptedLM([0, 4]), PROMPT, 10, eos_id=0))
+    true(out == [], f"第一个 token 就是 eos 时，什么都不发，你的是 {out}")
+
+@check("max_new_tokens 是硬上限")
+def _():
+    model = ScriptedLM([3])                              # 永远不生成 eos
+    out = list(stream_tokens(model, PROMPT, 4, eos_id=0))
+    true(out == [3, 3, 3, 3], f"max_new_tokens=4：应该正好 4 个 token，你的是 {out}")
+    model = ScriptedLM([3])
+    out = list(stream_tokens(model, PROMPT, 0, eos_id=0))
+    true(out == [] and model.calls == [], f"max_new_tokens=0：什么都不生成，也不调用模型。你得到 {out}，调用记录 {model.calls}")
+--- hints
+- 循环 `max_new_tokens` 次，每次开头调用一次模型；ids 第一次是整个 prompt，之后是 `torch.tensor([[tok]])`。
+- eos 检查放在 yield 前面。

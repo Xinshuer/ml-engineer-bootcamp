@@ -1,0 +1,922 @@
+@@ day 6
+title: Reading other people's code, tuning other people's models
+part: LLMs
+hours: 3–4 hours
+--- goal
+After today you can read and write the core of LoRA fine-tuning (a frozen base, a low-rank side path, merging the weights), build SFT labels and chat templates correctly, write gradient accumulation and a warmup + cosine learning rate, and estimate how much memory a fine-tuning run needs.
+--- checklist
+- Empty your Review list first (redo from blank anything where you saw the answer yesterday)
+- Read all 8 cards; press Run on each, change one number and run it again
+- Pass every practice exercise (d6-01 to d6-13)
+- Finish with the closed-book part: write LoRALinear and gradient accumulation without the cards
+
+@@ concept
+title: LoRA: keep W, add a small side path
+--- body
+Fine-tuning means taking a model someone else trained and training it a bit more on your own data. Full fine-tuning updates every parameter. A 7B model has 7 billion parameters, which does not fit on a normal GPU (the last card, "The memory bill", does the math).
+
+LoRA (Low-Rank Adaptation) leaves the original weight `W` (shape `(out, in)`) untouched and adds a small side path next to it:
+
+```
+y = base(x) + (x @ A.T @ B.T) * scaling
+```
+
+- `A` has shape `(r, in)` and `B` has shape `(out, r)`.
+- `r` is the rank. It is small: 4, 8 and 16 are common.
+- `x @ A.T` squeezes x down to r numbers; `@ B.T` expands it back to out numbers. So the side path has the same shape as `base(x)`, and the two can be added.
+- `B @ A` has shape `(out, in)`, as big as `W`, but it is built from only `r*in + out*r` numbers.
+
+The code below does the math for a 4096×4096 layer: the original weight has 16,777,216 parameters; with r = 8, A and B together have only 65,536, which is 0.39%.
+--- code
+in_f, out_f, r = 4096, 4096, 8
+full = in_f * out_f
+lora = r * in_f + out_f * r
+print("original weight parameters:", full)
+print("A + B parameters:", lora)
+print(f"ratio: {lora / full:.2%}")
+
+# look at the shapes with small sizes
+x = torch.randn(2, 16)     # 2 samples, in = 16
+A = torch.randn(4, 16)     # (r, in)
+B = torch.randn(8, 4)      # (out, r)
+print("x @ A.T:", tuple((x @ A.T).shape))
+print("x @ A.T @ B.T:", tuple((x @ A.T @ B.T).shape))
+
+@@ concept
+title: Three LoRA details: freeze, B = 0, alpha / r
+--- body
+Whether you write LoRA code or read someone else's, check these three things first. Getting any of them wrong raises no error; fine-tuning just works worse.
+
+1. **Freeze the base**: `for p in base.parameters(): p.requires_grad_(False)`. A parameter with `requires_grad=False` still has `.grad == None` after backward, and the optimizer does not change it. Only A and B train. To check: count the trainable parameters. They should be exactly the size of A plus B.
+2. **B starts at all zeros, A starts with small random numbers** (for example `normal_(0, 0.01)`). At the start `B @ A` is all zeros, the side path outputs 0, and the model gives exactly the same outputs as the original. Fine-tuning starts from the original model, not from "the original model plus random noise".
+3. **scaling = alpha / r**: alpha is a hyperparameter (often 1 to 2 times r). Dividing by r means that when you change r, the size of the side path's output barely changes, so you do not have to re-tune the learning rate. With alpha = 8 and r = 4, scaling = 2.0.
+
+New matrices must be wrapped in `nn.Parameter`. Only then does the module count them in `parameters()`, and only then does the optimizer update them.
+
+The code also shows how the gradients flow at the first step: B gets a gradient (B's gradient is multiplied by `x @ A.T`, and A is not zero); A's gradient is zero (it is multiplied by B, and B is zero). After one update B is no longer zero, and then A gets gradients too.
+--- code
+torch.manual_seed(0)
+base = nn.Linear(16, 8)
+for p in base.parameters():
+    p.requires_grad_(False)                      # 1) freeze the base
+A = nn.Parameter(torch.randn(4, 16) * 0.01)      # 2) A: small random numbers
+B = nn.Parameter(torch.zeros(8, 4))              #    B: all zeros
+scaling = 8 / 4                                  # 3) alpha / r
+
+x = torch.randn(3, 16)
+y = base(x) + (x @ A.T @ B.T) * scaling
+print("same output as the original model:", torch.allclose(y, base(x)))
+
+y.sum().backward()
+print("base.weight.grad:", base.weight.grad)
+print("B has a gradient:", bool(B.grad.abs().sum() > 0))
+print("A has a gradient:", bool(A.grad.abs().sum() > 0))
+
+@@ concept
+title: Merging LoRA: no extra cost at inference
+--- body
+After training, A and B no longer change. If you keep the side path in production, every layer does two extra matrix multiplications. You can instead "merge" the side path into the original weight.
+
+You can move the brackets in a chain of matrix products, and `A.T @ B.T == (B @ A).T`, so:
+
+```
+x @ A.T @ B.T * s  ==  x @ (s * B @ A).T
+```
+
+Therefore:
+
+```
+W_merged = W + s * (B @ A)     # shape (out, in), same as W
+the bias stays the same
+```
+
+The merged layer is a plain `nn.Linear`: the same number of parameters and the same speed as the original model. Mind the order: it is `B @ A`; `A @ B` has the wrong shape.
+
+To write values into the parameters of an `nn.Linear`, use `.copy_()` inside `with torch.no_grad():`. Without it you get an error: a parameter that requires grad cannot be changed in place.
+--- code
+torch.manual_seed(0)
+W = torch.randn(8, 16)
+A, B, s = torch.randn(4, 16), torch.randn(8, 4), 2.0
+x = torch.randn(3, 16)
+
+two_paths = x @ W.T + (x @ A.T @ B.T) * s        # original weight + side path
+W_merged = W + s * (B @ A)
+print("shape of B @ A:", tuple((B @ A).shape))
+
+lin = nn.Linear(16, 8, bias=False)
+with torch.no_grad():
+    lin.weight.copy_(W_merged)
+print("same output after merging:", torch.allclose(lin(x), two_paths, atol=1e-4))
+print("parameters after merging:", sum(p.numel() for p in lin.parameters()))
+
+@@ concept
+title: SFT labels: -100 means no loss
+--- body
+SFT (Supervised Fine-Tuning) trains a model on "question + good answer" pairs. One sample is the prompt's tokens followed by the answer's tokens, joined into one `input_ids`.
+
+We want the model to learn to write the answer, not to repeat the question. So we build `labels` as long as `input_ids`: -100 over the prompt, a copy of `input_ids` over the answer.
+
+- `F.cross_entropy` has an argument `ignore_index`, and its default is -100. A position whose label is -100 adds nothing to the loss, **and is not counted in the average's denominator**.
+- labels must be `torch.long` (integers).
+- "Token t predicts token t+1" needs a shift by one. Hugging Face language models do this shift inside their loss code, so you write labels aligned with input_ids.
+- If you get it wrong (forget the mask, or mask the answer too), the code still runs and the loss still goes down, but the model learns the wrong thing. The only way to catch it is to print the labels.
+
+Below, logits are the model's raw scores for every word (before softmax). The two losses should be the same.
+--- code
+torch.manual_seed(0)
+input_ids = torch.tensor([11, 12, 13, 21, 22])   # first 3 are the prompt, last 2 the answer
+labels = input_ids.clone()
+labels[:3] = -100
+print("labels:", labels.tolist())
+
+logits = torch.randn(5, 30)                       # 5 positions, a score for each of 30 words
+masked = F.cross_entropy(logits, labels)          # positions with -100 are skipped
+answer_only = F.cross_entropy(logits[3:], input_ids[3:])
+print("loss with -100:", round(masked.item(), 4))
+print("loss of the answer only:", round(answer_only.item(), 4))
+
+@@ concept
+title: Chat templates: turning a conversation into text
+--- body
+A chat model was not trained on Python lists. It was trained on text with special markers. The rule that turns a `messages` list into that text is called the chat template. Each model family has its own. Fine-tuning and inference must both use the template the model was trained with; one missing newline can make the model answer nonsense.
+
+Many models, Qwen among them, use the ChatML format. Each message becomes:
+
+```
+<|im_start|>{role}\n{content}<|im_end|>\n
+```
+
+- `<|im_start|>` and `<|im_end|>` are special tokens that mark where a message starts and ends.
+- role is `system` (the setup instructions), `user` or `assistant` (the model).
+- At inference time you append `<|im_start|>assistant\n` (the argument `add_generation_prompt=True`). It means "your turn". The model continues from there and stops when it writes `<|im_end|>`.
+- For SFT you do not add it, because the assistant's answer is already in the data. The `prompt_len` of the previous card is the number of tokens before the text of the assistant's answer (including `<|im_start|>assistant\n`).
+
+Printing a string with `repr()` shows the newline characters `\n`.
+--- code
+m = {"role": "user", "content": "1+1=?"}
+one = f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"
+print(one)
+print(repr(one))
+print(repr("<|im_start|>assistant\n"))
+
+@@ concept
+title: Gradient accumulation: small batches add up to a big one
+--- body
+Your GPU fits 8 samples at a time, but you want the effect of batch = 32? Feed 8 at a time, do forward + backward 4 times, and only then update the parameters. This is gradient accumulation.
+
+It works because `.backward()` **adds** the gradient to `.grad` instead of overwriting it. That is why a normal training step starts with `zero_grad()`, and why gradient accumulation deliberately waits a few steps before clearing.
+
+One trap: `F.cross_entropy` takes the **mean** over the batch by default. Adding up the means of 4 chunks gives 4 times the mean of the big batch. So divide each chunk's loss by the number of chunks `n_micro`:
+
+```
+model.zero_grad()
+for each chunk (xb, yb):
+    loss = F.cross_entropy(model(xb), yb) / n_micro
+    loss.backward()          # the gradient is added to .grad
+optimizer.step()             # one update after all the chunks
+```
+
+If you forget to divide, nothing crashes; the gradient is just n_micro times too big. With SGD that secretly multiplies the learning rate by n_micro, and gradient clipping and the printed loss are off too.
+--- code
+torch.manual_seed(0)
+model = nn.Linear(3, 2)
+xs, ys = torch.randn(8, 3), torch.randint(0, 2, (8,))
+
+model.zero_grad()
+F.cross_entropy(model(xs), ys).backward()           # all 8 at once
+big = model.weight.grad.clone()
+
+model.zero_grad()
+F.cross_entropy(model(xs[:4]), ys[:4]).backward()   # first 4
+F.cross_entropy(model(xs[4:]), ys[4:]).backward()   # last 4: the gradient is added
+print("plain sum == big batch?", torch.allclose(model.weight.grad, big))
+print("sum / 2 == big batch?", torch.allclose(model.weight.grad / 2, big))
+
+@@ concept
+title: Warmup + cosine: the learning rate goes up, then down
+--- body
+The learning rate (lr) does not stay the same for the whole run. The most common plan for training large models has three parts:
+
+1. **Warmup**: over the first `warmup_iters` steps, the lr rises in a straight line from very small to `max_lr`. At the start the model and Adam's running statistics are unstable, and a big lr right away can blow up the training.
+2. **Cosine decay**: then the lr falls along a cosine curve from `max_lr` to `min_lr`.
+3. After `max_iters`, it stays at `min_lr`.
+
+The formulas (`it` is the step number, starting at 0):
+
+```
+warmup:  lr = max_lr * (it + 1) / warmup_iters
+cosine:  progress = (it - warmup_iters) / (max_iters - warmup_iters)   # 0 → 1
+         coeff = 0.5 * (1 + cos(pi * progress))                        # 1 → 0
+         lr = min_lr + coeff * (max_lr - min_lr)
+```
+
+Why `it + 1`: then step 0 does not have lr = 0 (a step with lr 0 is wasted), and the last warmup step, `it = warmup_iters - 1`, lands exactly on `max_lr`. At progress = 0.5 (the middle of the cosine part), coeff = 0.5, so the lr is exactly the average of max_lr and min_lr.
+--- code
+for progress in [0, 0.25, 0.5, 0.75, 1.0]:
+    coeff = 0.5 * (1 + math.cos(math.pi * progress))
+    print("progress", progress, "-> coeff", round(coeff, 3))
+
+@@ concept
+title: The memory bill: weights, gradients, optimizer states
+--- body
+During training, GPU memory holds four main things:
+
+1. The parameters (weights)
+2. The gradients: one per parameter
+3. The optimizer states: AdamW keeps 2 numbers per parameter (`exp_avg`, the first moment, and `exp_avg_sq`, the second moment); SGD with momentum keeps 1; plain SGD keeps none
+4. The activations: intermediate results of the forward pass that backward needs. They depend on the batch size and sequence length; we leave them out today
+
+The first three depend only on the number of parameters, so you can compute them directly. In fp32 each number takes 4 bytes. AdamW stores "parameter + gradient + 2 states" = 4 copies, so 16 bytes per parameter (here 1 GB = 10^9 bytes):
+
+- 1 billion (1B) parameters → 16 GB
+- 7 billion (7B) parameters → 112 GB, more than one 80 GB GPU holds, before any activations
+
+Where LoRA saves: the frozen base has no gradients and no optimizer states, only the parameters themselves. Gradients and optimizer states are kept only for A and B, which are less than 1% of the parameters.
+
+In the code below, `step` is just a counter and takes almost no space; `exp_avg` and `exp_avg_sq` are each as big as the weight.
+--- code
+model = nn.Linear(100, 10)                       # 100*10 + 10 = 1010 parameters
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+model(torch.randn(4, 100)).sum().backward()
+opt.step()                                       # the states are created at the first step
+
+state = opt.state[model.weight]
+print({k: tuple(v.shape) for k, v in state.items()})
+n = sum(p.numel() for p in model.parameters())
+print("parameters:", n)
+print("parameters + gradients + 2 states:", n * 4 * 4, "bytes")
+print("7B model:", 7_000_000_000 * 4 * 4 / 1e9, "GB")
+
+@@ item d6-01
+type: code
+title: The LoRALinear layer
+level: 2
+cards: LoRA: keep W, add a small side path; Three LoRA details: freeze, B = 0, alpha / r
+targets: LoRALinear
+ref: day6
+--- context
+Open models have billions of parameters, so individuals and small teams fine-tune them almost exclusively with LoRA. When you read a library like Hugging Face PEFT, the core is a small class like this one: freeze the original Linear and train only two small matrices next to it.
+--- prompt
+Write `LoRALinear(base, r=4, alpha=8)`. It wraps an already-trained `nn.Linear` and adds a low-rank side path next to it.
+
+In `__init__`:
+- `self.base = base`, and freeze **all** of base's parameters (`requires_grad_(False)`)
+- `self.A`: an `nn.Parameter` of shape `(r, in_features)`, initialised with `normal_(0, 0.01)`
+- `self.B`: an `nn.Parameter` of shape `(out_features, r)`, **all zeros**
+- `self.scaling = alpha / r`
+
+`forward(x)`: return `base(x) + (x @ A.T @ B.T) * scaling`. x can have shape `(N, in)` or `(B, T, in)`.
+
+You can read `in_features` and `out_features` from `base.in_features` and `base.out_features`.
+--- starter
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, r=4, alpha=8):
+        super().__init__()
+        # 1) keep base and freeze all its parameters
+        # 2) A: (r, in_features), normal_(0, 0.01); B: (out_features, r), all zeros
+        # 3) scaling = alpha / r
+        raise todo()
+
+    def forward(self, x):
+        raise todo()
+--- solution
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, r=4, alpha=8):
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad_(False)
+        self.A = nn.Parameter(torch.empty(r, base.in_features).normal_(0, 0.01))
+        self.B = nn.Parameter(torch.zeros(base.out_features, r))   # must be zeros
+        self.scaling = alpha / r
+
+    def forward(self, x):
+        return self.base(x) + (x @ self.A.T @ self.B.T) * self.scaling
+--- tests
+@check("LoRALinear structure")
+def t01():
+    seed(0)
+    base = nn.Linear(16, 8)
+    m = LoRALinear(base, r=4, alpha=8)
+    shape_is(m(torch.randn(2, 5, 16)), (2, 5, 8), "forward should return the same shape as base(x)")
+    true(close(m.scaling, 2.0), f"scaling should be alpha/r = 2.0, yours is {m.scaling}")
+    shape_is(m.A, (4, 16), "A should have shape (r, in_features)")
+    shape_is(m.B, (8, 4), "B should have shape (out_features, r)")
+
+@check("Same output as the base at the start")
+def t02():
+    seed(1)
+    base = nn.Linear(16, 8)
+    x = torch.randn(3, 16)
+    before = base(x).clone()
+    m = LoRALinear(base, r=4, alpha=8)
+    eq(m(x), before, msg="B is not initialised to 0: the output changes before any training, which damages the pretrained weights for nothing")
+
+@check("The base is frozen")
+def t03():
+    m = LoRALinear(nn.Linear(16, 8), r=4)
+    true(trainable(m) == 4 * 16 + 8 * 4, f"trainable parameters should be A + B = 96, got {trainable(m)}")
+    true(params(m) == 16 * 8 + 8 + 96, f"total parameters should be base 136 + A and B 96 = 232, got {params(m)}")
+    names = {n for n, p in m.named_parameters() if p.requires_grad}
+    true(all("base" not in n for n in names), f"the base is not frozen; these base parameters can still train: {names}")
+--- hints
+- Freezing: `for p in self.base.parameters(): p.requires_grad_(False)`.
+- Wrap new matrices in `nn.Parameter`: `nn.Parameter(torch.empty(r, base.in_features).normal_(0, 0.01))`; for B use `torch.zeros(base.out_features, r)`.
+- forward is one line: `return self.base(x) + (x @ self.A.T @ self.B.T) * self.scaling`.
+
+@@ item d6-02
+type: code
+title: Merge the LoRA weights
+level: 2
+cards: Merging LoRA: no extra cost at inference; LoRA: keep W, add a small side path
+targets: merge_lora
+ref: day6
+--- context
+A trained LoRA is usually merged into the original weights before it goes to production (PEFT calls this merge_and_unload). The result is a plain Linear: inference is as fast as the original model, and the deployment does not need any LoRA code.
+--- prompt
+Write `merge_lora(m)`. It takes a trained `LoRALinear` (the class is already defined for you) and returns a **new** `nn.Linear` with:
+- `weight = m.base.weight + m.scaling * (m.B @ m.A)`
+- the same bias as `m.base.bias` (if base has no bias, the new layer has none either)
+- the same output as `m(x)` for the same input (within 1e-5)
+- only weight and bias; no A and B
+
+Write values into the parameters with `.copy_(...)` inside `with torch.no_grad():`.
+--- starter
+def merge_lora(m: LoRALinear) -> nn.Linear:
+    """Merge the LoRA back into a plain nn.Linear: W' = W + scaling * B @ A, bias unchanged."""
+    raise todo()
+--- solution
+def merge_lora(m):
+    out_f, in_f = m.base.out_features, m.base.in_features
+    lin = nn.Linear(in_f, out_f, bias=m.base.bias is not None)
+    with torch.no_grad():
+        lin.weight.copy_(m.base.weight + m.scaling * (m.B @ m.A))
+        if m.base.bias is not None:
+            lin.bias.copy_(m.base.bias)
+    return lin
+--- tests
+@check("Merge the LoRA weights")
+def t04():
+    seed(2)
+    m = LoRALinear(nn.Linear(16, 8), r=4, alpha=8)
+    with torch.no_grad():                      # a non-zero B, as if it had been trained
+        m.B.normal_(0, 0.5)
+    x = torch.randn(3, 16)
+    merged = merge_lora(m)
+    true(isinstance(merged, nn.Linear), "return a plain nn.Linear")
+    eq(merged(x), m(x), tol=1e-5, msg="the output changed after merging: check the order of B @ A, the scaling and the bias")
+    true(params(merged) == 16 * 8 + 8, "the merged layer should have only weight and bias, not A and B")
+--- hints
+- Start with a layer of the same size: `nn.Linear(m.base.in_features, m.base.out_features, bias=m.base.bias is not None)`.
+- Check the shapes: `B` is `(out, r)`, `A` is `(r, in)`, so `B @ A` is `(out, in)`, the same as weight.
+- Inside `with torch.no_grad():` write `lin.weight.copy_(m.base.weight + m.scaling * (m.B @ m.A))`, and copy the bias over with `copy_` too.
+
+@@ item d6-03
+type: code
+title: LoRA's share of the parameters
+level: 1
+cards: LoRA: keep W, add a small side path; The memory bill: weights, gradients, optimizer states
+targets: lora_ratio
+ref: day6
+--- context
+"Why is LoRA so cheap?" is a common interview question, and a good answer has numbers in it: for a 4096×4096 layer with r = 8, LoRA trains less than 0.5% of the original parameters.
+--- prompt
+Write `lora_ratio(in_f, out_f, r)`. Return "LoRA's parameter count / the original weight's parameter count" (no biases on either side).
+
+- original weight W: shape `(out_f, in_f)`
+- A: shape `(r, in_f)`; B: shape `(out_f, r)`
+
+Example: `lora_ratio(4096, 4096, 8)` is about 0.0039.
+--- starter
+def lora_ratio(in_f, out_f, r):
+    """Return LoRA's parameter count / the original weight's parameter count (no bias)."""
+    raise todo()
+--- solution
+def lora_ratio(in_f, out_f, r):
+    return (r * in_f + out_f * r) / (in_f * out_f)
+--- tests
+@check("LoRA's share of the parameters")
+def t05():
+    true(close(lora_ratio(4096, 4096, 8), 2 * 8 / 4096, 1e-9),
+         f"should be (8*4096 + 4096*8) / (4096*4096) ≈ 0.0039, you got {lora_ratio(4096, 4096, 8)}")
+    true(lora_ratio(4096, 4096, 8) < 0.005, "with r = 8 it should be below 0.5%")
+--- hints
+- A matrix has rows × columns parameters.
+- The top is A plus B: `r * in_f + out_f * r`; the bottom is W: `in_f * out_f`.
+
+@@ item d6-04
+type: code
+title: SFT labels with the -100 mask
+level: 1
+cards: SFT labels: -100 means no loss
+targets: build_sft_labels
+ref: day6
+--- context
+In SFT the model should learn how to answer, not how to repeat the question. With wrong labels, training still runs and the loss still goes down, but the model gets worse, and nothing ever reports an error.
+--- prompt
+Write `build_sft_labels(input_ids, prompt_len, ignore_index=-100)`.
+
+- `input_ids`: an integer tensor of shape `(T,)`, the prompt and the answer joined into one row of tokens.
+- Return `labels`: shape `(T,)`, dtype `torch.long`.
+  - the first `prompt_len` positions are `ignore_index`
+  - the other positions equal `input_ids`
+- Do not change the `input_ids` you were given (clone it first).
+
+Example: `input_ids = [5, 6, 7, 8, 9]`, `prompt_len = 3` → `[-100, -100, -100, 8, 9]`.
+--- starter
+def build_sft_labels(input_ids, prompt_len, ignore_index=-100):
+    """input_ids: (T,), all the tokens of prompt + answer.
+    Return labels: (T,), ignore_index for the first prompt_len, a copy of input_ids after that."""
+    raise todo()
+--- solution
+def build_sft_labels(input_ids, prompt_len, ignore_index=-100):
+    lab = input_ids.clone().long()
+    lab[:prompt_len] = ignore_index
+    return lab
+--- tests
+@check("SFT labels with the -100 mask")
+def t06():
+    ids = torch.tensor([5, 6, 7, 8, 9])
+    lab = build_sft_labels(ids, prompt_len=3)
+    eq(lab, torch.tensor([-100, -100, -100, 8, 9]), msg="the first 3 should be -100, the rest a copy of input_ids")
+    true(lab.dtype == torch.long, f"labels must be torch.long, yours are {lab.dtype}")
+    true(ids.tolist() == [5, 6, 7, 8, 9], "you changed the input_ids that were passed in: clone() them first")
+    # check that cross_entropy really ignores -100
+    logits = torch.randn(5, 20)
+    l_all = F.cross_entropy(logits, ids)
+    l_ans = F.cross_entropy(logits, lab)
+    l_manual = F.cross_entropy(logits[3:], ids[3:])
+    eq(l_ans, l_manual, msg="-100 should be ignored completely, and the mean should count only the valid positions")
+    true(not close(l_all, l_ans), "the mask has no effect")
+--- hints
+- `labels = input_ids.clone().long()` makes a copy and makes sure it is long.
+- Assign to a slice: `labels[:prompt_len] = ignore_index`, then return it.
+
+@@ item d6-05
+type: code
+title: Build a chat template
+level: 1
+cards: Chat templates: turning a conversation into text
+targets: apply_chat_template
+ref: day6
+--- context
+A chat model only understands the format it was trained on; one missing newline can make it answer nonsense. Both fine-tuning and inference start by turning the messages into this text, and it is one of the most common places for bugs in other people's inference code.
+--- prompt
+Write `apply_chat_template(messages, add_generation_prompt=True)`. It joins a conversation into one string in the ChatML format.
+
+- `messages` is a list; each element looks like `{"role": "user", "content": "Hi"}`. The role can be system, user or assistant.
+- Each message becomes: `<|im_start|>` + role + newline + content + `<|im_end|>` + newline. Join them in order.
+- When `add_generation_prompt=True`, append `<|im_start|>assistant` + newline at the end, so the model continues with its answer.
+
+Example: the user says Hi and the assistant says Hello. With `add_generation_prompt=False` the result (shown with repr) is:
+
+```
+'<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello<|im_end|>\n'
+```
+--- starter
+def apply_chat_template(messages, add_generation_prompt=True):
+    """messages: [{"role": ..., "content": ...}, ...] -> one string in the ChatML format."""
+    raise todo()
+--- solution
+def apply_chat_template(messages, add_generation_prompt=True):
+    s = "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages)
+    if add_generation_prompt:
+        s += "<|im_start|>assistant\n"
+    return s
+--- tests
+@check("Build a chat template")
+def t07():
+    msgs = [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}]
+    s = apply_chat_template(msgs, add_generation_prompt=False)
+    true(s == "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello<|im_end|>\n",
+         f"the string is wrong (mind the newline at the end of each part).\n       yours: {s!r}")
+    s2 = apply_chat_template([msgs[0]], add_generation_prompt=True)
+    true(s2.endswith("<|im_start|>assistant\n"),
+         f"with add_generation_prompt=True the string should end with '<|im_start|>assistant\\n'.\n       yours: {s2!r}")
+--- hints
+- One message: `f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"`.
+- Join all the messages with `"".join(...)`, then use `add_generation_prompt` to decide whether to add `"<|im_start|>assistant\n"`.
+
+@@ item d6-06
+type: code
+title: Gradient accumulation == a big batch
+level: 2
+cards: Gradient accumulation: small batches add up to a big one
+targets: grad_accum_step
+ref: day6
+--- context
+Your GPU fits batch = 8, but the paper used batch = 32? Almost every fine-tuning script solves this with gradient accumulation. Getting it wrong (for example, forgetting to divide by the number of chunks) raises no error; the gradients just quietly become several times too big.
+--- prompt
+Write `grad_accum_step(model, xs, ys, n_micro)`.
+
+- `xs`: inputs of shape `(N, ...)`; `ys`: class labels of shape `(N,)`. N is divisible by `n_micro`.
+- Clear the old gradients first. Then cut the big batch, in order, into `n_micro` equal chunks (each one is a micro-batch). For each chunk: forward, `F.cross_entropy`, backward.
+- The accumulated gradients must equal the gradients of feeding all N samples at once (within 1e-5).
+- Return a dict `{parameter name: a clone of its gradient}`, walking `model.named_parameters()`.
+
+No optimizer, and do not update the parameters.
+--- starter
+def grad_accum_step(model, xs, ys, n_micro):
+    """Cut the big batch into n_micro chunks and run forward/backward on each, so the accumulated
+    gradients equal those of the big batch. Return {parameter name: grad.clone()}."""
+    raise todo()
+--- solution
+def grad_accum_step(model, xs, ys, n_micro):
+    model.zero_grad(set_to_none=True)
+    n = xs.size(0) // n_micro
+    for i in range(n_micro):
+        xb, yb = xs[i * n:(i + 1) * n], ys[i * n:(i + 1) * n]
+        # each chunk's loss is already a mean over the chunk; dividing by the number of chunks gives the overall mean
+        (F.cross_entropy(model(xb), yb) / n_micro).backward()
+    return {k: p.grad.clone() for k, p in model.named_parameters()}
+--- tests
+@check("Gradient accumulation == a big batch")
+def t08():
+    seed(3)
+    model = nn.Linear(6, 4)
+    xs, ys = torch.randn(32, 6), torch.randint(0, 4, (32,))
+
+    model.zero_grad()
+    F.cross_entropy(model(xs), ys).backward()
+    ref = {n: p.grad.clone() for n, p in model.named_parameters()}
+
+    got = grad_accum_step(model, xs, ys, n_micro=4)
+    for n in ref:
+        eq(got[n], ref[n], tol=1e-5,
+           msg=f"the gradient of {n} does not match. Exactly 4 times too big: you forgot to divide by n_micro; off by more: maybe the old gradients were not cleared first")
+--- hints
+- Start with `model.zero_grad()`. Each chunk has `n = xs.size(0) // n_micro` samples; chunk i is `xs[i*n:(i+1)*n]`.
+- `cross_entropy` takes the mean over the chunk. Adding n_micro means gives n_micro times too much, so divide each chunk's loss by `n_micro` before backward.
+- At the end: `return {k: p.grad.clone() for k, p in model.named_parameters()}`.
+
+@@ item d6-07
+type: code
+title: Warmup + cosine schedule
+level: 2
+cards: Warmup + cosine: the learning rate goes up, then down
+targets: get_lr
+ref: day6
+--- context
+Training scripts for large models, such as nanoGPT and Llama, almost all use warmup + cosine. When you read someone's script you should see the lr curve at a glance. Write it wrong and training can blow up at the start, or the lr can still be large when training should be settling down.
+--- prompt
+Write `get_lr(it, warmup_iters, max_iters, max_lr, min_lr)`. Return the learning rate at step `it` (counting from 0). Three parts:
+
+1. `it < warmup_iters`: linear warmup, `max_lr * (it + 1) / warmup_iters`
+2. `warmup_iters <= it <= max_iters`: cosine decay
+   - `progress = (it - warmup_iters) / (max_iters - warmup_iters)` (goes from 0 to 1)
+   - `coeff = 0.5 * (1 + cos(pi * progress))` (goes from 1 to 0)
+   - return `min_lr + coeff * (max_lr - min_lr)`
+3. `it > max_iters`: always `min_lr`
+
+You can use `math.cos` and `math.pi`.
+--- starter
+def get_lr(it, warmup_iters, max_iters, max_lr, min_lr):
+    """Learning rate at step it: linear warmup -> cosine decay -> stay at min_lr."""
+    raise todo()
+--- solution
+def get_lr(it, warmup_iters, max_iters, max_lr, min_lr):
+    if it < warmup_iters:
+        return max_lr * (it + 1) / warmup_iters
+    if it > max_iters:
+        return min_lr
+    progress = (it - warmup_iters) / (max_iters - warmup_iters)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + coeff * (max_lr - min_lr)
+--- tests
+@check("Warmup + cosine schedule")
+def t09():
+    f = lambda it: get_lr(it, 100, 1000, 6e-4, 6e-5)
+    true(close(f(0), 6e-6, 1e-9), f"step 0 should be max_lr / warmup_iters = 6e-6, yours is {f(0)}")
+    true(close(f(99), 6e-4, 1e-9), f"the last warmup step (it = 99) should reach max_lr exactly, yours is {f(99)}")
+    true(close(f(100), 6e-4, 1e-9), f"the first cosine step (it = 100) should still be max_lr, with no jump, yours is {f(100)}")
+    true(close(f(550), (6e-4 + 6e-5) / 2, 1e-7), f"the middle of the cosine part (it = 550) should be the average of max_lr and min_lr, yours is {f(550)}")
+    true(close(f(1000), 6e-5, 1e-9), f"step max_iters should be exactly min_lr, yours is {f(1000)}")
+    true(close(f(5000), 6e-5, 1e-9), f"after max_iters it should stay at min_lr, yours is {f(5000)}")
+--- hints
+- Use `if` for the three parts: handle `it < warmup_iters` first, then `it > max_iters`; what is left is the cosine part.
+- The cosine part: `progress = (it - warmup_iters) / (max_iters - warmup_iters)`, `coeff = 0.5 * (1.0 + math.cos(math.pi * progress))`, `return min_lr + coeff * (max_lr - min_lr)`.
+
+@@ item d6-08
+type: code
+title: Estimate the optimizer memory
+level: 1
+cards: The memory bill: weights, gradients, optimizer states
+targets: optimizer_memory_bytes
+ref: day6
+--- context
+At work and in interviews you will hear: "Can I train this model on my GPU?" Work out the parameters, gradients and optimizer states first, and you can tell right away whether full fine-tuning fits or whether you need LoRA.
+--- prompt
+Write `optimizer_memory_bytes(n_params, dtype_bytes=4, optimizer="adamw")`. Return how many bytes "parameters + gradients + optimizer states" take during training (no activations).
+
+Each number takes `dtype_bytes` bytes (4 for fp32). How many copies per parameter depends on the optimizer:
+- `"adamw"`: parameter, gradient, first moment, second moment → 4 copies
+- `"sgd"`: parameter, gradient → 2 copies
+- `"sgd_momentum"`: parameter, gradient, momentum → 3 copies
+
+Example: 1 billion parameters, fp32, AdamW → 16,000,000,000 bytes (16 GB).
+--- starter
+def optimizer_memory_bytes(n_params, dtype_bytes=4, optimizer="adamw"):
+    """Bytes for parameters + gradients + optimizer states (no activations)."""
+    raise todo()
+--- solution
+def optimizer_memory_bytes(n_params, dtype_bytes=4, optimizer="adamw"):
+    mult = {"adamw": 4, "sgd": 2, "sgd_momentum": 3}[optimizer]
+    return n_params * dtype_bytes * mult
+--- tests
+@check("Estimate the optimizer memory")
+def t10():
+    true(optimizer_memory_bytes(1_000_000_000) == 16_000_000_000,
+         "1B parameters with fp32 AdamW need 16 GB; that is why full fine-tuning of a 7B model does not fit on one GPU")
+    true(optimizer_memory_bytes(1_000_000, optimizer="sgd") == 8_000_000,
+         "sgd keeps only parameter + gradient, 2 copies: 1,000,000 × 4 bytes × 2 = 8,000,000")
+    true(optimizer_memory_bytes(1_000_000, optimizer="sgd_momentum") == 12_000_000,
+         "sgd_momentum keeps parameter + gradient + momentum, 3 copies: 1,000,000 × 4 bytes × 3 = 12,000,000")
+--- hints
+- Bytes = number of parameters × bytes per number × number of copies.
+- Look up the number of copies in a dict: `{"adamw": 4, "sgd": 2, "sgd_momentum": 3}[optimizer]`.
+
+@@ item d6-09
+type: fix
+title: Find the bugs: LoRABuggy
+level: 2
+cards: Three LoRA details: freeze, B = 0, alpha / r; LoRA: keep W, add a small side path
+targets: LoRABuggy
+ref: day6
+--- context
+The most common "read someone else's code" situation: a colleague's LoRA trains badly, and the code raises no error. You can only find this kind of bug if you know what a correct LoRA must satisfy.
+--- prompt
+The `LoRABuggy` below runs, but it has **3 bugs**. Each one makes fine-tuning worse without raising an error. Find and fix them; do not change the class name or its arguments.
+
+After the fix:
+- right after creation, the output is exactly the output of `base`
+- only A and B are trainable (the base is frozen)
+- `scaling == alpha / r`
+--- starter
+class LoRABuggy(nn.Module):
+    def __init__(self, base, r=4, alpha=8):
+        super().__init__()
+        self.base = base
+        self.A = nn.Parameter(torch.randn(r, base.in_features) * 0.01)
+        self.B = nn.Parameter(torch.randn(base.out_features, r) * 0.01)
+        self.scaling = alpha * r
+
+    def forward(self, x):
+        return self.base(x) + (x @ self.A.T @ self.B.T) * self.scaling
+--- solution
+class LoRABuggy(nn.Module):
+    def __init__(self, base, r=4, alpha=8):
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():      # fix 1: freeze the base
+            p.requires_grad_(False)
+        self.A = nn.Parameter(torch.randn(r, base.in_features) * 0.01)
+        self.B = nn.Parameter(torch.zeros(base.out_features, r))   # fix 2: B starts at 0
+        self.scaling = alpha / r                                   # fix 3: divide, do not multiply
+
+    def forward(self, x):
+        return self.base(x) + (x @ self.A.T @ self.B.T) * self.scaling
+--- tests
+@check("Find the bugs: LoRABuggy")
+def t11():
+    seed(4)
+    base = nn.Linear(16, 8)
+    x = torch.randn(3, 16)
+    before = base(x).clone()
+    m = LoRABuggy(base, r=4, alpha=8)
+    eq(m(x), before, msg="the output differs from base right after creation: B should start at all zeros")
+    true(trainable(m) == 4 * 16 + 8 * 4, f"the base is not frozen: {trainable(m)} trainable parameters, but only A + B = 96 should be")
+
+@check("scaling = alpha / r")
+def t11b():
+    m = LoRABuggy(nn.Linear(16, 8), r=4, alpha=8)
+    true(close(m.scaling, 2.0), f"scaling should be alpha / r = 8 / 4 = 2.0, yours is {m.scaling}")
+--- hints
+- Go through the three LoRA details one by one: is the base frozen? Is B all zeros? How is scaling computed?
+- Three changes: add a for loop that freezes the base; make B `torch.zeros(base.out_features, r)`; change `alpha * r` to `alpha / r`.
+
+@@ item d6-10
+type: predict
+title: What if you never clear the gradients?
+level: 1
+cards: Gradient accumulation: small batches add up to a big one
+--- context
+Forgetting `zero_grad()` in a training loop is one of the most common beginner bugs: no error, but the gradients keep piling up. Gradient accumulation uses exactly the same mechanism, on purpose.
+--- prompt
+What does this code print? One line per print.
+--- code
+w = torch.tensor(1.0, requires_grad=True)
+for step in range(3):
+    loss = 2 * w
+    loss.backward()
+    print(w.grad.item())
+--- explain
+`.backward()` does not write the gradient into `.grad`; it adds it to `.grad`. The derivative of `loss = 2 * w` with respect to w is 2.
+
+- after the 1st backward: 0 + 2 = 2.0
+- nothing clears it, so the 2nd: 2 + 2 = 4.0
+- the 3rd: 4 + 2 = 6.0
+
+Normal training calls `optimizer.zero_grad()` every step; gradient accumulation deliberately waits a few steps before clearing.
+--- hints
+- For `loss = 2 * w`, what is the derivative of loss with respect to w?
+- Every backward adds the new gradient to `w.grad`; the old value is never cleared.
+
+@@ item d6-11
+type: predict
+title: Read a learning rate curve
+level: 2
+cards: Warmup + cosine: the learning rate goes up, then down
+--- context
+When you take over someone's training script, you should be able to read the lr of any step straight from the schedule's settings. When the loss suddenly changes at some step, the lr at that step is one of the first things to check.
+--- prompt
+The `get_lr` below is the answer to d6-07: 5 warmup steps, down to the bottom at step 15, `max_lr = 1.0`, `min_lr = 0.0`. What does this code print? One line per print.
+--- code
+def get_lr(it, warmup_iters, max_iters, max_lr, min_lr):
+    if it < warmup_iters:
+        return max_lr * (it + 1) / warmup_iters
+    if it > max_iters:
+        return min_lr
+    progress = (it - warmup_iters) / (max_iters - warmup_iters)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + coeff * (max_lr - min_lr)
+
+for it in [0, 4, 5, 10, 15, 20]:
+    print(it, round(get_lr(it, 5, 15, 1.0, 0.0), 2))
+--- explain
+- it = 0: warmup, 1.0 × (0 + 1) / 5 = 0.2
+- it = 4: the last warmup step, 1.0 × 5 / 5 = 1.0
+- it = 5: start of the cosine part, progress = 0, coeff = 1, lr = 1.0 (it joins the warmup with no jump)
+- it = 10: progress = (10 − 5) / (15 − 5) = 0.5, cos(0.5π) = 0, coeff = 0.5, lr = 0.5
+- it = 15: progress = 1, cos(π) = −1, coeff = 0, lr = min_lr = 0.0
+- it = 20: past max_iters, it stays at min_lr = 0.0
+--- hints
+- warmup_iters = 5: steps 0 to 4 are warming up, with `1.0 * (it + 1) / 5`.
+- Step 10: progress = (10 - 5) / (15 - 5) = 0.5, and cos(0.5π) = 0.
+
+@@ item d6-12
+type: choice
+title: Memory for LoRA on a 7B model
+level: 2
+cards: The memory bill: weights, gradients, optimizer states; LoRA: keep W, add a small side path
+--- context
+"Can I fine-tune this model with LoRA on my GPU?" comes up all the time in real work. The key is knowing which part of the memory LoRA actually saves.
+--- prompt
+You fine-tune a 7B (7 billion parameter) model with LoRA, in fp32 with AdamW. A and B together are 0.5% of the original parameter count. Counting only "parameters + gradients + optimizer states" (no activations), roughly how much memory do you need? (1 GB = 10^9 bytes)
+--- options
+- About 112 GB, the same as full fine-tuning
+- About 28.6 GB
+- About 0.56 GB, because only the LoRA part is stored
+- About 56 GB
+answer: 2
+--- explain
+The frozen base still has to sit in memory for the forward pass, but it has no gradients and no AdamW states: 7 billion × 4 bytes = 28 GB.
+
+LoRA has 7 billion × 0.5% = 35 million parameters. They need "parameter + gradient + 2 states" = 4 copies: 35 million × 4 bytes × 4 = 0.56 GB.
+
+Together that is about 28.6 GB. Full fine-tuning would be 7 billion × 16 bytes = 112 GB. So LoRA saves the gradients and optimizer states; the base itself costs exactly as much as before. To save more you store the base in fewer bytes (QLoRA, for example, quantizes the base to 4 bits).
+--- hints
+- The base is frozen. Does it still have to be in memory? Does it need gradients and AdamW states?
+- Base: 7 billion × 4 bytes; the LoRA part: 35 million parameters × 4 bytes × 4 copies.
+
+@@ item d6-13
+type: choice
+title: A and B both start at zero
+level: 2
+cards: Three LoRA details: freeze, B = 0, alpha / r
+--- context
+When you read someone's LoRA code, the initialisation is worth a close look. A wrong initialisation raises no error; the loss simply does not go down, and the logs do not tell you why.
+--- prompt
+To "make sure the output does not change at the start", a colleague initialised **both** A and B of a LoRA layer to all zeros (the base is frozen). What happens during training?
+--- options
+- Nothing bad; it works the same as setting only B to zero
+- The output differs from the original model right from the start
+- The gradients of A and B stay 0 forever, so LoRA learns nothing and the loss stays at the original model's level
+- PyTorch raises an error: parameters cannot be all zeros
+answer: 3
+--- explain
+The side path is `x @ A.T @ B.T`.
+
+- B's gradient is multiplied by `x @ A.T`. With A = 0 that is 0.
+- A's gradient is multiplied by B. With B = 0 that is 0 too.
+
+Both gradients are 0, so the optimizer changes nothing (AdamW's weight decay applied to 0 is still 0). The next step is the same, and so on forever. When only B is zero, A is random, so B gets a gradient at the first step; once B is not zero, A gets gradients too. This bug raises no error; the only symptom is a loss that does not go down.
+--- hints
+- Look at the card's example again: when B = 0, what is A's gradient?
+- The other way round: when A = 0, B's gradient is multiplied by `x @ A.T`. What is that?
+
+@@ item d6-14
+type: code
+title: Closed book: LoRALinear
+level: 2
+exam: yes
+cards: LoRA: keep W, add a small side path; Three LoRA details: freeze, B = 0, alpha / r
+targets: LoRALinear
+ref: day6
+--- context
+LoRA is today's most important building block, and interviews often ask you to write it on the spot. Write it from blank, without the cards.
+--- prompt
+Write `LoRALinear(base, r=4, alpha=8)` from blank:
+
+- keep `self.base` and freeze all its parameters
+- `self.A`: `(r, in_features)`, initialised with `normal_(0, 0.01)`
+- `self.B`: `(out_features, r)`, all zeros
+- `self.scaling = alpha / r`
+- `forward(x)` returns `base(x) + (x @ A.T @ B.T) * scaling`
+--- starter
+class LoRALinear(nn.Module):
+    def __init__(self, base, r=4, alpha=8):
+        raise todo()
+
+    def forward(self, x):
+        raise todo()
+--- solution
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, r=4, alpha=8):
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad_(False)
+        self.A = nn.Parameter(torch.empty(r, base.in_features).normal_(0, 0.01))
+        self.B = nn.Parameter(torch.zeros(base.out_features, r))   # must be zeros
+        self.scaling = alpha / r
+
+    def forward(self, x):
+        return self.base(x) + (x @ self.A.T @ self.B.T) * self.scaling
+--- tests
+@check("LoRALinear structure")
+def t01():
+    seed(0)
+    base = nn.Linear(16, 8)
+    m = LoRALinear(base, r=4, alpha=8)
+    shape_is(m(torch.randn(2, 5, 16)), (2, 5, 8), "forward should return the same shape as base(x)")
+    true(close(m.scaling, 2.0), f"scaling should be alpha/r = 2.0, yours is {m.scaling}")
+    shape_is(m.A, (4, 16), "A should have shape (r, in_features)")
+    shape_is(m.B, (8, 4), "B should have shape (out_features, r)")
+
+@check("Same output as the base at the start")
+def t02():
+    seed(1)
+    base = nn.Linear(16, 8)
+    x = torch.randn(3, 16)
+    before = base(x).clone()
+    m = LoRALinear(base, r=4, alpha=8)
+    eq(m(x), before, msg="B is not initialised to 0: the output changes before any training, which damages the pretrained weights for nothing")
+
+@check("The base is frozen")
+def t03():
+    m = LoRALinear(nn.Linear(16, 8), r=4)
+    true(trainable(m) == 4 * 16 + 8 * 4, f"trainable parameters should be A + B = 96, got {trainable(m)}")
+    true(params(m) == 16 * 8 + 8 + 96, f"total parameters should be base 136 + A and B 96 = 232, got {params(m)}")
+    names = {n for n, p in m.named_parameters() if p.requires_grad}
+    true(all("base" not in n for n in names), f"the base is not frozen; these base parameters can still train: {names}")
+--- hints
+- Do not forget `super().__init__()`, and wrap the new matrices in `nn.Parameter`.
+- The three details: freeze the base, B all zeros, scaling = alpha / r.
+
+@@ item d6-15
+type: code
+title: Closed book: gradient accumulation
+level: 2
+exam: yes
+cards: Gradient accumulation: small batches add up to a big one
+targets: grad_accum_step
+ref: day6
+--- context
+Gradient accumulation is a few of the most common lines in any fine-tuning script, and among the easiest to get quietly wrong. Write it from blank, without the cards, and make it exactly equal to the big batch.
+--- prompt
+Write `grad_accum_step(model, xs, ys, n_micro)` from blank:
+
+- clear the old gradients first
+- cut the `(N, ...)` batch, in order, into `n_micro` equal chunks; for each: forward, `F.cross_entropy`, backward
+- the accumulated gradients must equal those of feeding the whole batch at once
+- return `{parameter name: grad.clone()}`
+--- starter
+def grad_accum_step(model, xs, ys, n_micro):
+    raise todo()
+--- solution
+def grad_accum_step(model, xs, ys, n_micro):
+    model.zero_grad(set_to_none=True)
+    n = xs.size(0) // n_micro
+    for i in range(n_micro):
+        xb, yb = xs[i * n:(i + 1) * n], ys[i * n:(i + 1) * n]
+        # each chunk's loss is already a mean over the chunk; dividing by the number of chunks gives the overall mean
+        (F.cross_entropy(model(xb), yb) / n_micro).backward()
+    return {k: p.grad.clone() for k, p in model.named_parameters()}
+--- tests
+@check("Gradient accumulation == a big batch")
+def t08():
+    seed(3)
+    model = nn.Linear(6, 4)
+    xs, ys = torch.randn(32, 6), torch.randint(0, 4, (32,))
+
+    model.zero_grad()
+    F.cross_entropy(model(xs), ys).backward()
+    ref = {n: p.grad.clone() for n, p in model.named_parameters()}
+
+    got = grad_accum_step(model, xs, ys, n_micro=4)
+    for n in ref:
+        eq(got[n], ref[n], tol=1e-5,
+           msg=f"the gradient of {n} does not match. Exactly 4 times too big: you forgot to divide by n_micro; off by more: maybe the old gradients were not cleared first")
+--- hints
+- Divide each chunk's loss by `n_micro` before backward.
+- Clear the old gradients at the start; at the end collect `p.grad.clone()` with `named_parameters()`.

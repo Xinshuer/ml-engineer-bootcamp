@@ -3,28 +3,389 @@ title: nanoGPT，一天手写一个 Transformer
 part: 大语言模型
 hours: 3–4 小时
 --- goal
-TODO: 一句话写今天学完能做什么。
+从零手写一个能跑的 GPT：因果 mask、attention、多头、Block、完整模型、参数量公式、贪心生成。每一步都用测试证明它是对的（和 PyTorch 官方实现对拍、因果性检验）。这是全课最重要的一天，后面好几天都会复用今天的 Block。
 --- checklist
-- 先清空复习区
-- 读完知识卡片并改动运行
-- 练习区全部通过
+- 先清空复习区（昨天看过答案的题从空白重做）
+- 读完 8 张知识卡片，每张的代码都运行一次，再改一个数字重跑
+- 练习区全部通过（两道找 bug 题先读代码找，别急着运行）
+- 关掉所有参考，默写一遍 Block（练习 d4-11）
+- 闭卷：CausalSelfAttention 和 GPT 各从空白写一遍
+
+@@ concept
+title: GPT 全景：形状一路走下来
+ref: day4
+--- body
+今天要从零写出一个 GPT。先看全貌，后面的卡片再一块一块拆开。
+
+GPT 只做一件事：读一串 token，在**每个位置**猜「下一个 token 是什么」。
+
+今天所有的形状都用这几个字母：
+- B：batch 大小（一次喂几句话）
+- T：序列长度（每句几个 token）
+- C：每个 token 的向量长度（代码里叫 `n_embd`）
+- V：词表大小（`vocab_size`）
+- nh：头数（`n_head`）；hs：每个头的维度，hs = C / nh
+
+数据一路走下来：
+1. `idx` (B, T)：整数 token id
+2. `wte(idx) + wpe(pos)` → `x` (B, T, C)：token 嵌入加位置嵌入
+3. 经过 L 个 Block，每个 Block 进去 (B, T, C)，出来还是 (B, T, C)
+4. `ln_f` 再 `lm_head` → `logits` (B, T, V)：每个位置给词表里每个词打的原始分数（还没过 softmax）
+5. 和 targets 算 `cross_entropy` → 一个数：loss
+
+最重要的一点：**Block 不改变形状**。所以同一种 Block 想叠几层就叠几层。GPT-2 small 叠了 12 层，GPT-3 叠了 96 层。
+
+今天的顺序：因果 mask → attention → 多头 → Block → GPT → 参数量 → 生成。下面的代码用的是今天最后要写出来的那个 GPT，先当黑盒用，只看每一步的形状。
+--- code
+torch.manual_seed(0)
+m = GPT(vocab_size=10, block_size=8, n_layer=2, n_head=4, n_embd=16)
+idx = torch.randint(0, 10, (2, 5))          # B=2 句话，每句 T=5 个 token
+print("idx        ", tuple(idx.shape), "第 0 句:", idx[0].tolist())
+
+x = m.wte(idx) + m.wpe(torch.arange(5))     # token 嵌入 + 位置嵌入
+print("嵌入后      ", tuple(x.shape))
+for i, block in enumerate(m.h):
+    x = block(x)
+    print(f"Block {i} 之后", tuple(x.shape))  # 形状不变
+
+logits = m.lm_head(m.ln_f(x))
+print("logits     ", tuple(logits.shape))   # 每个位置 10 个分数
+print("第 0 句每个位置猜的下一个 token:", logits[0].argmax(-1).tolist())
+
+@@ concept
+title: 因果 mask：只能看过去
+--- body
+语言模型训练时，一句话一次全部喂进去，**每个位置**都去猜下一个 token。位置 2 要猜第 3 个 token。如果位置 2 能「看到」第 3 个 token，直接抄答案就行，什么也学不到。
+
+所以 attention 里有一条规矩：**位置 i 只能看位置 0…i（过去和自己），不能看 i 之后（未来）**。这就是因果 mask（causal mask）。
+
+attention 会算一个 (T, T) 的分数矩阵：
+- 第 i 行 = 第 i 个位置，它在「看」别人（叫 query）
+- 第 j 列 = 第 j 个位置，它被看（叫 key）
+- 允许 j ≤ i：对角线和它左下方的格子，也就是下三角 → `torch.tril`
+
+两种写法，效果一样：
+- **加性 mask**：允许的格子是 0，禁止的格子是 `-inf`，直接加到分数上
+- **masked_fill**：`scores.masked_fill(mask == 0, float("-inf"))`，mask 里 1 = 允许，0 = 禁止
+
+为什么用 `-inf`？softmax 要算 e 的分数次方，而 e^(-inf) = 0。所以被屏蔽的格子权重**正好是 0**，剩下的格子权重加起来仍然是 1。
+
+T 个位置一共屏蔽 T·(T−1)/2 个格子：T=4 时是 6 个。
+
+mask 常做成 (1, 1, T, T) 的形状。attention 分数是 (B, nh, T, T)，前面两个 1 靠广播对上 batch 和头，一个 mask 就能用在所有句子、所有头上。
+--- code
+T = 4
+allowed = torch.tril(torch.ones(T, T))      # 1 = 可以看，0 = 不许看
+print(allowed)
+
+bias = torch.zeros(T, T).masked_fill(allowed == 0, float("-inf"))
+print(bias)
+print("屏蔽的格子数:", int(torch.isinf(bias).sum()), "  T*(T-1)/2 =", T * (T - 1) // 2)
+
+torch.manual_seed(0)
+scores = torch.randn(T, T)                  # 随便一些分数
+att = (scores + bias).softmax(dim=-1)
+print(att.round(decimals=2))                # 右上角全是 0
+print("每行加起来:", att.sum(dim=-1))
+
+# (1, 1, T, T) 能广播到 (B, nh, T, T)
+print((torch.randn(2, 3, T, T) + bias.view(1, 1, T, T)).shape)
+
+@@ concept
+title: 缩放点积注意力，一步一步
+--- body
+attention 让每个位置从别的位置「取信息」。每个位置有三个向量：
+- **q**（query）：我在找什么
+- **k**（key）：我这里有什么
+- **v**（value）：如果你选中我，我交给你的内容
+
+q、k、v 的形状都是 (B, nh, T, hs)。下面用 B=1、nh=1、T=4、hs=8 走一遍：
+
+1. **打分**：`scores = q @ k.transpose(-2, -1)`。(1,1,4,8) @ (1,1,8,4) → (1,1,4,4)。`scores[i, j]` 是 q_i 和 k_j 的点积：位置 i 对位置 j 有多感兴趣。
+2. **缩放**：除以 `math.sqrt(hs)`，这里是 √8 ≈ 2.83。原因见下面。
+3. **mask**：未来的格子填成 `-inf`（上一张卡片）。
+4. **softmax(dim=-1)**：沿最后一维，也就是每一**行**，把分数变成权重：都 ≥ 0，每行加起来是 1。写成 `dim=-2` 就变成按列归一化，是错的。
+5. **加权求和**：`att @ v`。(1,1,4,4) @ (1,1,4,8) → (1,1,4,8)。位置 i 的输出 = 所有 v 按第 i 行的权重加起来。
+
+合成一行：`softmax(q @ kᵀ / √hs + mask) @ v`。
+
+PyTorch 自带同样的计算：`F.scaled_dot_product_attention(q, k, v, is_causal=True)`，简称 SDPA，在 GPU 上还会自动用更快的实现。自己写完拿它对答案，这叫「对拍」：两边数字的差应该非常小（1e-6 或更小，只是浮点误差）。
+
+### 为什么除以 √hs
+q 和 k 的每个数大致是均值 0、标准差 1。点积是 hs 个乘积相加，标准差会变成大约 √hs：hs=64 时约为 8。softmax 碰到相差十几、二十的分数，几乎把全部权重给最大的那一个（接近 one-hot），其他位置的梯度几乎是 0，模型很难学。除以 √hs，分数的标准差就回到 1 左右。代码最后两行打印这两个标准差。
+--- code
+torch.manual_seed(0)
+B, nh, T, hs = 1, 1, 4, 8                   # 1 句话、1 个头、4 个 token、每个头 8 维
+q, k, v = (torch.randn(B, nh, T, hs) for _ in range(3))
+
+s = q @ k.transpose(-2, -1)                 # (1,1,4,8) @ (1,1,8,4)
+print("1. 分数         ", tuple(s.shape))
+s = s / math.sqrt(hs)                       # 2. 除以 √8
+s = s.masked_fill(torch.tril(torch.ones(T, T)) == 0, float("-inf"))
+print("3. 缩放 + mask 后:\n", s[0, 0].round(decimals=2))
+att = s.softmax(dim=-1)
+print("4. softmax 后，每行和为 1:\n", att[0, 0].round(decimals=2))
+out = att @ v                               # (1,1,4,4) @ (1,1,4,8)
+print("5. 输出         ", tuple(out.shape))
+
+sdpa = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+print("和 SDPA 的最大差:", (out - sdpa).abs().max().item())
+
+a, b = torch.randn(1000, 64), torch.randn(1000, 64)    # 1000 对 hs=64 的 q、k
+dots = (a * b).sum(-1)
+print("hs=64 点积的标准差：不缩放", round(dots.std().item(), 2), "  除以 √64 后", round((dots / 8).std().item(), 2))
+
+@@ concept
+title: 因果性检验：改未来，过去不许变
+--- body
+和 SDPA 对拍能证明「数字对」。但还有一种 bug 更危险：**信息泄漏**。mask 漏了或写反了，模型训练时偷看答案，loss 降得特别漂亮，一到生成就胡言乱语。而且它不会报任何错。
+
+检验方法很简单，任何 causal 模型都能用：
+1. 正常算一次输出 `out1`
+2. 只改**最后几个位置**的输入（下面改最后 2 个位置的 k 和 v），再算一次 `out2`
+3. 前面位置的输出必须**一点都不变**：`out1[:, :, :4]` 和 `out2[:, :, :4]` 相等
+4. 被改的位置自己的输出应该**变了**。如果连它们都没变，说明你的检验根本没改到东西
+
+这种测试叫「不变量测试」：不需要知道正确答案是多少，只检查一条必须成立的性质。同样的办法可以用在整个模块、整个模型上：改掉 x 的后半段，前半段的输出不许变。第 17 天会讲更多这类测试。
+
+下面的代码用 SDPA 对比「有因果 mask」和「没有 mask」两种情况。
+--- code
+torch.manual_seed(0)
+q, k, v = (torch.randn(1, 1, 6, 4) for _ in range(3))   # T=6
+k2, v2 = k.clone(), v.clone()
+k2[:, :, 4:] = torch.randn(1, 1, 2, 4)      # 只改最后 2 个位置
+v2[:, :, 4:] = torch.randn(1, 1, 2, 4)
+
+def changes(causal):
+    out1 = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+    out2 = F.scaled_dot_product_attention(q, k2, v2, is_causal=causal)
+    past = (out1[:, :, :4] - out2[:, :, :4]).abs().max().item()
+    future = (out1[:, :, 4:] - out2[:, :, 4:]).abs().max().item()
+    return round(past, 4), round(future, 4)
+
+print("有因果 mask：前 4 个位置变了", changes(True)[0], "  后 2 个位置变了", changes(True)[1])
+print("没有 mask  ：前 4 个位置变了", changes(False)[0], "  后 2 个位置变了", changes(False)[1])
+
+@@ concept
+title: 多头：拆头、合头、register_buffer
+--- body
+一个头只能学一种「看」的方式。多头注意力把 C 维切成 nh 份，每份 hs = C / nh 维，各自独立做 attention，最后再拼回来。算力和一个大头差不多，但每个头可以关注不同的东西（有的头看前一个词，有的头看句首）。
+
+整套形状，用 B=2、T=5、C=12、nh=3（所以 hs=4）：
+1. `self.qkv(x)`：(2, 5, 12) → (2, 5, 36)。一个 Linear 一次投影出 q、k、v，比三个 Linear 快
+2. `.split(C, dim=-1)` → q、k、v 各 (2, 5, 12)
+3. `.view(B, T, nh, hs)` → (2, 5, 3, 4)：把 12 维切成 3 个头 × 4 维
+4. `.transpose(1, 2)` → (2, 3, 5, 4)：把「头」换到第 1 维。现在每个头是一个独立的 (T, hs) 矩阵，attention 的矩阵乘法对 (B, nh) 批量做
+5. attention → (2, 3, 5, 4)
+6. `.transpose(1, 2)` → (2, 5, 3, 4)，再 `.contiguous().view(B, T, C)` → (2, 5, 12)：合并头
+7. `self.proj(y)` → (2, 5, 12)：把各个头的结果混合一下
+
+为什么要 `.contiguous()`？`transpose` 不搬数据，只改「按什么顺序读内存」。`view` 要求数据在内存里按顺序排好，transpose 之后不是，直接 `view` 会报错。`.contiguous()` 按新顺序复制一份。（`.reshape` 也行，它在需要时自动复制。）
+
+### mask 存成 buffer
+mask 每次 forward 都一样，没必要现造。在 `__init__` 里：
+```
+self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
+```
+- buffer 是模块的一部分：`model.to("cuda")` 时跟着搬，`state_dict()` 里也有它
+- 但它**不是参数**：`parameters()` 里没有它，优化器不会改它
+- 输入可以比 block_size 短，用的时候切一块：`self.bias[:, :, :T, :T]`
+
+名字叫 "bias" 是 nanoGPT 的叫法，其实它是 mask。
+--- code
+torch.manual_seed(0)
+B, T, C, nh = 2, 5, 12, 3
+hs = C // nh                                # 每个头 4 维
+x = torch.randn(B, T, C)
+qkv = nn.Linear(C, 3 * C, bias=False)
+
+big = qkv(x)
+print("qkv(x)          ", tuple(big.shape))
+q, k, v = big.split(C, dim=-1)
+print("split 之后 q     ", tuple(q.shape))
+q = q.view(B, T, nh, hs)
+print("view 拆头        ", tuple(q.shape))
+q = q.transpose(1, 2)
+print("transpose(1, 2) ", tuple(q.shape))
+
+y = torch.randn(B, nh, T, hs)               # 假装这是 attention 的输出
+y = y.transpose(1, 2)
+print("转回来           ", tuple(y.shape), " 连续吗?", y.is_contiguous())
+try:
+    y.view(B, T, C)
+except RuntimeError as e:
+    print("直接 view 报错:  ", str(e)[:60], "...")
+y = y.contiguous().view(B, T, C)
+print("合并头           ", tuple(y.shape))
+
+class WithMask(nn.Module):
+    def __init__(self, block_size):
+        super().__init__()
+        self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
+
+m = WithMask(8)
+print("state_dict 里有:", list(m.state_dict().keys()), "  参数个数:", sum(p.numel() for p in m.parameters()))
+print("T=5 时切出来的 mask:", tuple(m.bias[:, :, :5, :5].shape))
+
+@@ concept
+title: Block：MLP + pre-LN 残差
+ref: day4
+--- body
+一个 Block = 两个子层。两个子层用同一个套路：`x = x + 子层(LayerNorm(x))`。
+```
+x = x + self.attn(self.ln1(x))    # token 之间交换信息
+x = x + self.mlp(self.ln2(x))     # 每个 token 自己加工
+```
+
+**MLP**：`Linear(C, 4C)` → GELU → `Linear(4C, C)`，两层都带 bias。先把维度放大 4 倍，过一个非线性函数（GELU，可以看成平滑版的 ReLU），再压回 C。它对每个位置单独做，位置之间不交流。
+
+**残差（residual）**：`x = x + 子层(...)`。子层只需要学「在 x 上改一点什么」。可以想象一条从输入直通输出的主干道（叫 residual stream），每个子层往上面加一点东西。梯度也能沿着这条路直接传回前面的层，所以几十层也训得动。
+
+**pre-LN**：LayerNorm 放在分支**里面**（先归一化，再进子层），主干上的 x 本身不做 LN。2017 年的原始 Transformer 是 post-LN：`x = LN(x + 子层(x))`，层一多就不稳定，要很小心地 warmup。GPT-2 开始改成了 pre-LN。因为主干上从来没做过 LN，模型出口要补一个 `ln_f`（下一张卡片）。
+
+**一个好用的检验**：如果两个子层都输出 0，pre-LN Block 应该原样返回 x（恒等映射）。post-LN 做不到，因为 LN(x) ≠ x。练习题就用这个测试。
+
+### 一个 Block 有多少参数
+- ln1、ln2：各 2C（LayerNorm 有 weight 和 bias 各 C 个）
+- qkv：3C²；proj：C²（nanoGPT 这里都不带 bias）
+- fc1：4C² + 4C；fc2：4C² + C
+- 合计 **12C² + 9C**。attention 占 4C²，MLP 占 8C²：大头在 MLP
+
+下面的代码逐个打印一个 Block（C=16）的参数，再做恒等检验：同样的零件，pre-LN 接法和 post-LN 接法对比。
+--- code
+torch.manual_seed(0)
+C = 16
+blk = Block(n_embd=C, n_head=4, block_size=8)      # 今天要写的 Block（参考实现）
+for name, p in blk.named_parameters():
+    print(f"{name:18s} {str(tuple(p.shape)):9s} {p.numel()}")
+print("合计", sum(p.numel() for p in blk.parameters()), "  12*C*C + 9*C =", 12 * C * C + 9 * C)
+
+x = torch.randn(2, 5, C)
+with torch.no_grad():                        # 让两个子层都输出 0
+    blk.attn.proj.weight.zero_()
+    for p in blk.mlp.parameters():
+        p.zero_()
+print("pre-LN : |Block(x) - x| 最大", (blk(x) - x).abs().max().item())
+h = blk.ln1(x + blk.attn(x))                 # 同样的零件，post-LN 的接法
+post = blk.ln2(h + blk.mlp(h))
+print("post-LN: |out - x| 最大     ", round((post - x).abs().max().item(), 3))
+
+@@ concept
+title: GPT：嵌入、初始化、weight tying
+ref: day4
+--- body
+把积木拼起来：
+```
+x = wte(idx) + wpe(pos)        # (B,T,C) + (T,C)，广播
+for block in h: x = block(x)
+logits = lm_head(ln_f(x))      # (B,T,V)
+```
+- `wte = nn.Embedding(V, C)`：每个 token id 查出一行向量
+- `wpe = nn.Embedding(block_size, C)`：每个位置 0…block_size−1 查出一行向量，`pos = torch.arange(T)`。attention 本身不知道谁先谁后，顺序信息全靠它（第 5 天会换成 RoPE）
+- `ln_f`：pre-LN 的主干没做过 LN，出口补一个
+- `lm_head = nn.Linear(C, V, bias=False)`：把每个位置的向量变成 V 个分数
+
+### 初始化：开始时 loss 应该约等于 ln V
+nanoGPT 把所有 Linear 和 Embedding 的权重初始化成均值 0、标准差 0.02 的正态分布，bias 清零。写法：定义一个 `_init(m)`，然后 `self.apply(self._init)`。`apply` 会对每个子模块各调用一次。
+
+刚初始化的模型什么都不懂，应该对 V 个词一视同仁：每个词的概率约 1/V，交叉熵约等于 ln V（第 3 天讲过这个基线）。标准差 0.02 让 logits 都很小，接近均匀分布。`nn.Embedding` 默认用的是标准差 1，大了 50 倍：logits 一开始就很大，loss 离 ln V 很远，训练前面几百步都在收拾这个烂摊子。
+
+### weight tying（权重共享）
+`self.lm_head.weight = self.wte.weight`：输出层和输入嵌入**共用同一个** (V, C) 的参数。道理是「这个词的向量」和「预测这个词时用的向量」本来就该相像。好处是少了 V·C 个参数（GPT-2 里约 3860 万个）。
+- 要的是**同一个对象**：`m.lm_head.weight is m.wte.weight` 必须是 True。用 `copy_` 只复制数值不算，训练一步它们就分开了
+- `parameters()` 会自动去重，共享的权重只数一次
+- nanoGPT 的两种 init 都是 N(0, 0.02)，所以 tying 写在 `apply` 前面还是后面都行
+
+### loss
+`F.cross_entropy` 要 (N, V) 的分数和 (N,) 的正确答案，所以先把 batch 和时间两维摊平：`logits.reshape(-1, V)` 是 (B·T, V)，`targets.reshape(-1)` 是 (B·T,)。
+
+整个 GPT 的参数量 = wte + wpe + L 个 Block + ln_f；lm_head 和 wte 共享，不另算。练习 d4-07 把它写成公式。
+--- code
+torch.manual_seed(0)
+V = 65
+m = GPT(vocab_size=V, block_size=16, n_layer=2, n_head=4, n_embd=32)
+idx = torch.randint(0, V, (4, 16))
+targets = torch.randint(0, V, (4, 16))
+logits, loss = m(idx, targets)
+print("logits", tuple(logits.shape), " 摊平后", tuple(logits.reshape(-1, V).shape))
+print("初始 loss =", round(loss.item(), 3), "  ln(V) =", round(math.log(V), 3))
+
+print("lm_head.weight is wte.weight:", m.lm_head.weight is m.wte.weight)
+print("wte 的标准差:", round(m.wte.weight.std().item(), 4))
+print("参数量:", sum(p.numel() for p in m.parameters()), "  不共享的话还要多", V * 32)
+
+with torch.no_grad():
+    m.wte.weight.normal_(0, 1.0)             # 换成 nn.Embedding 的默认初始化 N(0, 1)
+print("wte 改成标准差 1 之后的 loss =", round(m(idx, targets)[1].item(), 1))
+
+@@ concept
+title: 生成：贪心 + 上下文裁剪
+ref: day4
+--- body
+GPT 每次只猜**一个**下一个 token。要生成一段话，就一步一步来（叫自回归）：
+1. 把当前序列喂进模型，得到 logits (B, T, V)
+2. 只要**最后一个位置**的 logits：`logits[:, -1]`，形状 (B, V)。前面位置猜的那些 token 早就在序列里了
+3. 选一个 token。**贪心**：直接取分数最大的，`argmax(-1, keepdim=True)` → (B, 1)
+4. 拼到序列末尾：`torch.cat([idx, nxt], dim=1)`，长度 +1
+5. 回到第 1 步
+
+**上下文裁剪**：`wpe` 只有 block_size 行，mask buffer 也只有 block_size×block_size。序列一长过 block_size，查位置嵌入就越界报错。所以每一步只喂最后 block_size 个 token：`idx[:, -block_size:]`。序列还短的时候，这个切片什么也不做。
+
+两个小习惯：
+- 生成不需要梯度：函数上加 `@torch.no_grad()`，省显存，也更快
+- 先 `model.eval()`：关掉 dropout 这类训练时才有的随机性
+
+贪心的好处是**确定性**：同样的输入永远得到同样的输出，很适合写测试。缺点是容易车轱辘话来回说。temperature、top-k 这些采样方法在第 5 天讲。
+
+下面的代码只走**一步**，并演示不裁剪会怎样。
+--- code
+torch.manual_seed(0)
+m = GPT(vocab_size=11, block_size=8, n_layer=1).eval()
+idx = torch.tensor([[3, 1, 4]])              # B=1, T=3
+
+with torch.no_grad():
+    logits, _ = m(idx)
+print("logits      ", tuple(logits.shape))   # 每个位置都猜了一次
+last = logits[:, -1]                         # 只要最后一个位置
+print("最后一个位置  ", tuple(last.shape))
+nxt = last.argmax(-1, keepdim=True)
+print("下一个 token ", nxt.tolist(), tuple(nxt.shape))
+idx = torch.cat([idx, nxt], dim=1)
+print("拼上之后     ", idx.tolist())
+
+too_long = torch.randint(0, 11, (1, 9))      # 9 个 token > block_size=8
+try:
+    m(too_long)
+except IndexError as e:
+    print("直接喂 9 个 token:", type(e).__name__, "-", e)
+print("裁剪成最后 8 个:", tuple(too_long[:, -8:].shape))
 
 @@ item d4-01
 type: code
 title: causal mask 的方向
-level: 2
+level: 1
+cards: 因果 mask：只能看过去
 targets: causal_bias
 ref: day4
 --- context
-TODO
+GPT 训练时一次看整句话，但第 t 个位置只准用前面的 token 去猜下一个。因果 mask 就是这条规矩。方向写反，训练时模型偷看答案，loss 很好看，生成时却一塌糊涂。
 --- prompt
-01  causal mask
+写 `causal_bias(T, device=None)`，返回形状 `(1, 1, T, T)` 的**加性 mask**（要加到 attention 分数上的矩阵）：
+- 第 i 行第 j 列：j ≤ i（过去和自己）是 `0.0`；j > i（未来）是 `float("-inf")`
+- 前面两个 1 留给 batch 和头，这样它能靠广播直接加到 `(B, nh, T, T)` 的分数上
+- 用 `torch.tril`；张量建在参数 `device` 上（`device=None` 就是默认的 CPU）
+
+T=3 时，最后两维应该是：
+```
+[[0., -inf, -inf],
+ [0.,   0., -inf],
+ [0.,   0.,   0.]]
+```
 --- starter
 def causal_bias(T, device=None):
     """返回 (1, 1, T, T) 的加性 mask：允许的位置 0.0，禁止的位置 -inf。
     位置 t 只能看到 <= t 的位置。用 torch.tril。
     """
-    # --- TODO 01 ---
     raise todo()
 --- solution
 def causal_bias(T, device=None):
@@ -35,30 +396,39 @@ def causal_bias(T, device=None):
 def t01():
     m = causal_bias(4)
     shape_is(m, (1, 1, 4, 4))
-    true(m[0, 0, 0, 0] == 0, "对角线（看自己）必须允许")
-    true(m[0, 0, 0, 1] == float("-inf"), "第 0 个位置不能看到第 1 个 —— 你的 mask 反了")
+    true(m[0, 0, 0, 0] == 0, "对角线（看自己）必须允许，应该是 0")
+    true(m[0, 0, 0, 1] == float("-inf"), "第 0 个位置不能看到第 1 个 —— 你的 mask 方向反了（tril 和 triu 搞混了？）")
     true(m[0, 0, 3, 0] == 0, "第 3 个位置应该能看到第 0 个")
-    true(torch.isinf(m).sum() == 6, f"应该正好屏蔽 6 个位置，你屏蔽了 {int(torch.isinf(m).sum())} 个")
+    true(torch.isinf(m).sum() == 6, f"T=4 应该正好屏蔽 6 个位置，你屏蔽了 {int(torch.isinf(m).sum())} 个")
 --- hints
-- TODO
+- `torch.tril(torch.ones(T, T))` 是下三角全 1、右上角全 0 的矩阵：1 表示「允许看」。
+- 先造一个全 0 的 `(1, 1, T, T)`，再用 `.masked_fill(条件, float("-inf"))` 把「tril 里是 0」的格子填成 -inf。
+- `m = torch.tril(torch.ones(T, T, device=device))`，然后 `return torch.zeros(1, 1, T, T, device=device).masked_fill(m == 0, float("-inf"))`。
 
 @@ item d4-02
 type: code
-title: 手写 attention 对拍 SDPA
+title: 手写 attention，对拍 SDPA
 level: 2
+cards: 缩放点积注意力，一步一步; 因果性检验：改未来，过去不许变; 因果 mask：只能看过去
 targets: attention
 ref: day4
-# merged checks: t03 因果性检验
 --- context
-TODO
+attention 是 Transformer 的心脏，也是面试里最常被要求当场手写的东西。自己写一遍，再和 PyTorch 官方实现对上数字，是确认你真懂了的最快办法。
 --- prompt
-02  手写 attention，和 PyTorch 内置的对拍
+写 `attention(q, k, v, causal=True)`：
+- q、k、v 的形状都是 `(B, nh, T, hs)`（batch、头数、序列长度、每个头的维度），返回同样形状的张量
+- 步骤：`q @ kᵀ` → 除以 `√hs` → `causal=True` 时加上因果 mask → 在最后一维 softmax → 乘 `v`
+- 上一题的 `causal_bias(T, device)` 已经预先加载，可以直接用
+- **不许**调用 `F.scaled_dot_product_attention`：测试要拿它来对答案
+
+测试做两件事：
+1. 对拍：和 `F.scaled_dot_product_attention` 比，causal 和非 causal 都要一致（误差 < 1e-4）
+2. 因果性检验：只改最后 2 个位置的 k、v，前 4 个位置的输出必须一点不变
 --- starter
 def attention(q, k, v, causal=True):
     """q, k, v: (B, nh, T, hs)  ->  (B, nh, T, hs)
-    自己写 scores -> mask -> softmax -> @v。不许调 F.scaled_dot_product_attention。
+    自己写 scores -> 缩放 -> mask -> softmax -> @v。不许调 F.scaled_dot_product_attention。
     """
-    # --- TODO 02 ---
     raise todo()
 --- solution
 def attention(q, k, v, causal=True):
@@ -69,12 +439,14 @@ def attention(q, k, v, causal=True):
     att = att.softmax(dim=-1)
     return att @ v
 --- tests
-@check("手写 attention 对拍 SDPA")
+@check("和 SDPA 对拍（causal 和非 causal）")
 def t02():
     seed(0)
     q, k, v = (torch.randn(2, 3, 6, 8) for _ in range(3))
-    eq(attention(q, k, v, causal=True), F.scaled_dot_product_attention(q, k, v, is_causal=True))
-    eq(attention(q, k, v, causal=False), F.scaled_dot_product_attention(q, k, v, is_causal=False))
+    eq(attention(q, k, v, causal=True), F.scaled_dot_product_attention(q, k, v, is_causal=True),
+       msg="causal=True 时和 SDPA 不一致：检查缩放、mask 方向、softmax 的维度")
+    eq(attention(q, k, v, causal=False), F.scaled_dot_product_attention(q, k, v, is_causal=False),
+       msg="causal=False 时和 SDPA 不一致：这时不应该加 mask")
 
 @check("因果性检验")
 def t03():
@@ -87,20 +459,37 @@ def t03():
     out2 = attention(q, k2, v2, causal=True)
     eq(out1[:, :, :4], out2[:, :, :4],
        msg="改了未来的 k/v，前 4 个位置的输出也变了 —— 信息泄漏了")
-    true(not torch.allclose(out1[:, :, 4:], out2[:, :, 4:]), "后两个位置应该变了才对")
+    true(not torch.allclose(out1[:, :, 4:], out2[:, :, 4:]), "后两个位置自己的输出应该变了才对")
 --- hints
-- TODO
+- 转置 k 的最后两维：`k.transpose(-2, -1)` 把 (B, nh, T, hs) 变成 (B, nh, hs, T)，`q @ 它` 就是 (B, nh, T, T)。
+- 缩放用 `math.sqrt(q.size(-1))`；mask 用 `att + causal_bias(T, q.device)`，其中 `T = q.size(-2)`。
+- 最后两步：`att = att.softmax(dim=-1)`，`return att @ v`。
 
 @@ item d4-03
 type: code
 title: CausalSelfAttention 模块
-level: 2
+level: 3
+cards: 多头：拆头、合头、register_buffer; 缩放点积注意力，一步一步
 targets: CausalSelfAttention
 ref: day4
 --- context
-TODO
+这就是 GPT 里真正用的 attention 层：一个 Linear 投影出 q、k、v，拆成多个头并行算，再合并回来。拆头合头的形状变换是多头注意力里最容易出 bug 的地方。
 --- prompt
-04  CausalSelfAttention 模块
+写 `CausalSelfAttention(n_embd, n_head, block_size)`，一个 `nn.Module`。输入 `x` 是 `(B, T, C)`（C = n_embd），输出也是 `(B, T, C)`。
+
+`__init__` 里：
+- `self.qkv = nn.Linear(C, 3 * C, bias=False)`：一次投影出 q、k、v
+- `self.proj = nn.Linear(C, C, bias=False)`：最后的输出投影
+- 用 `self.register_buffer("bias", ...)` 存一个 `(1, 1, block_size, block_size)` 的下三角 mask（名字必须是 `"bias"`）。不要在 forward 里每次现造
+- 记下 `n_head`，forward 要用
+
+`forward(x)`：
+1. `qkv(x)` → `split` 成 q、k、v，各 `(B, T, C)`
+2. 拆头：各自变成 `(B, nh, T, hs)`，hs = C // nh
+3. causal attention：分数除以 √hs，mask 用 buffer 切出来的 `[:, :, :T, :T]`（T 可以比 block_size 短）
+4. 合并头回 `(B, T, C)`，再过 `proj`
+
+参数量必须正好是 3C² + C²（两个 Linear 都没有 bias）。测试还会检查：T 比 block_size 短也能跑；改掉 x 的后几个位置，前面位置的输出不变。
 --- starter
 class CausalSelfAttention(nn.Module):
     """要求:
@@ -112,7 +501,9 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, n_embd, n_head, block_size):
         super().__init__()
-        # --- TODO 04 ---
+        raise todo()
+
+    def forward(self, x):
         raise todo()
 --- solution
 class CausalSelfAttention(nn.Module):
@@ -142,34 +533,45 @@ def t04():
     m = CausalSelfAttention(32, 4, 16)
     x = torch.randn(2, 9, 32)
     shape_is(m(x), (2, 9, 32))
-    true("bias" in dict(m.named_buffers()), "mask 应该注册成 buffer，不是每次现算")
-    true(params(m) == 32 * 32 * 3 + 32 * 32, f"参数量不对: {params(m)}（qkv 无 bias + proj 无 bias）")
+    true("bias" in dict(m.named_buffers()), "mask 应该用 register_buffer 注册成名叫 \"bias\" 的 buffer，不是每次现算")
+    true(params(m) == 32 * 32 * 3 + 32 * 32,
+         f"参数量是 {params(m)}，应该是 3C²+C² = 4096：qkv 和 proj 都要 bias=False")
     # 变长输入也要能跑（T < block_size）
-    shape_is(m(torch.randn(1, 3, 32)), (1, 3, 32))
+    shape_is(m(torch.randn(1, 3, 32)), (1, 3, 32), "T=3 比 block_size=16 短时也要能跑：mask 要切成 [:, :, :T, :T]")
     # 因果性
     x2 = x.clone()
     x2[:, 5:] = torch.randn(2, 4, 32)
-    eq(m(x)[:, :5], m(x2)[:, :5], msg="模块级别的因果性挂了")
+    eq(m(x)[:, :5], m(x2)[:, :5], msg="改了 x 的后 4 个位置，前 5 个位置的输出也变了：模块的因果性挂了（mask 没用上或方向反了）")
 --- hints
-- TODO
+- 拆头：`q.view(B, T, self.n_head, hs).transpose(1, 2)`，k、v 一样；`hs = C // self.n_head`。
+- mask：`att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))`，然后 `.softmax(-1)`。
+- 合并头：`y = (att @ v).transpose(1, 2).contiguous().view(B, T, C)`，最后 `return self.proj(y)`。
 
 @@ item d4-04
 type: code
 title: MLP
-level: 2
+level: 1
+cards: Block：MLP + pre-LN 残差
 targets: MLP
 ref: day4
 --- context
-TODO
+attention 负责让 token 之间交换信息，MLP 负责让每个 token 自己「想一想」。GPT 的 Block 里，三分之二的参数都在 MLP。
 --- prompt
-05  MLP
+写 GPT-2 的 `MLP(n_embd)`（也叫 feed-forward 层）：
+- `Linear(C, 4C)` → GELU → `Linear(4C, C)`，两层都带 bias（`nn.Linear` 默认就带）
+- 输入输出都是 `(B, T, C)`
+- GELU 用 `F.gelu` 或 `nn.GELU()` 都行
+
+测试检查输出形状和参数量：C=16 时应该是 16·64 + 64 + 64·16 + 16 = 2128。
 --- starter
 class MLP(nn.Module):
     """标准 GPT-2 MLP: Linear(C, 4C) -> GELU -> Linear(4C, C)，两层都带 bias。"""
 
     def __init__(self, n_embd):
         super().__init__()
-        # --- TODO 05 ---
+        raise todo()
+
+    def forward(self, x):
         raise todo()
 --- solution
 class MLP(nn.Module):
@@ -181,24 +583,36 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.fc2(F.gelu(self.fc1(x)))
 --- tests
-@check("MLP")
+@check("MLP 的形状和参数量")
 def t05():
     m = MLP(16)
     shape_is(m(torch.randn(2, 5, 16)), (2, 5, 16))
-    true(params(m) == 16 * 64 + 64 + 64 * 16 + 16, f"参数量不对: {params(m)}")
+    true(params(m) == 16 * 64 + 64 + 64 * 16 + 16,
+         f"参数量是 {params(m)}，应该是 2128：Linear(16, 64) 和 Linear(64, 16)，都带 bias")
 --- hints
-- TODO
+- `__init__` 里建两个 Linear：`self.fc1 = nn.Linear(n_embd, 4 * n_embd)` 和 `self.fc2 = nn.Linear(4 * n_embd, n_embd)`。
+- forward 一行：`return self.fc2(F.gelu(self.fc1(x)))`。
 
 @@ item d4-05
 type: code
-title: Block: pre-LN 残差
+title: Block：pre-LN 残差
 level: 2
+cards: Block：MLP + pre-LN 残差
 targets: Block
 ref: day4
 --- context
-TODO
+GPT 就是把同一个 Block 叠很多层。残差加 pre-LN 让几十层的网络也能稳定训练。这个 Block 后面第 5、10、13 天还会反复用到。
 --- prompt
-06  Block：pre-LN 残差
+写 `Block(n_embd, n_head, block_size)`：
+```
+x = x + self.attn(self.ln1(x))
+x = x + self.mlp(self.ln2(x))
+```
+- 子模块的名字必须是 `ln1`、`attn`、`ln2`、`mlp`（测试会用到 `attn.proj` 和 `mlp`）
+- `CausalSelfAttention` 和 `MLP` 已经预先加载好（参考版本），直接用
+- pre-LN：LayerNorm 在残差分支**里面**；主干上的 `x` 不经过 LN
+
+测试：把 attn 的 `proj` 和整个 MLP 的参数清零，两个子层都输出 0，这时 Block 必须原样返回 x。
 --- starter
 class Block(nn.Module):
     """x = x + attn(ln1(x));  x = x + mlp(ln2(x))
@@ -207,7 +621,9 @@ class Block(nn.Module):
 
     def __init__(self, n_embd, n_head, block_size):
         super().__init__()
-        # --- TODO 06 ---
+        raise todo()
+
+    def forward(self, x):
         raise todo()
 --- solution
 class Block(nn.Module):
@@ -223,7 +639,7 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln2(x))
         return x
 --- tests
-@check("Block: pre-LN 残差")
+@check("Block：pre-LN 残差")
 def t06():
     seed(3)
     b = Block(32, 4, 16)
@@ -235,21 +651,36 @@ def t06():
         for p in b.mlp.parameters():
             p.zero_()
     eq(b(x), x, tol=1e-5,
-       msg="子层输出清零后 Block 应该是恒等映射。不相等说明残差写错了（比如写成了 x = attn(ln(x))）")
+       msg="子层输出清零后 Block 应该原样返回 x。不相等说明残差写错了（比如写成了 x = attn(ln(x))），或者 LN 放到了主干上（post-LN）")
 --- hints
-- TODO
+- `__init__`：`self.ln1 = nn.LayerNorm(n_embd)`，`self.attn = CausalSelfAttention(n_embd, n_head, block_size)`，`ln2`、`mlp` 同理。
+- 「残差」= 把子层的输出**加回**输入：`x = x + 子层(...)`，不是 `x = 子层(...)`。
+- forward 就是题目里那两行，再 `return x`。
 
 @@ item d4-06
 type: code
-title: GPT forward + loss
-level: 2
+title: GPT：forward + loss + weight tying
+level: 3
+cards: GPT：嵌入、初始化、weight tying; GPT 全景：形状一路走下来
 targets: GPT
 ref: day4
-# merged checks: t08 weight tying
 --- context
-TODO
+这就是 nanoGPT 的 model.py 的核心，也是 GPT-2 的结构。初始化和 weight tying 是面试官爱问的细节：前者决定训练一开始的 loss 正不正常，后者省掉一大块参数。
 --- prompt
-07  完整 GPT
+写完整的 `GPT(vocab_size, block_size, n_layer=2, n_head=4, n_embd=32)`（下面 C = n_embd，V = vocab_size）：
+- `self.wte = nn.Embedding(V, C)`：token 嵌入
+- `self.wpe = nn.Embedding(block_size, C)`：位置嵌入
+- `self.h = nn.ModuleList([...])`：n_layer 个 `Block(C, n_head, block_size)`（Block 已预先加载）
+- `self.ln_f = nn.LayerNorm(C)`
+- `self.lm_head = nn.Linear(C, V, bias=False)`
+- 初始化（nanoGPT 的做法）：所有 Linear 和 Embedding 的权重 `nn.init.normal_(w, 0.0, 0.02)`，Linear 的 bias 清零。用 `self.apply(函数)` 对每个子模块调用一次
+- weight tying：`self.lm_head.weight = self.wte.weight`（同一个参数对象）
+
+`forward(idx, targets=None)` 返回 `(logits, loss)`：
+- `idx` 是 `(B, T)` 的整数，`logits` 是 `(B, T, V)`
+- `targets` 是 None 时 `loss` 也是 None；否则 `loss` 是 `F.cross_entropy` 算出的一个标量
+
+测试：刚初始化的模型，loss 要在 ln(17) ≈ 2.83 附近（±0.7）；`lm_head.weight` 和 `wte.weight` 必须是同一个对象；n_layer=1 时参数量正好是 13696。
 --- starter
 class GPT(nn.Module):
     """要求:
@@ -259,13 +690,12 @@ class GPT(nn.Module):
       - ln_f: nn.LayerNorm(C)
       - lm_head: nn.Linear(C, vocab_size, bias=False)，且与 wte **权重共享**
       - 所有 Linear / Embedding 的权重用 normal_(mean=0, std=0.02) 初始化，bias 清零
-        （nanoGPT 的做法。不这么初始化，第 7 题的初始 loss 会远大于 ln(V)）
+        （nanoGPT 的做法。不这么初始化，初始 loss 会离 ln(V) 很远）
       - forward(idx, targets=None) -> (logits, loss)。targets 为 None 时 loss 是 None。
     """
 
     def __init__(self, vocab_size, block_size, n_layer=2, n_head=4, n_embd=32):
         super().__init__()
-        # --- TODO 07 ---
         raise todo()
 
     def forward(self, idx, targets=None):
@@ -281,7 +711,7 @@ class GPT(nn.Module):
         self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
         self.apply(self._init)
-        self.lm_head.weight = self.wte.weight     # tying 必须放在 init 之后
+        self.lm_head.weight = self.wte.weight     # 共享：同一个 Parameter 对象
 
     @staticmethod
     def _init(m):
@@ -311,32 +741,41 @@ def t07():
     shape_is(logits, (2, 9, 17))
     true(loss is None, "没给 targets 时 loss 应该是 None")
     logits, loss = m(idx, idx)
-    true(loss.dim() == 0, "loss 要是标量")
+    true(loss.dim() == 0, "loss 要是一个标量：cross_entropy 前先把 logits 摊成 (B*T, V)、targets 摊成 (B*T,)")
     # 随机初始化的模型，loss 应该在 ln(V) 附近
     true(abs(loss.item() - math.log(17)) < 0.7,
          f"初始 loss = {loss.item():.3f}，应该在 ln(17)={math.log(17):.3f} 附近。"
-         "偏太多说明初始化或 loss 展平写错了")
+         "离得太远，先检查初始化（std=0.02）和 loss 的摊平")
 
 @check("weight tying")
 def t08():
     m = GPT(vocab_size=17, block_size=16, n_layer=1)
     true(m.lm_head.weight is m.wte.weight,
-         "lm_head 和 wte 必须是同一个张量对象（is，不是 equal）")
-    ids = [id(p) for p in m.parameters()]
-    true(len(ids) == len(set(ids)), "共享的那个权重被 parameters() 数了两遍")
+         "lm_head.weight 和 wte.weight 必须是同一个对象（用 is 判断，不是数值相等）：self.lm_head.weight = self.wte.weight")
+    n = params(m)
+    true(n == 13696, f"参数量是 {n}，应该是 13696（差 {n - 13696}）。lm_head 要 bias=False，共享的权重只能有一份")
 --- hints
-- TODO
+- 位置：`pos = torch.arange(T, device=idx.device)`，然后 `x = self.wte(idx) + self.wpe(pos)`，(B,T,C) + (T,C) 会自动广播。
+- 初始化：写一个 `_init(m)`：`isinstance(m, (nn.Linear, nn.Embedding))` 时 `nn.init.normal_(m.weight, 0.0, 0.02)`，有 bias 就 `nn.init.zeros_(m.bias)`；再 `self.apply(self._init)`。
+- loss：`F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))`；tying：`self.lm_head.weight = self.wte.weight`。
 
 @@ item d4-07
 type: code
 title: 参数量公式
 level: 2
+cards: Block：MLP + pre-LN 残差; GPT：嵌入、初始化、weight tying
 targets: gpt_param_count
 ref: day4
 --- context
-TODO
+「GPT-2 small 为什么是 124M 参数？」是常见面试题。估算显存（权重、梯度、优化器状态都按参数量算）也从这里开始。能心算参数量，说明你知道模型里每一块是什么。
 --- prompt
-09  参数量公式 —— 面试和估算显存都要用
+写 `gpt_param_count(V, C, L, block_size, tied=True)`，**只用算术**（不许构造模型去数），返回上一题那个 GPT 的参数量：
+- wte：V·C；wpe：block_size·C
+- 每个 Block：ln1 (2C) + qkv (3C²) + proj (C²) + ln2 (2C) + fc1 (4C² + 4C) + fc2 (4C² + C)
+- 末尾 ln_f：2C
+- `tied=True` 时 lm_head 和 wte 共用权重，不另算；`tied=False` 时再加 V·C
+
+测试拿 3 组 (V, C, L, block_size) 构造真模型数参数，和你的结果比。
 --- starter
 def gpt_param_count(V, C, L, block_size, tied=True):
     """按下面的结构手算参数量（不许构造模型去数）:
@@ -345,7 +784,6 @@ def gpt_param_count(V, C, L, block_size, tied=True):
        末尾: ln_f(2C)
        tied=True 时 lm_head 不额外计数。
     """
-    # --- TODO 09 ---
     raise todo()
 --- solution
 def gpt_param_count(V, C, L, block_size, tied=True):
@@ -361,27 +799,36 @@ def t09():
         m = GPT(V, bs, n_layer=L, n_head=C // 8, n_embd=C)
         real = sum(p.numel() for p in set(m.parameters()))
         got = gpt_param_count(V, C, L, bs)
-        true(got == real, f"V={V},C={C},L={L}: 你算 {got}, 实际 {real}, 差 {got-real}")
+        true(got == real, f"V={V}, C={C}, L={L}, block_size={bs}：你算的是 {got}，实际是 {real}，差 {got - real}")
 --- hints
-- TODO
+- 先把一个 Block 的六项加起来，整理成 `a·C² + b·C` 的样子。
+- 一个 Block 是 `12 * C * C + 9 * C`；总数 = `V * C + block_size * C + L * 每个Block + 2 * C`，不 tie 再加 `V * C`。
 
 @@ item d4-08
 type: code
 title: 贪心生成 + 上下文裁剪
 level: 2
+cards: 生成：贪心 + 上下文裁剪
 targets: generate_greedy
 ref: day4
 --- context
-TODO
+ChatGPT 一个词一个词往外蹦，背后就是这个循环。贪心（每步取分数最大的）最简单，也最适合写测试：同样的输入永远给同样的输出。
 --- prompt
-10  贪心生成
+写 `generate_greedy(model, idx, max_new_tokens, block_size)`。`idx` 是 `(B, T0)` 的开头 token。循环 `max_new_tokens` 次，每一步：
+1. 上下文裁剪：序列比 block_size 长时，只取最后 block_size 个 token（不然位置嵌入会越界）
+2. 喂给模型。`model(x)` 返回 `(logits, loss)`，logits 是 `(B, T, V)`
+3. 取**最后一个位置**的 logits，`argmax` 得到下一个 token
+4. 拼到序列末尾
+
+返回 `(B, T0 + max_new_tokens)`，前 T0 个就是原来的 idx。函数上已经有 `@torch.no_grad()`：生成时不需要梯度。
+
+测试会用 block_size=8 的模型从 3 个 token 生成 10 个（总长 13，超过 8，必须裁剪），还会检查两次生成结果完全一样。
 --- starter
 @torch.no_grad()
 def generate_greedy(model, idx, max_new_tokens, block_size):
     """每步取 argmax 追加。序列超过 block_size 时只喂最后 block_size 个。
     返回 (B, T0+max_new_tokens)。
     """
-    # --- TODO 10 ---
     raise todo()
 --- solution
 @torch.no_grad()
@@ -399,26 +846,32 @@ def t10():
     m = GPT(vocab_size=11, block_size=8, n_layer=1).eval()
     idx = torch.randint(0, 11, (2, 3))
     out = generate_greedy(m, idx, 10, 8)
-    shape_is(out, (2, 13), "生成后的总长度不对")
-    eq(out[:, :3], idx, msg="前缀被改掉了")
-    true(out.max() < 11 and out.min() >= 0)
-    eq(out, generate_greedy(m, idx, 10, 8), msg="贪心生成必须是确定性的")
+    shape_is(out, (2, 13), "生成后的总长度应该是 T0 + max_new_tokens")
+    eq(out[:, :3], idx, msg="开头的 3 个 token 被改掉了：新 token 要拼在后面")
+    true(out.max() < 11 and out.min() >= 0, "生成的 token id 超出了词表范围 [0, 11)：argmax 要在最后一维（词表那一维）上取")
+    eq(out, generate_greedy(m, idx, 10, 8), msg="贪心生成必须是确定性的：同样的输入两次结果要一样")
     # 超长时不能崩（这就是必须裁剪上下文的原因）
     long_idx = torch.randint(0, 11, (1, 20))
-    shape_is(generate_greedy(m, long_idx, 3, 8), (1, 23))
+    shape_is(generate_greedy(m, long_idx, 3, 8), (1, 23), "开头就有 20 个 token（> block_size）时也要能跑")
 --- hints
-- TODO
+- 每一步先裁剪：`cond = idx[:, -block_size:]`，再 `logits, _ = model(cond)`。
+- `logits[:, -1]` 是 (B, V)；`.argmax(-1, keepdim=True)` 得到 (B, 1)，这样才能 `idx = torch.cat([idx, nxt], dim=1)`。
 
 @@ item d4-09
 type: fix
-title: 找 bug: attention_buggy
+title: 找 bug：attention_buggy
 level: 2
+cards: 缩放点积注意力，一步一步; 因果 mask：只能看过去
 targets: attention_buggy
 ref: day4
 --- context
-TODO
+attention 写错了往往不报错：形状全对，loss 也在降，只是模型学得很差，或者偷看了未来。靠读代码加对拍把这种 bug 找出来，是真实工作里的日常。
 --- prompt
-11  找 bug —— 这个 attention 有 3 处错
+下面这个 causal attention 有 **3 处** bug。修好它，让它和 `F.scaled_dot_product_attention(q, k, v, is_causal=True)` 的结果一致。
+- 输入 q、k、v 都是 `(B, nh, T, hs)`
+- 不要改函数名和参数
+
+先对照公式 `softmax(q @ kᵀ / √hs + mask) @ v` 一行一行读，找到了再运行。
 --- starter
 def attention_buggy(q, k, v):
     T = q.size(-2)
@@ -436,25 +889,34 @@ def attention_buggy(q, k, v):
     att = F.softmax(att, dim=-1)                            # 修 3: dim=-2 -> -1
     return att @ v
 --- tests
-@check("找 bug: attention_buggy")
+@check("和 SDPA 对拍")
 def t11():
     seed(6)
     q, k, v = (torch.randn(1, 2, 5, 8) for _ in range(3))
     eq(attention_buggy(q, k, v), F.scaled_dot_product_attention(q, k, v, is_causal=True),
-       msg="三处: 缩放因子 / mask 的三角方向 / softmax 的维度")
+       msg="一共三处：缩放因子 / mask 的三角方向 / softmax 的维度")
+--- explain
+1. 漏了除以 √hs：分数太大，softmax 接近 one-hot。
+2. `torch.triu` 是上三角：1 在右上方，等于「只许看未来」，正好反了。要 `torch.tril`。
+3. softmax 要让每个 query（每一**行**）的权重加起来是 1，所以是 `dim=-1`。`dim=-2` 是按列归一化。
 --- hints
-- TODO
+- 对着公式一项一项看：分数有没有除以 √hs？
+- mask 里 1 表示「允许看」：第 0 行应该只有第 0 个格子是 1。`torch.triu` 给的是哪个三角？
+- softmax 要让每个 query（每一行）的权重加起来等于 1：那是哪一维？
 
 @@ item d4-10
 type: fix
-title: 找 bug: BlockBuggy
+title: 找 bug：BlockBuggy
 level: 2
+cards: Block：MLP + pre-LN 残差
 targets: BlockBuggy
 ref: day4
 --- context
-TODO
+post-LN 和漏掉残差都不会报错，小模型甚至也能训；层数一多就训不动了。这种「能跑但不对」的 bug，要靠恒等检验这类不变量测试来抓。
 --- prompt
-12  找 bug —— 这个 Block 有 2 处错
+这个 Block 有 **2 处** bug，都在 `forward` 里（`__init__` 没问题）。把它修成正确的 pre-LN 残差 Block：每个子层都是 `x = x + 子层(LN(x))`。
+- `CausalSelfAttention` 和 `MLP` 是预先加载好的参考版本
+- 测试：attn 的 `proj` 和整个 MLP 清零后，Block 必须原样返回 x
 --- starter
 class BlockBuggy(nn.Module):
     def __init__(self, n_embd, n_head, block_size):
@@ -482,7 +944,7 @@ class BlockBuggy(nn.Module):
         x = x + self.mlp(self.ln2(x))     # 修 2: 漏了残差
         return x
 --- tests
-@check("找 bug: BlockBuggy")
+@check("子层清零后是恒等映射")
 def t12():
     seed(7)
     b = BlockBuggy(32, 4, 16)
@@ -491,31 +953,291 @@ def t12():
         b.attn.proj.weight.zero_()
         for p in b.mlp.parameters():
             p.zero_()
-    eq(b(x), x, tol=1e-5, msg="两处: LN 应该在残差分支内部(pre-LN)；MLP 那一行漏了残差")
+    eq(b(x), x, tol=1e-5, msg="两处：LN 应该在残差分支里面（pre-LN）；MLP 那一行漏了残差")
+--- explain
+1. 第一行是 post-LN：LN 套在了 `x + attn(x)` 外面，attn 吃的还是没归一化的 x。改成 `x = x + self.attn(self.ln1(x))`。
+2. 第二行没有 `x +`：MLP 的输出直接替换了 x，残差没了。改成 `x = x + self.mlp(self.ln2(x))`。
 --- hints
-- TODO
+- 正确结构：每个子层都是 `x = x + 子层(LN(x))`。对照着一行一行看。
+- 第一行把 LN 放到了残差相加之后（post-LN），而且 attn 吃的是没归一化的 x；第二行干脆把残差丢了。
 
 @@ item d4-11
 type: self
 title: 默写 Block（自评）
 level: 1
+cards: Block：MLP + pre-LN 残差; 多头：拆头、合头、register_buffer; 缩放点积注意力，一步一步
 --- context
-TODO
+默写是把「看懂了」变成「会写」的办法。面试会要你当场写，第 5 天把它改成 Llama 结构时也默认你闭着眼就能写出这个 Block。这一题不跑代码，但它是今天最该做的一题。
 --- prompt
-13  默写清单 —— 不跑代码，但这是今天最该做的一题
-关掉所有参考，在一个空文件里默写 Block 类。写完对照下面每一条自查，
-全部打勾之后把 DICTATION_DONE 改成 True。
+关掉所有参考（卡片、答案、之前写的代码），在一个空白文件里（VS Code 或纸上都行）默写 `Block`，连同它用到的 `CausalSelfAttention` 和 `MLP`。
 
-  [ ] class Block(nn.Module) 且 __init__ 里第一行是 super().__init__()
-  [ ] ln1 / attn / ln2 / mlp 四个子模块都建了
-  [ ] forward 里是 x = x + attn(ln1(x))，不是 x = attn(ln1(x))
-  [ ] mlp 那一行同样带残差
-  [ ] attention 里 qkv 一次投影成 3C 再 split
-  [ ] view 成 (B,T,nh,hs) 之后 transpose(1,2)
-  [ ] scores 除以 sqrt(head_dim)
-  [ ] mask 用 tril，masked_fill 成 -inf
-  [ ] softmax 在最后一维
-  [ ] 合并头时 transpose 回来要 .contiguous() 再 view
-  [ ] 最后过一层 proj
+写完后对照下面的清单逐条检查。每一条都真的做到了才打勾；有一条没做到，就先改好再勾。
+
+想确认能跑：把三个类一起粘到练习 d4-05 的编辑器里运行。
 --- checklist
-- TODO: 从 prompt 里的 [ ] 清单搬过来
+- `class Block(nn.Module)`，而且 `__init__` 里第一行是 `super().__init__()`
+- ln1 / attn / ln2 / mlp 四个子模块都建了
+- forward 里是 `x = x + self.attn(self.ln1(x))`，不是 `x = self.attn(self.ln1(x))`
+- mlp 那一行同样带残差
+- attention 里 qkv 一次投影成 3C，再 `split(C, dim=-1)`
+- `view` 成 (B, T, nh, hs) 之后 `transpose(1, 2)`
+- 分数除以 `math.sqrt(hs)`（hs = 每个头的维度）
+- mask 用 `tril`，`masked_fill` 成 `-inf`
+- softmax 在最后一维（`dim=-1`）
+- 合并头时 `transpose(1, 2)` 回来，先 `.contiguous()` 再 `view(B, T, C)`
+- 最后过一层 `proj`
+--- hints
+- 先写骨架：三个类的 `__init__` 和 `forward` 签名，再往里填。
+- 想不起形状时默念一遍：(B, T, C) → (B, nh, T, hs) → attention → (B, T, C)。
+
+@@ item d4-12
+type: predict
+title: 形状预测：多头注意力走一遍
+level: 2
+cards: 多头：拆头、合头、register_buffer
+--- context
+多头注意力里一大半的 bug 是形状 bug。能在脑子里把每一步的形状推出来，看到报错时就知道是哪一行出了问题。
+--- prompt
+B=3、T=7、C=32、nh=4。不运行，写出这段代码打印的 4 行（每行一个形状元组）。
+--- code
+B, T, C, nh = 3, 7, 32, 4
+hs = C // nh
+x = torch.randn(B, T, C)
+qkv = nn.Linear(C, 3 * C, bias=False)
+q, k, v = qkv(x).split(C, dim=-1)
+q = q.view(B, T, nh, hs).transpose(1, 2)
+k = k.view(B, T, nh, hs).transpose(1, 2)
+v = v.view(B, T, nh, hs).transpose(1, 2)
+att = (q @ k.transpose(-2, -1) / math.sqrt(hs)).softmax(dim=-1)
+y = att @ v
+print(tuple(q.shape))
+print(tuple(att.shape))
+print(tuple(y.shape))
+print(tuple(y.transpose(1, 2).contiguous().view(B, T, C).shape))
+--- explain
+- hs = 32 / 4 = 8。拆头后 q 是 (B, nh, T, hs) = (3, 4, 7, 8)。
+- 分数是每个头里 T×T 的矩阵：(3, 4, 7, 7)。它和 hs 无关。
+- `att @ v`：(3, 4, 7, 7) @ (3, 4, 7, 8) → (3, 4, 7, 8)。
+- 合并头回到输入的形状 (3, 7, 32)。
+--- hints
+- 先算 hs = C // nh。
+- 拆头之后是 (B, nh, T, hs)；分数矩阵的最后两维都是 T。
+
+@@ item d4-13
+type: predict
+title: 分数都一样时，attention 在算什么
+level: 1
+cards: 缩放点积注意力，一步一步; 因果 mask：只能看过去
+--- context
+所有分数一样时，因果 attention 就是「对过去求平均」。这个特例能帮你看清 attention 的本质：一个权重由模型自己决定的加权平均。
+--- prompt
+所有分数都是 0，加上因果 mask，再 softmax、乘 v。v 在 4 个位置上的值分别是 1、2、3、4。不运行，写出打印的 3 行。
+--- code
+T = 4
+scores = torch.zeros(1, 1, T, T)                      # 所有分数都一样
+bias = torch.zeros(T, T).masked_fill(torch.tril(torch.ones(T, T)) == 0, float("-inf"))
+att = (scores + bias).softmax(dim=-1)
+v = torch.tensor([1.0, 2.0, 3.0, 4.0]).view(1, 1, T, 1)
+out = att @ v
+print(int((att > 0).sum()))
+print([round(w, 2) for w in att[0, 0, 2].tolist()])
+print([round(o, 2) for o in out.flatten().tolist()])
+--- explain
+- 位置 i 能看 i+1 个位置，权重不为 0 的格子一共 1+2+3+4 = 10 个。
+- 分数都一样，softmax 就把权重平均分给能看的位置。第 2 行能看 3 个位置：各 1/3 ≈ 0.33，第 4 个是 0。
+- 输出 = 过去所有 v 的平均：1、(1+2)/2 = 1.5、(1+2+3)/3 = 2.0、(1+2+3+4)/4 = 2.5。训练会让分数不再相等，模型自己决定该多看谁。
+--- hints
+- 被 mask 的格子 softmax 之后是 0；剩下的格子分数都一样，权重就一样。
+- 位置 i 的输出 = 位置 0…i 上 v 的平均值。
+
+@@ item d4-14
+type: choice
+title: 为什么要除以 √hs
+level: 1
+cards: 缩放点积注意力，一步一步
+--- context
+「attention 里为什么要除以 √d」几乎是必考的面试题。答案不是「论文这么写的」，而是和 softmax 的饱和、梯度有关。
+--- prompt
+hs = 64，q 和 k 的每个数都大致是均值 0、标准差 1。如果算 attention 时**不**除以 √hs，会发生什么？
+--- options
+- 分数的标准差约为 8，softmax 几乎把全部权重给最大的那一个位置，其余位置的梯度接近 0，训练变慢、变不稳定
+- 分数会全部变成负数，softmax 输出 NaN
+- 输出的形状会从 (B, nh, T, hs) 变成 (B, nh, T, T)
+- 没有区别：softmax 本来就会把每一行归一化到和为 1，除不除都一样
+answer: 1
+--- explain
+点积是 64 个乘积之和，每个乘积的方差约为 1，所以点积的方差约 64、标准差约 8。softmax 看到相差十几的分数，输出接近 one-hot：几乎只看一个位置，别的位置拿不到梯度。除以 √64 = 8，标准差回到 1 左右。选项 4 错在：softmax 确实让每行和为 1，但**分布的形状**（平坦还是尖锐）取决于分数的大小。
+--- hints
+- 64 个「标准差为 1」的乘积加起来，标准差是多少？
+- softmax([0, 16]) 和 softmax([0, 2]) 的结果差别有多大？
+
+@@ item d4-15
+type: choice
+title: GPT-2 small 有多少参数
+level: 2
+cards: GPT：嵌入、初始化、weight tying; Block：MLP + pre-LN 残差
+--- context
+能用公式估出一个模型的参数量，是面试和估算显存的基本功。GPT-2 small 被叫作「124M」，这个数就是这么来的。
+--- prompt
+用今天的 GPT 结构（weight tying，qkv 和 proj 不带 bias）：V = 50257，C = 768，L = 12，block_size = 1024。参数量最接近哪个？
+--- options
+- 约 8500 万
+- 约 1.24 亿
+- 约 1.63 亿
+- 约 15 亿
+answer: 2
+--- explain
+- 12 个 Block：12 × (12·768² + 9·768) = 85,017,600，约 8500 万（选项 1 只算了 Block）
+- wte：50257 × 768 = 38,597,376，约 3860 万；wpe：1024 × 768 = 786,432；ln_f：1536
+- 合计 124,402,944，约 1.24 亿。不做 weight tying 还要再加一份 3860 万，就是约 1.63 亿（选项 3）
+- 真正的 GPT-2 在 qkv 和 proj 上还有 bias，多 36,864 个，一共 124,439,808：这就是「124M」
+--- hints
+- 一个 Block 是 12C² + 9C；C = 768 时 C² = 589,824。
+- 别忘了词表嵌入 V·C 有多大，也别忘了 tying 之后它只算一次。
+
+@@ item d4-16
+type: code
+title: 闭卷：CausalSelfAttention
+level: 3
+exam: yes
+cards: 多头：拆头、合头、register_buffer; 缩放点积注意力，一步一步
+targets: CausalSelfAttention
+ref: day4
+--- context
+闭卷从空白写出多头因果注意力，是今天最核心的能力，也是面试里最常见的「手写 Transformer」题。
+--- prompt
+从空白写 `CausalSelfAttention(n_embd, n_head, block_size)`，输入输出都是 `(B, T, C)`：
+- `self.qkv = nn.Linear(C, 3C, bias=False)`，`self.proj = nn.Linear(C, C, bias=False)`
+- 下三角 mask 用 `register_buffer` 存成 `"bias"`，形状 `(1, 1, block_size, block_size)`
+- forward：qkv → split → 拆头 → 缩放、mask、softmax → 乘 v → 合并头 → proj
+- T 可以比 block_size 短；必须满足因果性
+--- starter
+class CausalSelfAttention(nn.Module):
+    def __init__(self, n_embd, n_head, block_size):
+        super().__init__()
+        raise todo()
+
+    def forward(self, x):
+        raise todo()
+--- solution
+class CausalSelfAttention(nn.Module):
+    def __init__(self, n_embd, n_head, block_size):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.n_head = n_head
+        self.qkv = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        self.proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        hs = C // self.n_head
+        q, k, v = self.qkv(x).split(C, dim=-1)
+        q = q.view(B, T, self.n_head, hs).transpose(1, 2)
+        k = k.view(B, T, self.n_head, hs).transpose(1, 2)
+        v = v.view(B, T, self.n_head, hs).transpose(1, 2)
+        att = q @ k.transpose(-2, -1) / math.sqrt(hs)
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf")).softmax(-1)
+        y = (att @ v).transpose(1, 2).contiguous().view(B, T, C)
+        return self.proj(y)
+--- tests
+@check("CausalSelfAttention 模块")
+def t04():
+    seed(2)
+    m = CausalSelfAttention(32, 4, 16)
+    x = torch.randn(2, 9, 32)
+    shape_is(m(x), (2, 9, 32))
+    true("bias" in dict(m.named_buffers()), "mask 应该用 register_buffer 注册成名叫 \"bias\" 的 buffer，不是每次现算")
+    true(params(m) == 32 * 32 * 3 + 32 * 32,
+         f"参数量是 {params(m)}，应该是 3C²+C² = 4096：qkv 和 proj 都要 bias=False")
+    # 变长输入也要能跑（T < block_size）
+    shape_is(m(torch.randn(1, 3, 32)), (1, 3, 32), "T=3 比 block_size=16 短时也要能跑：mask 要切成 [:, :, :T, :T]")
+    # 因果性
+    x2 = x.clone()
+    x2[:, 5:] = torch.randn(2, 4, 32)
+    eq(m(x)[:, :5], m(x2)[:, :5], msg="改了 x 的后 4 个位置，前 5 个位置的输出也变了：模块的因果性挂了（mask 没用上或方向反了）")
+--- hints
+- 形状路线：(B, T, C) → (B, T, nh, hs) → (B, nh, T, hs) → attention → 转回来 → (B, T, C)。
+- 合并头之前要 `.contiguous()`。
+
+@@ item d4-17
+type: code
+title: 闭卷：完整 GPT
+level: 3
+exam: yes
+cards: GPT：嵌入、初始化、weight tying; GPT 全景：形状一路走下来
+targets: GPT
+ref: day4
+--- context
+从空白写出整个 GPT：嵌入、Block 堆叠、输出头、nanoGPT 初始化、weight tying、loss。写得出来，你就真的会写 Transformer 了。
+--- prompt
+从空白写 `GPT(vocab_size, block_size, n_layer=2, n_head=4, n_embd=32)`（`Block` 已预先加载）：
+- 子模块名：`wte`、`wpe`、`h`（ModuleList）、`ln_f`、`lm_head`（bias=False）
+- Linear 和 Embedding 的权重初始化成 N(0, 0.02)，Linear 的 bias 清零
+- `lm_head.weight` 和 `wte.weight` 共享（同一个对象）
+- `forward(idx, targets=None)` 返回 `(logits, loss)`；没有 targets 时 loss 是 None
+--- starter
+class GPT(nn.Module):
+    def __init__(self, vocab_size, block_size, n_layer=2, n_head=4, n_embd=32):
+        super().__init__()
+        raise todo()
+
+    def forward(self, idx, targets=None):
+        raise todo()
+--- solution
+class GPT(nn.Module):
+    def __init__(self, vocab_size, block_size, n_layer=2, n_head=4, n_embd=32):
+        super().__init__()
+        self.block_size = block_size
+        self.wte = nn.Embedding(vocab_size, n_embd)
+        self.wpe = nn.Embedding(block_size, n_embd)
+        self.h = nn.ModuleList([Block(n_embd, n_head, block_size) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        self.apply(self._init)
+        self.lm_head.weight = self.wte.weight     # 共享：同一个 Parameter 对象
+
+    @staticmethod
+    def _init(m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, 0.0, 0.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device)
+        x = self.wte(idx) + self.wpe(pos)          # (B,T,C) + (T,C) 广播
+        for b in self.h:
+            x = b(x)
+        logits = self.lm_head(self.ln_f(x))
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+--- tests
+@check("GPT forward + loss")
+def t07():
+    seed(4)
+    m = GPT(vocab_size=17, block_size=16, n_layer=2)
+    idx = torch.randint(0, 17, (2, 9))
+    logits, loss = m(idx)
+    shape_is(logits, (2, 9, 17))
+    true(loss is None, "没给 targets 时 loss 应该是 None")
+    logits, loss = m(idx, idx)
+    true(loss.dim() == 0, "loss 要是一个标量：cross_entropy 前先把 logits 摊成 (B*T, V)、targets 摊成 (B*T,)")
+    # 随机初始化的模型，loss 应该在 ln(V) 附近
+    true(abs(loss.item() - math.log(17)) < 0.7,
+         f"初始 loss = {loss.item():.3f}，应该在 ln(17)={math.log(17):.3f} 附近。"
+         "离得太远，先检查初始化（std=0.02）和 loss 的摊平")
+
+@check("weight tying")
+def t08():
+    m = GPT(vocab_size=17, block_size=16, n_layer=1)
+    true(m.lm_head.weight is m.wte.weight,
+         "lm_head.weight 和 wte.weight 必须是同一个对象（用 is 判断，不是数值相等）：self.lm_head.weight = self.wte.weight")
+    n = params(m)
+    true(n == 13696, f"参数量是 {n}，应该是 13696（差 {n - 13696}）。lm_head 要 bias=False，共享的权重只能有一份")
+--- hints
+- 顺序：建模块 → `self.apply(self._init)` → tying。
+- forward：嵌入相加 → 每个 Block → ln_f → lm_head → 有 targets 就摊平算 cross_entropy。

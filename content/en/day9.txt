@@ -1,0 +1,1096 @@
+@@ day 9
+title: Conditioning: a mini Stable Diffusion
+part: Image generation
+hours: 3–4 hours
+--- goal
+Make a diffusion model do what you ask: feed it text or a class with cross-attention and condition embeddings, control how closely it follows with condition dropout and CFG, sample in only 10 steps with DDIM, and work out every tensor shape inside Stable Diffusion.
+--- checklist
+- Clear the review list first (redo from blank anything you looked up the answer for)
+- Read the 8 cards; change one number in every example and run it
+- Pass every practice exercise, especially "The CFG batch trick" and "One DDIM step"
+- Write cfg_forward and ddim_step closed-book
+
+@@ concept
+title: Images become token sequences
+--- body
+Attention works on a sequence of tokens with shape (B, T, C): B samples, T tokens each, every token a vector of C numbers. An image feature map has shape (B, C, H, W). To use attention on image features, first flatten the map into a sequence.
+
+- Every pixel position becomes one token. Its vector is the C channel values at that position.
+- There are H*W tokens. The order is **row-major**: row 0 from left to right, then row 1, and so on.
+- In code: `x.flatten(2)` merges the dimensions from 2 on, (H, W), into one: (B, C, H*W). Then `.transpose(1, 2)` swaps dimensions 1 and 2: (B, H*W, C).
+
+After attention you go back to convolutions, so you need the reverse: `transpose(1, 2)` back to (B, C, H*W), then `reshape(B, C, H, W)`. After a transpose the memory is not contiguous, so `view` fails here; use `reshape`.
+
+Real numbers: a 64×64 feature map with 320 channels becomes 4096 tokens of 320 numbers each.
+--- code
+import torch
+
+x = torch.arange(12.).reshape(1, 3, 2, 2)   # B=1, C=3, H=2, W=2
+print(x[0, 0])                               # channel 0, a 2x2 grid
+tok = x.flatten(2).transpose(1, 2)
+print(tok.shape)                             # 4 tokens of 3 numbers
+print(tok[0])                                # row 0 = the top-left pixel's 3 channels; row 1 = the pixel to its right
+back = tok.transpose(1, 2).reshape(1, 3, 2, 2)
+print(torch.equal(back, x))                  # back to the image, exactly
+
+@@ concept
+title: Cross-attention: the image asks, the text answers
+--- body
+In self-attention, Q, K and V all come from the same sequence. Cross-attention splits them:
+
+- **Q comes from the image tokens** x, shape (B, Tx, C). Each pixel position asks: "which words in the text matter to me?"
+- **K and V come from the text embeddings** ctx, shape (B, Tc, Cc). The text width Cc can differ from C, so the projections wk and wv have shape (Cc, C): they map the text into C dimensions.
+- The attention matrix is (Tx, Tc): every image token scores every text token. After softmax each row sums to 1.
+- The output is (B, Tx, C). **The output length follows Q (the image)**, not the text. With 7 text tokens or 77, the output shape is the same.
+
+No causal mask: every image token may look at the whole text.
+
+Heads work as on day 4: after the projection, `view(B, T, n_head, hd).transpose(1, 2)` gives (B, n_head, T, hd) with hd = C // n_head; after `F.scaled_dot_product_attention`, `transpose(1, 2).reshape(B, T, C)` joins the heads again. The one difference: Q has length Tx, K and V have length Tc.
+
+This is how Stable Diffusion "tells" the UNet what the prompt says: many UNet layers have a cross-attention where Q is the image features and K, V are the text encoder's output.
+--- code
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+B, Tx, Tc, C, Cc = 1, 6, 3, 8, 5
+x = torch.randn(B, Tx, C)        # 6 image tokens of 8 numbers
+ctx = torch.randn(B, Tc, Cc)     # 3 text tokens of 5 numbers
+wq, wk, wv = torch.randn(C, C), torch.randn(Cc, C), torch.randn(Cc, C)
+q, k, v = x @ wq, ctx @ wk, ctx @ wv
+print("q", tuple(q.shape), "k", tuple(k.shape), "v", tuple(v.shape))
+att = (q @ k.transpose(1, 2) / C ** 0.5).softmax(-1)
+print("attention matrix", tuple(att.shape))   # each image token scores the 3 text tokens
+print("row sums", att.sum(-1))
+out = F.scaled_dot_product_attention(q, k, v)
+print("output", tuple(out.shape))              # the length follows the image
+
+@@ concept
+title: Class conditioning: add it to the time embedding
+--- body
+The "condition" is whatever you want to control: a class ("draw a 7") or a sentence. Text is long, so it goes in through cross-attention (previous card). A **class** is just a number. The simplest way in:
+
+1. `nn.Embedding(num_classes, D)` turns the class number into a vector of D numbers (the class embedding).
+2. **Add it to the time embedding**: `emb = t_emb + class_emb`, both (B, D).
+3. emb then goes through day 8's FiLM into every ResBlock, as before.
+
+Why is adding enough? After the sum, the next Linear layer gets one vector that holds both "which step is this" and "what to draw". The network learns to use both. DiT and many class-conditional diffusion models do exactly this.
+
+One extra thing for CFG: keep one more number for "no condition" (null). With 10 classes, build `nn.Embedding(11, D)`; number 10 means "I won't tell you what to draw".
+--- code
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+D, num_classes = 4, 10
+class_table = nn.Embedding(num_classes + 1, D)   # number 10 = null (no condition)
+t_emb = torch.zeros(3, D)                         # pretend these are 3 time embeddings
+labels = torch.tensor([7, 7, 10])                 # two "7"s and one "no condition"
+emb = t_emb + class_table(labels)
+print(emb.shape)
+print(emb.detach().round(decimals=2))             # rows 0 and 1 match: same class, same step
+
+@@ concept
+title: Condition dropout: what makes CFG possible
+--- body
+CFG (next card) needs **two** predictions at sampling time: one with the condition and one without. Do you train two models? No. During training, randomly replace the condition of some samples with null. Then one model learns both:
+
+- with the real condition: the noise to remove "for this condition"
+- with null: the noise to remove "when it knows nothing"
+
+Key points:
+
+- The drop probability p is usually 0.1: 10% of the samples get no condition.
+- **Drop per sample, not per element.** A sample keeps its whole condition or gets the whole null. Zeroing some numbers inside the vector, like normal dropout, gives "half a condition" that sampling never uses.
+- In code: draw **one** random number per sample, `keep = torch.rand(B, 1) >= p`. Shape (B, 1) broadcasts to (B, D). Turn keep into floats, then `keep * cond + (1 - keep) * null`.
+- Only during training. At sampling time you choose the condition.
+--- code
+import torch
+
+torch.manual_seed(0)
+B, D, p = 6, 3, 0.5                # p = 0.5 here so you can see it; real training often uses 0.1
+cond = torch.ones(B, D)            # real condition: all ones
+null = torch.zeros(D)              # null condition: all zeros
+keep = (torch.rand(B, 1) >= p).float()
+print(keep.squeeze(1))             # one 0 or 1 per sample
+out = keep * cond + (1 - keep) * null
+print(out)                         # every row is all ones or all zeros
+
+@@ concept
+title: CFG: the formula and the batch trick
+--- body
+Classifier-free guidance (CFG) is the knob that makes a model follow the condition more closely. At every sampling step the model predicts the noise twice:
+
+- eps_u: the prediction with the null condition (unconditional)
+- eps_c: the prediction with the real condition (conditional)
+
+Then it combines them:
+
+```
+eps = eps_u + scale * (eps_c - eps_u)
+```
+
+- `eps_c - eps_u` is "what the condition changes": a direction.
+- scale = 0: the result is eps_u; the condition is ignored.
+- scale = 1: the result is exactly eps_c, plain conditional generation.
+- scale > 1: **push further** along that direction (extrapolation). The image matches the condition better but varies less; too high (say 20) and colours oversaturate. Stable Diffusion uses 7.5 by default.
+
+The distance from eps_u is exactly scale × |eps_c - eps_u|, so a larger scale always lands further away.
+
+**The batch trick**: do not run the model twice. Duplicate the input and do one forward pass:
+
+1. x becomes `torch.cat([x, x])`, shape (2B, ...); the timesteps t are duplicated the same way.
+2. The conditions become `torch.cat([null expanded to B rows, cond])`: **first half null, second half cond**. This is a convention; you must split the same way.
+3. `out.chunk(2)` splits the output into two blocks: the first is eps_u, the second eps_c. Then apply the formula.
+
+On a GPU, one forward pass with batch 2B is faster than two with batch B. The cost: twice the activation memory for that step.
+--- code
+import torch
+
+eps_u = torch.tensor([0.0, 1.0])
+eps_c = torch.tensor([1.0, 1.0])
+for scale in [0.0, 1.0, 3.0, 7.5]:
+    eps = eps_u + scale * (eps_c - eps_u)
+    print(scale, eps.tolist(), "distance from eps_u", (eps - eps_u).norm().item())
+
+B, D = 2, 4
+x = torch.randn(B, 1, 8, 8)
+cond = torch.ones(B, D)
+null = torch.zeros(D)
+both_x = torch.cat([x, x])
+both_c = torch.cat([null.expand(B, -1), cond])     # first half null, second half cond
+print(both_x.shape, both_c.shape)
+print(both_c)
+
+@@ concept
+title: DDIM timesteps: skipping ahead
+--- body
+Day 8's DDPM trains with T=1000 steps and also samples one step at a time, 1000 steps. Too slow. DDIM uses **the same trained model** but walks through only a few of those timesteps, say 50 or even 10. No retraining.
+
+Which ones: evenly spaced. The gap is k = T // steps (integer division), and the timesteps are 0, k, 2k, …, (steps-1)*k, exactly steps of them. Sampling starts where the noise is largest, so **reverse** them, largest first:
+
+- T=1000, steps=5: k=200, timesteps [800, 600, 400, 200, 0]
+- T=1000, steps=50: k=20, timesteps [980, 960, …, 20, 0]
+
+Two details:
+
+- The last one is always 0. The last step must land on the clean image.
+- There must be exactly steps of them. `torch.arange(0, T, k)` works when steps divides T; with T=100 and steps=30, k=3 and it gives 34 values (0, 3, …, 99), four too many.
+
+Each step goes from t to the next timestep in the list, called t_prev (for example 800 to 600). The last step goes from 0 to "-1", which means "the clean image itself".
+--- code
+import torch
+
+T, steps = 1000, 5
+k = T // steps
+print("k =", k)
+print(torch.arange(0, T, k))              # smallest first
+print(torch.arange(0, T, k).flip(0))      # reversed: start where the noise is largest
+
+T, steps = 100, 30
+k = T // steps
+print(f"k = {k}; arange(0, T, k) gives {len(torch.arange(0, T, k))} values, we want {steps}")
+
+@@ concept
+title: One DDIM step: guess x0, then re-noise
+ref: day8
+--- body
+Recall day 8's q_sample: `x_t = sqrt(ab_t) * x0 + sqrt(1 - ab_t) * eps`. ab is alphas_cumprod (the running product of the alphas). The larger t, the smaller ab and the more noise in x_t.
+
+One DDIM step (eta=0: no new random noise) has two halves:
+
+1. **Recover x0 from x_t.** The model predicted the noise eps; solve the q_sample formula for x0: `x0_pred = (x_t - sqrt(1 - ab_t) * eps) / sqrt(ab_t)`
+2. **Add the same eps back, at level t_prev**: `x_prev = sqrt(ab_prev) * x0_pred + sqrt(1 - ab_prev) * eps`
+
+Step 2 is just `q_sample(x0_pred, t_prev, eps)`. So if the predicted eps is exactly the noise that was added, one DDIM step lands **exactly** on `q_sample(x0, t_prev, eps)`. That makes the best unit test for a sampler.
+
+- t_prev = -1 means "done": use ab_prev = 1, so x_prev is x0_pred.
+- There are no random numbers in the whole process. The same starting noise always gives the same image. DDPM adds fresh random noise at every step, so it differs every time.
+- t and t_prev are (B,) tensors. Take the coefficients with day 8's `extract(arr, t, x.shape)`; it turns (B,) into (B, 1, 1, 1), which broadcasts against the image.
+- The gather inside `extract` does not accept -1. Take ab_prev with `t_prev.clamp(min=0)` first, then use `torch.where` to put 1 where t_prev < 0.
+
+**The sampling loop**: start from `x = torch.randn(shape)` and walk (t, t_prev) = (800, 600), (600, 400), …, (0, -1). At each step, `eps = model(x, t)`, then `x = ddim_step(x, t, t_prev, eps, sched)`. The final x is the generated image.
+
+The example shows only half 1: at t=600, x_t is almost pure noise, yet with the true eps the recovered x0 is exact.
+--- code
+torch.manual_seed(0)
+s = linear_schedule(1000)
+x0 = torch.randn(1, 4)                 # a "clean image" of just 4 numbers
+eps = torch.randn(1, 4)                # the noise that was added
+t = torch.tensor([600])
+x_t = q_sample(x0, t, eps, s)
+ab = extract(s["alphas_cumprod"], t, x_t.shape)
+print("ab_600 =", round(ab.item(), 4))  # small: x_t is almost all noise
+print("x_t    ", x_t)
+x0_pred = (x_t - (1 - ab).sqrt() * eps) / ab.sqrt()
+print("x0     ", x0)
+print("x0_pred", x0_pred)              # the same as x0
+
+@@ concept
+title: Latent diffusion: the shapes in Stable Diffusion
+--- body
+Diffusion directly on 512×512 pixels is expensive: one image is 3×512×512 ≈ 786,000 numbers, and the UNet processes all of them at every step. Stable Diffusion uses latent diffusion: a VAE like day 7's first shrinks the image, diffusion runs on the small latent, and the VAE decodes the result back to pixels at the end.
+
+Fixed numbers in Stable Diffusion 1.x:
+
+- VAE: height and width shrink 8 times; the latent has 4 channels.
+- The UNet's first convolution lifts the 4 channels to 320.
+- The text encoder (CLIP) turns the prompt into 77 tokens of 768 numbers each.
+
+With these you can work out every shape. Example with batch 2 and 256×256 images:
+
+1. Image: (2, 3, 256, 256)
+2. VAE encoder: 256 ÷ 8 = 32, so the latent is (2, 4, 32, 32). 48 times fewer numbers.
+3. Adding noise, the UNet's noise prediction and DDIM denoising all happen on the latent. The UNet output (the predicted noise) has the latent's shape: (2, 4, 32, 32).
+4. Inside the UNet: after the first convolution, (2, 320, 32, 32); flattened into tokens, (2, 32*32, 320) = (2, 1024, 320).
+5. Text embeddings: (2, 77, 768).
+6. Cross-attention: Q from (2, 1024, 320), K and V from (2, 77, 768) (wk and wv map 768 to 320). The output follows Q: (2, 1024, 320).
+7. After sampling, the VAE decodes back to (2, 3, 256, 256).
+
+Add CFG's batch trick and the batch the UNet actually processes at every step doubles.
+--- code
+import torch
+import torch.nn as nn
+
+B, H, W = 2, 256, 256
+image = torch.zeros(B, 3, H, W)
+latent = torch.zeros(B, 4, H // 8, W // 8)        # VAE: height and width / 8, 4 channels
+print("image ", tuple(image.shape), image[0].numel(), "numbers per image")
+print("latent", tuple(latent.shape), latent[0].numel(), "numbers per image")
+print(f"{image.numel() // latent.numel()} times fewer numbers")
+h = nn.Conv2d(4, 320, 3, padding=1)(latent)       # the UNet's first layer: 4 -> 320 channels
+tokens = h.flatten(2).transpose(1, 2)
+print("latent tokens", tuple(tokens.shape))
+
+@@ item d9-01
+type: code
+title: Spatial <-> tokens round trip
+level: 1
+cards: Images become token sequences
+targets: to_tokens, to_spatial
+ref: day8, day9
+--- context
+Attention layers in a UNet, DiT and ViT all flatten a (B, C, H, W) feature map into a token sequence and turn it back afterwards. Get the order wrong and tokens no longer match their pixels: nothing crashes, but the model learns badly.
+--- prompt
+Write two functions:
+
+- `to_tokens(x)`: input (B, C, H, W), output (B, H*W, C). Token i holds the C channel values of pixel position i, with pixels in **row-major** order (row 0 left to right, then row 1, …).
+- `to_spatial(tok, H, W)`: input (B, H*W, C), output (B, C, H, W). It undoes `to_tokens`: `to_spatial(to_tokens(x), H, W)` must equal x exactly.
+
+Example: x has shape (2, 8, 4, 6); `to_tokens(x)` is (2, 24, 8).
+--- starter
+def to_tokens(x):
+    """(B, C, H, W) -> (B, H*W, C). After this, the image is "a sentence"."""
+    raise todo()
+
+def to_spatial(tok, H, W):
+    """(B, H*W, C) -> (B, C, H, W), the inverse of to_tokens."""
+    raise todo()
+--- solution
+def to_tokens(x):
+    return x.flatten(2).transpose(1, 2)          # (B,C,H,W) -> (B,C,HW) -> (B,HW,C)
+
+def to_spatial(tok, H, W):
+    B, N, C = tok.shape
+    return tok.transpose(1, 2).reshape(B, C, H, W)
+--- tests
+@check("spatial <-> tokens round trip")
+def t01():
+    x = torch.randn(2, 8, 4, 6)
+    tok = to_tokens(x)
+    shape_is(tok, (2, 24, 8))
+    eq(to_spatial(tok, 4, 6), x, msg="the round trip must give back x exactly (row-major order)")
+    eq(tok[0, 0], x[0, :, 0, 0], msg="token 0 should be the channel vector of the top-left pixel")
+    eq(tok[0, 1], x[0, :, 0, 1], msg="token 1 should be the pixel to its right (row-major)")
+--- hints
+- `x.flatten(2)` merges H and W (dimensions 2 and on) into one: (B, C, H*W). One step left: move C to the end.
+- `to_tokens`: `x.flatten(2).transpose(1, 2)`.
+- `to_spatial`: `tok.transpose(1, 2)` back to (B, C, H*W), then `.reshape(B, C, H, W)`. `view` fails here because the memory is not contiguous after a transpose.
+
+@@ item d9-02
+type: code
+title: Cross-attention
+level: 2
+cards: Cross-attention: the image asks, the text answers
+targets: cross_attention
+ref: day8, day9
+--- context
+Cross-attention is how Stable Diffusion tells the UNet what the prompt says: image features are Q, text embeddings are K and V. The text can have any length and the output shape follows the image, so one UNet works with prompts of any length.
+--- prompt
+Write `cross_attention(x, ctx, wq, wk, wv, n_head)`:
+
+- x: (B, Tx, C), image tokens. ctx: (B, Tc, Cc), text embeddings. Tc has nothing to do with Tx, and Cc may differ from C.
+- Weights: wq is (C, C); wk and wv are (Cc, C). The projections are `x @ wq`, `ctx @ wk`, `ctx @ wv`, no bias.
+- Split into n_head heads of hd = C // n_head numbers. Compute attention with `F.scaled_dot_product_attention`, no causal mask. Join the heads again.
+- Return (B, Tx, C).
+
+The check compares with a reference at Tc=7, then switches to Tc=77 and checks the shape.
+--- starter
+def cross_attention(x, ctx, wq, wk, wv, n_head):
+    """x:   (B, Tx, C)    image tokens
+    ctx: (B, Tc, Cc)   text embeddings (length unrelated to Tx)
+    wq: (C, C)   wk: (Cc, C)   wv: (Cc, C)
+    Returns (B, Tx, C). F.scaled_dot_product_attention is allowed (no causal mask).
+    """
+    raise todo()
+--- solution
+def cross_attention(x, ctx, wq, wk, wv, n_head):
+    B, Tx, C = x.shape
+    Tc = ctx.size(1)
+    hd = C // n_head
+    q = (x @ wq).view(B, Tx, n_head, hd).transpose(1, 2)       # Q comes from the image
+    k = (ctx @ wk).view(B, Tc, n_head, hd).transpose(1, 2)     # K and V come from the text
+    v = (ctx @ wv).view(B, Tc, n_head, hd).transpose(1, 2)
+    o = F.scaled_dot_product_attention(q, k, v)                 # (B, n_head, Tx, hd)
+    return o.transpose(1, 2).reshape(B, Tx, C)
+--- tests
+@check("cross-attention")
+def t02():
+    seed(0)
+    B, Tx, Tc, C, Cc, nh = 2, 16, 7, 32, 64, 4
+    x, ctx = torch.randn(B, Tx, C), torch.randn(B, Tc, Cc)
+    wq, wk, wv = torch.randn(C, C) * .1, torch.randn(Cc, C) * .1, torch.randn(Cc, C) * .1
+    out = cross_attention(x, ctx, wq, wk, wv, nh)
+    shape_is(out, (B, Tx, C), "the output length must follow the image, not the text")
+
+    q = (x @ wq).view(B, Tx, nh, C // nh).transpose(1, 2)
+    k = (ctx @ wk).view(B, Tc, nh, C // nh).transpose(1, 2)
+    v = (ctx @ wv).view(B, Tc, nh, C // nh).transpose(1, 2)
+    ref = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, Tx, C)
+    eq(out, ref, tol=1e-4, msg="values differ from the reference. Check: Q from x, K and V from ctx; split heads with view + transpose(1, 2)")
+
+    # a different text length must work too: this is what makes cross-attention better than concatenation
+    shape_is(cross_attention(x, torch.randn(B, 77, Cc), wq, wk, wv, nh), (B, Tx, C),
+             "wrong shape with 77 text tokens: K and V must use ctx's length Tc")
+--- hints
+- Project first: `x @ wq` is (B, Tx, C); `ctx @ wk` and `ctx @ wv` are (B, Tc, C).
+- Split heads: `q.view(B, Tx, n_head, hd).transpose(1, 2)` gives (B, n_head, Tx, hd). Split k and v the same way, with length Tc.
+- SDPA returns (B, n_head, Tx, hd); `o.transpose(1, 2).reshape(B, Tx, C)` joins the heads.
+
+@@ item d9-03
+type: code
+title: Adding the condition embedding
+level: 1
+cards: Class conditioning: add it to the time embedding
+targets: combine_cond
+ref: day8, day9
+--- context
+For class-conditional generation ("draw a 7") the simplest way in is to add the class embedding to the time embedding and let FiLM do the rest. DiT and many class-conditional diffusion models do this.
+--- prompt
+Write `combine_cond(t_emb, class_emb)`: both inputs are (B, D); return their element-wise sum, shape (B, D).
+
+This one is short. When it passes, think: why does a sum let the later layers know both "which step is this" and "what to draw"?
+--- starter
+def combine_cond(t_emb, class_emb):
+    """The simplest class conditioning: add the class embedding to the time embedding.
+    Both are (B, D). Returns (B, D).
+    """
+    raise todo()
+--- solution
+def combine_cond(t_emb, class_emb):
+    return t_emb + class_emb
+--- tests
+@check("adding the condition embedding")
+def t03():
+    a, b = torch.randn(4, 16), torch.randn(4, 16)
+    eq(combine_cond(a, b), a + b, msg="it should be the element-wise sum of the two embeddings")
+--- hints
+- Two tensors of the same shape: just use `+`.
+- `return t_emb + class_emb`
+
+@@ item d9-04
+type: code
+title: Condition dropout
+level: 2
+cards: Condition dropout: what makes CFG possible
+targets: drop_cond
+ref: day8, day9
+--- context
+CFG needs an unconditional prediction, and nobody wants to train a second model for it. Replacing the condition of about 10% of the training samples with null teaches one model both. Drop per element instead of per sample and CFG stops working.
+--- prompt
+Write `drop_cond(cond_emb, null_emb, p, generator=None)`:
+
+- cond_emb: (B, D), one condition embedding per sample. null_emb: (D,), the "no condition" embedding.
+- For each sample independently, with probability p replace the **whole row** with null_emb; otherwise keep it. Return (B, D).
+- Per sample: every row is either exactly its original condition or exactly null_emb.
+- p=0 drops nothing; p=1 drops everything.
+- Pass the generator when you draw random numbers: `torch.rand(..., generator=generator)`. When it is None, the global random generator is used.
+
+The check uses B=4000 and p=0.1: the fraction of dropped rows must be between 0.08 and 0.12.
+--- starter
+def drop_cond(cond_emb, null_emb, p, generator=None):
+    """With probability p, replace a sample's whole condition with null_emb (the unconditional embedding).
+    cond_emb: (B, D)   null_emb: (D,)   returns (B, D).
+    Drop per sample, not per element.
+    """
+    raise todo()
+--- solution
+def drop_cond(cond_emb, null_emb, p, generator=None):
+    B = cond_emb.size(0)
+    keep = (torch.rand(B, 1, generator=generator) >= p).to(cond_emb.dtype)   # one random number per sample
+    return keep * cond_emb + (1 - keep) * null_emb.expand_as(cond_emb)
+--- tests
+@check("condition dropout")
+def t04():
+    seed(1)
+    B, D = 4000, 8
+    cond = torch.ones(B, D)
+    null = torch.zeros(D)
+    out = drop_cond(cond, null, p=0.1)
+    shape_is(out, (B, D))
+    per_row = out.sum(1)
+    true(set(per_row.unique().tolist()) <= {0.0, float(D)},
+         "some rows were only partly dropped: drop whole rows, not elements (one random number per sample)")
+    frac = (per_row == 0).float().mean().item()
+    true(abs(frac - 0.1) < 0.02, f"the dropped fraction should be about 0.1, got {frac:.3f}")
+    eq(drop_cond(cond, null, p=0.0), cond, msg="with p=0 no row should be dropped")
+    eq(drop_cond(cond, null, p=1.0), torch.zeros(B, D), msg="with p=1 every row should be dropped")
+--- hints
+- One random number per sample: `torch.rand(B, 1, generator=generator)`. Shape (B, 1) broadcasts to (B, D).
+- `keep = torch.rand(B, 1, generator=generator) >= p`: samples whose number is ≥ p are kept. Then p=0 keeps all and p=1 drops all.
+- `keep = keep.to(cond_emb.dtype)`, then `return keep * cond_emb + (1 - keep) * null_emb` (null_emb broadcasts to (B, D)).
+
+@@ item d9-05
+type: code
+title: The CFG formula
+level: 1
+cards: CFG: the formula and the batch trick
+targets: cfg_combine
+ref: day8, day9
+--- context
+The CFG scale is the most-tuned knob in text-to-image (Stable Diffusion defaults to 7.5). The formula is one line, but a reversed direction or the wrong base term turns the images into a mess, with no error at all.
+--- prompt
+Write `cfg_combine(eps_uncond, eps_cond, scale)` that returns:
+
+```
+eps_uncond + scale * (eps_cond - eps_uncond)
+```
+
+Both eps have the same shape; scale is a float. The checks verify:
+
+- scale=0 gives exactly eps_uncond
+- scale=1 gives exactly eps_cond
+- a larger scale lands further from eps_uncond
+--- starter
+def cfg_combine(eps_uncond, eps_cond, scale):
+    """eps = eps_uncond + scale * (eps_cond - eps_uncond)
+    scale=1 is plain conditional generation; scale>1 "pushes a bit further towards the condition".
+    """
+    raise todo()
+--- solution
+def cfg_combine(eps_uncond, eps_cond, scale):
+    return eps_uncond + scale * (eps_cond - eps_uncond)
+--- tests
+@check("the CFG formula")
+def t05():
+    u, c = torch.randn(2, 3), torch.randn(2, 3)
+    eq(cfg_combine(u, c, 1.0), c, msg="scale=1 should give exactly the conditional prediction")
+    eq(cfg_combine(u, c, 0.0), u, msg="scale=0 should give the unconditional prediction")
+    eq(cfg_combine(u, c, 2.0), 2 * c - u)
+    # direction: a larger scale lands further from the unconditional prediction
+    d1 = (cfg_combine(u, c, 3.0) - u).norm()
+    d2 = (cfg_combine(u, c, 1.0) - u).norm()
+    true(d1 > d2, "a larger scale should land further from the unconditional prediction: your formula points the wrong way")
+
+@check("guidance grows with the scale")
+def t10():
+    u = torch.zeros(1, 4)
+    c = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    prev = None
+    for sc in [1.0, 2.0, 5.0, 10.0]:
+        d = (cfg_combine(u, c, sc) - u).norm().item()
+        if prev is not None:
+            true(d > prev, f"with scale={sc} the result moved closer to the unconditional prediction")
+        prev = d
+--- hints
+- Follow the formula. The difference is `eps_cond - eps_uncond`, not the other way round, and the base term is `eps_uncond`.
+- `return eps_uncond + scale * (eps_cond - eps_uncond)`
+
+@@ item d9-06
+type: code
+title: The CFG batch trick
+level: 2
+cards: CFG: the formula and the batch trick
+targets: cfg_forward
+ref: day8, day9
+--- context
+In production sampling, CFG's two branches run as one forward pass with batch 2B, which is faster than calling the model twice; diffusers and other libraries do it this way. If the split order does not match the concatenation order, the result is wrong and nothing crashes.
+--- prompt
+Write `cfg_forward(model, x, t, cond, null_cond, scale)`:
+
+- x: (B, C, H, W); t: (B,); cond: (B, D); null_cond: (D,).
+- `model(x, t, c)` returns a noise prediction with the shape of x.
+- Call the model **once**. Its batch is 2B: duplicate x and t; the conditions are **null_cond in the first half, cond in the second half**.
+- Split the output into (eps_uncond, eps_cond), combine them with `cfg_combine(eps_uncond, eps_cond, scale)` (already given), and return (B, C, H, W).
+
+The check uses a fake model whose output is the mean of the condition vector: null is all 0, cond is all 2, scale=3, so the result should be 0 + 3 × (2 - 0) = 6 everywhere.
+--- starter
+def cfg_forward(model, x, t, cond, null_cond, scale):
+    """Do not run the model twice. Duplicate x, stack the conditions as [null, cond], run once, split.
+    x: (B,C,H,W)   t: (B,)   cond: (B,D)   null_cond: (D,)
+    model(x, t, c) -> same shape as x
+    Returns the combined (B,C,H,W).
+    """
+    raise todo()
+--- solution
+def cfg_forward(model, x, t, cond, null_cond, scale):
+    B = x.size(0)
+    both_x = torch.cat([x, x])
+    both_t = torch.cat([t, t])
+    both_c = torch.cat([null_cond.expand(B, -1), cond])       # convention: first half null, second half cond
+    out = model(both_x, both_t, both_c)
+    e_u, e_c = out.chunk(2)
+    return cfg_combine(e_u, e_c, scale)
+--- tests
+@check("the CFG batch trick")
+def t06():
+    m = _FakeEps()
+    x = torch.randn(3, 1, 2, 2)
+    t = torch.zeros(3, dtype=torch.long)
+    cond = torch.full((3, 4), 2.0)
+    null = torch.zeros(4)
+    out = cfg_forward(m, x, t, cond, null, scale=3.0)
+    shape_is(out, x.shape)
+    # uncond=0, cond=2 -> 0 + 3*(2-0) = 6
+    eq(out, torch.full_like(x, 6.0),
+       msg="wrong result. The convention is first half null, second half cond; after chunk(2) the first block is unconditional, the second conditional")
+    calls = []
+    class Counting(nn.Module):
+        def forward(self, x, t, c):
+            calls.append(x.shape[0])
+            return torch.zeros_like(x) + c.mean(-1).reshape(-1, 1, 1, 1)
+    cfg_forward(Counting(), x, t, cond, null, 3.0)
+    true(len(calls) == 1 and calls[0] == 6,
+         f"call the model once with the batch doubled to 6; it was called {len(calls)} times, batch={calls}")
+--- hints
+- Duplicate: `torch.cat([x, x])`, `torch.cat([t, t])`. null_cond is a single row: `null_cond.expand(B, -1)` makes it (B, D).
+- Conditions: `torch.cat([null_cond.expand(B, -1), cond])`. After the one forward pass, `e_u, e_c = out.chunk(2)`.
+- Finally `return cfg_combine(e_u, e_c, scale)`.
+
+@@ item d9-07
+type: code
+title: A subset of timesteps for DDIM
+level: 2
+cards: DDIM timesteps: skipping ahead
+targets: ddim_timesteps
+ref: day8, day9
+--- context
+DDIM samples with a small subset of the 1000 training steps (20 to 50 is common), so images come out tens of times faster. Picking the steps comes first: reversed order, a last step that is not 0 or the wrong count all hurt the image.
+--- prompt
+Write `ddim_timesteps(T, steps)`:
+
+- The gap is k = T // steps; take the steps timesteps 0, k, 2k, …, (steps-1)*k.
+- Return them **largest first** as a 1D LongTensor (dtype torch.long).
+- The last one must be 0. There must be exactly steps of them, also when steps does not divide T.
+
+Examples:
+
+- T=1000, steps=5: tensor([800, 600, 400, 200, 0])
+- T=1000, steps=50: [980, 960, …, 20, 0]
+- T=100, steps=30: k=3, [87, 84, …, 3, 0], exactly 30 values
+--- starter
+def ddim_timesteps(T, steps):
+    """Take steps evenly spaced timesteps from [0, T); return them largest first as a 1D LongTensor.
+    The last one must be 0 (otherwise the last step never reaches the clean image).
+    T=1000, steps=5 -> tensor([800, 600, 400, 200, 0])
+    """
+    raise todo()
+--- solution
+def ddim_timesteps(T, steps):
+    return (torch.arange(steps) * (T // steps)).flip(0).long()
+--- tests
+@check("a subset of timesteps for DDIM")
+def t07():
+    ts = ddim_timesteps(1000, 5)
+    true(ts.dtype == torch.long, f"the dtype should be torch.long, yours is {ts.dtype}")
+    eq(ts, torch.tensor([800, 600, 400, 200, 0]))
+    ts2 = ddim_timesteps(1000, 50)
+    true(len(ts2) == 50 and ts2[0] == 980 and ts2[-1] == 0,
+         "T=1000, steps=50 should give 50 values, from 980 down to 0")
+    true((ts2[1:] < ts2[:-1]).all(), "must be strictly decreasing")
+    ts3 = ddim_timesteps(100, 30)
+    true(len(ts3) == 30 and ts3[0] == 87 and ts3[-1] == 0,
+         f"T=100, steps=30 should give exactly 30 values (87, 84, …, 0); you gave {len(ts3)}. "
+         "torch.arange(0, T, k) gives too many here")
+--- hints
+- `torch.arange(steps)` is 0, 1, …, steps-1. Multiply each by k = T // steps and you have the timesteps (smallest first).
+- Do not use `torch.arange(0, T, k)`: with T=100 and steps=30 it gives 34 values.
+- `(torch.arange(steps) * (T // steps)).flip(0)`. An integer arange is already long.
+
+@@ item d9-08
+type: code
+title: One DDIM step (exact recovery test)
+level: 3
+cards: One DDIM step: guess x0, then re-noise
+targets: ddim_step
+ref: day8, day9
+--- context
+DDIM is the most common fast sampler for diffusion models. With this step right, feeding in the true noise reproduces the noising process exactly: the best unit test for a sampler, and the reason DDIM has no randomness.
+--- prompt
+Write `ddim_step(x_t, t, t_prev, eps_pred, sched)` (eta=0: no new random noise):
+
+- x_t: (B, C, H, W). t and t_prev: long tensors of shape (B,). eps_pred: the model's noise prediction, shaped like x_t. sched: day 8's schedule dict; you only need `sched["alphas_cumprod"]`.
+- ab_t = alphas_cumprod[t] and ab_prev = alphas_cumprod[t_prev]. Take them with `extract`, which gives (B, 1, 1, 1).
+- `x0_pred = (x_t - sqrt(1 - ab_t) * eps_pred) / sqrt(ab_t)`
+- Return `x_prev = sqrt(ab_prev) * x0_pred + sqrt(1 - ab_prev) * eps_pred`
+- t_prev can be -1 (meaning "done"). Then use ab_prev = 1, so the result is x0_pred.
+
+Day 8's `linear_schedule`, `q_sample` and `extract` are already loaded.
+--- starter
+def ddim_step(x_t, t, t_prev, eps_pred, sched):
+    """x0_pred = (x_t - sqrt(1-ab_t) * eps) / sqrt(ab_t)
+    x_prev  = sqrt(ab_prev) * x0_pred + sqrt(1-ab_prev) * eps      (eta=0, no random noise)
+    t / t_prev are both (B,) tensors. t_prev may be -1; then ab_prev = 1 (return x0_pred).
+    """
+    raise todo()
+--- solution
+def ddim_step(x_t, t, t_prev, eps_pred, sched):
+    ab = extract(sched["alphas_cumprod"], t, x_t.shape)
+    x0 = (x_t - (1 - ab).sqrt() * eps_pred) / ab.sqrt()          # half 1: recover x0
+    prev_ok = (t_prev >= 0)
+    tp = t_prev.clamp(min=0)                                       # gather does not accept -1
+    ab_prev = extract(sched["alphas_cumprod"], tp, x_t.shape)
+    ones = torch.ones_like(ab_prev)
+    ab_prev = torch.where(prev_ok.reshape(-1, *([1] * (x_t.dim() - 1))), ab_prev, ones)
+    return ab_prev.sqrt() * x0 + (1 - ab_prev).sqrt() * eps_pred   # half 2: re-noise with the same eps
+--- tests
+@check("one DDIM step (exact recovery test)")
+def t08():
+    seed(2)
+    s = linear_schedule(1000)
+    x0 = torch.randn(4, 1, 8, 8)
+    eps = torch.randn_like(x0)
+    t = torch.full((4,), 600, dtype=torch.long)
+    tp = torch.full((4,), 400, dtype=torch.long)
+    xt = q_sample(x0, t, eps, s)
+    got = ddim_step(xt, t, tp, eps, s)
+    want = q_sample(x0, tp, eps, s)
+    eq(got, want, tol=1e-4,
+       msg="fed the noise that was really added, one DDIM step should land exactly on q_sample(x0, t_prev). "
+           "That is why DDIM has no randomness")
+    # all the way to the end
+    last = ddim_step(xt, t, torch.full((4,), -1, dtype=torch.long), eps, s)
+    eq(last, x0, tol=1e-3, msg="with t_prev=-1 it should return x0 directly (use ab_prev = 1)")
+--- hints
+- Take ab_t with `extract(sched["alphas_cumprod"], t, x_t.shape)` and compute x0_pred from the formula.
+- The gather in `extract` does not accept -1. Take ab_prev with `t_prev.clamp(min=0)`, then put 1 where t_prev < 0: `torch.where((t_prev >= 0).reshape(-1, 1, 1, 1), ab_prev, torch.ones_like(ab_prev))`.
+- Finally `return ab_prev.sqrt() * x0_pred + (1 - ab_prev).sqrt() * eps_pred`.
+
+@@ item d9-09
+type: code
+title: The DDIM sampling loop
+level: 2
+cards: DDIM timesteps: skipping ahead; One DDIM step: guess x0, then re-noise
+targets: ddim_sample
+ref: day8, day9
+--- context
+Chain the last two exercises and you have a working sampler. The "sampling steps: 20 / 50" setting in Stable Diffusion tools is how many times this loop runs. DDIM has no randomness: the same seed always gives the same image, which is what makes debugging and reproducing possible.
+--- prompt
+Write `ddim_sample(model, shape, sched, steps=10, device="cpu")`:
+
+1. Timesteps: `ts = ddim_timesteps(len(sched["betas"]), steps)` (T is the length of betas).
+2. Start: `x = torch.randn(shape, device=device)`. This is the only random call in the function.
+3. Walk in order: at step i, t = ts[i] and t_prev = ts[i+1]; on the last step t_prev = -1. Make t and t_prev long tensors of shape (B,), with B = shape[0].
+4. At every step: `x = ddim_step(x, t, t_prev, model(x, t), sched)`.
+5. Return the final x, with shape equal to shape.
+
+`ddim_timesteps` and `ddim_step` are given (reference versions). Keep the `@torch.no_grad()` above the function: sampling needs no gradients.
+--- starter
+@torch.no_grad()
+def ddim_sample(model, shape, sched, steps=10, device="cpu"):
+    """Start from N(0,I) and call ddim_step for each timestep from ddim_timesteps.
+    model(x, t) -> predicted noise. Returns the final x0 with shape = shape.
+    """
+    raise todo()
+--- solution
+@torch.no_grad()
+def ddim_sample(model, shape, sched, steps=10, device="cpu"):
+    ts = ddim_timesteps(len(sched["betas"]), steps).to(device)
+    x = torch.randn(shape, device=device)
+    for i, tv in enumerate(ts):
+        t = torch.full((shape[0],), int(tv), dtype=torch.long, device=device)
+        tp_val = int(ts[i + 1]) if i + 1 < len(ts) else -1          # the last step goes to -1
+        t_prev = torch.full((shape[0],), tp_val, dtype=torch.long, device=device)
+        x = ddim_step(x, t, t_prev, model(x, t), sched)
+    return x
+--- tests
+class _Tiny(nn.Module):
+    """A tiny "noise prediction model": one convolution."""
+    def __init__(self):
+        super().__init__()
+        self.c = nn.Conv2d(1, 1, 3, 1, 1)
+    def forward(self, x, t):
+        return self.c(x) * 0.1
+
+@check("the DDIM sampling loop")
+def t09():
+    seed(3)
+    s = linear_schedule(100)
+    m = _Tiny().eval()
+    torch.manual_seed(7)
+    a = ddim_sample(m, (2, 1, 8, 8), s, steps=10)
+    shape_is(a, (2, 1, 8, 8))
+    torch.manual_seed(7)
+    b = ddim_sample(m, (2, 1, 8, 8), s, steps=10)
+    eq(a, b, msg="the same starting noise must give exactly the same result (DDIM has no randomness)")
+    true(torch.isfinite(a).all(), "the result contains nan/inf")
+
+@check("same result as calling ddim_step step by step")
+def t09b():
+    seed(3)
+    s = linear_schedule(100)
+    m = _Tiny().eval()
+    torch.manual_seed(7)
+    got = ddim_sample(m, (2, 1, 8, 8), s, steps=10)
+    torch.manual_seed(7)
+    with torch.no_grad():
+        x = torch.randn(2, 1, 8, 8)
+        ts = ddim_timesteps(100, 10).tolist() + [-1]
+        for a, b in zip(ts[:-1], ts[1:]):
+            t = torch.full((2,), a, dtype=torch.long)
+            x = ddim_step(x, t, torch.full((2,), b, dtype=torch.long), m(x, t), s)
+    eq(got, x, tol=1e-4,
+       msg="differs from the step-by-step result. Check: one torch.randn(shape) at the start; timesteps largest first; "
+           "feed the current x to the model at every step; t_prev is -1 on the last step")
+--- hints
+- `torch.full((B,), value, dtype=torch.long, device=device)` turns one integer into a (B,) timestep tensor.
+- The next timestep: `int(ts[i + 1]) if i + 1 < len(ts) else -1`.
+- Loop with `for i, tv in enumerate(ts):`; inside, build t and t_prev, then `x = ddim_step(x, t, t_prev, model(x, t), sched)`.
+
+@@ item d9-10
+type: code
+title: The shapes of latent diffusion
+level: 2
+cards: Latent diffusion: the shapes in Stable Diffusion; Images become token sequences; Cross-attention: the image asks, the text answers
+targets: LDM_SHAPES
+ref: day8, day9
+--- context
+A very common question in interviews and code reviews: "what shape is this tensor in Stable Diffusion?" Working out the shapes through the VAE, the UNet, the text encoder and cross-attention once makes the whole system clear.
+--- prompt
+No function this time: fill in a dict. Replace every None with a shape tuple, such as `(4, 3, 512, 512)`. Expressions like `64 * 64` are fine.
+
+The setting (Stable Diffusion 1.x):
+
+- batch 4, 512×512 RGB images
+- VAE: height and width shrink 8 times; the latent has 4 channels
+- the UNet's first layer lifts the latent to 320 channels, then it is flattened into tokens that are Q in cross-attention
+- CLIP text embeddings: 77 tokens of 768 numbers each
+
+Work it out in your head first, then run. The card's example uses batch 2 and 256×256: different numbers, same rules.
+--- starter
+LDM_SHAPES = {
+    "image":          None,   # 512x512 RGB images, batch 4
+    "latent":         None,   # after the VAE encoder: 8x downsampling, 4 channels
+    "latent_tokens":  None,   # the UNet's first layer lifts it to 320 channels, then flatten into tokens
+    "text_emb":       None,   # CLIP text embeddings: 77 tokens of 768 numbers
+    "cross_attn_out": None,   # the output of cross-attention
+    "unet_out":       None,   # the UNet output (the predicted noise)
+}
+--- solution
+LDM_SHAPES = {
+    "image": (4, 3, 512, 512),
+    "latent": (4, 4, 64, 64),
+    "latent_tokens": (4, 64 * 64, 320),
+    "text_emb": (4, 77, 768),
+    "cross_attn_out": (4, 64 * 64, 320),      # follows Q (the image tokens)
+    "unet_out": (4, 4, 64, 64),               # same shape as the latent
+}
+--- tests
+@check("the shapes of latent diffusion")
+def t11():
+    want = {
+        "image": (4, 3, 512, 512),
+        "latent": (4, 4, 64, 64),
+        "latent_tokens": (4, 64 * 64, 320),
+        "text_emb": (4, 77, 768),
+        "cross_attn_out": (4, 64 * 64, 320),
+        "unet_out": (4, 4, 64, 64),
+    }
+    why = {
+        "image": "(B, C, H, W); RGB has 3 channels",
+        "latent": "divide height and width by 8; there are 4 channels",
+        "latent_tokens": "a token sequence is (B, H*W, C), and C is the channel count of the UNet's first layer",
+        "text_emb": "(B, number of tokens, numbers per token)",
+        "cross_attn_out": "the output shape follows Q (the image tokens)",
+        "unet_out": "the UNet predicts the noise on the latent",
+    }
+    wrong = [f"{k}: you wrote {LDM_SHAPES.get(k)}, which is wrong. Hint: {why[k]}" for k in want
+             if LDM_SHAPES.get(k) is None or tuple(LDM_SHAPES[k]) != want[k]]
+    true(not wrong, "\n".join(wrong))
+--- hints
+- latent: 512 ÷ 8 = 64, 4 channels, same batch.
+- A token sequence is (B, H*W, C): 64*64 tokens of 320 numbers. Cross-attention's output follows Q (the image), whatever the text length.
+- The UNet predicts the noise on the latent, so it has the latent's shape.
+
+@@ item d9-11
+type: fix
+title: Find the bugs: cfg_sample_buggy
+level: 2
+cards: CFG: the formula and the batch trick
+targets: cfg_sample_buggy
+ref: day8, day9
+--- context
+CFG bugs raise no error; they only make the images worse, so they are hard to spot. The usual ones in real projects: the split order does not match the concatenation order, or the direction in the formula is reversed.
+--- prompt
+`cfg_sample_buggy` should do exactly what `cfg_forward` does: one forward pass, conditions **null in the first half, cond in the second half**, then combine with `eps_u + scale * (eps_c - eps_u)`. It has 2 bugs. Find and fix them; keep the function name.
+
+Two checks: the result matches `cfg_forward`, and the conditions passed to the model really are null first, cond second.
+--- starter
+def cfg_sample_buggy(model, x, t, cond, null_cond, scale):
+    both_x = torch.cat([x, x])
+    both_c = torch.cat([cond, null_cond.expand(cond.size(0), -1)])
+    both_t = torch.cat([t, t])
+    out = model(both_x, both_t, both_c)
+    e_a, e_b = out.chunk(2)
+    return e_a + scale * (e_a - e_b)
+--- solution
+def cfg_sample_buggy(model, x, t, cond, null_cond, scale):
+    both_x = torch.cat([x, x])
+    both_c = torch.cat([null_cond.expand(cond.size(0), -1), cond])   # fix 1: the order is [null, cond]
+    both_t = torch.cat([t, t])
+    out = model(both_x, both_t, both_c)
+    e_u, e_c = out.chunk(2)
+    return e_u + scale * (e_c - e_u)                                 # fix 2: the difference is (cond - uncond)
+--- tests
+@check("same result as cfg_forward")
+def t12():
+    m = _FakeEps()
+    x = torch.randn(3, 1, 2, 2)
+    t = torch.zeros(3, dtype=torch.long)
+    cond, null = torch.full((3, 4), 2.0), torch.zeros(4)
+    for sc in [1.0, 3.0]:
+        eq(cfg_sample_buggy(m, x, t, cond, null, sc),
+           cfg_forward(m, x, t, cond, null, sc), tol=1e-5,
+           msg=f"wrong result with scale={sc}. First check which block after chunk(2) is unconditional and which is conditional, "
+               "then the formula: the base term is the unconditional one and the difference is (conditional - unconditional)")
+
+@check("conditions passed to the model: null first, cond second")
+def t12b():
+    seen = []
+    class Rec(nn.Module):
+        def forward(self, x, t, c):
+            seen.append(c.detach().clone())
+            return torch.zeros_like(x) + c.mean(-1).reshape(-1, 1, 1, 1)
+    x = torch.randn(3, 1, 2, 2)
+    t = torch.zeros(3, dtype=torch.long)
+    cond, null = torch.full((3, 4), 2.0), torch.zeros(4)
+    cfg_sample_buggy(Rec(), x, t, cond, null, 3.0)
+    true(len(seen) == 1, f"the model should be called once; it was called {len(seen)} times")
+    shape_is(seen[0], (6, 4), "the conditions should be stacked into 2B rows")
+    eq(seen[0][:3], null.expand(3, -1), msg="the first half (first 3 rows) should be the null condition")
+    eq(seen[0][3:], cond, msg="the second half (last 3 rows) should be the real condition cond")
+--- hints
+- Look at `both_c` first: which half is null? Then, after `chunk(2)`, whose prediction is e_a and whose is e_b?
+- Once the order is [null, cond], e_a is the unconditional prediction and e_b the conditional one. The difference in the formula should be (conditional - unconditional).
+- `both_c = torch.cat([null_cond.expand(cond.size(0), -1), cond])` and `return e_a + scale * (e_b - e_a)`. Renaming them e_u and e_c makes the code much harder to get wrong.
+
+@@ item d9-12
+type: predict
+title: CFG in your head
+level: 1
+cards: CFG: the formula and the batch trick
+--- context
+Before tuning the guidance scale, be able to do the formula in your head: a scale above 1 extrapolates, so the result leaves the range of the two predictions. That is also why a very high scale oversaturates images.
+--- prompt
+Do not run it. Write what this code prints, one line per print.
+--- code
+eps_u = torch.tensor([1.0, 2.0])
+eps_c = torch.tensor([3.0, 1.0])
+for scale in [0.0, 1.0, 3.0]:
+    eps = eps_u + scale * (eps_c - eps_u)
+    print(scale, eps.tolist())
+--- explain
+The difference `eps_c - eps_u` is [2.0, -1.0].
+
+- scale=0: just eps_u, [1.0, 2.0].
+- scale=1: exactly eps_c, [3.0, 1.0].
+- scale=3: [1 + 3×2, 2 + 3×(-1)] = [7.0, -1.0].
+
+Look at the second number: the two predictions are 2 and 1, yet the result is -1, outside both. That is extrapolation, and a larger scale goes further out.
+--- hints
+- Compute the difference eps_c - eps_u first.
+- With scale=3, the result is eps_u + 3 × the difference.
+
+@@ item d9-13
+type: choice
+title: What if you skip condition dropout?
+level: 2
+cards: Condition dropout: what makes CFG possible; CFG: the formula and the batch trick
+answer: 2
+--- context
+A common interview question: "why is CFG called classifier-free, and where does the unconditional prediction come from?" The answer is condition dropout during training.
+--- prompt
+A text-to-image model was trained **without** condition dropout (p=0): every sample always had its real condition. Now you sample with CFG (scale=7.5), feeding the null embedding to the unconditional branch. What happens?
+--- options
+- Nothing special. CFG is a sampling trick and has nothing to do with training
+- The unconditional branch is unreliable: the model never saw the null condition, so eps_uncond is an output it never learned, and the direction (eps_cond - eps_uncond) means nothing
+- It raises an error because the null embedding has the wrong shape
+- Sampling gets faster because the unconditional branch can be skipped
+--- explain
+CFG needs one model that can do two things: predict with the condition and without it. The unconditional part is learned through condition dropout: about 10% of the training samples get null, so the model learns "how to denoise when there is no condition".
+
+With p=0 the model has never seen null. Its output for null was never trained and could be anything. CFG then multiplies (eps_cond - eps_uncond) by 7.5, and the images usually get worse.
+
+No error: the null embedding has the same shape as a real condition, so the code runs. That is what makes it dangerous. Not faster either: CFG still computes both branches.
+--- hints
+- Where does the unconditional prediction come from?
+- See the card "Condition dropout: what makes CFG possible".
+
+@@ item d9-14
+type: predict
+title: Where each DDIM step goes
+level: 2
+cards: DDIM timesteps: skipping ahead; One DDIM step: guess x0, then re-noise
+--- context
+The easiest part of the sampling loop to get wrong is the last step: it must go from 0 to -1 and return x0. Skip it and some noise stays in the image. List every (t, t_prev) pair first and the loop writes itself.
+--- prompt
+Do not run it. Write what this code prints, one line per print.
+--- code
+ts = (torch.arange(4) * (1000 // 4)).flip(0).tolist()
+print(ts)
+for i in range(len(ts)):
+    t = ts[i]
+    t_prev = ts[i + 1] if i + 1 < len(ts) else -1
+    print(t, "->", t_prev)
+print(len(ts), "model calls")
+--- explain
+k = 1000 // 4 = 250. `torch.arange(4) * 250` is [0, 250, 500, 750]; after flip it is [750, 500, 250, 0].
+
+Each step goes from t to the next value in the list. Nothing comes after 0, so t_prev = -1, meaning "return x0 directly".
+
+4 timesteps means 4 iterations and one model call each. With CFG's batch trick it is still 4 calls, each with a doubled batch.
+--- hints
+- Compute k = 1000 // 4, list 0, k, 2k, 3k, then reverse.
+- The last timestep has no next one. What is t_prev then?
+
+@@ item d9-15
+type: choice
+title: The shape the UNet sees with CFG
+level: 2
+cards: Latent diffusion: the shapes in Stable Diffusion; CFG: the formula and the batch trick
+answer: 3
+--- context
+To estimate memory and speed you need the size of the tensor the UNet processes at every step. CFG's batch trick doubles the batch, a big part of the memory a text-to-image service uses.
+--- prompt
+Stable Diffusion 1.x generates 4 images of 512×512 at once with CFG's batch trick. At each DDIM step, what shape is the noisy latent that goes into the UNet?
+--- options
+- (4, 4, 64, 64)
+- (8, 3, 512, 512)
+- (8, 4, 64, 64)
+- (4, 8, 64, 64)
+--- explain
+The latent is (4, 4, 64, 64): 512 ÷ 8 = 64, 4 channels.
+
+The batch trick uses `torch.cat([x, x])`, which concatenates along dimension 0 (the batch), so the batch goes from 4 to 8: (8, 4, 64, 64).
+
+- (4, 4, 64, 64): forgets that CFG doubles the batch.
+- (8, 3, 512, 512): the UNet works on the latent, not on pixels.
+- (4, 8, 64, 64): that is what concatenating along the channels (dim=1) gives, a common bug.
+--- hints
+- Work out the latent shape first, then think about which dimension `torch.cat([x, x])` uses by default.
+
+@@ item d9-16
+type: code
+title: Closed book: the CFG batch trick
+level: 2
+exam: yes
+cards: CFG: the formula and the batch trick
+targets: cfg_forward
+ref: day8, day9
+--- context
+The CFG batch trick is a few lines found in every text-to-image inference code base. Getting the concatenation order and the formula right without notes helps both when reading diffusers and when writing it in an interview.
+--- prompt
+Without the cards, write `cfg_forward(model, x, t, cond, null_cond, scale)`:
+
+- x: (B, C, H, W); t: (B,); cond: (B, D); null_cond: (D,). `model(x, t, c)` returns a noise prediction with the shape of x.
+- Call the model once: the batch is 2B, conditions null_cond in the first half and cond in the second.
+- Split into (eps_uncond, eps_cond) and return `eps_uncond + scale * (eps_cond - eps_uncond)`, shape (B, C, H, W).
+
+You may use `cfg_combine` or write the formula directly.
+--- starter
+def cfg_forward(model, x, t, cond, null_cond, scale):
+    raise todo()
+--- solution
+def cfg_forward(model, x, t, cond, null_cond, scale):
+    B = x.size(0)
+    both_x = torch.cat([x, x])
+    both_t = torch.cat([t, t])
+    both_c = torch.cat([null_cond.expand(B, -1), cond])       # convention: first half null, second half cond
+    out = model(both_x, both_t, both_c)
+    e_u, e_c = out.chunk(2)
+    return e_u + scale * (e_c - e_u)
+--- tests
+@check("the CFG batch trick")
+def t06():
+    m = _FakeEps()
+    x = torch.randn(3, 1, 2, 2)
+    t = torch.zeros(3, dtype=torch.long)
+    cond = torch.full((3, 4), 2.0)
+    null = torch.zeros(4)
+    out = cfg_forward(m, x, t, cond, null, scale=3.0)
+    shape_is(out, x.shape)
+    # uncond=0, cond=2 -> 0 + 3*(2-0) = 6
+    eq(out, torch.full_like(x, 6.0),
+       msg="wrong result. The convention is first half null, second half cond; after chunk(2) the first block is unconditional, the second conditional")
+    calls = []
+    class Counting(nn.Module):
+        def forward(self, x, t, c):
+            calls.append(x.shape[0])
+            return torch.zeros_like(x) + c.mean(-1).reshape(-1, 1, 1, 1)
+    cfg_forward(Counting(), x, t, cond, null, 3.0)
+    true(len(calls) == 1 and calls[0] == 6,
+         f"call the model once with the batch doubled to 6; it was called {len(calls)} times, batch={calls}")
+--- hints
+- `torch.cat([a, a])` for x and for t; conditions `torch.cat([null_cond.expand(B, -1), cond])`.
+- `e_u, e_c = out.chunk(2)`, then the formula.
+
+@@ item d9-17
+type: code
+title: Closed book: one DDIM step
+level: 3
+exam: yes
+cards: One DDIM step: guess x0, then re-noise
+targets: ddim_step
+ref: day8, day9
+--- context
+One DDIM step is today's central formula: recover x0 from x_t, then add the same noise back at t_prev. If you can write it from memory, you understand why DDIM has no randomness and why it can skip steps.
+--- prompt
+Without the cards, write `ddim_step(x_t, t, t_prev, eps_pred, sched)` (eta=0):
+
+- x_t: (B, C, H, W); t, t_prev: long tensors of shape (B,); eps_pred has the shape of x_t; use `sched["alphas_cumprod"]`.
+- Recover x0_pred from x_t and eps_pred, then add the same eps_pred back at level t_prev and return the result.
+- t_prev can be -1; then use ab_prev = 1 (return x0_pred).
+
+`extract`, `linear_schedule` and `q_sample` are available.
+--- starter
+def ddim_step(x_t, t, t_prev, eps_pred, sched):
+    raise todo()
+--- solution
+def ddim_step(x_t, t, t_prev, eps_pred, sched):
+    ab = extract(sched["alphas_cumprod"], t, x_t.shape)
+    x0 = (x_t - (1 - ab).sqrt() * eps_pred) / ab.sqrt()
+    tp = t_prev.clamp(min=0)
+    ab_prev = extract(sched["alphas_cumprod"], tp, x_t.shape)
+    ab_prev = torch.where((t_prev >= 0).reshape(-1, *([1] * (x_t.dim() - 1))), ab_prev, torch.ones_like(ab_prev))
+    return ab_prev.sqrt() * x0 + (1 - ab_prev).sqrt() * eps_pred
+--- tests
+@check("one DDIM step (exact recovery test)")
+def t08():
+    seed(2)
+    s = linear_schedule(1000)
+    x0 = torch.randn(4, 1, 8, 8)
+    eps = torch.randn_like(x0)
+    t = torch.full((4,), 600, dtype=torch.long)
+    tp = torch.full((4,), 400, dtype=torch.long)
+    xt = q_sample(x0, t, eps, s)
+    got = ddim_step(xt, t, tp, eps, s)
+    want = q_sample(x0, tp, eps, s)
+    eq(got, want, tol=1e-4,
+       msg="fed the noise that was really added, one DDIM step should land exactly on q_sample(x0, t_prev). "
+           "That is why DDIM has no randomness")
+    # all the way to the end
+    last = ddim_step(xt, t, torch.full((4,), -1, dtype=torch.long), eps, s)
+    eq(last, x0, tol=1e-3, msg="with t_prev=-1 it should return x0 directly (use ab_prev = 1)")
+--- hints
+- Two halves: x0_pred = (x_t - sqrt(1 - ab_t) * eps) / sqrt(ab_t); x_prev = sqrt(ab_prev) * x0_pred + sqrt(1 - ab_prev) * eps.
+- Handling -1: `clamp(min=0)` before `extract`, then `torch.where` puts ab_prev = 1 at those positions.

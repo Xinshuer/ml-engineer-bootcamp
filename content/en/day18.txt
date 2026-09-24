@@ -1,0 +1,1341 @@
+@@ day 18
+title: Pitfalls 1: train/serve skew
+part: Production pitfalls
+hours: 3–4 hours
+--- goal
+Make a deployed model give the same results as it did in training and evaluation: the preprocessing and the tokenizer travel with the model; inference runs with eval() plus inference_mode(); batched generation uses left padding, an attention mask and position ids; a test proves results do not depend on the batch; seeds are set; and model outputs are compared with tolerances that fit the precision.
+--- checklist
+- Clear the review queue first (redo from scratch every item whose answer you looked at)
+- 8 cards: run each card's code, change one number, run it again
+- Pass every practice item; solve the three batched-generation items (left padding, fixing right padding, the generation loop) without looking at the answers
+- Closed book: write Preprocessor and left_pad from memory
+
+@@ concept
+title: Train/serve skew: one preprocessing path for both
+--- body
+**Train/serve skew** means the model's input is prepared one way during training and evaluation, and another way in the live service. Nothing raises an error. The model just quietly gets worse in production.
+
+The most common sources:
+
+- The preprocessing was written in a training notebook, then written again by hand for the service, with small differences (order of steps, defaults, lowercasing)
+- Normalisation statistics: computed on the training set during training, but recomputed from "the current batch of requests" in the service
+- The tokenizer was upgraded, or the vocabulary changed order (next card)
+
+There is one rule: **write the preprocessing once**, and import that code from both training and serving. The statistics it needs (means, standard deviations, the vocabulary) are computed once, on training data only (day 17 explains why never on test data). They are saved **in the same file** as the model weights and loaded together when the service starts. They are never recomputed.
+
+As a class, it looks like this:
+
+```
+pre = Preprocessor().fit(train_x)          # training: fit on training data only
+torch.save({"model": model.state_dict(), "pre": pre.state_dict()}, "bundle.pt")
+
+bundle = torch.load("bundle.pt")           # service start-up
+pre = Preprocessor()
+pre.load_state_dict(bundle["pre"])         # load the statistics, no fit
+x = pre.transform(request_x)
+```
+
+In the example below, the service gets a single request. If you compute the mean and standard deviation from that request alone, you get nan (one row minus its own mean is 0, its standard deviation is 0 too, and 0/0 = nan). The statistics saved at training time give the right answer.
+--- code
+torch.manual_seed(0)
+train = torch.randn(100, 2) * torch.tensor([10.0, 0.1]) + torch.tensor([50.0, 3.0])
+mean, std = train.mean(dim=0), train.std(dim=0)      # computed once, on training data
+bundle = {"pre": {"mean": mean, "std": std}}         # saved in the same file as the weights
+
+req = torch.tensor([[60.0, 3.1]])                    # one request arrives at the service
+print("with the training statistics:", (req - mean) / std)
+print("with the request's own stats:", (req - req.mean(dim=0)) / req.std(dim=0, correction=0))
+
+@@ concept
+title: The tokenizer has a version too: match it with a fingerprint
+--- body
+Row 17 of the model's embedding table learned "the token whose id was 17 during training". If the service loads a different vocabulary (an upgraded tokenizer, a rebuilt vocabulary, a different order), the same word gets a different id. Nothing raises an error, but the model reads a different sentence.
+
+The fix: at training time, compute a **fingerprint** of the vocabulary (a short string that changes whenever anything in the vocabulary changes) and store it with the checkpoint. When the service starts, compute it again for the vocabulary it loaded. If they differ, refuse to start.
+
+How to compute the fingerprint:
+
+1. `json.dumps(vocab, sort_keys=True)` turns the dict into text. `sort_keys=True` sorts by key, so the result does not depend on the order the dict was built in
+2. `hashlib.sha256(text.encode("utf-8")).hexdigest()` gives a digest of 64 hex characters; the first 16 are enough
+
+Do not use Python's built-in `hash()`. For strings it changes every time Python starts (it is randomised on purpose, for security), so the training process and the serving process would never agree.
+--- code
+import hashlib
+import json
+
+def fingerprint(vocab):
+    text = json.dumps(vocab, sort_keys=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+v1 = {"<pad>": 0, "hello": 1, "world": 2}
+v2 = {"world": 2, "hello": 1, "<pad>": 0}     # the same vocabulary, built in another order
+v3 = {"<pad>": 0, "world": 1, "hello": 2}     # the same words, but the ids are swapped
+print(json.dumps(v2, sort_keys=True))
+print("v1:", fingerprint(v1))
+print("v2:", fingerprint(v2))
+print("v3:", fingerprint(v3))
+
+@@ concept
+title: Two switches for inference: eval() and inference_mode()
+--- body
+Before inference you flip two switches. They control two different things:
+
+- `model.eval()` changes **how layers behave**. Dropout stops dropping units. BatchNorm uses the running mean / var saved during training instead of the current batch's statistics (day 17 covers the details). It does not turn off gradients.
+- `with torch.inference_mode():` turns off autograd's bookkeeping (no graph, no saved intermediate results for the backward pass). That saves memory and time. It does not change how any layer behaves.
+
+So you need both. With only inference_mode, dropout is still dropping. With only eval, every request still builds a graph for nothing.
+
+`torch.no_grad()` also turns off gradients. `inference_mode` goes further: tensors created inside it can never be used in a backward pass later (that raises an error), so use it only for pure inference. How much memory and time it saves is measured on day 19.
+
+Two common traps:
+
+- A freshly built (or freshly trained) model is in train mode. If the service forgets `eval()` after loading it, dropout stays on in production.
+- A training loop calls `model.eval()` for validation at the end of each epoch and forgets `model.train()` when training resumes.
+--- code
+torch.manual_seed(0)
+net = nn.Sequential(nn.Linear(4, 8), nn.Dropout(0.5), nn.Linear(8, 2))
+x = torch.randn(1, 4)
+
+with torch.inference_mode():
+    a, b = net(x), net(x)
+print("only inference_mode, same twice:", torch.equal(a, b))
+
+net.eval()
+c = net(x)
+print("only eval, requires_grad =", c.requires_grad)
+
+with torch.inference_mode():
+    d, e = net(x), net(x)
+print("both, same twice:", torch.equal(d, e), " requires_grad =", d.requires_grad)
+
+@@ concept
+title: Results must not depend on the batch
+--- body
+A service often groups several requests into one batch. The result for one request must not depend on which other requests it was grouped with, or on how big the batch was.
+
+Common ways to break this:
+
+- BatchNorm still in train mode: it normalises with the mean and variance of *the current batch*, so different batchmates give different results. (In train mode with a batch of 1 it even raises `Expected more than 1 value per channel when training`, which is often the first sign that someone forgot `eval()`.)
+- Padding to the longest sequence in the batch, with a model that does not use an attention mask and so includes the padding in its computation
+- Tiny floating-point differences: for a different batch size, the library may add numbers in a different order, and results differ by about 1e-7. That is normal; compare with a small tolerance (last card)
+
+The check is called a **batch-invariance test**: run the same data once as one batch and once split up, and look at the largest difference. If it is below 1e-6, the result does not depend on the batch. Below, 5 rows are split into batches of 3 and 2.
+--- code
+torch.manual_seed(0)
+net = nn.Sequential(nn.Linear(4, 8), nn.BatchNorm1d(8), nn.Linear(8, 2))
+x = torch.randn(5, 4)
+
+for mode in ["train", "eval"]:
+    net.train(mode == "train")
+    with torch.inference_mode():
+        together = net(x)                                  # all 5 rows at once
+        split = torch.cat([net(x[:3]), net(x[3:])])        # 3 rows, then 2 rows
+    print(mode, "largest difference:", (together - split).abs().max().item())
+
+@@ concept
+title: Batched generation (1): why right padding breaks
+ref: day18
+--- body
+A decoder-only model (the GPT / Llama family) generates text step by step: feed in the whole sequence, take the logits (the raw score the model gives each word in the vocabulary) at the **last position**, pick the best word, append it, repeat.
+
+One prompt at a time is easy. To put prompts of different lengths into one batch, you must pad them to the same length. If you pad on the right (right padding):
+
+```
+[3, 7, 2, 9]
+[5, 1, 0, 0]      <- 0 is the pad token
+```
+
+The "last position" of the second row is a pad. The model predicts what comes after the pads, which is wrong, and the new word is appended after the pads, leaving a gap of two.
+
+With left padding, the last position of every row is that row's real last word:
+
+```
+[3, 7, 2, 9]
+[0, 0, 5, 1]
+```
+
+Moving the pads to the left is not enough on its own, though. The next card covers the other two pieces.
+
+The code below uses a tiny decoder-only model, `tiny_lm()` (token 0 is the pad token). `generate_one(model, prompt, n)` greedily generates n tokens for one prompt, with no padding at all; it is the "right answer".
+--- code
+model = tiny_lm()
+prompts = [[3, 7, 2, 9], [5, 1]]
+alone = [generate_one(model, p, 1)[0] for p in prompts]    # one at a time, no padding
+
+right = torch.tensor([[3, 7, 2, 9], [5, 1, 0, 0]])         # right padding
+with torch.inference_mode():
+    batch = model(right)[:, -1].argmax(dim=-1).tolist()
+print("one at a time:      ", alone)
+print("right-padded batch: ", batch)
+
+@@ concept
+title: Batched generation (2): left padding + attention mask + position ids
+ref: day18
+--- body
+After left padding, the model needs two more things:
+
+1. **An attention mask**: which positions are real (1) and which are padding (0). Inside attention, the model blocks the padding columns, so real tokens cannot see the pads. Without it, the 5 and the 1 in the second row attend to the two pads on their left, and their results are polluted.
+2. **Position ids**: the position of each token inside *its own* sequence. After left padding, the 5 in the second row sits in slot 2, but it is really token 0 of its sequence. The model tells order apart through its position embeddings, so wrong positions mean wrong results.
+
+For `[[5, 6, 7], [8]]` with pad = 0:
+
+```
+input_ids      = [[5, 6, 7], [0, 0, 8]]
+attention_mask = [[1, 1, 1], [0, 0, 1]]
+position_ids   = [[0, 1, 2], [0, 0, 0]]
+```
+
+Build the mask from "was this position added as padding?", not from `ids != pad_id`. Many models (GPT-2, for example) use the eos token as the pad token, and a real eos would be masked out too.
+
+Position ids come from the mask: `mask.cumsum(-1) - 1` is exactly 0, 1, 2, … at the real positions. At padding positions it is -1; `.clamp(min=0)` turns that into 0. Padding is masked anyway, so any value works there, but it must not be negative or the embedding lookup fails.
+
+At every generation step, append the new token to `input_ids`, and also:
+
+- append a column of 1s to `attention_mask` (the new token is real)
+- append "each row's last position + 1" to `position_ids`
+
+In Hugging Face this is `tokenizer.padding_side = "left"` plus passing `attention_mask` to `generate`; for many models, `generate` computes the position ids for you with the same cumsum trick.
+
+Below, `left_pad(seqs, pad_id)` returns all three (you write it yourself in the practice items).
+--- code
+mask = torch.tensor([[1, 1, 1], [0, 0, 1]])
+print(mask.cumsum(-1) - 1)
+print((mask.cumsum(-1) - 1).clamp(min=0))
+
+model = tiny_lm()
+prompts = [[3, 7, 2, 9], [5, 1]]
+ids, mask, pos = left_pad(prompts, pad_id=0)
+print(ids)
+with torch.inference_mode():
+    logits = model(ids, attention_mask=mask, position_ids=pos)
+print("one at a time:     ", [generate_one(model, p, 1)[0] for p in prompts])
+print("left-padded batch: ", logits[:, -1].argmax(dim=-1).tolist())
+
+@@ concept
+title: Reproducibility: seeds and determinism switches
+--- body
+The same code run twice should give the same result. Only then can you reproduce a problem or compare two experiments fairly. Random numbers come from three places, each with its own seed:
+
+- Python's `random`: `random.seed(seed)`
+- NumPy: `np.random.seed(seed)`
+- PyTorch: `torch.manual_seed(seed)` (seeds the CPU and every GPU; the `torch.cuda.manual_seed_all(seed)` line you see in older code does no harm)
+
+`torch.manual_seed` does not touch the other two. Data augmentation often uses `random` and dataset splits often use NumPy, so seeding only torch still gives different runs.
+
+Even with the same seed, GPU results can differ between runs. There are three more switches:
+
+- `torch.backends.cudnn.benchmark = False`: when it is True, cuDNN times several convolution algorithms and picks the fastest. Different runs may pick different algorithms, and results differ in the last digits.
+- `torch.backends.cudnn.deterministic = True`: convolutions use only deterministic algorithms.
+- `torch.use_deterministic_algorithms(True)`: every operation must use a deterministic implementation; an operation without one raises an error instead of quietly giving different results. On a GPU you must also set the environment variable `CUBLAS_WORKSPACE_CONFIG=:4096:8` at the very start of the program (before any GPU work), or matrix multiplications raise an error.
+
+These switches make the program slower. Turn them on for debugging, for tests, or when you need exact reproduction.
+
+Also remember: a different GPU model, driver, PyTorch version or batch size can still change the last digits. So always compare two results with a tolerance.
+--- code
+import random
+import numpy as np
+
+torch.manual_seed(0)
+a = (random.random(), np.random.rand(), torch.rand(1).item())
+torch.manual_seed(0)
+b = (random.random(), np.random.rand(), torch.rand(1).item())
+print("random, numpy, torch the same twice:", [x == y for x, y in zip(a, b)])
+print("cudnn.benchmark =", torch.backends.cudnn.benchmark)
+print("deterministic algorithms on:", torch.are_deterministic_algorithms_enabled())
+
+@@ concept
+title: Precision and tolerances: fp32 / TF32 / bf16 / fp16
+--- body
+Four common floating-point formats. Mantissa bits set the precision (how small a difference you can see); exponent bits set the range (how big a number you can store). eps is the gap between 1 and the next bigger number:
+
+- **fp32**: 23 mantissa bits, eps ≈ 1.2e-7, max about 3.4e38. PyTorch's default.
+- **TF32**: not a storage format but a way NVIDIA GPUs (Ampere and later, such as the A100 and the RTX 30/40/50 series) compute fp32 matrix multiplications and convolutions: the inputs keep only 10 mantissa bits before multiplying, and the result is still stored as fp32. Much faster, but relative errors reach about 1e-3. Convolutions may use it by default (`torch.backends.cudnn.allow_tf32` is True); matrix multiplications do not by default, but many training scripts turn it on with `torch.set_float32_matmul_precision("high")`.
+- **bf16**: 7 mantissa bits, eps ≈ 7.8e-3, coarse; but it has as many exponent bits as fp32, so it rarely overflows. Common for training and inference.
+- **fp16**: 10 mantissa bits, eps ≈ 9.8e-4, finer than bf16; but its max is only 65504, and anything larger becomes inf.
+
+When you compare two outputs (say a bf16 service output against an fp32 reference):
+
+1. Convert both to fp32 before subtracting: `(got.float() - ref.float()).abs()`
+2. Use an absolute tolerance atol and a relative tolerance rtol together: `|got - ref| <= atol + rtol * |ref|`. Relative error alone fails: where ref is close to 0, the relative error becomes huge (above 10 for bf16 in the example below). Absolute error alone fails too: large values naturally have larger rounding errors.
+3. Pick the tolerance of the lower-precision side. Rough values for model outputs: about 1e-5 for fp32, 1e-2 for fp16, 5e-2 for bf16. A single operation can be held to tighter limits; `torch.testing.assert_close` has defaults per dtype. A real bug usually shows up as a difference of 0.1 or more, far above these tolerances.
+4. Looser is not safer: comparing an fp32 output with the bf16 tolerance lets bugs through.
+--- code
+for dt in (torch.float32, torch.float16, torch.bfloat16):
+    fi = torch.finfo(dt)
+    print(f"{str(dt):15s} eps={fi.eps:.1e}  max={fi.max:.1e}")
+
+torch.manual_seed(0)
+a, b = torch.randn(64, 64), torch.randn(64, 64)
+ref = a @ b                                    # fp32 reference
+for dt in (torch.float16, torch.bfloat16):
+    got = (a.to(dt) @ b.to(dt)).float()        # compute in low precision, compare in fp32
+    diff = (got - ref).abs()
+    print(dt, f"max abs error {diff.max():.3f}", f"max relative error {(diff / ref.abs()).max():.1f}")
+
+@@ item d18-01
+type: code
+title: Preprocessor: the statistics travel with the model
+level: 2
+cards: Train/serve skew: one preprocessing path for both
+targets: Preprocessor
+--- context
+When a model does worse in production than in offline evaluation, one of the most common causes is that the service prepares inputs differently from training. Put the preprocessing in one class, save its statistics with the model, and use the same code for training and serving, and this whole class of bugs goes away.
+--- prompt
+Write a class `Preprocessor` that standardises features: `(x - mean) / std`. x has shape `(N, D)`: N rows, D features each.
+
+- `fit(x)`: on the training data, compute each feature's `mean = x.mean(dim=0)` and `std = x.std(dim=0)`, then `.clamp_min(1e-6)` the std (a constant column has std 0; this avoids dividing by 0). Store them as `self.mean` and `self.std`, then `return self`.
+- `transform(x)`: return `(x - self.mean) / self.std`. **Use only the stored statistics**; never compute them from x. If it is called before any fit or load, `raise RuntimeError(...)`.
+- `state_dict()`: return `{"mean": ..., "std": ...}` (two tensors), to be saved in the same file as the model weights.
+- `load_state_dict(d)`: restore `self.mean` and `self.std` from such a dict.
+--- starter
+class Preprocessor:
+    def __init__(self):
+        self.mean = None
+        self.std = None
+
+    def fit(self, x):
+        raise todo()
+
+    def transform(self, x):
+        raise todo()
+
+    def state_dict(self):
+        raise todo()
+
+    def load_state_dict(self, d):
+        raise todo()
+--- solution
+class Preprocessor:
+    def __init__(self):
+        self.mean = None
+        self.std = None
+
+    def fit(self, x):
+        self.mean = x.mean(dim=0)
+        self.std = x.std(dim=0).clamp_min(1e-6)     # constant column: std = 0, do not divide by 0
+        return self
+
+    def transform(self, x):
+        if self.mean is None:
+            raise RuntimeError("call fit() or load_state_dict() first")
+        return (x - self.mean) / self.std           # always the stored statistics
+
+    def state_dict(self):
+        return {"mean": self.mean.clone(), "std": self.std.clone()}
+
+    def load_state_dict(self, d):
+        self.mean = d["mean"].clone()
+        self.std = d["std"].clone()
+        return self
+--- tests
+import os
+import tempfile
+
+
+def _train_data():
+    torch.manual_seed(1)
+    return torch.randn(200, 3) * torch.tensor([10.0, 0.1, 3.0]) + torch.tensor([50.0, -2.0, 0.0])
+
+
+@check("after fit, the training data has mean 0 and std 1")
+def _():
+    train = _train_data()
+    pre = Preprocessor()
+    true(pre.fit(train) is pre, "fit must end with return self, so you can write Preprocessor().fit(x)")
+    z = pre.transform(train)
+    shape_is(z, (200, 3))
+    eq(z.mean(dim=0), torch.zeros(3), tol=1e-4, msg="every column should have mean 0: compute the mean over dim=0 (per feature)")
+    eq(z.std(dim=0), torch.ones(3), tol=1e-3, msg="every column should have std 1: compute the std over dim=0 with the default x.std(dim=0)")
+
+
+@check("a constant column does not become nan / inf")
+def _():
+    train = _train_data()
+    train[:, 1] = 5.0
+    z = Preprocessor().fit(train).transform(train)
+    true(torch.isfinite(z).all().item(), "one column is constant, std = 0, and the division gives nan: add .clamp_min(1e-6) to the std in fit")
+
+
+@check("a single request uses the training statistics")
+def _():
+    train = _train_data()
+    pre = Preprocessor().fit(train)
+    one = torch.tensor([[60.0, -2.05, 1.0]])
+    want = (one - train.mean(dim=0)) / train.std(dim=0)
+    eq(pre.transform(one), want, tol=1e-4,
+       msg="transform must use the mean / std stored by fit, not compute them from the request (one row has std 0)")
+    batch = torch.cat([one, torch.randn(4, 3) * 100])
+    eq(pre.transform(batch)[:1], want, tol=1e-4,
+       msg="the same request gives a different result when other requests share its batch: transform must not use the current batch's statistics")
+
+
+@check("the statistics are saved with the model and loaded as-is by the service")
+def _():
+    pre = Preprocessor().fit(_train_data())
+    sd = pre.state_dict()
+    true(isinstance(sd, dict) and set(sd) == {"mean", "std"},
+         f"state_dict() must return a dict with exactly the keys mean and std; yours is {sd!r}")
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "bundle.pt")
+        torch.save({"model": nn.Linear(3, 1).state_dict(), "pre": sd}, path)
+        bundle = torch.load(path)
+    served = Preprocessor()          # the serving process: a brand-new object, no fit
+    served.load_state_dict(bundle["pre"])
+    req = torch.tensor([[48.0, -1.9, 2.5]])
+    eq(served.transform(req), pre.transform(req), tol=1e-6,
+       msg="the loaded Preprocessor gives different results from the trained one: load_state_dict must restore both mean and std")
+
+
+@check("transform before any fit or load raises an error")
+def _():
+    try:
+        Preprocessor().transform(torch.ones(1, 3))
+    except RuntimeError:
+        return
+    true(False, "transform without statistics should raise RuntimeError instead of quietly returning something (that is exactly how train/serve skew starts)")
+--- hints
+- In fit, compute `self.mean` and `self.std`, and make the last line `return self`. Start transform with `if self.mean is None:`.
+- `self.std = x.std(dim=0).clamp_min(1e-6)`; `state_dict` returns `{"mean": self.mean, "std": self.std}`; `load_state_dict` does the reverse: `self.mean = d["mean"]`, `self.std = d["std"]`.
+
+@@ item d18-02
+type: code
+title: A fingerprint for the vocabulary
+level: 1
+cards: The tokenizer has a version too: match it with a fingerprint
+targets: vocab_fingerprint, check_vocab
+--- context
+With a different tokenizer or a reordered vocabulary, the same word gets a different id. The model raises no error; it just reads a different sentence. Store a fingerprint of the vocabulary with the checkpoint, compare it when the service starts, and refuse to start on a mismatch.
+--- prompt
+Write two functions:
+
+- `vocab_fingerprint(vocab)`: vocab is a dict (token string → integer id). Turn it into text with `json.dumps(vocab, sort_keys=True)`, compute `hashlib.sha256(text.encode("utf-8")).hexdigest()`, and return **the first 16 characters**.
+- `check_vocab(saved_fp, vocab)`: saved_fp is the fingerprint stored at training time. If the current vocabulary has the same fingerprint, do nothing (return None). If not, `raise ValueError(...)` with both fingerprints in the message, to make debugging easy.
+
+Do not use Python's `hash()`.
+--- starter
+import hashlib
+import json
+
+
+def vocab_fingerprint(vocab):
+    raise todo()
+
+
+def check_vocab(saved_fp, vocab):
+    raise todo()
+--- solution
+import hashlib
+import json
+
+
+def vocab_fingerprint(vocab):
+    text = json.dumps(vocab, sort_keys=True)       # sorted keys: insertion order does not matter
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def check_vocab(saved_fp, vocab):
+    fp = vocab_fingerprint(vocab)
+    if fp != saved_fp:
+        raise ValueError(f"vocabulary mismatch: the checkpoint used {saved_fp}, the loaded one is {fp}")
+--- tests
+import hashlib
+import json
+
+V = {"<pad>": 0, "<eos>": 1, "hello": 2, "world": 3, "你好": 4}
+
+
+@check("same vocabulary in another insertion order, same fingerprint")
+def _():
+    fp = vocab_fingerprint(V)
+    true(isinstance(fp, str) and len(fp) == 16, f"return a string of 16 characters; you returned {fp!r}")
+    shuffled = dict(reversed(list(V.items())))
+    true(vocab_fingerprint(shuffled) == fp, "only the insertion order changed, yet the fingerprint changed: use json.dumps with sort_keys=True")
+
+
+@check("computed the required way (training and serving processes agree)")
+def _():
+    want = hashlib.sha256(json.dumps(V, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    true(vocab_fingerprint(V) == want,
+         "the fingerprint is not the first 16 characters of sha256(json.dumps(vocab, sort_keys=True)). "
+         "If you used hash(): it changes every time Python starts, so training and serving would never agree")
+
+
+@check("any change to a token or an id changes the fingerprint")
+def _():
+    fp = vocab_fingerprint(V)
+    swapped = dict(V, hello=3, world=2)
+    added = dict(V, new_word=5)
+    renamed = {("Hello" if k == "hello" else k): v for k, v in V.items()}
+    for name, v in (("swapping two ids", swapped), ("adding a token", added), ("changing a token's case", renamed)):
+        true(vocab_fingerprint(v) != fp, f"the fingerprint did not change after {name}: it must cover the whole vocabulary (tokens and ids)")
+
+
+@check("check_vocab: lets a match through, rejects a mismatch")
+def _():
+    fp = vocab_fingerprint(V)
+    true(check_vocab(fp, V) is None, "when the fingerprints match, check_vocab should do nothing (return None)")
+    try:
+        check_vocab(fp, dict(V, hello=3, world=2))
+    except ValueError as e:
+        true(fp in str(e), "put the stored fingerprint in the error message, so whoever debugs it knows which vocabulary the checkpoint was trained with")
+        return
+    true(False, "the vocabulary changed, so check_vocab should raise ValueError")
+--- hints
+- Fingerprint: `text = json.dumps(vocab, sort_keys=True)`, then `hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]`.
+- check_vocab: `fp = vocab_fingerprint(vocab)`, then `if fp != saved_fp: raise ValueError(f"... {saved_fp} ... {fp}")`.
+
+@@ item d18-03
+type: fix
+title: The served model is still in train mode
+level: 2
+cards: Two switches for inference: eval() and inference_mode(); Results must not depend on the batch
+targets: serve_predict
+ref: day18
+--- context
+A model that has just been trained is in train mode. Serve it like that and dropout keeps dropping while BatchNorm keeps using the current batch's statistics: the same request gets different answers, and the answer changes with whatever else is in the batch.
+--- prompt
+`serve_predict(model, x)` is the service's prediction function: `x` holds `(B, 4)` features and it returns `(B, 3)` class probabilities. The model comes from `make_net()` (Linear → BatchNorm → ReLU → Dropout → Linear) and arrives in train mode.
+
+The current code has two problems: the model does not switch to inference behaviour, and every call builds a graph. Fix it so that:
+
+- calling it twice on the same input gives exactly the same result
+- a request's result does not change with the other requests in the batch
+- the model's forward pass runs inside `torch.inference_mode()` and the returned tensor does not track gradients
+--- starter
+def serve_predict(model, x):
+    logits = model(x)
+    return logits.softmax(dim=-1)
+--- solution
+def serve_predict(model, x):
+    model.eval()                        # dropout off, BatchNorm uses its stored statistics
+    with torch.inference_mode():        # no graph
+        logits = model(x)
+        return logits.softmax(dim=-1)
+--- tests
+@check("the same input twice gives exactly the same result")
+def _():
+    net = make_net()
+    x = torch.randn(8, 4)
+    a = serve_predict(net, x)
+    b = serve_predict(net, x)
+    shape_is(a, (8, 3))
+    true(torch.equal(a, b), "two different results: dropout is still on. Call model.eval() first")
+
+
+@check("a request's result does not change with the rest of the batch")
+def _():
+    net = make_net()
+    x = torch.randn(8, 4)
+    together = serve_predict(net, x)
+    alone = torch.cat([serve_predict(net, x[i:i + 1]) for i in range(8)])
+    eq(together, alone, tol=1e-5,
+       msg="the whole batch and one-by-one give different results: BatchNorm still uses the current batch's mean and variance; call model.eval()")
+
+
+@check("the forward pass runs in inference_mode and tracks no gradients")
+def _():
+    net = make_net()
+    seen = []
+    hook = net.register_forward_hook(lambda m, i, o: seen.append(torch.is_inference_mode_enabled()))
+    out = serve_predict(net, torch.randn(4, 4))
+    hook.remove()
+    true(not out.requires_grad, "the result has requires_grad=True: every call builds a graph and wastes memory")
+    true(len(seen) > 0 and all(seen), "the model's forward pass did not run inside torch.inference_mode(): wrap it in with torch.inference_mode():")
+
+
+@check("matches the reference; each row of probabilities sums to 1")
+def _():
+    net = make_net()
+    x = torch.randn(5, 4)
+    ref = make_net().eval()
+    with torch.no_grad():
+        want = ref(x).softmax(dim=-1)
+    got = serve_predict(net, x)
+    eq(got.sum(dim=-1), torch.ones(5), tol=1e-5, msg="each row should sum to 1: apply softmax over the last dimension (the classes)")
+    eq(got, want, tol=1e-5)
+--- hints
+- Two problems, two switches: one changes how layers behave, the other stops gradient tracking.
+- Call `model.eval()` first, then wrap the forward pass and the softmax in `with torch.inference_mode():`.
+
+@@ item d18-04
+type: predict
+title: The same row, different batchmates
+level: 1
+cards: Results must not depend on the batch
+--- context
+When a service groups requests into a batch, each request's result must not depend on who it was grouped with. BatchNorm in train mode does exactly that.
+--- prompt
+Write the two lines this code prints.
+--- code
+torch.manual_seed(0)
+bn = nn.BatchNorm1d(3)
+x = torch.randn(4, 3)
+
+a = bn(x)[0]          # row 0, computed together with 3 other rows
+b = bn(x[:2])[0]      # still row 0, now with only 1 other row
+print("train:", torch.allclose(a, b))
+
+bn.eval()
+a = bn(x)[0]
+b = bn(x[:2])[0]
+print("eval:", torch.allclose(a, b))
+--- explain
+In train mode, BatchNorm normalises with the mean and variance of the current batch. A batch of 4 rows and a batch of 2 rows have different statistics, so row 0's output changes too: `False`.
+
+In eval mode it uses the running mean / var stored during training, which do not depend on the rest of the batch: `True`.
+
+Also: in train mode, a batch with a single row raises an error (`Expected more than 1 value per channel when training`). If you see that error in a service, someone most likely forgot `model.eval()`.
+--- hints
+- In train mode, whose mean and variance does BatchNorm use? Do 4 rows and 2 of those rows have the same mean?
+- In eval mode it uses running_mean / running_var, which do not care what else is in the batch.
+
+@@ item d18-05
+type: choice
+title: Is inference_mode alone enough?
+level: 1
+cards: Two switches for inference: eval() and inference_mode()
+--- context
+A common interview question and a common production bug: assuming that inference_mode (or no_grad) also switches the model to inference behaviour.
+--- prompt
+A service runs `with torch.inference_mode(): y = model(x)` but never calls `model.eval()` anywhere. The model contains Dropout and BatchNorm. What happens?
+--- options
+- Nothing bad: inference_mode switches the model to eval mode automatically
+- Dropout keeps dropping and BatchNorm keeps using the current batch's statistics: the same request gets different results, which also change with the other requests in the batch
+- It raises an error: inference_mode is not allowed in train mode
+- It is just a bit slower and uses a bit more memory; the results are exactly the same as with eval()
+answer: 2
+--- explain
+`inference_mode` only affects autograd: no graph, no saved intermediate results for the backward pass. It does not touch how any layer behaves.
+
+Layer behaviour is set by `model.train()` / `model.eval()`, which is a separate switch. So inference needs both: `model.eval()` (once, after loading the model) and `with torch.inference_mode():` (around every forward pass).
+
+Option 3 is wrong: there is no such restriction. The code runs fine and gives wrong results, which is exactly why it is dangerous.
+--- hints
+- What does inference_mode turn off? And what decides whether dropout is active?
+- Layers only look at the `model.training` flag, and only `train()` / `eval()` change it.
+
+@@ item d18-06
+type: code
+title: A batch-invariance test
+level: 1
+cards: Results must not depend on the batch
+targets: batch_gap
+--- context
+Before deploying, add a test that says "whole batch = one by one". Bugs like a forgotten eval() or unmasked padding then fail in the test suite instead of reaching a user who notices that the same question gets two different answers.
+--- prompt
+Write `batch_gap(model, x)`:
+
+- `x` is a batch of data; dimension 0 is the batch (for example shape `(B, C, L)`)
+- run the whole batch once: `model(x)`
+- run each row alone: `model(x[i:i+1])` (this keeps the batch dimension, shape `(1, ...)`), and concatenate the B results along dimension 0
+- return the largest absolute difference between the two, as a Python float (use `.item()`)
+
+Run every forward pass inside `with torch.inference_mode():`. Do not change the model's mode (no `eval()` or `train()`): you are **testing** the model, not fixing it.
+--- starter
+def batch_gap(model, x):
+    raise todo()
+--- solution
+def batch_gap(model, x):
+    with torch.inference_mode():
+        together = model(x)
+        alone = torch.cat([model(x[i:i + 1]) for i in range(x.shape[0])], dim=0)
+    return (together - alone).abs().max().item()
+--- tests
+def _conv_bn():
+    torch.manual_seed(0)
+    return nn.Sequential(nn.Conv1d(2, 4, kernel_size=3, padding=1), nn.BatchNorm1d(4), nn.ReLU())
+
+
+@check("a model in eval mode: the gap is almost 0")
+def _():
+    m = _conv_bn().eval()
+    x = torch.randn(6, 2, 5)
+    g = batch_gap(m, x)
+    true(isinstance(g, float), f"return a Python float (use .item()); you returned {type(g).__name__}")
+    true(g < 1e-5, f"in eval mode the gap should be < 1e-5, you got {g:.3e}: run each row as x[i:i+1] and concatenate along dim=0")
+
+
+@check("BatchNorm in train mode: the gap is clearly above 0")
+def _():
+    m = _conv_bn().train()
+    x = torch.randn(6, 2, 5)
+    g = batch_gap(m, x)
+    true(g > 0.1, f"BatchNorm in train mode uses the current batch's statistics, so batch and one-by-one should differ a lot; you got {g:.3e}. Did you call eval() inside the function?")
+
+
+@check("the model's mode is not changed")
+def _():
+    m = _conv_bn().train()
+    batch_gap(m, torch.randn(4, 2, 5))
+    true(m.training, "after the call the model went from train to eval: a test must not secretly change what it tests")
+    m.eval()
+    batch_gap(m, torch.randn(4, 2, 5))
+    true(not m.training, "after the call the model went from eval to train")
+
+
+@check("a plain linear model: the gap is almost 0")
+def _():
+    m = nn.Linear(8, 3)
+    g = batch_gap(m, torch.randn(10, 8))
+    true(g < 1e-5, f"Linear does not depend on the batch, so the gap should be < 1e-5; you got {g:.3e}")
+--- hints
+- Keep the batch dimension when running one row: `x[i:i+1]` has shape `(1, ...)`, while `x[i]` loses a dimension.
+- `alone = torch.cat([model(x[i:i + 1]) for i in range(x.shape[0])], dim=0)`, then return `(together - alone).abs().max().item()`.
+
+@@ item d18-07
+type: code
+title: Left padding: input_ids, attention_mask, position_ids
+level: 2
+cards: Batched generation (2): left padding + attention mask + position ids
+targets: left_pad
+ref: day18
+--- context
+When you batch generation with a decoder-only model, Hugging Face warns you to use left padding. Ids, mask and positions are the inputs every LLM inference service prepares at every step; get one of them wrong and batched results stop matching single-prompt results.
+--- prompt
+Write `left_pad(seqs, pad_id=0)`. seqs is a list of B token-id lists of different lengths. Return three tensors of shape `(B, T)`, where T is the length of the longest one:
+
+- `input_ids`: padding on the **left**, dtype `torch.long`
+- `attention_mask`: 1 for real tokens, 0 for padding (decide by position, not with `ids != pad_id`)
+- `position_ids`: the position of each real token inside its own sequence (0, 1, 2, …); 0 at padding positions. dtype `torch.long`
+
+Example: `left_pad([[5, 6, 7], [8]], pad_id=0)` returns
+
+```
+input_ids      = [[5, 6, 7], [0, 0, 8]]
+attention_mask = [[1, 1, 1], [0, 0, 1]]
+position_ids   = [[0, 1, 2], [0, 0, 0]]
+```
+--- starter
+def left_pad(seqs, pad_id=0):
+    raise todo()
+--- solution
+def left_pad(seqs, pad_id=0):
+    T = max(len(s) for s in seqs)
+    ids = torch.full((len(seqs), T), pad_id, dtype=torch.long)
+    mask = torch.zeros((len(seqs), T), dtype=torch.long)
+    for i, s in enumerate(seqs):
+        ids[i, T - len(s):] = torch.tensor(s, dtype=torch.long)   # real tokens go to the right
+        mask[i, T - len(s):] = 1
+    pos = (mask.cumsum(dim=-1) - 1).clamp(min=0)                 # real positions 0, 1, 2, …; padding gets 0
+    return ids, mask, pos
+--- tests
+@check("small example: [[5, 6, 7], [8]]")
+def _():
+    ids, mask, pos = left_pad([[5, 6, 7], [8]], pad_id=0)
+    shape_is(ids, (2, 3))
+    true(ids.dtype == torch.long, f"input_ids must be torch.long (embedding lookups need integers); yours is {ids.dtype}")
+    eq(ids, torch.tensor([[5, 6, 7], [0, 0, 8]]), tol=0, msg="padding goes on the left: the short row is [0, 0, 8], not [8, 0, 0]")
+    eq(mask.long(), torch.tensor([[1, 1, 1], [0, 0, 1]]), tol=0, msg="attention_mask: 1 for real tokens, 0 for padding")
+    true(pos.dtype == torch.long, f"position_ids must be torch.long; yours is {pos.dtype}")
+    eq(pos, torch.tensor([[0, 1, 2], [0, 0, 0]]), tol=0,
+       msg="position_ids: the 8 in the second row is token 0 of its sequence, so its position is 0; padding positions get 0")
+
+
+@check("three sequences of different lengths, pad_id is 9")
+def _():
+    ids, mask, pos = left_pad([[4, 4, 4, 4], [1, 2], [7, 8, 9]], pad_id=9)
+    eq(ids, torch.tensor([[4, 4, 4, 4], [9, 9, 1, 2], [9, 7, 8, 9]]), tol=0, msg="pad with the pad_id you were given")
+    eq(mask.long(), torch.tensor([[1, 1, 1, 1], [0, 0, 1, 1], [0, 1, 1, 1]]), tol=0,
+       msg="build the mask from whether a position was added as padding, not from id == pad_id (the last real token of row 3 happens to be 9 too)")
+    eq(pos, torch.tensor([[0, 1, 2, 3], [0, 0, 0, 1], [0, 0, 1, 2]]), tol=0,
+       msg="position_ids must count from each sequence's own first real token")
+
+
+@check("with the model: batched next-token scores = one prompt at a time")
+def _():
+    model = tiny_lm()
+    prompts = [[3, 7, 2, 9], [5, 1], [4, 4, 8], [11]]
+    ids, mask, pos = left_pad(prompts, pad_id=0)
+    with torch.inference_mode():
+        logits = model(ids, attention_mask=mask, position_ids=pos)[:, -1]
+        for i, p in enumerate(prompts):
+            want = model(torch.tensor([p]))[0, -1]
+            eq(logits[i], want, tol=1e-4, msg=f"prompt {i} {p}: the batched scores differ from the scores computed alone")
+--- hints
+- Start with `T = max(len(s) for s in seqs)`; build ids with `torch.full((B, T), pad_id, dtype=torch.long)` and the mask with `torch.zeros((B, T), dtype=torch.long)`.
+- Write each row's real tokens at the right end: `ids[i, T - len(s):] = torch.tensor(s)`, and `mask[i, T - len(s):] = 1`.
+- Position ids: `(mask.cumsum(dim=-1) - 1).clamp(min=0)`.
+
+@@ item d18-08
+type: fix
+title: Right padding breaks the whole batch
+level: 2
+cards: Batched generation (1): why right padding breaks; Batched generation (2): left padding + attention mask + position ids
+targets: next_token_batch
+ref: day18
+--- context
+Generation works one prompt at a time, but as soon as you batch it, the short prompts get nonsense answers. This is one of the most common bugs in LLM inference services, and the cause is almost always the padding side, the attention mask or the position ids.
+--- prompt
+`next_token_batch(model, prompts, pad_id=0)` puts prompts of different lengths into one batch, picks each prompt's next token greedily (the highest score), and returns a list of B ints.
+
+It should give the same result as `generate_one(model, p, 1)[0]` (one prompt at a time, no padding), but it does not.
+
+Fix it: use left padding, and pass the attention mask and the position ids to the model. You can use the ready-made `left_pad(seqs, pad_id)` (it returns ids, mask, pos). Call the model as `model(ids, attention_mask=mask, position_ids=pos)`; it returns `(B, T, V)` logits.
+--- starter
+def next_token_batch(model, prompts, pad_id=0):
+    T = max(len(p) for p in prompts)
+    ids = torch.tensor([p + [pad_id] * (T - len(p)) for p in prompts])   # right padding
+    with torch.inference_mode():
+        logits = model(ids)
+    return logits[:, -1].argmax(dim=-1).tolist()
+--- solution
+def next_token_batch(model, prompts, pad_id=0):
+    ids, mask, pos = left_pad(prompts, pad_id)                   # left padding
+    with torch.inference_mode():
+        logits = model(ids, attention_mask=mask, position_ids=pos)
+    return logits[:, -1].argmax(dim=-1).tolist()                 # every row's last slot is its real last token
+--- tests
+class _Spy(nn.Module):
+    """Wraps a model and records the inputs it receives."""
+
+    def __init__(self, inner):
+        super().__init__()
+        self.inner = inner
+        self.calls = []
+
+    def forward(self, ids, attention_mask=None, position_ids=None):
+        self.calls.append((ids, attention_mask, position_ids))
+        return self.inner(ids, attention_mask=attention_mask, position_ids=position_ids)
+
+
+P1 = [[3, 7, 2, 9], [5, 1], [4, 4, 8], [11]]
+P2 = [[2, 9, 6, 1, 13], [7], [12, 3], [9, 9, 9]]
+
+
+@check("batched result = one prompt at a time")
+def _():
+    model = tiny_lm()
+    for P in (P1, P2):
+        got = next_token_batch(model, P)
+        want = [generate_one(model, p, 1)[0] for p in P]
+        true(got == want, f"prompts {P}: the batch gives {got}, one at a time gives {want}")
+
+
+@check("left padding is used")
+def _():
+    spy = _Spy(tiny_lm())
+    next_token_batch(spy, P1)
+    ids = spy.calls[0][0]
+    true(bool((ids[:, -1] != 0).all()),
+         f"the last column the model received contains padding: {ids[:, -1].tolist()}. With right padding a short prompt's last slot is a pad; put the padding on the left")
+
+
+@check("the attention mask and the position ids are passed to the model")
+def _():
+    spy = _Spy(tiny_lm())
+    next_token_batch(spy, P1)
+    ids, mask, pos = spy.calls[0]
+    true(mask is not None, "no attention_mask: real tokens attend to the padding on their left")
+    true(pos is not None, "no position_ids: after left padding a short prompt's first token is not in slot 0, so every position is wrong")
+
+
+@check("the order of the prompts does not change the results")
+def _():
+    model = tiny_lm()
+    a = next_token_batch(model, P1)
+    b = next_token_batch(model, P1[::-1])
+    true(a == b[::-1], "reversing the prompts changes the results: some prompt's result depends on the other prompts in the batch")
+--- hints
+- With right padding, what is in a short prompt's last slot? The model predicts the token after which token there?
+- `ids, mask, pos = left_pad(prompts, pad_id)`, then `model(ids, attention_mask=mask, position_ids=pos)`; still take the last slot with `[:, -1]`.
+
+@@ item d18-09
+type: fill
+title: Batched greedy generation: what to append at each step
+level: 2
+cards: Batched generation (2): left padding + attention mask + position ids
+ref: day18
+--- context
+At every generation step the new token is appended to the sequence. Append it to input_ids but forget the attention mask and the position ids, and batched results diverge from the second token on. The first token still looks fine, which makes the bug hard to spot.
+--- prompt
+Fill in the blanks to finish batched greedy generation. `generate_batch(model, prompts, n_new)` must give exactly the same result as calling `generate_one(model, p, n_new)` for each prompt separately.
+
+- Blank 1: take the logits at each row's last position and pick the best token, shape `(B,)`
+- Blank 2: turn the new tokens into shape `(B, 1)` so they can be appended to `ids`
+- Blank 3: append a column of 1s to `mask` (same dtype as mask)
+- Blank 4: append "each row's last position + 1" to `pos`
+--- template
+def generate_batch(model, prompts, n_new, pad_id=0):
+    ids, mask, pos = left_pad(prompts, pad_id)
+    new = []
+    with torch.inference_mode():
+        for _ in range(n_new):
+            logits = model(ids, attention_mask=mask, position_ids=pos)   # (B, T, V)
+            nxt = [[logits[:, -1].argmax(dim=-1)]]
+            new.append(nxt)
+            ids = torch.cat([ids, [[nxt.unsqueeze(1)]]], dim=1)
+            mask = torch.cat([mask, [[torch.ones_like(mask[:, :1])]]], dim=1)
+            pos = torch.cat([pos, [[pos[:, -1:] + 1]]], dim=1)
+    return torch.stack(new, dim=1).tolist()                               # B lists of n_new tokens each
+--- tests
+P1 = [[3, 7, 2, 9], [5, 1], [4, 4, 8], [11]]
+P2 = [[2, 9, 6, 1, 13], [7], [12, 3], [9, 9, 9]]
+
+
+@check("batched generation = one prompt at a time (6 new tokens)")
+def _():
+    model = tiny_lm()
+    for P in (P1, P2):
+        got = generate_batch(model, P, 6)
+        want = [generate_one(model, p, 6) for p in P]
+        for i, (g, w) in enumerate(zip(got, want)):
+            true(g == w, f"prompt {i} {P[i]}: the batch generates {g}, one at a time generates {w}. "
+                         "Wrong from the 1st token: check which position the logits come from; wrong later: check that mask and pos grow too")
+
+
+@check("shape: B lists of n_new tokens")
+def _():
+    out = generate_batch(tiny_lm(), P1, 3)
+    true(len(out) == 4 and all(len(r) == 3 for r in out), f"expected 4 lists of length 3, got {out}")
+--- hints
+- After left padding, each row's last position holds its real last token, so blank 1 takes `logits[:, -1]` and then `.argmax(dim=-1)`.
+- The new tokens have shape `(B,)`; `nxt.unsqueeze(1)` makes them `(B, 1)`. The mask gets `torch.ones_like(mask[:, :1])`; pos gets `pos[:, -1:] + 1` (`-1:` instead of `-1` keeps that dimension).
+
+@@ item d18-10
+type: code
+title: set_seed: cover all three sources of randomness
+level: 1
+cards: Reproducibility: seeds and determinism switches
+targets: set_seed
+--- context
+"We can't reproduce last week's result" is one of the most common complaints on an ML team. torch.manual_seed alone is not enough: data augmentation and dataset splits often use Python's random and NumPy, which have their own seeds.
+--- prompt
+Write `set_seed(seed, deterministic=False)`:
+
+- seed Python's `random`, NumPy and PyTorch
+- when `deterministic=True`, also turn on three determinism switches: `torch.backends.cudnn.benchmark = False`, `torch.backends.cudnn.deterministic = True`, `torch.use_deterministic_algorithms(True)`
+- when `deterministic=False` (the default), leave those switches alone
+--- starter
+import random
+
+import numpy as np
+
+
+def set_seed(seed, deterministic=False):
+    torch.manual_seed(seed)
+--- solution
+import random
+
+import numpy as np
+
+
+def set_seed(seed, deterministic=False):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)                       # the CPU and every GPU
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True)
+--- tests
+import random
+
+import numpy as np
+
+
+def _draw():
+    return random.random(), float(np.random.rand()), torch.rand(1).item()
+
+
+def _flags():
+    return (torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic,
+            torch.are_deterministic_algorithms_enabled())
+
+
+def _restore(f):
+    torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = f[0], f[1]
+    torch.use_deterministic_algorithms(f[2])
+
+
+@check("random, NumPy and torch are all seeded")
+def _():
+    set_seed(123)
+    a = _draw()
+    set_seed(123)
+    b = _draw()
+    true(a[0] == b[0], "Python's random differs between the two runs: add random.seed(seed)")
+    true(a[1] == b[1], "NumPy differs between the two runs: add np.random.seed(seed)")
+    true(a[2] == b[2], "torch differs between the two runs: add torch.manual_seed(seed)")
+
+
+@check("different seeds give different numbers")
+def _():
+    set_seed(1)
+    a = _draw()
+    set_seed(2)
+    b = _draw()
+    true(all(x != y for x, y in zip(a, b)), "the seed changed but the numbers did not: use the seed you were given, not a hard-coded number")
+
+
+@check("deterministic=True turns on the three determinism switches")
+def _():
+    old = _flags()
+    try:
+        torch.backends.cudnn.benchmark = True        # pretend someone turned it on for speed
+        torch.backends.cudnn.deterministic = False
+        torch.use_deterministic_algorithms(False)
+        set_seed(0, deterministic=True)
+        now = _flags()
+    finally:
+        _restore(old)
+    true(now[0] is False, "cudnn.benchmark is still True: it lets each run pick a different convolution algorithm")
+    true(now[1] is True, "cudnn.deterministic was not set to True")
+    true(now[2] is True, "torch.use_deterministic_algorithms(True) was not called")
+
+
+@check("the default (deterministic=False) leaves the switches alone")
+def _():
+    old = _flags()
+    try:
+        torch.backends.cudnn.benchmark = True
+        torch.use_deterministic_algorithms(False)
+        set_seed(0)
+        now = _flags()
+    finally:
+        _restore(old)
+    true(now[0] is True and now[2] is False,
+         "the switches changed with deterministic=False: they slow things down, and deterministic algorithms make some operations raise errors, so turn them on only when needed")
+--- hints
+- Three lines: `random.seed(seed)`, `np.random.seed(seed)`, `torch.manual_seed(seed)`.
+- Set the switches only inside `if deterministic:`: `torch.backends.cudnn.benchmark = False`, `torch.backends.cudnn.deterministic = True`, `torch.use_deterministic_algorithms(True)`.
+
+@@ item d18-11
+type: predict
+title: 1 + 0.001 and 70000 in three precisions
+level: 2
+cards: Precision and tolerances: fp32 / TF32 / bf16 / fp16
+--- context
+Moving a service from fp32 to bf16 or fp16 halves the memory and speeds things up. But you need to know where each format loses information: small changes get rounded away, and big numbers overflow to inf.
+--- prompt
+Write the three lines this code prints. Each line has: the dtype's name, whether 1 + 0.001 still equals 1, and whether 70000 became inf.
+--- code
+for dt in [torch.float32, torch.float16, torch.bfloat16]:
+    one = torch.tensor(1.0, dtype=dt)
+    lost = (one + 0.001 == one).item()                       # after adding 0.001, is it still 1?
+    overflow = torch.tensor(70000.0).to(dt).isinf().item()   # does 70000 fit?
+    print(str(dt).replace("torch.", ""), lost, overflow)
+--- explain
+Near 1, the gap between two neighbouring numbers is eps: about 1.2e-7 for fp32, 9.8e-4 for fp16, 7.8e-3 for bf16.
+
+- 0.001 is bigger than fp16's gap, so in fp16 1 + 0.001 becomes 1.000977, which is not 1 (`False`).
+- 0.001 is much smaller than bf16's gap, so it is rounded away and the result is still 1 (`True`).
+- fp16 tops out at 65504, so 70000 becomes inf (`True`). bf16 has as many exponent bits as fp32, so 70000 fits; it is stored as 70144 (coarse, but no overflow).
+
+So bf16 is "wide range, coarse precision" and fp16 is "finer precision, small range". Training in fp16 needs loss scaling (multiplying the loss so tiny gradients do not become 0); bf16 usually does not.
+--- hints
+- Look at eps: about 9.8e-4 for fp16 and 7.8e-3 for bf16. Is 0.001 bigger or smaller than each?
+- fp16 tops out at 65504; bf16 has the same range as fp32.
+
+@@ item d18-12
+type: code
+title: Compare two outputs with a tolerance that fits the dtype
+level: 2
+cards: Precision and tolerances: fp32 / TF32 / bf16 / fp16
+targets: outputs_match
+--- context
+After changing precision, changing hardware or exporting to ONNX, the first thing to do is compare against the fp32 reference output. Too tight a tolerance flags a correct bf16 result as a bug; too loose a tolerance lets real bugs through.
+--- prompt
+Write `outputs_match(ref, got)`. `ref` is the fp32 reference output; `got` is the output to check, with dtype fp32, fp16 or bf16.
+
+- If the shapes differ, return `False` right away (do not let broadcasting turn `(4, 1)` and `(4,)` into `(4, 4)`)
+- Look up `(rtol, atol)` in `TOL` by `got.dtype`
+- Convert both to fp32 and check every element: `|got - ref| <= atol + rtol * |ref|`
+- Return `True` if every element passes, otherwise `False`, as a Python bool (use `bool(...)` or `.item()`). nan and inf count as failing.
+--- starter
+TOL = {                          # (rtol, atol), rough values for model outputs
+    torch.float32: (1e-5, 1e-5),
+    torch.float16: (1e-2, 1e-2),
+    torch.bfloat16: (5e-2, 5e-2),
+}
+
+
+def outputs_match(ref, got):
+    raise todo()
+--- solution
+TOL = {                          # (rtol, atol), rough values for model outputs
+    torch.float32: (1e-5, 1e-5),
+    torch.float16: (1e-2, 1e-2),
+    torch.bfloat16: (5e-2, 5e-2),
+}
+
+
+def outputs_match(ref, got):
+    if ref.shape != got.shape:
+        return False
+    rtol, atol = TOL[got.dtype]                   # the tolerance of the lower-precision side
+    ref32, got32 = ref.float(), got.float()       # compare in fp32
+    ok = (got32 - ref32).abs() <= atol + rtol * ref32.abs()
+    return bool(ok.all())                         # any comparison with nan is False
+--- tests
+def _case():
+    torch.manual_seed(0)
+    x, w = torch.randn(8, 32), torch.randn(32, 16)
+    return x, w, x @ w
+
+
+@check("fp32: another summation order, about 1e-7 apart, counts as a match")
+def _():
+    x, w, ref = _case()
+    got = (x[:, :, None] * w[None]).sum(dim=1)      # same maths, different summation order
+    r = outputs_match(ref, got)
+    true(isinstance(r, bool), f"return a Python bool; you returned {type(r).__name__}: use bool(...) or .item()")
+    true(r is True, "only the summation order differs (errors around 1e-7); this should not count as a mismatch")
+
+
+@check("correct fp16 / bf16 results count as a match")
+def _():
+    x, w, ref = _case()
+    for dt in (torch.float16, torch.bfloat16):
+        got = x.to(dt) @ w.to(dt)
+        true(outputs_match(ref, got) is True,
+             f"a correct {dt} result was flagged as a mismatch: look up the tolerance in TOL by got.dtype instead of always using the fp32 one")
+
+
+@check("a real bug is a mismatch in every precision")
+def _():
+    x, w, ref = _case()
+    bug = ref.clone()
+    bug[3, 5] += 1.0                                # one element is off by 1.0
+    for dt in (torch.float32, torch.float16, torch.bfloat16):
+        true(outputs_match(ref, bug.to(dt)) is False, f"{dt}: one element is off by 1.0, which should be a mismatch")
+
+
+@check("fp32 must not get the loose bf16 tolerance")
+def _():
+    x, w, ref = _case()
+    true(outputs_match(ref, ref + 1e-3) is False,
+         "the fp32 output is shifted by 1e-3, which should be a mismatch: fp32 needs the fp32 tolerance, not always the loosest one")
+
+
+@check("different shapes or a nan count as a mismatch")
+def _():
+    ref = torch.ones(4)
+    true(outputs_match(ref, torch.ones(4, 1)) is False,
+         "shapes (4,) and (4, 1) differ, so return False right away; otherwise broadcasting turns them into (4, 4) and every value even matches")
+    got = ref.clone()
+    got[1] = float("nan")
+    true(outputs_match(ref, got) is False, "the output contains a nan, which should be a mismatch")
+--- hints
+- Start with `if ref.shape != got.shape: return False`, then `rtol, atol = TOL[got.dtype]`.
+- `ok = (got.float() - ref.float()).abs() <= atol + rtol * ref.float().abs()`, then return `bool(ok.all())`. Any comparison with nan is False, so nan needs no special case.
+
+@@ item d18-13
+type: choice
+title: The same fp32 model, 1e-3 apart on CPU and GPU
+level: 2
+cards: Precision and tolerances: fp32 / TF32 / bf16 / fp16
+--- context
+Before deploying, you compare the GPU output with a CPU reference and find a difference of 1e-3. First decide: is this the normal error of a precision setting, or a real bug?
+--- prompt
+The training script starts with `torch.set_float32_matmul_precision("high")` (to train faster). You run the same fp32 model on the same input once on a CPU and once on an RTX 4090. The outputs differ by a relative error of about 1e-3. What is the most likely cause?
+--- options
+- The GPU computed it wrong; the card has a hardware fault
+- That setting makes fp32 matrix multiplications on the GPU use TF32 (inputs keep only 10 mantissa bits), and about 1e-3 is its normal error; to confirm, set it to "highest" and compare again
+- fp32 on the CPU is really computed as fp64, so the two differ
+- set_seed was not called, so the two runs used different random numbers
+answer: 2
+--- explain
+TF32 multiplies with 10 mantissa bits, a relative precision of about 1e-3, which matches the size of the error you see.
+
+`set_float32_matmul_precision("high")` lets matrix multiplications use TF32 (the default is "highest", full fp32). Convolutions in cuDNN may use TF32 by default (`torch.backends.cudnn.allow_tf32`).
+
+To confirm: set it to "highest" before comparing. If the error drops to around 1e-6, it is not a bug. Then pick tolerances that fit the precision, or turn TF32 off for comparisons.
+
+Option 3 is wrong: fp32 on a CPU is fp32. Option 4 is wrong: inference in eval mode uses no random numbers, so seeds do not matter.
+--- hints
+- Which format's mantissa size matches an error of about 1e-3?
+- TF32 has only 10 mantissa bits, a relative precision of about 1e-3.
+
+@@ item d18-14
+type: code
+title: Closed book: Preprocessor
+level: 2
+exam: yes
+cards: Train/serve skew: one preprocessing path for both
+targets: Preprocessor
+--- context
+One preprocessing path shared by training and serving, with its statistics saved next to the model, is the first line of defence against train/serve skew. Interviewers like to ask for it on the spot.
+--- prompt
+Without looking at the cards, write the `Preprocessor` class (standardise with `(x - mean) / std`; x has shape `(N, D)`):
+
+- `__init__()`: set `self.mean` and `self.std` to None
+- `fit(x)`: `mean = x.mean(dim=0)`, `std = x.std(dim=0).clamp_min(1e-6)`, store them on self, `return self`
+- `transform(x)`: use only the stored statistics; `raise RuntimeError` if there are none yet
+- `state_dict()`: return `{"mean": ..., "std": ...}`
+- `load_state_dict(d)`: restore the statistics from that dict
+--- starter
+class Preprocessor:
+    def __init__(self):
+        raise todo()
+
+    def fit(self, x):
+        raise todo()
+
+    def transform(self, x):
+        raise todo()
+
+    def state_dict(self):
+        raise todo()
+
+    def load_state_dict(self, d):
+        raise todo()
+--- solution
+class Preprocessor:
+    def __init__(self):
+        self.mean = None
+        self.std = None
+
+    def fit(self, x):
+        self.mean = x.mean(dim=0)
+        self.std = x.std(dim=0).clamp_min(1e-6)
+        return self
+
+    def transform(self, x):
+        if self.mean is None:
+            raise RuntimeError("call fit() or load_state_dict() first")
+        return (x - self.mean) / self.std
+
+    def state_dict(self):
+        return {"mean": self.mean.clone(), "std": self.std.clone()}
+
+    def load_state_dict(self, d):
+        self.mean = d["mean"].clone()
+        self.std = d["std"].clone()
+        return self
+--- tests
+import os
+import tempfile
+
+
+def _train_data():
+    torch.manual_seed(1)
+    return torch.randn(200, 3) * torch.tensor([10.0, 0.1, 3.0]) + torch.tensor([50.0, -2.0, 0.0])
+
+
+@check("after fit, the training data has mean 0 and std 1")
+def _():
+    train = _train_data()
+    pre = Preprocessor()
+    true(pre.fit(train) is pre, "fit must end with return self, so you can write Preprocessor().fit(x)")
+    z = pre.transform(train)
+    shape_is(z, (200, 3))
+    eq(z.mean(dim=0), torch.zeros(3), tol=1e-4, msg="every column should have mean 0: compute the mean over dim=0 (per feature)")
+    eq(z.std(dim=0), torch.ones(3), tol=1e-3, msg="every column should have std 1: compute the std over dim=0 with the default x.std(dim=0)")
+
+
+@check("a constant column does not become nan / inf")
+def _():
+    train = _train_data()
+    train[:, 1] = 5.0
+    z = Preprocessor().fit(train).transform(train)
+    true(torch.isfinite(z).all().item(), "one column is constant, std = 0, and the division gives nan: add .clamp_min(1e-6) to the std in fit")
+
+
+@check("a single request uses the training statistics")
+def _():
+    train = _train_data()
+    pre = Preprocessor().fit(train)
+    one = torch.tensor([[60.0, -2.05, 1.0]])
+    want = (one - train.mean(dim=0)) / train.std(dim=0)
+    eq(pre.transform(one), want, tol=1e-4,
+       msg="transform must use the mean / std stored by fit, not compute them from the request (one row has std 0)")
+    batch = torch.cat([one, torch.randn(4, 3) * 100])
+    eq(pre.transform(batch)[:1], want, tol=1e-4,
+       msg="the same request gives a different result when other requests share its batch: transform must not use the current batch's statistics")
+
+
+@check("the statistics are saved with the model and loaded as-is by the service")
+def _():
+    pre = Preprocessor().fit(_train_data())
+    sd = pre.state_dict()
+    true(isinstance(sd, dict) and set(sd) == {"mean", "std"},
+         f"state_dict() must return a dict with exactly the keys mean and std; yours is {sd!r}")
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "bundle.pt")
+        torch.save({"model": nn.Linear(3, 1).state_dict(), "pre": sd}, path)
+        bundle = torch.load(path)
+    served = Preprocessor()          # the serving process: a brand-new object, no fit
+    served.load_state_dict(bundle["pre"])
+    req = torch.tensor([[48.0, -1.9, 2.5]])
+    eq(served.transform(req), pre.transform(req), tol=1e-6,
+       msg="the loaded Preprocessor gives different results from the trained one: load_state_dict must restore both mean and std")
+
+
+@check("transform before any fit or load raises an error")
+def _():
+    try:
+        Preprocessor().transform(torch.ones(1, 3))
+    except RuntimeError:
+        return
+    true(False, "transform without statistics should raise RuntimeError instead of quietly returning something (that is exactly how train/serve skew starts)")
+--- hints
+- In fit, compute `self.mean` and `self.std`, and make the last line `return self`. Start transform with `if self.mean is None:`.
+- `self.std = x.std(dim=0).clamp_min(1e-6)`; `state_dict` returns `{"mean": self.mean, "std": self.std}`; `load_state_dict` does the reverse.
+
+@@ item d18-15
+type: code
+title: Closed book: left_pad
+level: 2
+exam: yes
+cards: Batched generation (2): left padding + attention mask + position ids
+targets: left_pad
+ref: day18
+--- context
+Left padding, attention masks and position ids are the basics of batched inference with decoder-only models. Writing them correctly without notes shows you really understand why batched generation goes wrong.
+--- prompt
+Without looking at the cards, write `left_pad(seqs, pad_id=0)`. Return three tensors of shape `(B, T)` (T is the length of the longest sequence):
+
+- `input_ids`: padding on the left, dtype `torch.long`
+- `attention_mask`: 1 for real tokens, 0 for padding (decide by position)
+- `position_ids`: each real token's position inside its own sequence, 0 at padding positions, dtype `torch.long`
+
+`left_pad([[5, 6, 7], [8]])` → ids `[[5, 6, 7], [0, 0, 8]]`, mask `[[1, 1, 1], [0, 0, 1]]`, pos `[[0, 1, 2], [0, 0, 0]]`.
+--- starter
+def left_pad(seqs, pad_id=0):
+    raise todo()
+--- solution
+def left_pad(seqs, pad_id=0):
+    T = max(len(s) for s in seqs)
+    ids = torch.full((len(seqs), T), pad_id, dtype=torch.long)
+    mask = torch.zeros((len(seqs), T), dtype=torch.long)
+    for i, s in enumerate(seqs):
+        ids[i, T - len(s):] = torch.tensor(s, dtype=torch.long)
+        mask[i, T - len(s):] = 1
+    pos = (mask.cumsum(dim=-1) - 1).clamp(min=0)
+    return ids, mask, pos
+--- tests
+@check("small example: [[5, 6, 7], [8]]")
+def _():
+    ids, mask, pos = left_pad([[5, 6, 7], [8]], pad_id=0)
+    shape_is(ids, (2, 3))
+    true(ids.dtype == torch.long, f"input_ids must be torch.long (embedding lookups need integers); yours is {ids.dtype}")
+    eq(ids, torch.tensor([[5, 6, 7], [0, 0, 8]]), tol=0, msg="padding goes on the left: the short row is [0, 0, 8], not [8, 0, 0]")
+    eq(mask.long(), torch.tensor([[1, 1, 1], [0, 0, 1]]), tol=0, msg="attention_mask: 1 for real tokens, 0 for padding")
+    true(pos.dtype == torch.long, f"position_ids must be torch.long; yours is {pos.dtype}")
+    eq(pos, torch.tensor([[0, 1, 2], [0, 0, 0]]), tol=0,
+       msg="position_ids: the 8 in the second row is token 0 of its sequence, so its position is 0; padding positions get 0")
+
+
+@check("three sequences of different lengths, pad_id is 9")
+def _():
+    ids, mask, pos = left_pad([[4, 4, 4, 4], [1, 2], [7, 8, 9]], pad_id=9)
+    eq(ids, torch.tensor([[4, 4, 4, 4], [9, 9, 1, 2], [9, 7, 8, 9]]), tol=0, msg="pad with the pad_id you were given")
+    eq(mask.long(), torch.tensor([[1, 1, 1, 1], [0, 0, 1, 1], [0, 1, 1, 1]]), tol=0,
+       msg="build the mask from whether a position was added as padding, not from id == pad_id (the last real token of row 3 happens to be 9 too)")
+    eq(pos, torch.tensor([[0, 1, 2, 3], [0, 0, 0, 1], [0, 0, 1, 2]]), tol=0,
+       msg="position_ids must count from each sequence's own first real token")
+
+
+@check("with the model: batched next-token scores = one prompt at a time")
+def _():
+    model = tiny_lm()
+    prompts = [[3, 7, 2, 9], [5, 1], [4, 4, 8], [11]]
+    ids, mask, pos = left_pad(prompts, pad_id=0)
+    with torch.inference_mode():
+        logits = model(ids, attention_mask=mask, position_ids=pos)[:, -1]
+        for i, p in enumerate(prompts):
+            want = model(torch.tensor([p]))[0, -1]
+            eq(logits[i], want, tol=1e-4, msg=f"prompt {i} {p}: the batched scores differ from the scores computed alone")
+--- hints
+- Build `(B, T)` ids full of padding and a mask of zeros, then write each row's real tokens at the right end.
+- Position ids: `(mask.cumsum(dim=-1) - 1).clamp(min=0)`.

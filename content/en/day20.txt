@@ -1,0 +1,1291 @@
+@@ day 20
+title: Pitfalls 3: checkpoints
+part: Production pitfalls
+hours: 3–4 hours
+--- goal
+After today you can save training state safely and restore it exactly: save only the state_dict, load with weights_only=True or safetensors, handle module. / _orig_mod. prefixes and tied weights, write a checkpoint where "resumed = never interrupted", and save without fear of the process being killed.
+--- checklist
+- Clear the review queue first (redo from blank any item whose answer you looked at yesterday)
+- Read all 8 cards; change every code example a little and run it
+- Pass every practice item
+- Closed book: write a resumable checkpoint and a strict loader without looking at the cards
+
+@@ concept
+title: state_dict: save the numbers, not the code
+ref: day20
+--- body
+`model.state_dict()` is an ordered dict: **parameter name → tensor**. The name is the attribute path, for example `body.weight`. Besides parameters it also holds buffers (tensors that are part of the model's state but are not trained, like BatchNorm's `running_mean`). Layers without parameters (ReLU, Dropout) do not appear.
+
+There are two ways to save a model:
+
+- `torch.save(model.state_dict(), path)`: saves only the numbers. To load, you first build the model in code (`Net()`), then fill in the numbers with `load_state_dict`. **Use this one.**
+- `torch.save(model, path)`: pickles the whole model object. The file records "which module the class lives in and what it is called", plus all attributes. Loading needs **the same class at the same import path**. Rename a file, move a folder or rename the class, and the old file no longer opens. It is also unsafe (next card).
+
+Remember one sentence: **the structure comes from code, the numbers come from the file.**
+
+`Net` below is the small model we use all day: `body` (Linear 4→8) → ReLU → `drop` (Dropout) → `head` (Linear 8→2).
+--- code
+import os, tempfile
+
+model = Net()
+sd = model.state_dict()
+for name, t in sd.items():
+    print(f"{name:12s} {tuple(t.shape)}")        # drop has no parameters, so it does not appear
+
+with tempfile.TemporaryDirectory() as folder:
+    path = os.path.join(folder, "net.pt")
+    torch.save(sd, path)
+    fresh = Net()                                                # structure from code
+    fresh.load_state_dict(torch.load(path, weights_only=True))   # numbers from the file
+
+model.eval(); fresh.eval()                       # turn dropout off before comparing
+x = torch.randn(2, 4)
+print("same output?", torch.equal(model(x), fresh(x)))
+
+@@ concept
+title: torch.load and pickle: loading can run code
+--- body
+`.pt` / `.pth` / `.bin` files use pickle (Python's built-in way to turn objects into bytes). Pickle stores more than data: it also stores "which function to call, with which arguments" to rebuild each object when loading. An object can use `__reduce__` to say: when you load me, please call `os.system("...")`. So **loading a pickle = running code the file's author wrote**.
+
+`torch.load(path, weights_only=True)` uses a restricted loader. It only allows plain data: tensors, dicts, lists, tuples, numbers, strings. If the file contains any other function or class, it raises `UnpicklingError` (the message contains "Unsupported global") and runs nothing.
+
+- Since PyTorch 2.6, `weights_only=True` is the default for `torch.load`. Use the `weights_only=False` you see in old tutorials only on files you created yourself.
+- This is one more reason to save only the state_dict: it holds only tensors and strings, so `weights_only=True` loads it directly. A file with a pickled model object is refused.
+- numpy arrays are not on the allow list either: to save numpy's random state, convert the array inside it to a tensor first.
+- For weights from unknown sources, prefer safetensors (later cards).
+--- code
+import os, pickle, tempfile
+
+class Sneaky:
+    def __reduce__(self):          # tells pickle: when loading me, call print(...)
+        return (print, ("This line ran while loading! os.system would run just the same.",))
+
+data = pickle.dumps(Sneaky())
+pickle.loads(data)                 # we only "loaded", and the code ran
+
+with tempfile.TemporaryDirectory() as folder:
+    path = os.path.join(folder, "bad.pt")
+    torch.save({"w": torch.ones(2), "x": Sneaky()}, path)
+    try:
+        torch.load(path, weights_only=True)
+    except Exception as e:
+        line = [l for l in str(e).splitlines() if "Unsupported global" in l][0]
+        print(type(e).__name__, "->", line.split("Unsupported global:")[1].split(" was")[0].strip())
+
+    torch.save({"w": torch.ones(2)}, path)           # a dict of tensors only
+    print(torch.load(path, weights_only=True))       # loads fine
+
+@@ concept
+title: Key prefixes: module. and _orig_mod.
+ref: day20
+--- body
+Two common "wrappers" change the keys of a state_dict:
+
+- **DDP / DataParallel** (multi-GPU training): `DDP(model)` keeps your model in the attribute `module`, so `body.weight` becomes `module.body.weight`.
+- **torch.compile**: `torch.compile(model)` returns a new wrapper object that keeps the original model in the attribute `_orig_mod`, so the key becomes `_orig_mod.body.weight`. Use both and you may get `_orig_mod.module.body.weight`.
+
+The model you serve has no wrapper, so loading directly fails with a long list of Missing / Unexpected keys. Two fixes:
+
+1. **Save the inner model**: `ddp.module.state_dict()`, or keep the `model` variable from before `torch.compile` and save that. This is the cleanest.
+2. **Strip the prefix when loading**: strip it only at the **start** of the key (`str.removeprefix`) and leave the middle alone (the `module` in `encoder.module.weight` may be a real submodule name). PyTorch also has `torch.nn.modules.utils.consume_prefix_in_state_dict_if_present(sd, "module.")`, which changes sd in place.
+
+Below, `Wrapper` imitates DDP (real DDP needs several processes; here we only look at how the keys change).
+--- code
+model = Net()
+wrapped = Wrapper(model)                 # just like DDP(model)
+sd = wrapped.state_dict()
+print(list(sd)[:2])
+
+fresh = Net()
+try:
+    fresh.load_state_dict(sd)
+except RuntimeError as e:
+    for line in str(e).splitlines()[1:]:
+        print(line.strip())
+
+print(list(wrapped.module.state_dict())[:2])      # fix 1: save the inner model
+clean = {k.removeprefix("module."): v for k, v in sd.items()}
+print(fresh.load_state_dict(clean))               # fix 2: strip the prefix at the start
+
+@@ concept
+title: strict=False hides bugs
+ref: day20
+--- body
+`model.load_state_dict(sd)` uses `strict=True` by default: the keys on both sides must match exactly, otherwise it raises and lists:
+
+- **missing keys**: the model needs them, the file does not have them. These parameters keep their random initial values.
+- **unexpected keys**: the file has them, the model does not know them. These numbers are thrown away.
+
+`strict=False` does not raise. It only puts the two lists in the return value (`result.missing_keys` / `result.unexpected_keys`). Most people never look at the return value. So: a refactor renames `classifier` to `head`, loading "works", the head stays random, and the service ships anyway.
+
+A few rules:
+
+- Loading matches by **name**, not by position. Same structure with different names loads nothing.
+- A shape mismatch raises even with `strict=False` (size mismatch).
+- When it raises, PyTorch may already have copied the parameters that did match, so the model is left "half new, half old". To stay clean, **check first, then load**.
+- If you really want to load only part of a model (say, a new classification head for fine-tuning), use `strict=False` and **check the return value**: the missing keys must be exactly the ones you plan to train from scratch.
+--- code
+torch.manual_seed(0)
+v1 = Net()
+sd = {k.replace("head.", "classifier."): v for k, v in v1.state_dict().items()}   # the old version called it classifier
+
+v2 = Net()
+result = v2.load_state_dict(sd, strict=False)      # no error!
+print("missing:   ", result.missing_keys)
+print("unexpected:", result.unexpected_keys)
+print("body loaded:", torch.equal(v2.body.weight, v1.body.weight))
+print("head loaded:", torch.equal(v2.head.weight, v1.head.weight))
+
+try:
+    Net().load_state_dict(sd)                      # default strict=True: fails right away
+except RuntimeError as e:
+    print("strict=True:", str(e).splitlines()[1].strip())
+
+@@ concept
+title: safetensors: a file that holds only tensors
+ref: day20
+--- body
+safetensors is a weight format made by Hugging Face; most open models now ship as `model.safetensors`. The file is simple: a small JSON header (each tensor's name, dtype, shape and position in the file), then the raw bytes.
+
+- **Safe**: only data, no code. Loading someone else's file runs nothing.
+- **Fast**: the file can be mapped into memory, and you can read just the one tensor you need (`safe_open` + `get_tensor`).
+- **Tensors only**: optimizer state, the step and RNG states do not fit. Small facts can go into `metadata`, but metadata must be "string → string".
+- Tensors must be contiguous, and no two names may share the same memory (next card).
+
+The functions you use most (all in `safetensors.torch`):
+
+- `save_file(sd, path, metadata={...})`: saves a "name → tensor" dict.
+- `load_file(path)`: reads the dict back; then call `model.load_state_dict(...)`.
+- `with safe_open(path, framework="pt") as f:`, then `f.keys()`, `f.get_tensor(name)`, `f.metadata()`.
+
+A common split: weights you publish or deploy go into safetensors; the full mid-training checkpoint (with optimizer and RNG states) goes into a `.pt` file that you load with `weights_only=True`.
+--- code
+import os, tempfile
+from safetensors.torch import save_file, load_file, safe_open
+
+model = Net()
+with tempfile.TemporaryDirectory() as folder:
+    path = os.path.join(folder, "net.safetensors")
+    save_file(model.state_dict(), path, metadata={"step": "1200", "arch": "Net"})
+
+    sd = load_file(path)                              # name -> tensor
+    print({k: tuple(v.shape) for k, v in sd.items()})
+    with safe_open(path, framework="pt") as f:
+        print(f.metadata())
+        print(f.get_tensor("head.bias").shape)        # read only this one tensor
+
+    try:
+        save_file(model.state_dict(), path, metadata={"step": 1200})
+    except TypeError as e:
+        print("metadata must be strings:", e)
+
+@@ concept
+title: Tied weights meet safetensors
+ref: day20
+--- body
+Many language models use one weight matrix for both the token embedding and the output layer (tied weights, as in GPT-2). On the way in it turns tokens into vectors; on the way out it turns vectors back into a score per word. This saves vocab × dim parameters: 50257 × 768 ≈ 38.6 million for GPT-2 small.
+
+In code it is one line: `self.head.weight = self.emb.weight`. Two names, one Parameter. But `state_dict()` lists both names.
+
+- `torch.save` knows they are the same memory, stores it once, and they are still shared after loading.
+- safetensors' `save_file` **refuses**: `RuntimeError: Some tensors share memory...`. A flat file cannot say "these two names are the same memory"; forcing it means storing it twice.
+
+The fix: `save_model(model, path)` / `load_model(model, path)` (also in `safetensors.torch`).
+
+- `save_model` finds the shared tensors, stores one name only, and writes "head.weight is really emb.weight" into the metadata.
+- `load_model` loads strictly, except that the name dropped because of sharing does not count as missing.
+- The weights are still shared after loading, because the sharing is set up by **the model's constructor**; loading only copies numbers into the existing Parameter.
+--- code
+import os, tempfile
+from safetensors.torch import save_file, save_model, load_model, safe_open
+
+lm = TinyLM()
+print("same Parameter:", lm.head.weight is lm.emb.weight)
+print("state_dict keys:", list(lm.state_dict()))
+
+with tempfile.TemporaryDirectory() as folder:
+    path = os.path.join(folder, "lm.safetensors")
+    try:
+        save_file(lm.state_dict(), path)
+    except RuntimeError as e:
+        print("save_file error:", str(e).strip().split(",")[0])
+
+    save_model(lm, path)                                  # stored once
+    with safe_open(path, framework="pt") as f:
+        print("in the file:", list(f.keys()), f.metadata())
+
+    fresh = TinyLM()
+    print("missing, unexpected:", load_model(fresh, path))
+    print("still shared:", fresh.head.weight is fresh.emb.weight)
+    print("same numbers:", torch.equal(fresh.emb.weight, lm.emb.weight))
+
+@@ concept
+title: What a resumable checkpoint must hold
+ref: day20
+--- body
+The bar for "resumable": **interrupted + resumed = never interrupted**, down to the last digit of the loss. For that, the checkpoint needs:
+
+- **The model**: `model.state_dict()`.
+- **The optimizer**: `opt.state_dict()`. AdamW keeps two running averages per parameter (`exp_avg`, `exp_avg_sq`, often called momentum) and a step count. Forget it and the loss jumps after resuming.
+- **The learning-rate scheduler**: `sched.state_dict()` (which step it is on, the current learning rate). Forget it and the warm-up runs again, or the learning rate jumps back to its peak.
+- **The step** (and the epoch, and how far into the data you are): decides where to continue and how the logs join up.
+- **RNG states** (the random number generators): `torch.get_rng_state()`; with a GPU also `torch.cuda.get_rng_state_all()`; if you use the `random` module, `random.getstate()`. Dropout and data shuffling depend on them. Forget them and training still runs, but the result differs from the uninterrupted run and cannot be reproduced.
+- **EMA weights** (if you use an EMA, common in diffusion models): a second copy of the weights that must be saved too.
+
+To load: build the model, optimizer and scheduler in code, load each `state_dict` back in, and restore the RNG states last.
+
+**How to prove the checkpoint is complete**: run A trains 5 steps without stopping. Run B trains 3 steps → saves → scrambles the RNG and builds brand-new objects (like a restarted process) → loads → trains 2 more steps. A and B must end with exactly the same losses and weights.
+
+Below, `make_run()` returns a model + AdamW + StepLR (halves the learning rate every 2 steps), and `train_step()` trains one step (data is made on the spot with `torch.randn`, and the model has dropout). This checkpoint holds only the model and the optimizer: the first 3 steps match, the 2 resumed steps do not.
+--- code
+import os, tempfile
+
+torch.manual_seed(0)
+model, opt, sched = make_run()
+full = [round(train_step(model, opt, sched), 4) for _ in range(5)]
+print("5 steps, no stop:   ", full)
+
+torch.manual_seed(0)
+model, opt, sched = make_run()
+losses = [round(train_step(model, opt, sched), 4) for _ in range(3)]
+with tempfile.TemporaryDirectory() as folder:
+    path = os.path.join(folder, "ckpt.pt")
+    torch.save({"model": model.state_dict(), "optimizer": opt.state_dict(), "step": 3}, path)  # only half of it
+    torch.manual_seed(999)                 # like a restarted process: a completely different RNG state
+    model, opt, sched = make_run()         # brand-new objects
+    ckpt = torch.load(path, weights_only=True)
+    model.load_state_dict(ckpt["model"])
+    opt.load_state_dict(ckpt["optimizer"])
+losses += [round(train_step(model, opt, sched), 4) for _ in range(2)]
+print("3 steps + 2 resumed:", losses)
+print("same?", losses == full)
+
+@@ concept
+title: Atomic save: temp file first, then os.replace
+--- body
+`torch.save(obj, path)` first empties `path`, then writes into it. If the process is killed halfway (pre-emption, OOM, power cut, full disk), you end up with **the old checkpoint gone and the new one broken**.
+
+An atomic save ("either all of it happens, or none of it"):
+
+1. Write to a temporary file first, for example `path + ".tmp"`.
+2. Once it is completely written, swap it in with one call: `os.replace(tmp, path)`.
+
+On one file system, `os.replace` is atomic: either it did not happen at all (the old file is still there) or it happened completely (the new file is in place). There is no "half". A few details:
+
+- Put the temporary file in **the same folder** as the target. Across drives (say C: to G:) `os.replace` cannot be atomic, and on Windows it simply fails.
+- Use `os.replace`, not `os.rename`: on Windows, `os.rename` fails when the target already exists.
+- On an error, delete the temporary file, then re-raise the error unchanged; do not swallow it.
+- To be even safer: after writing, call `f.flush()` and `os.fsync(f.fileno())` so the data really reaches the disk (protects against power cuts).
+--- code
+import io, os, tempfile
+
+new_bytes = io.BytesIO()
+torch.save({"step": 200, "w": torch.ones(1000)}, new_bytes)
+half = new_bytes.getvalue()[: len(new_bytes.getvalue()) // 2]      # "crashed halfway through writing"
+
+with tempfile.TemporaryDirectory() as folder:
+    path = os.path.join(folder, "ckpt.pt")
+
+    # overwrite in place
+    torch.save({"step": 100, "w": torch.ones(1000)}, path)          # yesterday's good checkpoint
+    with open(path, "wb") as f:
+        f.write(half)                                               # half written, process killed
+    try:
+        torch.load(path, weights_only=True)
+    except Exception as e:
+        print("overwrite in place: old one gone, new one broken ->", type(e).__name__)
+
+    # atomic
+    torch.save({"step": 100, "w": torch.ones(1000)}, path)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(half)                        # same crash halfway; we never reach os.replace
+    print("atomic: the old one is still there -> step", torch.load(path, weights_only=True)["step"])
+
+    torch.save({"step": 200, "w": torch.ones(1000)}, tmp)           # try again, fully written this time
+    os.replace(tmp, path)                                           # swap it in with one call
+    print("swapped in -> step", torch.load(path, weights_only=True)["step"], sorted(os.listdir(folder)))
+
+@@ item d20-01
+type: fill
+title: Save only the state_dict, then load it back
+level: 1
+cards: state_dict: save the numbers, not the code; torch.load and pickle: loading can run code
+targets: save_and_reload
+ref: day20
+--- context
+A file with a pickled model object stops opening when you move a folder or rename a class, and it is unsafe. The standard practice: save only the state_dict (name → tensor); to load, build the model in code, then fill in the numbers.
+--- prompt
+Fill in the blanks: save the state_dict of `model`; read it back with `weights_only=True`; build a new `Net`; load the weights into it; return the new model.
+--- template
+def save_and_reload(model, path):
+    torch.save(model.[[state_dict()]], path)          # numbers only: name -> tensor
+    sd = torch.load(path, weights_only=[[True]])      # plain data only: tensors, dicts, numbers
+    fresh = [[Net()]]                                 # structure from code
+    fresh.[[load_state_dict]](sd)                     # numbers from the file
+    return fresh
+--- tests
+import os, tempfile
+
+@check("the file holds a state_dict (name -> tensor)")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path = os.path.join(folder, "net.pt")
+        save_and_reload(Net(), path)
+        sd = torch.load(path, weights_only=True)
+    true(isinstance(sd, dict), f"the file should hold a dict; it holds a {type(sd).__name__}")
+    true(sorted(sd) == ["body.bias", "body.weight", "head.bias", "head.weight"], f"wrong keys: {sorted(sd)}")
+
+@check("loads with weights_only=True written out")
+def _():
+    seen = []
+    real_load = torch.load
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("weights_only"))
+        return real_load(*args, **kwargs)
+    torch.load = spy
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+            save_and_reload(Net(), os.path.join(folder, "net.pt"))
+    finally:
+        torch.load = real_load
+    true(seen == [True], f"torch.load got weights_only = {seen}; write True explicitly")
+
+@check("returns a new model with the same weights")
+def _():
+    model = Net().eval()
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        fresh = save_and_reload(model, os.path.join(folder, "net.pt"))
+    true(fresh is not model, "return a newly built Net, not the object you were given")
+    fresh.eval()
+    x = torch.randn(3, 4)
+    eq(fresh(x), model(x), tol=0, msg="the new model's output differs: the weights were not loaded into it")
+--- hints
+- The first blank wants the numbers, not the model itself: which method of the model returns "name → tensor"? Do not forget the parentheses.
+- Structure from code: `fresh = Net()`; numbers from the file: `fresh.load_state_dict(sd)`.
+
+@@ item d20-02
+type: choice
+title: Why you should not torch.load someone else's .pt
+level: 1
+cards: torch.load and pickle: loading can run code
+--- context
+Downloading models from the internet is everyday work. PyTorch 2.6 changed the default of torch.load to weights_only=True precisely to block the attack below.
+--- prompt
+A colleague found a `model.pt` on a forum. Loading it fails with `UnpicklingError: Weights only load failed ... Unsupported global`. He plans to use `torch.load("model.pt", weights_only=False)` to "make it work". What is the biggest risk?
+--- options
+- The file is large, and weights_only=False reads it all into memory at once, which can run out of memory
+- A .pt file is a pickle; with weights_only=False, loading runs any Python code the file's author put in it (delete files, steal API keys, install a backdoor)
+- weights_only=False converts the weights to float64, which hurts precision and speed
+- Loading is a little slower, and nothing else changes
+answer: 2
+--- explain
+Pickle stores more than data: it also stores "which function to call when loading, and with which arguments". An object can use `__reduce__` to make the loader call `os.system(...)`. The "Unsupported global" in the error means the file really does contain a function or class to call, not just tensors. So use `weights_only=False` only on files you (or someone you fully trust) created. For other people's weights: prefer safetensors; if all you have is a .pt, use `weights_only=True`. It allows only plain data (tensors, dicts, lists, numbers, strings) and refuses everything else.
+--- hints
+- The error says "Unsupported global": besides numbers, the file contains something to call.
+- When loading, pickle calls functions named in the file to rebuild the objects. Who wrote those instructions?
+
+@@ item d20-03
+type: predict
+title: The keys after wrapping
+level: 1
+cards: Key prefixes: module. and _orig_mod.
+ref: day20
+--- context
+Train with DDP on several GPUs, or save a wrapped model, and every state_dict key gets an extra piece in front. See what it looks like first; then you will know how to fix it.
+--- prompt
+Like DDP, `Wrapper` keeps the model in `self.module`. Write the 3 lines this code prints.
+--- code
+model = nn.Sequential(nn.Linear(2, 3), nn.ReLU(), nn.Linear(3, 1))
+wrapped = Wrapper(model)
+keys = list(wrapped.state_dict().keys())
+print(len(keys))
+print(keys[0])
+print(keys[-1])
+--- explain
+nn.Sequential names its layers by position: 0 is the first Linear, 1 is the ReLU (no parameters, so it does not appear), 2 is the second Linear. Each Linear has a weight and a bias: 4 keys in total. Wrapper keeps the model in the attribute `module`, so every key starts with `module.`: the first is `module.0.weight`, the last is `module.2.bias`.
+--- hints
+- Does ReLU have parameters? Layers without parameters do not appear in the state_dict.
+- A key reads "attribute.submodule.parameter", and the outermost attribute is `module`.
+
+@@ item d20-04
+type: code
+title: Strip module. / _orig_mod. prefixes
+level: 2
+cards: Key prefixes: module. and _orig_mod.
+targets: strip_prefix
+ref: day20
+--- context
+Weights saved from DDP start with `module.`; a torch.compile'd model adds `_orig_mod.`; use both and you can get both. The model you serve has no wrappers, so loading fails with a long list of missing / unexpected keys. Almost every training project has this little helper.
+--- prompt
+Write `strip_prefix(sd, prefixes=("module.", "_orig_mod."))`:
+
+- `sd` is a state_dict (name → tensor). Return a **new** dict; do not change the `sd` you were given.
+- If a key starts with one of the prefixes, remove it. There may be several layers (for example `_orig_mod.module.head.weight`): keep removing until the key no longer starts with one of them.
+- Remove prefixes only at the **start**. The `module.` in the middle of `encoder.module.weight` is a real submodule name; keep it.
+- Put the values (tensors) into the new dict unchanged, in the same order.
+--- starter
+def strip_prefix(sd, prefixes=("module.", "_orig_mod.")):
+    """Return a new dict: each key without the prefixes at its start (maybe several layers); values unchanged."""
+    out = {}
+    for key, value in sd.items():
+        raise todo()
+    return out
+--- solution
+def strip_prefix(sd, prefixes=("module.", "_orig_mod.")):
+    out = {}
+    for key, value in sd.items():
+        while key.startswith(prefixes):          # startswith accepts a tuple: True if the key starts with any of them
+            for p in prefixes:
+                key = key.removeprefix(p)        # only at the start; unchanged if the key does not start with p
+        out[key] = value
+    return out
+--- tests
+@check("strips the module. prefix")
+def _():
+    sd = Wrapper(Net()).state_dict()
+    out = strip_prefix(sd)
+    true(list(out) == ["body.weight", "body.bias", "head.weight", "head.bias"], f"wrong keys (the order matters too): {list(out)}")
+    for k, v in sd.items():
+        eq(out[k.removeprefix("module.")], v, tol=0, msg="put the values in unchanged")
+
+@check("after stripping _orig_mod. it loads strictly into a plain model")
+def _():
+    net = Net()
+    sd = {"_orig_mod." + k: v for k, v in net.state_dict().items()}
+    fresh = Net()
+    fresh.load_state_dict(strip_prefix(sd))
+    eq(fresh.head.weight, net.head.weight, tol=0, msg="the weights differ after loading")
+
+@check("strips two layers of prefixes")
+def _():
+    sd = {"_orig_mod.module.head.weight": torch.ones(2), "module._orig_mod.body.bias": torch.zeros(3)}
+    out = strip_prefix(sd)
+    true(sorted(out) == ["body.bias", "head.weight"], f"wrong keys: {sorted(out)}. Use a while loop: keep stripping until the key no longer starts with a prefix")
+
+@check("only at the start: keeps module. in the middle")
+def _():
+    sd = {"encoder.module.weight": torch.ones(1), "modules.0.bias": torch.ones(1), "head.bias": torch.ones(1)}
+    out = strip_prefix(sd)
+    true(sorted(out) == ["encoder.module.weight", "head.bias", "modules.0.bias"],
+         f"wrong keys: {sorted(out)}. replace also removes it from the middle; use startswith / removeprefix, and keep the dot in the prefix")
+
+@check("does not change the dict it was given")
+def _():
+    sd = {"module.w": torch.ones(1)}
+    strip_prefix(sd)
+    true(list(sd) == ["module.w"], "you changed the sd you were given. Build a new dict and return it")
+--- hints
+- `key.startswith(("module.", "_orig_mod."))` tests both prefixes at once; `key.removeprefix(p)` removes p only at the start and returns the key unchanged otherwise.
+- There may be several layers, so use `while key.startswith(prefixes):` and inside it do `key = key.removeprefix(p)` for each p.
+- Finally `out[key] = value`, and `return out` after the loop.
+
+@@ item d20-05
+type: predict
+title: What strict=False actually loaded
+level: 1
+cards: strict=False hides bugs
+ref: day20
+--- context
+People often treat `strict=False` as the switch that makes errors go away. It does stop the error, but it may load no weights at all.
+--- prompt
+Version 1 of the code built the model with `nn.Sequential`; version 2 refactored it into `Net` (`body` / `drop` / `head`) with exactly the same structure. Write the 2 lines this code prints.
+--- code
+torch.manual_seed(0)
+v1 = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Dropout(0.2), nn.Linear(8, 2))
+v2 = Net()
+result = v2.load_state_dict(v1.state_dict(), strict=False)
+print(len(result.missing_keys), len(result.unexpected_keys))
+print(torch.equal(v2.body.weight, v1[0].weight))
+--- explain
+v1's keys are `0.weight`, `0.bias`, `3.weight`, `3.bias`; v2 wants `body.weight`, `body.bias`, `head.weight`, `head.bias`. Not one matches: 4 missing (v2 wants them, the file does not have them) and 4 unexpected (the file has them, v2 does not know them). `strict=False` does not raise, so v2 **loaded no weights at all** and is still randomly initialised, which is why the second line is False. The same structure does not help: `load_state_dict` matches by name only.
+--- hints
+- `load_state_dict` matches by name, not by position. Write down the keys of both sides and compare them.
+- nn.Sequential uses positions as names: the two Linear layers are at positions 0 and 3.
+
+@@ item d20-06
+type: code
+title: A strict loader that says what does not match
+level: 2
+cards: strict=False hides bugs; Key prefixes: module. and _orig_mod.
+targets: load_strict
+ref: day20
+--- context
+When a checkpoint fails to load, most of the time goes into finding out what exactly does not match. A loader that reports missing / unexpected / shape problems in one go, and leaves the model untouched on error, saves a lot of debugging.
+--- prompt
+Write `load_strict(model, sd)`:
+
+1. **Check first; do not load first.** Compare the keys of `model.state_dict()` (including buffers such as BatchNorm's `running_mean`) with the keys of `sd` and find three kinds of problems: missing (in the model, not in sd), unexpected (in sd, not in the model), and shape mismatches (in both, with different shapes).
+2. If there is any problem at all, `raise ValueError(...)` with a message that names every key with a problem. In that case **no weight of the model may change**.
+3. Only if everything matches, call `model.load_state_dict(sd)` and return `model`.
+--- starter
+def load_strict(model, sd):
+    """Check first; load only if everything matches. Otherwise raise ValueError naming every bad key."""
+    want = model.state_dict()        # what the model needs: name -> tensor (buffers included)
+    # 1. find missing / unexpected / shape mismatches
+    # 2. if there is a problem, raise ValueError(...)
+    # 3. otherwise load and return model
+    raise todo()
+--- solution
+def load_strict(model, sd):
+    want = model.state_dict()
+    missing = sorted(set(want) - set(sd))
+    unexpected = sorted(set(sd) - set(want))
+    wrong_shape = [f"{k}: checkpoint {tuple(sd[k].shape)} vs model {tuple(want[k].shape)}"
+                   for k in want if k in sd and tuple(sd[k].shape) != tuple(want[k].shape)]
+    if missing or unexpected or wrong_shape:
+        raise ValueError(
+            "the checkpoint does not match the model:\n"
+            f"  missing (in the model, not in the file): {missing}\n"
+            f"  unexpected (in the file, not in the model): {unexpected}\n"
+            f"  wrong shape: {wrong_shape}")
+    model.load_state_dict(sd)        # we already know everything matches, so this cannot fail halfway
+    return model
+--- tests
+def _expect_value_error(model, sd, names, why=""):
+    try:
+        load_strict(model, sd)
+    except ValueError as e:
+        for n in names:
+            true(n in str(e), f"the message must name {n!r}. Your message: {e}. {why}")
+        return
+    except NotImplementedError:
+        raise
+    except Exception as e:
+        true(False, f"expected a ValueError, but your code raised {type(e).__name__}. That is usually torch's own error, which means you loaded before checking. {why}")
+    true(False, f"the checkpoint has a problem ({', '.join(names)}) but no ValueError was raised. {why}")
+
+@check("loads when everything matches and returns model")
+def _():
+    src, dst = Net(), Net()
+    out = load_strict(dst, src.state_dict())
+    true(out is dst, "return the model you were given")
+    for k, v in src.state_dict().items():
+        eq(dst.state_dict()[k], v, tol=0, msg=f"{k} was not loaded")
+
+@check("missing key: ValueError that names it")
+def _():
+    sd = Net().state_dict()
+    del sd["head.bias"]
+    _expect_value_error(Net(), sd, ["head.bias"])
+
+@check("reports unexpected keys too (e.g. a module. prefix)")
+def _():
+    sd = Wrapper(Net()).state_dict()
+    _expect_value_error(Net(), sd, ["module.body.weight", "body.weight"])
+
+@check("a shape mismatch is a ValueError too")
+def _():
+    sd = Net().state_dict()
+    sd["head.weight"] = torch.randn(3, 8)
+    _expect_value_error(Net(), sd, ["head.weight"])
+
+@check("on error, not a single number of the model changes")
+def _():
+    dst = Net()
+    before = {k: v.clone() for k, v in dst.state_dict().items()}
+    sd = Net().state_dict()
+    sd["head.weight"] = torch.randn(3, 8)
+    try:
+        load_strict(dst, sd)
+    except NotImplementedError:
+        raise
+    except Exception:
+        pass
+    for k, v in before.items():
+        eq(dst.state_dict()[k], v, tol=0,
+           msg=f"{k} changed: you loaded part of the checkpoint before noticing that head.weight is wrong. Find every problem first; load only if there is none")
+
+@check("checks buffers too (BatchNorm's running_mean)")
+def _():
+    model = nn.Sequential(nn.Linear(4, 4), nn.BatchNorm1d(4))
+    sd = model.state_dict()
+    del sd["1.running_mean"]
+    _expect_value_error(model, sd, ["1.running_mean"],
+                        why="Compare against the keys of model.state_dict(), not named_parameters(): a buffer is not a parameter, but it must be loaded too.")
+--- hints
+- Use set difference: `set(want) - set(sd)` is missing; the other way round is unexpected.
+- Shapes: for keys on both sides, compare `tuple(sd[k].shape)` with `tuple(want[k].shape)`.
+- If any of the three lists is not empty, `raise ValueError(f"missing: {missing} ...")`; only if all are empty, call `model.load_state_dict(sd)` and `return model`.
+
+@@ item d20-07
+type: fix
+title: strict=False leaves the head random
+level: 2
+cards: strict=False hides bugs; state_dict: save the numbers, not the code
+targets: load_v1_checkpoint
+ref: day20
+--- context
+A real incident: a refactor renamed classifier to head, loading the old checkpoint failed, so someone added strict=False. The service started, nothing raised, and the outputs were random until users complained.
+--- prompt
+In version 1 of the code the last layer was called `classifier`, so the old checkpoint's keys are `body.weight`, `body.bias`, `classifier.weight`, `classifier.bias`. After the refactor the model is `Net`, and the last layer is now called `head`.
+
+The function below "works", but the head is never loaded. Fix it:
+
+- replace the old name `classifier.` at the start of a key with the new name `head.`;
+- load with strict=True (the default), so that any future mismatch raises right away instead of quietly running a half-random model.
+--- starter
+def load_v1_checkpoint(model, path):
+    sd = torch.load(path, weights_only=True)
+    model.load_state_dict(sd, strict=False)   # errors are annoying, turn them off for now
+    return model.eval()
+--- solution
+def load_v1_checkpoint(model, path):
+    sd = torch.load(path, weights_only=True)
+    renamed = {}
+    for key, value in sd.items():
+        if key.startswith("classifier."):
+            key = "head." + key.removeprefix("classifier.")    # v1 name -> v2 name
+        renamed[key] = value
+    model.load_state_dict(renamed)            # strict=True: any future mismatch raises right away
+    return model.eval()
+--- tests
+import os, tempfile
+
+def _v1_file(folder, drop=None):
+    """Make a v1 checkpoint: weights from a Net, but the last layer is called classifier. Returns (path, original model)."""
+    torch.manual_seed(7)
+    net = Net().eval()
+    sd = {("classifier." + k.removeprefix("head.")) if k.startswith("head.") else k: v
+          for k, v in net.state_dict().items()}
+    if drop:
+        del sd[drop]
+    path = os.path.join(folder, "v1.pt")
+    torch.save(sd, path)
+    return path, net
+
+@check("the head is really loaded (no longer random)")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path, net = _v1_file(folder)
+        torch.manual_seed(0)
+        model = load_v1_checkpoint(Net(), path)
+    eq(model.head.weight, net.head.weight, tol=0,
+       msg="head.weight still has its random initial values: strict=False threw classifier.* away as unexpected, without a word")
+
+@check("the output matches the v1 model exactly")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path, net = _v1_file(folder)
+        torch.manual_seed(0)
+        model = load_v1_checkpoint(Net(), path)
+    x = torch.randn(5, 4)
+    eq(model(x), net(x), tol=0, msg="the outputs differ: some weights are still not loaded correctly (or eval() is missing)")
+
+@check("a broken checkpoint raises instead of running quietly")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path, _ = _v1_file(folder, drop="body.bias")
+        try:
+            load_v1_checkpoint(Net(), path)
+        except NotImplementedError:
+            raise
+        except Exception:
+            return
+    true(False, "the checkpoint has no body.bias, yet loading did not raise: strict=False is still there")
+--- hints
+- First work out: with strict=False, is classifier.weight missing or unexpected? And head.weight?
+- Build a new dict: keys starting with `"classifier."` become `"head." + key.removeprefix("classifier.")`; copy the rest as they are.
+- Drop `strict=False` when loading, so PyTorch raises when keys do not match.
+
+@@ item d20-08
+type: code
+title: safetensors round trip, with the step in the metadata
+level: 2
+cards: safetensors: a file that holds only tensors
+targets: save_weights, load_weights
+ref: day20
+--- context
+Almost every model on Hugging Face is a model.safetensors: tensors only, no code, safe and fast to load. Small facts (the step, a config version) go in the metadata, but metadata can only hold strings.
+--- prompt
+Write two functions (`save_file`, `load_file` and `safe_open` are already imported from `safetensors.torch`):
+
+- `save_weights(model, path, step)`: save `model.state_dict()` as safetensors with `save_file`, with the metadata `{"step": "<step>"}`.
+- `load_weights(model, path)`: read the tensors with `load_file` and load them strictly into `model`; then read the metadata with `safe_open` and return the step as an int.
+--- starter
+def save_weights(model, path, step):
+    raise todo()
+
+
+def load_weights(model, path):
+    raise todo()
+--- solution
+def save_weights(model, path, step):
+    save_file(model.state_dict(), path, metadata={"step": str(step)})   # metadata must be str -> str
+
+
+def load_weights(model, path):
+    model.load_state_dict(load_file(path))            # strict=True by default
+    with safe_open(path, framework="pt") as f:
+        step = int(f.metadata()["step"])
+    return step
+--- tests
+import os, tempfile
+
+@check("the file is safetensors with exactly the model's 4 tensors")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path = os.path.join(folder, "net.safetensors")
+        save_weights(Net(), path, 1200)
+        with safe_open(path, framework="pt") as f:
+            keys = sorted(f.keys())
+    true(keys == ["body.bias", "body.weight", "head.bias", "head.weight"], f"tensors in the file: {keys}")
+
+@check("round trip: identical weights after loading")
+def _():
+    src, dst = Net(), Net()
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path = os.path.join(folder, "net.safetensors")
+        save_weights(src, path, 5)
+        load_weights(dst, path)
+    for k, v in src.state_dict().items():
+        eq(dst.state_dict()[k], v, tol=0, msg=f"{k} was not loaded")
+
+@check("the step is in the metadata and comes back as an int")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path = os.path.join(folder, "net.safetensors")
+        save_weights(Net(), path, 1200)
+        with safe_open(path, framework="pt") as f:
+            meta = f.metadata()
+        step = load_weights(Net(), path)
+    true(meta is not None and meta.get("step") == "1200", f"the metadata should be {{'step': '1200'}}; it is {meta}")
+    true(isinstance(step, int) and step == 1200, f"load_weights should return the int 1200; you returned {step!r}")
+--- hints
+- Saving: `save_file(model.state_dict(), path, metadata=...)`. Metadata values must be strings, so use `str(step)`.
+- Reading the metadata: inside `with safe_open(path, framework="pt") as f:`, `f.metadata()` returns a dict.
+- Turn the string back into a number with `int(...)` before returning it.
+
+@@ item d20-09
+type: fix
+title: Tied weights will not go into safetensors
+level: 2
+cards: Tied weights meet safetensors; safetensors: a file that holds only tensors
+targets: save_lm, load_lm
+ref: day20
+--- context
+Many language models share one weight between the token embedding and the output layer. The first time you save such a model as safetensors, you will almost certainly hit the "Some tensors share memory" error.
+--- prompt
+In `TinyLM`, `head.weight` and `emb.weight` are the same Parameter. The `save_lm` below fails as soon as it runs. Fix both functions:
+
+- saving must not fail, and the shared weight must be stored **only once** in the file (a large model's vocabulary matrix is often hundreds of MB; storing it twice is a waste);
+- after loading, the output matches the original model, and `head.weight` and `emb.weight` are still the same object;
+- loading is still strict: do not paper over it with `strict=False`.
+
+Besides `save_file` / `load_file`, `safetensors.torch` has `save_model` / `load_model`; all four are already imported.
+--- starter
+def save_lm(model, path):
+    save_file(model.state_dict(), path)
+
+
+def load_lm(model, path):
+    model.load_state_dict(load_file(path))
+    return model
+--- solution
+def save_lm(model, path):
+    save_model(model, path)       # finds the shared tensors, stores one copy, records the alias in the metadata
+
+
+def load_lm(model, path):
+    load_model(model, path)       # strict; the key dropped because of sharing does not count as missing
+    return model
+--- tests
+import os, tempfile
+from safetensors import SafetensorError
+
+class _BiggerLM(TinyLM):
+    """TinyLM plus a LayerNorm whose weights are not in the file."""
+    def __init__(self):
+        super().__init__()
+        self.norm = nn.LayerNorm(8)
+
+@check("saving does not fail")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        save_lm(TinyLM(), os.path.join(folder, "lm.safetensors"))
+
+@check("the shared weight is stored only once")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path = os.path.join(folder, "lm.safetensors")
+        save_lm(TinyLM(), path)
+        with safe_open(path, framework="pt") as f:
+            keys = list(f.keys())
+    true(len(keys) == 1, f"the file holds {keys}: the same 10×8 matrix is stored {len(keys)} times. Use save_model, which stores it once")
+
+@check("same output after loading, and still shared")
+def _():
+    lm = TinyLM()
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path = os.path.join(folder, "lm.safetensors")
+        save_lm(lm, path)
+        fresh = load_lm(TinyLM(), path)
+    idx = torch.tensor([[1, 2, 3]])
+    eq(fresh(idx), lm(idx), tol=0, msg="the output differs after loading")
+    true(fresh.head.weight is fresh.emb.weight, "after loading, head.weight and emb.weight are no longer the same object")
+
+@check("loading is still strict")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path = os.path.join(folder, "lm.safetensors")
+        save_lm(TinyLM(), path)
+        try:
+            load_lm(_BiggerLM(), path)
+        except NotImplementedError:
+            raise
+        except (RuntimeError, ValueError, KeyError, SafetensorError):
+            return
+    true(False, "the model has norm.weight / norm.bias that the file does not have, yet loading did not fail: do not use strict=False")
+--- hints
+- The last sentence of the error already gives the answer: "A potential way to correctly save your model is to use save_model".
+- Save with `save_model(model, path)` and load with `load_model(model, path)`. They take the model, not a state_dict.
+- `load_model` is strict by default; remember to `return model` at the end.
+
+@@ item d20-10
+type: choice
+title: The loss jumps after resuming
+level: 2
+cards: What a resumable checkpoint must hold
+--- context
+A three-day training run being pre-empted is normal. Whether it can simply continue depends on whether the checkpoint is complete. Anything left out raises no error; it only leaves strange symptoms.
+--- prompt
+Training was interrupted at step 10,000 and resumed from a checkpoint. The optimizer is AdamW. The learning-rate curve is continuous (the scheduler was restored correctly), but for the first few dozen steps after resuming the loss jumps up, and only then slowly comes back down. What was most likely left out of the checkpoint?
+--- options
+- The model's state_dict
+- The optimizer's state_dict: the running averages AdamW keeps for each parameter (exp_avg, exp_avg_sq) started again from 0
+- The RNG state of Python's random module
+- The current step number
+answer: 2
+--- explain
+Without the model weights, the loss would go back to where training started, not "jump and come back down". Without AdamW's state: with the running averages reset to 0, the first updates are about lr × the sign of the gradient, so every parameter takes a full learning-rate step, including noisy directions the averages normally smooth out. The loss jumps, and recovers once the averages have built up again. Without the step, the learning-rate curve would be shifted, but we know it is continuous. Without the RNG state, only the later data order and dropout masks change; that causes no clear jump.
+--- hints
+- Which component needs some time after resuming to build up again?
+- The learning rate is fine, so look at what the optimizer itself keeps.
+
+@@ item d20-11
+type: code
+title: A resumable checkpoint
+level: 3
+cards: What a resumable checkpoint must hold; torch.load and pickle: loading can run code
+targets: save_checkpoint, load_checkpoint
+ref: day20
+--- context
+Large training runs get interrupted all the time (hardware faults, pre-emptible GPUs). A good checkpoint makes "interrupted + resumed" give exactly the same result as "never interrupted". Otherwise runs cannot be reproduced, and you cannot tell whether a change in results came from your change or from the resume.
+--- prompt
+Write two functions:
+
+- `save_checkpoint(path, model, opt, sched, step)`: put everything needed to resume training into one dict and write it to `path` with `torch.save`.
+- `load_checkpoint(path, model, opt, sched)`: read it back with `torch.load(path, weights_only=True)`, load the state into the **already built** `model` / `opt` / `sched`, restore the RNG states, and return the step.
+
+What to save: the `state_dict()` of the model, the optimizer and the scheduler, the step, and the RNG states (at least `torch.get_rng_state()`; with a GPU also `torch.cuda.get_rng_state_all()`; if you use the `random` module, also `random.getstate()`).
+
+The checks run this experiment: A trains 5 steps without stopping; B trains 3 steps → saves → scrambles the RNG and builds brand-new objects → loads → trains 2 more steps. A and B must have **exactly** the same losses and final weights. Training uses `make_run()` (Net + AdamW + StepLR) and `train_step()` (data made on the spot with `torch.randn`, dropout in the model) from the card.
+--- starter
+import random
+
+def save_checkpoint(path, model, opt, sched, step):
+    ckpt = {
+        "model": model.state_dict(),
+        # what else is needed?
+    }
+    torch.save(ckpt, path)
+
+
+def load_checkpoint(path, model, opt, sched):
+    ckpt = torch.load(path, weights_only=True)
+    model.load_state_dict(ckpt["model"])
+    raise todo()
+--- solution
+import random
+
+def save_checkpoint(path, model, opt, sched, step):
+    ckpt = {
+        "model": model.state_dict(),
+        "optimizer": opt.state_dict(),        # AdamW's running averages and step count
+        "scheduler": sched.state_dict(),      # which step it is on, the current learning rate
+        "step": step,
+        "rng_torch": torch.get_rng_state(),   # dropout and torch.randn depend on it
+        "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        "rng_python": random.getstate(),
+    }
+    torch.save(ckpt, path)
+
+
+def load_checkpoint(path, model, opt, sched):
+    ckpt = torch.load(path, weights_only=True)
+    model.load_state_dict(ckpt["model"])
+    opt.load_state_dict(ckpt["optimizer"])
+    sched.load_state_dict(ckpt["scheduler"])
+    torch.set_rng_state(ckpt["rng_torch"])
+    if ckpt["rng_cuda"] and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(ckpt["rng_cuda"])
+    random.setstate(ckpt["rng_python"])
+    return ckpt["step"]
+--- tests
+@check("the checkpoint is a plain dict that loads with weights_only=True")
+def _():
+    r = _resume_run(save_checkpoint, load_checkpoint)
+    err = r["file_error"]
+    true(err is None, f"torch.load(path, weights_only=True) failed ({type(err).__name__}). "
+         "A checkpoint may hold only tensors, dicts, lists, numbers and strings: do not put the model or optimizer objects in it, put their state_dict()")
+    true(isinstance(r["file"], dict), f"the checkpoint should be a dict; it is a {type(r['file']).__name__}")
+
+@check("model weights are restored")
+def _():
+    r = _resume_run(save_checkpoint, load_checkpoint)
+    for k, v in r["saved"]["model"].items():
+        eq(r["loaded"]["model"][k], v, tol=0, msg=f"{k} differs from the saved one: the model's state_dict was not saved or not loaded")
+
+@check("optimizer state is restored (AdamW's running averages)")
+def _():
+    r = _resume_run(save_checkpoint, load_checkpoint)
+    want, got = r["saved"]["opt"]["state"], r["loaded"]["opt"]["state"]
+    true(len(got) == len(want), "the new optimizer's state is empty: opt.state_dict() was not saved or not loaded. "
+         "AdamW's exp_avg / exp_avg_sq start again from 0, and the loss jumps when you resume")
+    for i in want:
+        for name in ("exp_avg", "exp_avg_sq"):
+            eq(got[i][name], want[i][name], tol=0, msg=f"{name} of parameter {i} was not restored")
+
+@check("scheduler and step are restored")
+def _():
+    r = _resume_run(save_checkpoint, load_checkpoint)
+    s, l = r["saved"], r["loaded"]
+    true(l["step"] == 3, f"load_checkpoint should return the saved step (3); you returned {l['step']!r}")
+    true(l["last_epoch"] == s["last_epoch"], f"sched.last_epoch is {l['last_epoch']}, but it was {s['last_epoch']} when saved: "
+         "sched.state_dict() was not saved or not loaded, so the learning-rate schedule starts over")
+    true(l["lr"] == s["lr"], f"the current learning rate is {l['lr']}; when saved it was {s['lr']}")
+
+@check("RNG state is restored")
+def _():
+    r = _resume_run(save_checkpoint, load_checkpoint)
+    true(torch.equal(r["loaded"]["rng"], r["saved"]["rng"]),
+         "after loading, torch's RNG state differs from the saved one: save torch.get_rng_state() and restore it with torch.set_rng_state(). "
+         "Otherwise the later dropout masks and data differ from the uninterrupted run")
+
+@check("2 resumed steps == 5 uninterrupted steps")
+def _():
+    r = _resume_run(save_checkpoint, load_checkpoint)
+    true(r["rest"] == r["full"][3:], f"the resumed losses are {r['rest']}; steps 4 and 5 without stopping are {r['full'][3:]}")
+    for k, v in r["full_state"].items():
+        eq(r["resumed_state"][k], v, tol=0, msg=f"the final {k} differs from the uninterrupted run")
+--- hints
+- The optimizer and the scheduler both have `state_dict()` / `load_state_dict()`, used just like the model's.
+- RNG: save `torch.get_rng_state()` and restore it with `torch.set_rng_state(ckpt["rng_torch"])`. For Python's `random`, use `random.getstate()` / `random.setstate()`.
+- Loading order: model → optimizer → scheduler → RNG states, then `return ckpt["step"]`.
+
+@@ item d20-12
+type: code
+title: Atomic save
+level: 2
+cards: Atomic save: temp file first, then os.replace
+targets: atomic_save
+ref: day20
+--- context
+If the process is killed, the disk fills up or the power fails while a checkpoint is being saved, you get a half-written file that has already overwritten the last good checkpoint. Days of training can be lost this way.
+--- prompt
+Turn `atomic_save(obj, path)` into an atomic save:
+
+1. First write to the temporary file `tmp = path + ".tmp"` with `torch.save(obj, tmp)` (in **the same folder** as `path`).
+2. Once it is completely written, swap it in with `os.replace(tmp, path)` (this overwrites an existing target).
+3. If anything fails on the way: delete the temporary file, then re-raise the error unchanged (`raise`). The old `path` must not be touched.
+--- starter
+import os
+
+def atomic_save(obj, path):
+    torch.save(obj, path)       # overwrites in place: a crash halfway destroys the old file too
+--- solution
+import os
+
+def atomic_save(obj, path):
+    tmp = path + ".tmp"                 # same folder, so os.replace is atomic
+    try:
+        torch.save(obj, tmp)
+        os.replace(tmp, path)           # either it does not happen at all, or it happens completely
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)              # leave no half-written temp file behind
+        raise                           # re-raise the original error
+--- tests
+import os, tempfile
+
+def _crash(obj, path):
+    """Swap in a fake torch.save that crashes halfway, call atomic_save once. Returns (the error raised, what torch.save was given)."""
+    seen, real_save = [], torch.save
+    def fake(o, f, *args, **kwargs):
+        seen.append(f)
+        if hasattr(f, "write"):
+            f.write(b"half a checkpoint")
+        else:
+            with open(f, "wb") as fh:
+                fh.write(b"half a checkpoint")
+        raise OSError("simulated: the disk filled up halfway through writing")
+    torch.save = fake
+    try:
+        atomic_save(obj, path)
+        err = None
+    except NotImplementedError:
+        raise
+    except Exception as e:
+        err = e
+    finally:
+        torch.save = real_save
+    return err, seen
+
+@check("a normal save loads back")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path = os.path.join(folder, "ckpt.pt")
+        atomic_save({"step": 1, "w": torch.arange(3.0)}, path)
+        ck = torch.load(path, weights_only=True)
+    true(ck["step"] == 1, "the step read back is wrong")
+    eq(ck["w"], torch.arange(3.0), tol=0)
+
+@check("overwrites an existing file")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path = os.path.join(folder, "ckpt.pt")
+        atomic_save({"step": 1}, path)
+        atomic_save({"step": 2}, path)
+        step = torch.load(path, weights_only=True)["step"]
+    true(step == 2, f"after the second save the step read back is {step}; it should be 2")
+
+@check("leaves no temp file after saving")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path = os.path.join(folder, "ckpt.pt")
+        atomic_save({"step": 1}, path)
+        atomic_save({"step": 2}, path)
+        files = sorted(os.listdir(folder))
+    true(files == ["ckpt.pt"], f"the folder holds {files}; it should hold only ckpt.pt")
+
+@check("crash halfway: the old file is intact and the error still propagates")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path = os.path.join(folder, "ckpt.pt")
+        atomic_save({"step": 1}, path)
+        err, _ = _crash({"step": 2}, path)
+        try:
+            step = torch.load(path, weights_only=True)["step"]
+        except Exception:
+            step = None
+    true(step == 1, "the old checkpoint is broken: you wrote straight into path. Write a temp file first, then os.replace")
+    true(isinstance(err, OSError), "torch.save failed but atomic_save did not re-raise the error: do not swallow errors, use raise")
+
+@check("leaves no temp file after a crash either")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path = os.path.join(folder, "ckpt.pt")
+        atomic_save({"step": 1}, path)
+        _crash({"step": 2}, path)
+        files = sorted(os.listdir(folder))
+    true(files == ["ckpt.pt"], f"the folder holds {files}: on an error, delete the half-written temp file")
+
+@check("the temp file is in the same folder as the target")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path = os.path.join(folder, "ckpt.pt")
+        _, seen = _crash({"step": 2}, path)
+    true(len(seen) == 1, "atomic_save should call torch.save once")
+    target = getattr(seen[0], "name", seen[0])
+    true(os.path.dirname(os.path.abspath(target)) == os.path.abspath(folder),
+         f"the temp file was written to {target}: it must be in the same folder as {path} for os.replace to be atomic (across drives it simply fails on Windows)")
+--- hints
+- Two steps: `torch.save(obj, tmp)`, then `os.replace(tmp, path)`.
+- For the clean-up, use `try: ... except BaseException: ... raise`: inside the except, first delete tmp if it exists, then a bare `raise` re-raises the original error.
+- Check `os.path.exists(tmp)` before deleting it, because tmp may not have been created yet.
+
+@@ item d20-13
+type: code
+title: Closed book: a resumable checkpoint
+level: 3
+exam: yes
+cards: What a resumable checkpoint must hold
+targets: save_checkpoint, load_checkpoint
+ref: day20
+--- context
+This is today's most important skill: after an interruption, training continues exactly as if nothing happened. "What goes into a checkpoint?" is also a common interview question.
+--- prompt
+Without looking at the cards, write `save_checkpoint(path, model, opt, sched, step)` and `load_checkpoint(path, model, opt, sched)` (which returns the step).
+
+The checks are the same as in item 11: the checkpoint loads with `weights_only=True`; train 3 steps → save → scramble the RNG and build brand-new objects → load → train 2 more steps, and the result must be exactly the same as 5 steps without stopping.
+--- starter
+import random
+
+def save_checkpoint(path, model, opt, sched, step):
+    raise todo()
+
+
+def load_checkpoint(path, model, opt, sched):
+    raise todo()
+--- solution
+import random
+
+def save_checkpoint(path, model, opt, sched, step):
+    ckpt = {
+        "model": model.state_dict(),
+        "optimizer": opt.state_dict(),
+        "scheduler": sched.state_dict(),
+        "step": step,
+        "rng_torch": torch.get_rng_state(),
+        "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        "rng_python": random.getstate(),
+    }
+    torch.save(ckpt, path)
+
+
+def load_checkpoint(path, model, opt, sched):
+    ckpt = torch.load(path, weights_only=True)
+    model.load_state_dict(ckpt["model"])
+    opt.load_state_dict(ckpt["optimizer"])
+    sched.load_state_dict(ckpt["scheduler"])
+    torch.set_rng_state(ckpt["rng_torch"])
+    if ckpt["rng_cuda"] and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(ckpt["rng_cuda"])
+    random.setstate(ckpt["rng_python"])
+    return ckpt["step"]
+--- tests
+@check("the checkpoint is a plain dict that loads with weights_only=True")
+def _():
+    r = _resume_run(save_checkpoint, load_checkpoint)
+    err = r["file_error"]
+    true(err is None, f"torch.load(path, weights_only=True) failed ({type(err).__name__}). "
+         "A checkpoint may hold only tensors, dicts, lists, numbers and strings: do not put the model or optimizer objects in it, put their state_dict()")
+    true(isinstance(r["file"], dict), f"the checkpoint should be a dict; it is a {type(r['file']).__name__}")
+
+@check("model weights are restored")
+def _():
+    r = _resume_run(save_checkpoint, load_checkpoint)
+    for k, v in r["saved"]["model"].items():
+        eq(r["loaded"]["model"][k], v, tol=0, msg=f"{k} differs from the saved one: the model's state_dict was not saved or not loaded")
+
+@check("optimizer state is restored (AdamW's running averages)")
+def _():
+    r = _resume_run(save_checkpoint, load_checkpoint)
+    want, got = r["saved"]["opt"]["state"], r["loaded"]["opt"]["state"]
+    true(len(got) == len(want), "the new optimizer's state is empty: opt.state_dict() was not saved or not loaded. "
+         "AdamW's exp_avg / exp_avg_sq start again from 0, and the loss jumps when you resume")
+    for i in want:
+        for name in ("exp_avg", "exp_avg_sq"):
+            eq(got[i][name], want[i][name], tol=0, msg=f"{name} of parameter {i} was not restored")
+
+@check("scheduler and step are restored")
+def _():
+    r = _resume_run(save_checkpoint, load_checkpoint)
+    s, l = r["saved"], r["loaded"]
+    true(l["step"] == 3, f"load_checkpoint should return the saved step (3); you returned {l['step']!r}")
+    true(l["last_epoch"] == s["last_epoch"], f"sched.last_epoch is {l['last_epoch']}, but it was {s['last_epoch']} when saved: "
+         "sched.state_dict() was not saved or not loaded, so the learning-rate schedule starts over")
+    true(l["lr"] == s["lr"], f"the current learning rate is {l['lr']}; when saved it was {s['lr']}")
+
+@check("RNG state is restored")
+def _():
+    r = _resume_run(save_checkpoint, load_checkpoint)
+    true(torch.equal(r["loaded"]["rng"], r["saved"]["rng"]),
+         "after loading, torch's RNG state differs from the saved one: save torch.get_rng_state() and restore it with torch.set_rng_state(). "
+         "Otherwise the later dropout masks and data differ from the uninterrupted run")
+
+@check("2 resumed steps == 5 uninterrupted steps")
+def _():
+    r = _resume_run(save_checkpoint, load_checkpoint)
+    true(r["rest"] == r["full"][3:], f"the resumed losses are {r['rest']}; steps 4 and 5 without stopping are {r['full'][3:]}")
+    for k, v in r["full_state"].items():
+        eq(r["resumed_state"][k], v, tol=0, msg=f"the final {k} differs from the uninterrupted run")
+--- hints
+- Five things: the state_dict of the model, the optimizer and the scheduler; the step; the RNG states.
+- Load each state_dict, then `torch.set_rng_state(...)` last, then return the step.
+
+@@ item d20-14
+type: code
+title: Closed book: a strict loader
+level: 2
+exam: yes
+cards: strict=False hides bugs
+targets: load_strict
+ref: day20
+--- context
+When loading weights before going live, the worst case is "it loaded fine, but one layer is random". Checking first, reporting every problem at once and loading only when all is well stops a whole class of production incidents.
+--- prompt
+Without looking at the cards, write `load_strict(model, sd)`: compare the keys of `model.state_dict()` (buffers included) with `sd` and find the missing, unexpected and wrong-shape keys. If there is any problem, `raise ValueError` with a message naming every bad key, and leave every number of the model unchanged. Only if everything matches, load and return `model`.
+--- starter
+def load_strict(model, sd):
+    raise todo()
+--- solution
+def load_strict(model, sd):
+    want = model.state_dict()
+    missing = sorted(set(want) - set(sd))
+    unexpected = sorted(set(sd) - set(want))
+    wrong_shape = [f"{k}: checkpoint {tuple(sd[k].shape)} vs model {tuple(want[k].shape)}"
+                   for k in want if k in sd and tuple(sd[k].shape) != tuple(want[k].shape)]
+    if missing or unexpected or wrong_shape:
+        raise ValueError(
+            "the checkpoint does not match the model:\n"
+            f"  missing (in the model, not in the file): {missing}\n"
+            f"  unexpected (in the file, not in the model): {unexpected}\n"
+            f"  wrong shape: {wrong_shape}")
+    model.load_state_dict(sd)
+    return model
+--- tests
+def _expect_value_error(model, sd, names, why=""):
+    try:
+        load_strict(model, sd)
+    except ValueError as e:
+        for n in names:
+            true(n in str(e), f"the message must name {n!r}. Your message: {e}. {why}")
+        return
+    except NotImplementedError:
+        raise
+    except Exception as e:
+        true(False, f"expected a ValueError, but your code raised {type(e).__name__}. That is usually torch's own error, which means you loaded before checking. {why}")
+    true(False, f"the checkpoint has a problem ({', '.join(names)}) but no ValueError was raised. {why}")
+
+@check("loads when everything matches and returns model")
+def _():
+    src, dst = Net(), Net()
+    out = load_strict(dst, src.state_dict())
+    true(out is dst, "return the model you were given")
+    for k, v in src.state_dict().items():
+        eq(dst.state_dict()[k], v, tol=0, msg=f"{k} was not loaded")
+
+@check("missing key: ValueError that names it")
+def _():
+    sd = Net().state_dict()
+    del sd["head.bias"]
+    _expect_value_error(Net(), sd, ["head.bias"])
+
+@check("reports unexpected keys too (e.g. a module. prefix)")
+def _():
+    sd = Wrapper(Net()).state_dict()
+    _expect_value_error(Net(), sd, ["module.body.weight", "body.weight"])
+
+@check("a shape mismatch is a ValueError too")
+def _():
+    sd = Net().state_dict()
+    sd["head.weight"] = torch.randn(3, 8)
+    _expect_value_error(Net(), sd, ["head.weight"])
+
+@check("on error, not a single number of the model changes")
+def _():
+    dst = Net()
+    before = {k: v.clone() for k, v in dst.state_dict().items()}
+    sd = Net().state_dict()
+    sd["head.weight"] = torch.randn(3, 8)
+    try:
+        load_strict(dst, sd)
+    except NotImplementedError:
+        raise
+    except Exception:
+        pass
+    for k, v in before.items():
+        eq(dst.state_dict()[k], v, tol=0,
+           msg=f"{k} changed: you loaded part of the checkpoint before noticing that head.weight is wrong. Find every problem first; load only if there is none")
+
+@check("checks buffers too (BatchNorm's running_mean)")
+def _():
+    model = nn.Sequential(nn.Linear(4, 4), nn.BatchNorm1d(4))
+    sd = model.state_dict()
+    del sd["1.running_mean"]
+    _expect_value_error(model, sd, ["1.running_mean"],
+                        why="Compare against the keys of model.state_dict(), not named_parameters(): a buffer is not a parameter, but it must be loaded too.")
+--- hints
+- missing / unexpected are differences of two sets; compare shapes only for keys on both sides.
+- Raise first, load after.

@@ -99,7 +99,7 @@ Type-specific sections:
 |---|---|---|
 | `code` | writes a function / class | starter, solution, tests, targets |
 | `fix` | fixes buggy code | starter (the buggy code), solution, tests, targets |
-| `fill` | fills blanks in code | `--- template` with `[[answer]]` blanks, tests |
+| `fill` | fills blanks in code | `--- template` with `[[answer]]` blanks, tests. A blank ends at the first `]]`, so an answer cannot end in `]` (write `x.unsqueeze(1)`, not `x[:, None]`); the build rejects blanks with unbalanced brackets |
 | `order` | puts shuffled lines in order | `--- lines` (correct order), optional `--- distractors`, tests |
 | `choice` | picks option(s) | `--- options` (`- ` list), `answer: 2` (1-based; `answer: 1,3` = several), `--- explain` |
 | `predict` | writes what the code prints | `--- code` (the page runs it at build time to get the expected output), `--- explain` |
@@ -128,11 +128,15 @@ Check helpers (available in tests, setup and learner code):
 | `close(a, b, tol=1e-4)` | returns a bool |
 | `seed(n)` | `torch.manual_seed(n)` |
 | `params(m)`, `trainable(m)` | parameter counts |
-| `raise todo()` | "not written yet" (shown as –, not ✗) |
+| `raise todo()` | "not written yet" (shown as –, not ✗). It raises a `BaseException`, not an `Exception`, so a test may wrap the learner's call in `except Exception` / `except RuntimeError` without swallowing it |
 
 Rules for tests:
 
-- Deterministic: call `seed(...)` before random data. Every check starts with `torch.manual_seed(0)`.
+- Deterministic: call `seed(...)` before random data. Every run and every check starts with `torch.manual_seed(0)`,
+  `random.seed(0)` and (if numpy is loaded) `numpy.random.seed(0)`, and with the cudnn / TF32 switches back at
+  their defaults.
+- Tests that swap out a function (`torch.save`, `F.softmax`, ...) must put it back in `finally`: the worker process is
+  reused for the next run.
 - Fast: the whole item must run in a few seconds **on a CPU** (learners without a GPU must be able to do the course).
   Use tiny sizes. A check may use CUDA only if it also passes when `torch.cuda.is_available()` is False.
 - Failure messages teach: say what is wrong and the likely cause ("改了未来的 k/v，前 4 个位置的输出也变了 —— 信息泄漏了").
@@ -154,6 +158,9 @@ The learner is new to programming and to ML (they started coding a few weeks ago
   shape) as they are. Use 「」 for quoting UI/text in Chinese prose.
 - English: plain English (short sentences, active voice), not a literal translation. Same facts, same numbers.
 - Never promise what the code does not do. Every number in a card or explanation must be true for the code shown.
+- Don't point by position. A choice item's `--- code` is shown *below* its prompt, and a card's code sits beside
+  the text on a wide screen but under it on a phone: write "the code below" / "this card's code", never "on the right".
+- `title:` and `cards:` values are taken literally: don't wrap them in quotes (the build rejects quoted titles).
 
 ## The English file
 

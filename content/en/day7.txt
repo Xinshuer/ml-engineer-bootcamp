@@ -1,0 +1,949 @@
+@@ day 7
+title: Latent space and the VAE
+part: Image generation
+hours: 3–4 hours
+--- goal
+You can build a small VAE from scratch: work out how big the image is after each conv layer, write the reparameterization trick, the KL term and the VAE loss, and explain why Stable Diffusion works in a latent space and where 0.18215 comes from.
+--- checklist
+- Empty the Review list first (redo from blank anything whose answer you looked at yesterday)
+- Read the 8 knowledge cards: press Run on each one, change a number, run it again
+- Solve the 14 practice exercises
+- Finish with the closed-book exam: rewrite reparameterize and kl_normal without notes
+
+@@ concept
+title: Conv2d and its output size
+--- body
+In PyTorch a batch of images has shape `(B, C, H, W)`: B images, C channels each (a color image has C=3: red, green, blue), height H, width W.
+
+`nn.Conv2d(in_ch, out_ch, kernel, stride, padding)` is a convolution layer:
+
+- A small kernel×kernel window slides over the image. At each position it outputs `out_ch` numbers.
+- **stride**: how many pixels the window moves each step. With stride=2 the output side is about half as long.
+- **padding**: rings of zeros added around the image first, so the window can fully cover the border pixels too.
+
+The output side length (`//` is floor division: it rounds down):
+
+```text
+H_out = (H + 2*padding - kernel) // stride + 1
+```
+
+Example: H=32, kernel=4, stride=2, padding=1 → (32 + 2 − 4) // 2 + 1 = 30 // 2 + 1 = 16.
+
+Three settings worth memorizing:
+
+- kernel 3, stride 1, padding 1: same size
+- kernel 4, stride 2, padding 1: half the size
+- kernel 1, stride 1, padding 0 (a 1×1 conv): same size, only the number of channels changes
+
+The number of output channels is simply `out_ch`. The formula above does not affect it.
+--- code
+x = torch.zeros(1, 3, 32, 32)                      # (B, C, H, W)
+for k, s, p in [(3, 1, 1), (4, 2, 1), (1, 1, 0), (5, 1, 0)]:
+    y = nn.Conv2d(3, 8, k, s, p)(x)
+    formula = (32 + 2 * p - k) // s + 1
+    print(f"k={k} s={s} p={p}: output {tuple(y.shape)}, the formula gives side {formula}")
+
+@@ concept
+title: The VAE: encode an image as a distribution
+--- body
+An **autoencoder** has two halves:
+
+- The **encoder** squeezes an image into a small block of numbers called the **latent** (written z).
+- The **decoder** turns z back into an image.
+
+It is trained to make the copy as close to the original as possible.
+
+A plain autoencoder has a problem: its latent space is full of "holes". Pick a random z, give it to the decoder, and you mostly get garbage. So you cannot use it to make new images.
+
+What a **VAE** (variational autoencoder) changes: the encoder no longer outputs one fixed z. For every number in z it outputs a normal distribution:
+
+- `mu`: the mean
+- `logvar`: the log of the variance, log(σ²)
+
+During training we sample a z from that distribution and let the decoder rebuild the image. The loss gets an extra KL term that pulls every distribution toward the standard normal N(0, 1). This fills the latent space and makes it smooth: after training, you can sample any z from N(0, 1) and the decoder draws a reasonable image.
+
+Why logvar: the standard deviation σ must be greater than 0, but a conv layer can output negative numbers. logvar can be any real number, and `std = exp(0.5 * logvar)` is always greater than 0. The 0.5 is there because σ = √(σ²), and inside a log a square root becomes "multiply by 0.5".
+
+The shapes of today's small VAE:
+
+```text
+x (B, 3, 32, 32)
+  --Encoder-->  mu, logvar (B, 4, 8, 8)
+  --sample--->  z (B, 4, 8, 8)
+  --Decoder-->  x_hat (B, 3, 32, 32)
+```
+--- code
+logvar = torch.tensor([-4.0, -1.0, 0.0, 1.0, 4.0])   # the network can output any real number
+std = torch.exp(0.5 * logvar)                        # standard deviation: always > 0
+print("logvar:", logvar.tolist())
+print("std   :", [round(v, 3) for v in std.tolist()])
+print("var   :", [round(v, 3) for v in (std ** 2).tolist()])
+
+@@ concept
+title: Reparameterization: sampling that gradients can pass through
+--- body
+Training a VAE means sampling z from N(mu, std²). The gradient has to flow from the loss back to the `mu` and `logvar` that the encoder produced. But "draw a random sample" is not ordinary arithmetic.
+
+Sampling with `torch.normal(mu, std)` **raises no error**, but PyTorch defines its gradient with respect to `mu` and `std` as 0. The encoder gets no signal and never learns.
+
+The **reparameterization trick** moves the randomness out of the parameters:
+
+1. First draw standard normal noise that does not depend on any parameter: `eps = torch.randn_like(std)` (same shape and device as `std`)
+2. Then compute `z = mu + std * eps`
+
+z has the same distribution as before (mean mu, standard deviation std). But now z is just an addition and a multiplication of mu and std: dz/dmu = 1 and dz/dstd = eps, so the gradient flows back.
+
+`torch.distributions.Normal` works the same way: `.sample()` carries no gradient, and `.rsample()` (r for reparameterized) uses this trick.
+--- code
+mu = torch.tensor([1.0, 2.0], requires_grad=True)
+logvar = torch.tensor([0.0, 2.0], requires_grad=True)
+
+std = torch.exp(0.5 * logvar)
+eps = torch.randn_like(std)          # the randomness lives here, independent of the parameters
+z = mu + std * eps
+z.sum().backward()
+
+print("eps        :", eps)
+print("mu.grad    :", mu.grad)                    # dz/dmu = 1
+print("logvar.grad:", logvar.grad)                # equals 0.5 * std * eps
+print("0.5*std*eps:", (0.5 * std * eps).detach())
+
+@@ concept
+title: KL divergence: closed form and Monte Carlo
+--- body
+The **KL divergence** measures how far a distribution q is from a distribution p. It is always ≥ 0, and it is 0 only when q and p are identical. It is not a true "distance": KL(q‖p) and KL(p‖q) are usually different.
+
+In a VAE, q = N(mu, σ²) (the encoder's distribution) and p = N(0, 1) (the standard normal). For this case the KL has a ready-made formula, called the **closed form**. Per dimension:
+
+```text
+KL = 0.5 * (mu² + σ² - 1 - log σ²)
+   = 0.5 * (mu² + exp(logvar) - 1 - logvar)
+```
+
+- mu=0, logvar=0 (q is p): 0.5 × (0 + 1 − 1 − 0) = 0
+- mu=1, logvar=0: 0.5 × (1 + 1 − 1 − 0) = 0.5
+
+The latent dimensions are independent, so the KL of the whole z is the **sum** of the per-dimension KLs. For a mu of shape `(B, 4, 8, 8)`: `.flatten(1)` makes it `(B, 256)`, then `.sum(1)` leaves one number per sample, shape `(B,)`.
+
+A **Monte Carlo estimate** (an average over random samples) follows the definition directly: draw many z from q and average log q(z) − log p(z). More samples make it more accurate, but it is slow and noisy. So training uses the closed form, and Monte Carlo is only a check that the formula is right.
+--- code
+mu, logvar = torch.tensor(1.0), torch.tensor(0.5)
+closed = 0.5 * (mu ** 2 + logvar.exp() - 1 - logvar)
+
+std = torch.exp(0.5 * logvar)
+z = mu + std * torch.randn(200000)                     # 200,000 samples from q
+log_q = torch.distributions.Normal(mu, std).log_prob(z)
+log_p = torch.distributions.Normal(0.0, 1.0).log_prob(z)
+
+print(f"closed form: {closed.item():.4f}")
+print(f"Monte Carlo: {(log_q - log_p).mean().item():.4f}")
+
+@@ concept
+title: Encoder and decoder: shrink, then grow back
+--- body
+The **encoder** halves the side length again and again with stride-2 convs: 32 → 16 → 8. The number of channels goes up, so each position can hold more information.
+
+The last layer outputs `2 * z_ch` channels. Cut them in two along the channel dimension (dimension 1):
+
+- `h[:, :z_ch]` → mu
+- `h[:, z_ch:]` → logvar
+
+The last layer has no activation after it, because mu and logvar can be any real number.
+
+Between layers we use the **SiLU** activation: SiLU(x) = x · sigmoid(x), a smooth version of ReLU that VAEs and diffusion models use a lot.
+
+The **decoder** does the opposite and doubles the side length again and again:
+
+- `nn.Upsample(scale_factor=2, mode="nearest")` copies each pixel into a 2×2 block, so the side doubles. It has no learnable parameters.
+- A conv with kernel 3, stride 1, padding 1 follows (same size). It smooths out the copied blocks.
+- Why not upsample with `nn.ConvTranspose2d` (transposed convolution): its windows overlap unevenly, which tends to leave a checkerboard pattern on the image.
+
+The decoder ends with **tanh**, which squeezes any real number into (-1, 1). Training images are usually normalized to [-1, 1] first (pixel value ÷ 127.5 − 1), so the ranges match.
+
+`nn.Sequential(layer1, layer2, ...)` chains layers in order. Calling it passes the input through each layer in turn.
+--- code
+x = torch.randn(2, 3, 32, 32)
+h = nn.Conv2d(3, 8, 4, 2, 1)(x)
+print("stride-2 conv       :", tuple(h.shape))
+mu, logvar = h[:, :4], h[:, 4:]
+print("split along channels:", tuple(mu.shape), tuple(logvar.shape))
+
+up = nn.Upsample(scale_factor=2, mode="nearest")
+print("Upsample x2         :", tuple(up(mu).shape))
+print(up(torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])))
+print("tanh:", torch.tanh(torch.tensor([-5.0, 0.0, 0.5, 5.0])))
+
+@@ concept
+title: The VAE loss: reconstruction + β·KL
+--- body
+The VAE loss has two terms. Both are costs (smaller is better), so we **add** them:
+
+```text
+total = recon + beta * kl
+```
+
+- **recon** (reconstruction error): for each image, **sum** the squared error over all its pixels, then average over the batch.
+- **kl**: each sample's KL (summed over all latent dimensions), then averaged over the batch.
+
+Why recon uses a sum and not a mean: a 3×32×32 image has 3072 numbers, while a 4×8×8 latent has only 256. When both terms are "summed per sample", their sizes are comparable (in the code below both are around 30). If recon averaged over pixels, it would be thousands of times smaller, and the KL would win: the model stores nothing in z and the reconstructions come out blurry.
+
+`F.mse_loss(x_hat, x, reduction="sum") / B` is the same number as "sum per image, then average over the batch" (B is the batch size).
+
+**beta** (β) sets the balance between the two:
+
+- Large β: the latent space is closer to the standard normal and smoother, but reconstructions are blurrier and dimensions collapse more easily.
+- Small β: sharper reconstructions, but the latent space does not look like a standard normal, so images generated from N(0, 1) samples get worse.
+--- code
+x = torch.rand(4, 3, 32, 32) * 2 - 1              # 4 images, values in [-1, 1]
+x_hat = x + 0.1 * torch.randn_like(x)             # a decent reconstruction
+sq = (x_hat - x) ** 2
+print("mean over every pixel         :", round(sq.mean().item(), 4))
+print("sum per image, mean over batch:", round(sq.flatten(1).sum(1).mean().item(), 2))
+print("F.mse_loss(sum) / B           :", round((F.mse_loss(x_hat, x, reduction="sum") / 4).item(), 2))
+
+mu, logvar = 0.5 * torch.randn(4, 4, 8, 8), torch.zeros(4, 4, 8, 8)
+kl = 0.5 * (mu ** 2 + logvar.exp() - 1 - logvar).flatten(1).sum(1).mean()
+print("KL (sum per sample, then mean):", round(kl.item(), 2))
+
+@@ concept
+title: Latent space: compression ratio and scaling_factor
+--- body
+**Why a latent space**: to generate one image, a diffusion model (day 8) runs a big network tens of times. Stable Diffusion first uses a VAE to squeeze a 512×512×3 image into a 64×64×4 latent. The diffusion model works only in that latent space, and at the end the decoder turns the latent back into an image.
+
+**Compression ratio** = number of elements in the image ÷ number of elements in the latent:
+
+- 512 × 512 × 3 = 786,432
+- 64 × 64 × 4 = 16,384
+- 786,432 ÷ 16,384 = 48 times
+
+**scaling_factor**: a diffusion model adds standard normal noise to its data, so it wants the data itself to have a standard deviation of about 1. Stable Diffusion's VAE was trained with a very small KL weight (about 1e-6), so its latents were never pulled to N(0, 1): their standard deviation is about 5.5.
+
+The fix: measure the standard deviation σ of a batch of latents and take s = 1/σ.
+
+- After encoding, multiply by s and give the result to the diffusion model (standard deviation ≈ 1).
+- When the diffusion model is done, divide by s to undo it, then give the result to the decoder.
+
+That is where the 0.18215 of Stable Diffusion 1.x / 2.x comes from: 1 / 5.49 ≈ 0.182. A different VAE needs its own value (for example, the SDXL VAE uses 0.13025).
+--- code
+print("compression ratio:", (512 * 512 * 3) / (64 * 64 * 4))
+
+lat = torch.randn(16, 4, 8, 8) * 5.49            # pretend these are latents from a VAE encoder
+s = 1.0 / lat.std().item()
+z = lat * s                                      # what the diffusion model gets
+print(f"std before = {lat.std().item():.2f}, s = {s:.4f}, std after = {z.std().item():.2f}")
+print("dividing by s undoes it:", torch.allclose(z / s, lat))
+
+@@ concept
+title: Posterior collapse: latent dimensions left unused
+--- body
+The **posterior** is the distribution the encoder outputs, q(z|x): what z should look like once we have seen the image x.
+
+**Posterior collapse**: for some dimensions, the encoder outputs mu≈0 and logvar≈0 no matter which image it sees. That is exactly the standard normal N(0, 1). The KL of that dimension is ≈0, so the loss is happy. But the dimension carries no information about the image, and the decoder learns to ignore it. It is wasted.
+
+Common causes: β is too large; the decoder is so strong that it can rebuild the input without z (common in text VAEs); early in training the KL term overpowers the reconstruction.
+
+**How to detect it**: look at the KL per dimension, averaged over a batch.
+
+1. For mu and logvar of shape `(B, D)`, compute the KL element by element: shape `(B, D)`.
+2. `.mean(0)` averages over the batch: one number per dimension, shape `(D,)`.
+3. A dimension whose average KL is below a threshold (for example 0.01) has collapsed.
+
+Do not sum over the dimensions first (that is what `kl_normal` does): then you cannot tell which dimension is unused.
+
+Common remedies: a smaller β; KL warm-up (β grows slowly from 0 to 1 at the start of training).
+--- code
+B, D = 256, 4
+mu, logvar = torch.zeros(B, D), torch.zeros(B, D)
+mu[:, 0] = torch.randn(B) * 1.5      # dimension 0: each image gets its own mu, so it carries information
+mu[:, 1] = torch.randn(B) * 0.05     # dimension 1: barely changes from image to image
+                                     # dimensions 2 and 3: always exactly N(0, 1)
+kl = 0.5 * (mu ** 2 + logvar.exp() - 1 - logvar)       # (B, D)
+per_dim = kl.mean(0)                                    # (D,)
+print("average KL per dimension:", [round(v, 4) for v in per_dim.tolist()])
+
+@@ item d7-01
+type: code
+title: Conv output size
+level: 1
+cards: Conv2d and its output size
+targets: conv_out
+ref: day7
+--- context
+The most common error when building a conv net is a shape mismatch. If you can work out in your head how big the image is after each conv layer, you catch the problem before you write the code. Interviewers also like to ask you to do it by hand.
+--- prompt
+Two things:
+
+1. Write `conv_out(H, kernel, stride, padding)`: for an image with side length `H` going through `nn.Conv2d(..., kernel, stride, padding)`, return the output side length (an integer). The formula: `(H + 2*padding - kernel) // stride + 1`.
+2. **Work these out in your head first, do not run code**: replace every `None` in `CONV_SHAPES` with the output side length. The keys are `(H, kernel, stride, padding)`.
+
+The check first tests your formula against a real `nn.Conv2d`, then compares each of your mental answers.
+--- starter
+def conv_out(H, kernel, stride, padding):
+    """Side length of an H x H image after Conv2d(kernel, stride, padding)."""
+    raise todo()
+
+
+# Work them out in your head, then fill in: replace each None with the output side length
+CONV_SHAPES = {
+    # (H, kernel, stride, padding): output side length
+    (32, 3, 1, 1): None,     # the most common "same size" setting
+    (32, 4, 2, 1): None,     # the most common "half the size" setting
+    (32, 3, 2, 1): None,
+    (32, 1, 1, 0): None,     # 1x1 conv
+    (7, 3, 2, 0): None,
+}
+--- solution
+def conv_out(H, kernel, stride, padding):
+    return (H + 2 * padding - kernel) // stride + 1
+
+
+CONV_SHAPES = {
+    (32, 3, 1, 1): 32,
+    (32, 4, 2, 1): 16,
+    (32, 3, 2, 1): 16,
+    (32, 1, 1, 0): 32,
+    (7, 3, 2, 0): 3,
+}
+--- tests
+@check("conv output size")
+def t01():
+    wrong = []
+    for H, k, s, p in [(32, 3, 1, 1), (32, 4, 2, 1), (32, 3, 2, 1), (32, 1, 1, 0), (7, 3, 2, 0)]:
+        guess = CONV_SHAPES.get((H, k, s, p))
+        real = conv_out(H, k, s, p)
+        ref = nn.Conv2d(1, 1, k, s, p)(torch.zeros(1, 1, H, H)).shape[-1]
+        true(real == ref, f"conv_out({H}, {k}, {s}, {p}) returns {real}, but a real nn.Conv2d gives side {ref}. "
+                          "Check the formula: (H + 2*padding - kernel) // stride + 1")
+        if guess != real:
+            wrong.append(f"({H}, {k}, {s}, {p}): you wrote {guess}, it is {real}")
+    true(not wrong, "The formula is right, but these mental answers are not:\n       " + "\n       ".join(wrong))
+--- hints
+- `//` is floor division: `31 // 2` is 15, not 15.5.
+- `(32, 3, 2, 1)`: (32 + 2 − 3) // 2 + 1 = 31 // 2 + 1. `(7, 3, 2, 0)`: (7 − 3) // 2 + 1.
+- The function body is one line: `return (H + 2 * padding - kernel) // stride + 1`
+
+@@ item d7-02
+type: code
+title: Reparameterization
+level: 2
+cards: Reparameterization: sampling that gradients can pass through; The VAE: encode an image as a distribution
+targets: reparameterize
+ref: day7
+--- context
+While training a VAE you sample z from the distribution the encoder gives you. Sample it directly and the gradient cannot reach the encoder, so the encoder learns nothing. Reparameterization is what makes a VAE trainable, and "why do we need the reparameterization trick?" is a classic interview question.
+--- prompt
+Write `reparameterize(mu, logvar)`:
+
+- Input: `mu` and `logvar` with the same shape (any shape, for example `(B, 4, 8, 8)`). `logvar` is the log of the variance.
+- Output: `z`, same shape as `mu`, drawn from a normal distribution with mean `mu` and standard deviation `std`.
+- How: `std = exp(0.5 * logvar)`; draw standard normal noise `eps` with the same shape as `std`; `z = mu + std * eps`.
+- Do not use `torch.normal` or `.sample()` from `torch.distributions`: the gradient would not reach `mu` and `logvar`.
+
+The check draws 20,000 samples to test the mean and the standard deviation, then makes sure gradients reach `mu` and `logvar`.
+--- starter
+def reparameterize(mu, logvar):
+    """z = mu + std * eps, where std = exp(0.5 * logvar) and eps ~ N(0, 1)."""
+    raise todo()
+--- solution
+def reparameterize(mu, logvar):
+    std = torch.exp(0.5 * logvar)
+    return mu + std * torch.randn_like(std)
+--- tests
+@check("reparameterization")
+def t02():
+    seed(0)
+    mu = torch.zeros(20000, 3)
+    logvar = torch.full((20000, 3), math.log(4.0))    # variance 4 -> standard deviation 2
+    z = reparameterize(mu, logvar)
+    shape_is(z, mu.shape)
+    true(abs(z.mean().item()) < 0.05, f"the mean should be about 0 (mu is all zeros), it is {z.mean().item():.3f}")
+    true(abs(z.std().item() - 2.0) < 0.05,
+         f"the standard deviation should be about 2 (= exp(0.5 * log 4)), it is {z.std().item():.3f}. "
+         "With exp(logvar) you would get 4")
+    # gradients must reach mu and logvar
+    mu2 = torch.zeros(4, 3, requires_grad=True)
+    lv2 = torch.zeros(4, 3, requires_grad=True)
+    reparameterize(mu2, lv2).sum().backward()
+    true(mu2.grad is not None and lv2.grad is not None,
+         "no gradient reaches mu or logvar (grad is None): compute z directly from mu and std, without detach")
+    true(lv2.grad.abs().sum() > 0,
+         "the gradient of logvar is all zeros. torch.normal(mu, std) raises no error but its gradient is 0: write mu + std * eps")
+--- hints
+- The variance is std squared, so log(std) is half of logvar: `std = torch.exp(0.5 * logvar)`, not `torch.exp(logvar)`.
+- `torch.randn_like(std)` makes standard normal noise with the same shape and device as `std`.
+- The last line: `return mu + std * torch.randn_like(std)`
+
+@@ item d7-03
+type: code
+title: Closed-form KL
+level: 2
+cards: KL divergence: closed form and Monte Carlo
+targets: kl_normal
+ref: day7
+--- context
+The VAE loss has a KL term that pulls the encoder's distribution toward the standard normal. It is computed at every step, so we use the formula directly (the closed form) instead of sampling. Get one sign wrong and the model still trains, just badly, so we check the formula against a Monte Carlo estimate.
+--- prompt
+Write `kl_normal(mu, logvar)`: return the KL divergence of q = N(mu, exp(logvar)) from p = N(0, 1).
+
+- Input: `mu` and `logvar` of shape `(B, ...)`. Dimension 0 is the batch; any number of dimensions can follow (for example `(B, 4)` or `(B, 4, 8, 8)`).
+- The KL of each element (each dimension): `0.5 * (mu² + exp(logvar) − 1 − logvar)`.
+- For each sample, add up the KL over all its dimensions. Return shape `(B,)`.
+
+The second check compares your closed form with a Monte Carlo estimate from 400,000 samples.
+--- starter
+def kl_normal(mu, logvar):
+    """KL( N(mu, exp(logvar)) || N(0, 1) ), summed over all dimensions of each sample; returns (B,)."""
+    raise todo()
+--- solution
+def kl_normal(mu, logvar):
+    return 0.5 * (mu ** 2 + logvar.exp() - 1 - logvar).flatten(1).sum(1)
+--- tests
+@check("closed-form KL")
+def t03():
+    mu, lv = torch.zeros(2, 5), torch.zeros(2, 5)
+    eq(kl_normal(mu, lv), torch.zeros(2), msg="with mu=0 and logvar=0, q is N(0, 1), so the KL must be 0, with shape (B,)")
+    k = kl_normal(torch.ones(1, 1), torch.zeros(1, 1))
+    eq(k, torch.tensor([0.5]), msg="with mu=1 and logvar=0, KL = 0.5 × (1 + 1 − 1 − 0) = 0.5")
+    true((kl_normal(torch.randn(8, 4) * 3, torch.randn(8, 4)) >= 0).all(),
+         "the KL came out negative, which is impossible. Check the signs: mu² + exp(logvar) − 1 − logvar")
+
+@check("closed-form KL vs Monte Carlo")
+def t04():
+    seed(1)
+    mu = torch.tensor([[0.5, -1.0]])
+    lv = torch.tensor([[0.3, -0.7]])
+    closed = kl_normal(mu, lv)[0]
+
+    n = 400000
+    std = (0.5 * lv).exp()
+    z = mu + std * torch.randn(n, 2)
+    log_q = (-0.5 * ((z - mu) / std) ** 2 - lv * 0.5 - 0.5 * math.log(2 * math.pi)).sum(-1)
+    log_p = (-0.5 * z ** 2 - 0.5 * math.log(2 * math.pi)).sum(-1)
+    mc = (log_q - log_p).mean()
+    true(abs(closed.item() - mc.item()) < 0.02,
+         f"closed form {closed.item():.4f} vs Monte Carlo estimate {mc.item():.4f}: too far apart, the closed form is wrong")
+--- hints
+- First compute the KL of every element (same shape as `mu`), then sum at the end.
+- `t.flatten(1)` turns `(B, 4, 8, 8)` into `(B, 256)`; then `.sum(1)` gives `(B,)`. It works for `(B, 4)` as well.
+- `return 0.5 * (mu ** 2 + logvar.exp() - 1 - logvar).flatten(1).sum(1)`
+
+@@ item d7-04
+type: code
+title: Encoder
+level: 2
+cards: Encoder and decoder: shrink, then grow back; Conv2d and its output size; The VAE: encode an image as a distribution
+targets: Encoder
+ref: day7
+--- context
+The encoder squeezes an image into a small latent. Stable Diffusion's VAE encoder follows the same idea: a stack of stride-2 convs halves the side length again and again, and the end outputs mu and logvar.
+--- prompt
+Write `Encoder(nn.Module)`.
+
+In `__init__(self, z_ch=4)`, build these 3 conv layers in order. Put an `nn.SiLU()` after each of the first two; put nothing after the last one:
+
+```text
+Conv2d(3  -> 32,      kernel 4, stride 2, padding 1)   32x32 -> 16x16
+Conv2d(32 -> 64,      kernel 4, stride 2, padding 1)   16x16 -> 8x8
+Conv2d(64 -> 2*z_ch,  kernel 3, stride 1, padding 1)   8x8 stays 8x8
+```
+
+`forward(x)`: `x` has shape `(B, 3, 32, 32)`. Cut the `2*z_ch` output channels of the last layer in two: the first `z_ch` are `mu`, the last `z_ch` are `logvar`. Return `(mu, logvar)`, both of shape `(B, z_ch, 8, 8)`.
+--- starter
+class Encoder(nn.Module):
+    def __init__(self, z_ch=4):
+        super().__init__()
+        raise todo()
+
+    def forward(self, x):
+        raise todo()
+--- solution
+class Encoder(nn.Module):
+    def __init__(self, z_ch=4):
+        super().__init__()
+        self.z_ch = z_ch
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 32, 4, 2, 1), nn.SiLU(),
+            nn.Conv2d(32, 64, 4, 2, 1), nn.SiLU(),
+            nn.Conv2d(64, 2 * z_ch, 3, 1, 1),
+        )
+
+    def forward(self, x):
+        h = self.net(x)
+        return h[:, :self.z_ch], h[:, self.z_ch:]
+--- tests
+@check("Encoder")
+def t05():
+    m = Encoder(4)
+    mu, lv = m(torch.randn(2, 3, 32, 32))
+    shape_is(mu, (2, 4, 8, 8), "the shape of mu")
+    shape_is(lv, (2, 4, 8, 8), "the shape of logvar")
+    true(not torch.equal(mu, lv), "mu and logvar are identical: they should be the two halves of the last layer's output (the first z_ch channels and the last z_ch channels)")
+--- hints
+- The argument order of `nn.Conv2d(3, 32, 4, 2, 1)` is (in channels, out channels, kernel, stride, padding).
+- Chain the 5 modules (3 Conv2d, 2 SiLU) with `nn.Sequential(...)` into `self.net`. Save `z_ch` as `self.z_ch`, because `forward` needs it.
+- Channels are dimension 1: `h[:, :self.z_ch]` is the first half, `h[:, self.z_ch:]` the second half.
+
+@@ item d7-05
+type: code
+title: Decoder
+level: 2
+cards: Encoder and decoder: shrink, then grow back; Conv2d and its output size
+targets: Decoder
+ref: day7
+--- context
+The decoder turns a latent back into an image. It is the part you use to make new images: Stable Diffusion generates in latent space, and its very last step is the decoder growing a 64x64 latent into a 512x512 image.
+--- prompt
+Write `Decoder(nn.Module)`.
+
+In `__init__(self, z_ch=4)`, build in order:
+
+```text
+Conv2d(z_ch -> 64, kernel 3, stride 1, padding 1), SiLU    8x8
+Upsample(x2)                                              8x8   -> 16x16
+Conv2d(64 -> 32,   kernel 3, stride 1, padding 1), SiLU    16x16
+Upsample(x2)                                              16x16 -> 32x32
+Conv2d(32 -> 3,    kernel 3, stride 1, padding 1), Tanh    32x32
+```
+
+Upsample with `nn.Upsample(scale_factor=2, mode="nearest")`, not with `ConvTranspose2d`.
+
+`forward(z)`: `z` has shape `(B, z_ch, 8, 8)`. Return an image of shape `(B, 3, 32, 32)` with values in [-1, 1].
+--- starter
+class Decoder(nn.Module):
+    def __init__(self, z_ch=4):
+        super().__init__()
+        raise todo()
+
+    def forward(self, z):
+        raise todo()
+--- solution
+class Decoder(nn.Module):
+    def __init__(self, z_ch=4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(z_ch, 64, 3, 1, 1), nn.SiLU(),
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(64, 32, 3, 1, 1), nn.SiLU(),
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(32, 3, 3, 1, 1), nn.Tanh(),
+        )
+
+    def forward(self, z):
+        return self.net(z)
+--- tests
+@check("Decoder")
+def t06():
+    m = Decoder(4)
+    y = m(torch.randn(2, 4, 8, 8))
+    shape_is(y, (2, 3, 32, 32))
+    true(y.min() >= -1.0 and y.max() <= 1.0, "the output goes outside [-1, 1]: put nn.Tanh() after the last conv")
+--- hints
+- As in the encoder, put 8 modules in order in one `nn.Sequential`; `forward` is just `return self.net(z)`.
+- A conv with kernel 3, stride 1, padding 1 keeps the size, so the side only doubles at each Upsample: 8 → 16 → 32.
+- The last module is `nn.Tanh()`: it squeezes any real number into (-1, 1).
+
+@@ item d7-06
+type: code
+title: VAE loss
+level: 2
+cards: The VAE loss: reconstruction + β·KL; KL divergence: closed form and Monte Carlo
+targets: vae_loss
+ref: day7
+--- context
+The VAE loss has two terms: the reconstruction error and the KL. Their sizes must be balanced for β to mean anything. Get one sum or mean wrong and the model either only cares about reconstruction or only about looking like a standard normal.
+--- prompt
+Write `vae_loss(x, x_hat, mu, logvar, beta=1.0)`. It returns three scalars `(total, recon, kl)`:
+
+- `x`, `x_hat`: the original and the reconstructed images, shape `(B, C, H, W)`.
+- `recon`: for each image, **sum** the squared error over all pixels, then average over the batch.
+- `kl`: each sample's KL (summed over all latent dimensions), averaged over the batch.
+- `total = recon + beta * kl`.
+
+`kl_normal(mu, logvar)` from exercise 3 is already defined for you; call it directly (it returns `(B,)`).
+--- starter
+def vae_loss(x, x_hat, mu, logvar, beta=1.0):
+    """Return (total, recon, kl), all three scalars."""
+    raise todo()
+--- solution
+def vae_loss(x, x_hat, mu, logvar, beta=1.0):
+    recon = ((x_hat - x) ** 2).flatten(1).sum(1).mean()
+    kl = kl_normal(mu, logvar).mean()
+    return recon + beta * kl, recon, kl
+--- tests
+@check("VAE loss")
+def t07():
+    x = torch.zeros(4, 3, 8, 8)
+    xh = torch.full_like(x, 0.5)
+    mu, lv = torch.zeros(4, 2, 2, 2), torch.zeros(4, 2, 2, 2)
+    tot, rec, kl = vae_loss(x, xh, mu, lv, beta=1.0)
+    eq(rec, torch.tensor(3 * 8 * 8 * 0.25),
+       msg="recon should be the sum of squared errors over all pixels of each image (3×8×8 pixels, 0.25 each: 48), then averaged over the batch")
+    eq(kl, torch.tensor(0.0), msg="with mu=0 and logvar=0 the KL should be 0")
+    eq(tot, rec, msg="when the KL is 0, total should equal recon")
+    tot2, _, _ = vae_loss(x, xh, torch.ones(4, 2, 2, 2), lv, beta=10.0)
+    true(tot2 > tot, "with nonzero mu and beta=10, total should be larger: total is recon + beta * kl, not minus")
+--- hints
+- The squared error summed per image: `((x_hat - x) ** 2).flatten(1).sum(1)`, shape `(B,)`; then `.mean()`.
+- `kl = kl_normal(mu, logvar).mean()`, and finally `return recon + beta * kl, recon, kl`.
+- Do not write `((x_hat - x) ** 2).mean()`: that averages over pixels and is C×H×W times too small.
+
+@@ item d7-07
+type: code
+title: Latent compression ratio
+level: 1
+cards: Latent space: compression ratio and scaling_factor
+targets: compression
+ref: day7
+--- context
+Stable Diffusion does not run diffusion on pixels but in the VAE's latent space. Compute the compression ratio and you see why: the network handles tens of times fewer numbers at every step, so training and generation get much cheaper.
+--- prompt
+Write `compression(H, W, C_img, h, w, C_z)`: return "number of elements in the image ÷ number of elements in the latent".
+
+- The image has shape `(C_img, H, W)`: H × W × C_img elements.
+- The latent has shape `(C_z, h, w)`: h × w × C_z elements.
+- Return a number (a decimal is fine). For example, 32x32x3 squeezed into 8x8x4 is 12 times.
+--- starter
+def compression(H, W, C_img, h, w, C_z):
+    """Return image elements / latent elements."""
+    raise todo()
+--- solution
+def compression(H, W, C_img, h, w, C_z):
+    return (H * W * C_img) / (h * w * C_z)
+--- tests
+@check("latent compression ratio")
+def t08():
+    true(close(compression(32, 32, 3, 8, 8, 4), 12.0),
+         f"32x32x3 into 8x8x4 should be 12 times; you returned {compression(32, 32, 3, 8, 8, 4)}")
+    true(close(compression(512, 512, 3, 64, 64, 4), 48.0),
+         "Stable Diffusion's 512x512x3 into 64x64x4 should be 48 times: the diffusion model handles 48 times fewer numbers per step")
+--- hints
+- Divide one product by the other.
+- In Python 3, `/` always gives a decimal (`12 / 4` is `3.0`), so there is no integer-division trap.
+- `return (H * W * C_img) / (h * w * C_z)`
+
+@@ item d7-08
+type: code
+title: scaling_factor
+level: 1
+cards: Latent space: compression ratio and scaling_factor
+targets: fit_scaling_factor
+ref: day7
+--- context
+Stable Diffusion code is full of 0.18215. It scales the VAE latents to a standard deviation of about 1, so they match the standard normal noise the diffusion model adds. Switch to another VAE and you have to compute this number again.
+--- prompt
+Write `fit_scaling_factor(latents)`: given a batch of latents from a VAE encoder (a tensor of any shape), return a Python float `s` such that the overall standard deviation of `latents * s` is about 1.
+
+The check uses latents with a standard deviation of about 5.49, and you should get about 0.182. That is where Stable Diffusion's 0.18215 comes from.
+--- starter
+def fit_scaling_factor(latents):
+    """Return s such that (latents * s).std() ≈ 1."""
+    raise todo()
+--- solution
+def fit_scaling_factor(latents):
+    return 1.0 / latents.std().item()
+--- tests
+@check("scaling_factor")
+def t09():
+    seed(2)
+    lat = torch.randn(64, 4, 8, 8) * 5.49      # real SD VAE latents have a standard deviation of about this size
+    s = fit_scaling_factor(lat)
+    true(close(s, 0.182, 0.01), f"you got {float(s):.5f}; it should be about 0.182 (that is where 0.18215 comes from)")
+    true(abs((lat * s).std().item() - 1.0) < 0.01,
+         f"after multiplying by s the standard deviation should be about 1, it is {(lat * s).std().item():.3f}")
+--- hints
+- The overall standard deviation is `latents.std()`, computed over all elements at once.
+- Multiply something with standard deviation σ by 1/σ and its standard deviation becomes 1.
+- `.item()` turns a one-element tensor into a Python number: `return 1.0 / latents.std().item()`
+
+@@ item d7-09
+type: code
+title: Detecting posterior collapse
+level: 2
+cards: Posterior collapse: latent dimensions left unused; KL divergence: closed form and Monte Carlo
+targets: collapsed_dims
+ref: day7
+--- context
+Posterior collapse is the most common silent failure of a VAE: the loss goes down, but some latent dimensions are never used. One look at the KL per dimension during training reveals it.
+--- prompt
+Write `collapsed_dims(mu, logvar, thresh=0.01)`: return the number of collapsed dimensions (a Python int).
+
+- `mu` and `logvar` have shape `(B, D)`: B samples, D latent dimensions each.
+- Compute the KL of every element: `0.5 * (mu² + exp(logvar) − 1 − logvar)`, shape `(B, D)`.
+- Average over the batch to get the average KL of each dimension, shape `(D,)`.
+- A dimension whose average KL is below `thresh` has collapsed. Count them.
+
+You cannot use `kl_normal` here: it adds all dimensions together, and you need to look at each dimension separately.
+--- starter
+def collapsed_dims(mu, logvar, thresh=0.01):
+    """mu, logvar: (B, D). Return the number of dimensions whose average KL < thresh."""
+    raise todo()
+--- solution
+def collapsed_dims(mu, logvar, thresh=0.01):
+    per_dim = 0.5 * (mu ** 2 + logvar.exp() - 1 - logvar)   # (B, D)
+    return int((per_dim.mean(0) < thresh).sum())
+--- tests
+@check("posterior collapse detection")
+def t10():
+    B = 100
+    mu = torch.zeros(B, 4)
+    lv = torch.zeros(B, 4)
+    mu[:, 0] = torch.randn(B) * 2      # only dimension 0 is used
+    true(collapsed_dims(mu, lv) == 3,
+         f"only dimension 0 carries information, so 3 dimensions have collapsed; you found {collapsed_dims(mu, lv)}")
+    true(collapsed_dims(torch.randn(B, 4) * 2, torch.zeros(B, 4)) == 0,
+         "mu changes from sample to sample in all 4 dimensions (all carry information), so 0 have collapsed. "
+         "Did you compare with the threshold before averaging over the batch?")
+--- hints
+- `per_dim.mean(0)` averages over dimension 0 (the batch) and gives `(D,)`.
+- `(v < thresh)` is a True/False tensor; `.sum()` counts the Trues.
+- Wrap the result in `int(...)` so you return a Python int.
+
+@@ item d7-10
+type: fix
+title: Find the bugs: vae_step_buggy
+level: 2
+cards: The VAE loss: reconstruction + β·KL; Reparameterization: sampling that gradients can pass through
+targets: vae_step_buggy
+ref: day7
+--- context
+Bugs like these raise no error: the loss is still a number and training still runs; the model just learns the wrong thing. Checking code line by line against the formula is a basic ML engineering skill.
+--- prompt
+`vae_step_buggy(x, x_hat, mu, logvar, beta)` below should do two things:
+
+- Sample `z` with the reparameterization trick: `std = exp(0.5 * logvar)`, `z = mu + std * eps`.
+- Compute exactly the same total as `vae_loss`: recon and kl are both "summed per sample, then averaged over the batch", and `total = recon + beta * kl`.
+
+It has **3 bugs**. Find and fix them. Keep the function name and the return value `(loss, z)`.
+
+The check compares your loss with the correct `vae_loss` (already defined), then tests the standard deviation of the sampled `z`.
+--- starter
+def vae_step_buggy(x, x_hat, mu, logvar, beta=1.0):
+    std = torch.exp(logvar)
+    z = mu + std * torch.randn_like(std)
+    recon = F.mse_loss(x_hat, x, reduction="sum") / x.size(0)
+    kl = 0.5 * (mu ** 2 + torch.exp(logvar) - 1 - logvar).sum()
+    return recon - beta * kl, z
+--- solution
+def vae_step_buggy(x, x_hat, mu, logvar, beta=1.0):
+    std = torch.exp(0.5 * logvar)                                              # fix 1
+    z = mu + std * torch.randn_like(std)
+    recon = F.mse_loss(x_hat, x, reduction="sum") / x.size(0)
+    kl = 0.5 * (mu ** 2 + torch.exp(logvar) - 1 - logvar).sum() / x.size(0)   # fix 2
+    return recon + beta * kl, z                                                # fix 3
+--- tests
+@check("find the bugs: vae_step_buggy")
+def t11():
+    seed(3)
+    B = 8
+    x, x_hat = torch.randn(B, 3, 8, 8), torch.randn(B, 3, 8, 8)
+    mu, lv = torch.randn(B, 4) * 0.5, torch.randn(B, 4) * 0.5
+    loss, _ = vae_step_buggy(x, x_hat, mu, lv, beta=2.0)
+    tot, _, _ = vae_loss(x, x_hat, mu, lv, beta=2.0)
+    eq(loss, tot, tol=1e-3,
+       msg="the loss does not match vae_loss. Check two things: is kl averaged over the batch (divided by x.size(0))? Are recon and kl added or subtracted?")
+    n = 50000
+    z0 = torch.zeros(n, 1)
+    _, z = vae_step_buggy(z0, z0, torch.zeros(n, 2), torch.full((n, 2), math.log(9.0)))
+    true(abs(z.std().item() - 3.0) < 0.1,
+         f"the sampled z has standard deviation {z.std().item():.2f}; it should be 3 (logvar = log 9, variance 9, standard deviation 3). "
+         "Compute std as exp(0.5 * logvar)")
+--- hints
+- Compare with the reparameterization card: how should `std` be computed from `logvar`?
+- `recon` is divided by `x.size(0)` (the batch size). What about `kl`?
+- Both terms of the loss are costs (smaller is better). Should they be added or subtracted?
+
+@@ item d7-11
+type: predict
+title: Gradients through a direct sample
+level: 2
+cards: Reparameterization: sampling that gradients can pass through
+--- context
+A bug that raises no error: `torch.normal(mu, std)` backpropagates without complaint, but every gradient it sends back is 0. The model runs, and the encoder never learns anything.
+--- prompt
+Both parts sample from N(mu, std²) and then backpropagate. Write the two lines the program prints.
+--- code
+mu = torch.zeros(3, requires_grad=True)
+std = torch.ones(3, requires_grad=True)
+
+z = torch.normal(mu, std)          # sample directly
+z.sum().backward()
+print(mu.grad.tolist())
+
+mu.grad = None                     # clear the gradient from above
+z = mu + std * torch.randn(3)      # reparameterization
+z.sum().backward()
+print(mu.grad.tolist())
+--- explain
+The first line is `[0.0, 0.0, 0.0]`: PyTorch defines the gradient of `torch.normal` with respect to mean and std as 0; the sample is treated as a random number unrelated to the parameters. No error, but the encoder gets no signal.
+
+The second line is `[1.0, 1.0, 1.0]`: after reparameterization z = mu + std·eps, so the derivative of z with respect to each element of mu is 1.
+
+`torch.distributions` is the same: `.sample()` carries no gradient, only `.rsample()` does.
+--- hints
+- Second part: z = mu + std·eps. What is the derivative of z.sum() with respect to each element of mu?
+- First part: `torch.normal` raises no error, but PyTorch defines its gradient as 0.
+
+@@ item d7-12
+type: choice
+title: Why output logvar
+level: 1
+cards: The VAE: encode an image as a distribution
+--- context
+Almost every VAE encoder outputs logvar instead of the standard deviation or the variance. Interviewers often ask why.
+--- prompt
+The last layer of a VAE encoder is an ordinary conv, and its outputs can be positive or negative. Why does it output logvar (the log of the variance) and then compute the standard deviation with `std = exp(0.5 * logvar)`, instead of outputting std directly?
+--- options
+- logvar is faster to compute than std
+- The standard deviation must be greater than 0, but a conv can output negative numbers; logvar can be any real number, and its exp is always positive
+- The KL formula can only be written with logvar, not with std
+- std has no gradient, logvar does
+answer: 2
+--- explain
+A standard deviation must be positive. If the network output std directly, it could output a negative number or 0 at any time, and both sampling and taking a log would break. Outputting logvar removes that limit: logvar is any real number, and `exp(0.5 * logvar)` is always greater than 0.
+
+There is a second benefit: a variance can be as small as 0.0001 or as large as 100, but its log only ranges from −9.2 to 4.6, which is easier for a network to learn.
+
+The other claims are false: the KL formula can be written with std too (log σ² is just logvar), and std has a gradient like anything else.
+--- hints
+- Can a standard deviation be negative? Can the output of an ordinary conv layer?
+- What do exp(any real number) results have in common?
+
+@@ item d7-13
+type: choice
+title: β set too high
+level: 2
+cards: The VAE loss: reconstruction + β·KL; Posterior collapse: latent dimensions left unused
+--- context
+β is the hyperparameter people tune most in a VAE, and both directions have a cost. You should be able to tell from the symptoms what β is doing wrong.
+--- prompt
+A VAE trained with β = 1 reconstructs reasonably well. You change β to 50 and train again. What is most likely to happen?
+--- options
+- Sharper reconstructions, because the loss is larger and the gradients are stronger
+- The KL gets pushed very low, many latent dimensions collapse to the standard normal, and reconstructions get blurrier
+- Nothing changes: β is just a scale factor and does not affect the result
+- The KL gets very large and the latent space moves away from the standard normal
+answer: 2
+--- explain
+The larger β is, the more the KL term weighs in the loss. The cheapest move for the model is to set mu≈0 and logvar≈0 in many dimensions: exactly the standard normal, KL≈0. Those dimensions no longer carry any information about the image. That is posterior collapse. With less information, the decoder can only output a blurrier "average image".
+
+In the other direction, a small β gives sharper reconstructions, but the latent space does not look like a standard normal, so images decoded from random N(0, 1) samples get worse.
+--- hints
+- Which term is multiplied by β? When β grows, which term will the model try harder to shrink?
+- What is the smallest possible KL, and when is it reached? Does that dimension still carry information about the image then?
+
+@@ item d7-14
+type: choice
+title: Where scaling_factor goes
+level: 2
+cards: Latent space: compression ratio and scaling_factor
+--- context
+A common bug in latent diffusion code: the scaling factor is applied the wrong way round when encoding or decoding, or it is forgotten. Nothing raises an error; the generated images are just wrong.
+--- prompt
+In Stable Diffusion, `s = 0.18215`. Facts: the latents from `encode(x)` have a standard deviation of about 5.5; `decode` was trained on these unscaled latents; the diffusion model wants inputs with a standard deviation of about 1. Which pair is correct?
+--- options
+- Training the diffusion model: `z = encode(x) * s`; after generating: `img = decode(z / s)`
+- Training the diffusion model: `z = encode(x) * s`; after generating: `img = decode(z * s)`
+- Training the diffusion model: `z = encode(x) / s`; after generating: `img = decode(z * s)`
+- Training the diffusion model: `z = encode(x)`; after generating: `img = decode(z)`; s is only used to train the VAE
+answer: 1
+--- explain
+Multiplying by s: a standard deviation of 5.5 × 0.18215 ≈ 1, just right for the diffusion model. The z the diffusion model generates is on that same "standard deviation about 1" scale, but the decoder knows the original scale, so you divide by s before decoding.
+
+- Option 2 multiplies by s again before decoding: the decoder gets numbers about 30 times too small (1 / 0.18215² ≈ 30).
+- Option 3 scales the wrong way when encoding: the standard deviation becomes about 30.
+- Option 4 never scales: the diffusion model gets data with a standard deviation of about 5.5.
+
+In the diffusers library this is `latents * vae.config.scaling_factor` and `vae.decode(latents / vae.config.scaling_factor)`.
+--- hints
+- After encoding, the standard deviation must go from 5.5 to 1. Multiply by s or divide by s?
+- The decoder only knows unscaled latents, so the scaling must be undone before decoding.
+
+@@ item d7-15
+type: code
+title: Closed book: reparameterization
+level: 2
+exam: yes
+cards: Reparameterization: sampling that gradients can pass through
+targets: reparameterize
+ref: day7
+--- context
+Closed-book rewrite. Reparameterization is what makes a VAE trainable, and interviews often ask you to write it on the spot.
+--- prompt
+Without notes, write `reparameterize(mu, logvar)`: sample `z` (same shape as `mu`) from the normal distribution with mean `mu` and log-variance `logvar`, in a way that lets gradients reach `mu` and `logvar`.
+--- starter
+def reparameterize(mu, logvar):
+    raise todo()
+--- solution
+def reparameterize(mu, logvar):
+    std = torch.exp(0.5 * logvar)
+    return mu + std * torch.randn_like(std)
+--- tests
+@check("reparameterization")
+def t02():
+    seed(0)
+    mu = torch.zeros(20000, 3)
+    logvar = torch.full((20000, 3), math.log(4.0))    # variance 4 -> standard deviation 2
+    z = reparameterize(mu, logvar)
+    shape_is(z, mu.shape)
+    true(abs(z.mean().item()) < 0.05, f"the mean should be about 0 (mu is all zeros), it is {z.mean().item():.3f}")
+    true(abs(z.std().item() - 2.0) < 0.05,
+         f"the standard deviation should be about 2 (= exp(0.5 * log 4)), it is {z.std().item():.3f}. "
+         "With exp(logvar) you would get 4")
+    # gradients must reach mu and logvar
+    mu2 = torch.zeros(4, 3, requires_grad=True)
+    lv2 = torch.zeros(4, 3, requires_grad=True)
+    reparameterize(mu2, lv2).sum().backward()
+    true(mu2.grad is not None and lv2.grad is not None,
+         "no gradient reaches mu or logvar (grad is None): compute z directly from mu and std, without detach")
+    true(lv2.grad.abs().sum() > 0,
+         "the gradient of logvar is all zeros. torch.normal(mu, std) raises no error but its gradient is 0: write mu + std * eps")
+--- hints
+- How do you get the standard deviation from logvar? Remember σ = √(σ²).
+- Make the noise with `torch.randn_like(std)`, then `mu + std * eps`.
+
+@@ item d7-16
+type: code
+title: Closed book: closed-form KL
+level: 2
+exam: yes
+cards: KL divergence: closed form and Monte Carlo
+targets: kl_normal
+ref: day7
+--- context
+Closed-book rewrite. The closed-form KL between Gaussians is one of the most frequent VAE interview questions; you should get it right without notes.
+--- prompt
+Without notes, write `kl_normal(mu, logvar)`: return the KL divergence of N(mu, exp(logvar)) from N(0, 1). The input shape is `(B, ...)`; sum over all dimensions of each sample and return `(B,)`.
+--- starter
+def kl_normal(mu, logvar):
+    raise todo()
+--- solution
+def kl_normal(mu, logvar):
+    return 0.5 * (mu ** 2 + logvar.exp() - 1 - logvar).flatten(1).sum(1)
+--- tests
+@check("closed-form KL")
+def t03():
+    mu, lv = torch.zeros(2, 5), torch.zeros(2, 5)
+    eq(kl_normal(mu, lv), torch.zeros(2), msg="with mu=0 and logvar=0, q is N(0, 1), so the KL must be 0, with shape (B,)")
+    k = kl_normal(torch.ones(1, 1), torch.zeros(1, 1))
+    eq(k, torch.tensor([0.5]), msg="with mu=1 and logvar=0, KL = 0.5 × (1 + 1 − 1 − 0) = 0.5")
+    true((kl_normal(torch.randn(8, 4) * 3, torch.randn(8, 4)) >= 0).all(),
+         "the KL came out negative, which is impossible. Check the signs: mu² + exp(logvar) − 1 − logvar")
+
+@check("closed-form KL vs Monte Carlo")
+def t04():
+    seed(1)
+    mu = torch.tensor([[0.5, -1.0]])
+    lv = torch.tensor([[0.3, -0.7]])
+    closed = kl_normal(mu, lv)[0]
+
+    n = 400000
+    std = (0.5 * lv).exp()
+    z = mu + std * torch.randn(n, 2)
+    log_q = (-0.5 * ((z - mu) / std) ** 2 - lv * 0.5 - 0.5 * math.log(2 * math.pi)).sum(-1)
+    log_p = (-0.5 * z ** 2 - 0.5 * math.log(2 * math.pi)).sum(-1)
+    mc = (log_q - log_p).mean()
+    true(abs(closed.item() - mc.item()) < 0.02,
+         f"closed form {closed.item():.4f} vs Monte Carlo estimate {mc.item():.4f}: too far apart, the closed form is wrong")
+--- hints
+- For each dimension, compute one number from four terms: mu², exp(logvar), 1 and logvar, times 0.5.
+- Finish with `.flatten(1).sum(1)`: one number per sample.

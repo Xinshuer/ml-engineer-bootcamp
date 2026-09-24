@@ -3,31 +3,291 @@ title: 三条线在这里合流：音频 codec + LM
 part: 音频
 hours: 3–4 小时
 --- goal
-TODO: 一句话写今天学完能做什么。
+学完今天，你能把一段音频看成 codec 给出的 (n_q, T) 整数矩阵，算清它的码率和 token 数；用 delay pattern 把多个码本排成语言模型能一步一步预测的序列；再只改输入和输出，把 Day 4 的 GPT 变成一个能算 loss、能生成的音频语言模型。
 --- checklist
-- 先清空复习区
-- 读完知识卡片并改动运行
-- 练习区全部通过
+- 先清空复习区（昨天看过答案的题，从空白重做一遍）
+- 读完 8 张知识卡片，每张的代码都点「运行」，改一个数字再跑一次
+- 练习区全部通过，d13-11 的自评清单逐条用自己的话说一遍
+- 闭卷区从空白写出 build_delay 和 AudioLM
+
+@@ concept
+title: 神经 codec：音频变成整数矩阵
+--- body
+Day 11 说过，音频就是一长串采样点。24 kHz 的音频，一秒就是 24000 个浮点数。让语言模型一个一个预测这些浮点数，序列太长，也没法用「从词表里选下一个 token」的方式来学。
+
+神经音频 codec（EnCodec、SoundStream、DAC 都是）先把音频变成整数：
+
+1. encoder 把波形压成「帧」。EnCodec 24 kHz 版每 320 个采样点压成 1 帧，一秒就是 24000 / 320 = 75 帧，叫 frame_rate = 75。
+2. 每一帧用 n_q 个整数表示。每个整数是某一本「码本」（codebook：一张有 1024 行的向量表）里的行号，取值 0～1023。
+3. decoder 能把这些整数还原成波形。
+
+所以一段音频变成一个整数矩阵，形状是 (n_q, T)：每一行是一个码本，每一列是一个时间帧，T = int(秒数 × frame_rate)。加上 batch 就是 (B, n_q, T)。
+
+这 n_q 个码本不是平等的：码本 0 记下这一帧最粗的样子，码本 1 补上码本 0 没说准的部分，码本 2 再补码本 1 剩下的……（这叫残差量化。码本里的整数具体怎么挑，Day 14 再讲。）今天只要记住一句：**后面的码本依赖前面的码本**。
+
+### 码率：一秒多少比特
+
+一个码有 1024 种可能，存它要 log2(1024) = 10 比特。所以 bitrate = frame_rate × n_q × log2(codebook_size)。EnCodec 24 kHz 用 8 个码本时：75 × 8 × 10 = 6000 bps（6 kbps）。只用 2 个码本是 1500 bps，文件更小，音质也更差。
+
+### token 账：一秒多少个 token
+
+对语言模型来说，一个码就是一个 token：tokens_per_second = frame_rate × n_q。8 个码本时一秒是 600 个 token，10 秒就是 6000 个。而一秒钟的说话写成文字，也就四五个字。所以音频 LM 特别在意「一步能出几个码、一共要走多少步」。
+--- code
+frame_rate, n_q, K = 75, 8, 1024           # EnCodec 24 kHz：每秒 75 帧，8 个码本，每本 1024 行
+seconds = 2.0
+T = int(seconds * frame_rate)
+codes = torch.randint(0, K, (n_q, T))      # 假装这是 codec encoder 的输出
+print("codes:", tuple(codes.shape), codes.dtype)
+print("frame 0:", codes[:, 0].tolist())    # 一帧 = n_q 个整数
+print("bits per code:", math.log2(K))
+for nq in [2, 4, 8, 16]:
+    print(f"n_q={nq:2d}   bitrate={frame_rate * nq * math.log2(K):6.0f} bps   tokens/s={frame_rate * nq}")
+
+@@ concept
+title: delay pattern：每个码本多等一步
+--- body
+语言模型一步只往后走一格。可音频的每一帧有 n_q 个码，怎么排队？有三种办法：
+
+- **展平**：把 n_q × T 个码排成一条长队（帧 0 的 8 个码、帧 1 的 8 个码……）。最细致，但 10 秒音频要走 750 × 8 = 6000 步，太慢。
+- **并行**：每一步同时预测同一帧的 n_q 个码。只要 T 步，但码本 1 看不到同一帧码本 0 选了什么，而它明明依赖码本 0。
+- **delay pattern**（MusicGen 用的办法）：第 k 个码本整体往右挪 k 格，空出来的格子填 pad（占位用的特殊 id）。
+
+n_q = 3、T = 4 的例子（P 是 pad）：
+
+```
+原始 (n_q, T)          delay 之后 (n_q, T + n_q - 1)
+[1, 2, 3, 4]           [1, 2, 3, 4, P, P]
+[5, 6, 7, 8]     ->    [P, 5, 6, 7, 8, P]
+[9,10,11,12]           [P, P, 9,10,11,12]
+```
+
+新序列的每一列，模型一步同时生成。看第 2 列：3（码本 0 的帧 2）、6（码本 1 的帧 1）、9（码本 2 的帧 0）。生成 6 的时候，帧 1 的码本 0（也就是 2）在第 1 列，上一步已经生成好了，看得见。于是后面的码本总能看到同一帧前面的码本，代价只是多走 n_q − 1 步：一共 T + n_q − 1 步，而不是 n_q × T 步。
+
+还原（undo）反过来做：第 k 行从第 k 列开始，取 T 个，也就是 `delayed[:, k, k:k + T]`。往返必须一个码都不差，否则 codec 解出来的声音会错位。
+--- code
+codes = torch.tensor([[1, 2, 3, 4],
+                      [5, 6, 7, 8],
+                      [9, 10, 11, 12]])     # (n_q=3, T=4)
+n_q, T = codes.shape
+P = 0                                     # pad id
+delayed = torch.full((n_q, T + n_q - 1), P)
+delayed[0, 0:4] = codes[0]                # 码本 0：不挪
+delayed[1, 1:5] = codes[1]                # 码本 1：右移 1 格
+delayed[2, 2:6] = codes[2]                # 码本 2：右移 2 格
+print(delayed)
+print("row 1 back:", delayed[1, 1:1 + T].tolist())
+
+@@ concept
+title: 多码本嵌入：每本一张表，查完相加
+--- body
+GPT 每个位置只有 1 个 token，查 1 张表 wte，得到 (B, T, dim)。音频每个时间步有 n_q 个码，怎么变成一个向量？
+
+- 每个码本一张自己的 nn.Embedding(vocab, dim)。同样是 3，码本 0 的 3 和码本 1 的 3 是两个完全不同的码，不能共用一张表。
+- 第 k 个码本的码是 codes[:, k]，形状 (B, T)；查第 k 张表得到 (B, T, dim)。
+- n_q 个 (B, T, dim) 直接相加，还是 (B, T, dim)。形状和 GPT 的 wte(idx) 一模一样，后面的 Block 一行不用改。
+
+为什么相加不拼接？相加以后维度还是 dim；拼接会变成 n_q × dim，后面每一层都得跟着改。
+
+n_q 张表要放进 **nn.ModuleList**。放进普通 Python list 的话，PyTorch 看不到它们：parameters() 里没有，优化器不会更新它们，.to(device) 也不会搬它们。
+--- code
+torch.manual_seed(0)
+n_q, V, dim = 2, 10, 4
+tables = nn.ModuleList([nn.Embedding(V, dim) for _ in range(n_q)])
+codes = torch.tensor([[[3, 3, 7],
+                       [3, 1, 1]]])              # (B=1, n_q=2, T=3)
+e0 = tables[0](codes[:, 0])                      # 码本 0：(1, 3) -> (1, 3, 4)
+e1 = tables[1](codes[:, 1])                      # 码本 1：(1, 3) -> (1, 3, 4)
+x = e0 + e1
+print("codes[:, 0]:", tuple(codes[:, 0].shape), "-> e0:", tuple(e0.shape))
+print("x:", tuple(x.shape))
+print("same vector for id 3?", torch.equal(tables[0].weight[3], tables[1].weight[3]))
+print("params (ModuleList):", sum(p.numel() for p in tables.parameters()))
+
+class PlainList(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.tables = [nn.Embedding(V, dim) for _ in range(n_q)]   # 普通 list：PyTorch 看不见
+
+print("params (plain list):", sum(p.numel() for p in PlainList().parameters()))
+
+@@ concept
+title: n_q 个输出头：先 view 再 permute
+--- body
+GPT 最后的 lm_head 把 (B, T, dim) 变成 (B, T, V)：每个位置对词表里每个 token 打一个分数（logits：还没过 softmax 的原始分数）。音频每个时间步要预测 n_q 个码，每个码都要 V 个分数。
+
+最省事的写法是一个 nn.Linear(dim, n_q * V)，输出 (B, T, n_q·V)。每个时间步那一长条 n_q·V 个数里，前 V 个属于码本 0，接着 V 个属于码本 1，依此类推。变成 (B, n_q, T, V) 分两步：
+
+1. `.view(B, T, n_q, V)`：把每个时间步的一长条切成 n_q 段。数据顺序没动，只是换了个看法。
+2. `.permute(0, 2, 1, 3)`：交换 T 和 n_q 两个轴，得到 (B, n_q, T, V)。
+
+陷阱：直接 `.view(B, n_q, T, V)` 形状也对，也不报错，但内容全乱了：它按内存顺序把「前几个时间步的数」切出来当成了码本 0。**形状对不代表对。**
+
+还有一点：permute 以后张量在内存里不连续，之后再展平要用 .reshape，.view 会报错。
+--- code
+# 假装这是 Linear 的输出：B=1, T=3, n_q=2, V=2，每帧 n_q*V = 4 个数
+# 数字的百位 = 帧号，十位 = 码本号，个位 = 词表里的第几个
+y = torch.tensor([[[  0,   1,  10,  11],
+                   [100, 101, 110, 111],
+                   [200, 201, 210, 211]]])
+out = y.view(1, 3, 2, 2).permute(0, 2, 1, 3)    # (B, n_q, T, V)
+print("out:", tuple(out.shape))
+print("codebook 1, every frame:", out[0, 1].tolist())
+bad = y.view(1, 2, 3, 2)                         # 形状一样，内容错了
+print("bad 'codebook 1':", bad[0, 1].tolist())
+print("contiguous after permute?", out.is_contiguous())
+
+@@ concept
+title: 多码本 loss：展平 + ignore_index
+--- body
+logits 是 (B, n_q, T, V)，targets 是 (B, n_q, T)。F.cross_entropy 要的是 (N, V) 和 (N,)。所以把前三个轴全部展平：
+
+- `logits.reshape(-1, V)` 得到 (B·n_q·T, V)
+- `targets.reshape(-1)` 得到 (B·n_q·T,)
+
+这样所有码本、所有时间步的交叉熵一起取平均。
+
+**ignore_index**：delay pattern 补出来的 pad 不是真的码，不该算 loss。把这些位置的 target 设成 -100（F.cross_entropy 默认的 ignore_index），它们就不参与计算，取平均时也不算进分母。不排除的话，模型会花力气去学「预测 pad」，loss 看着在降，声音却没变好。
+
+一个好用的检查：随机初始化的模型对每个码的预测差不多是均匀的，loss 应该在 ln(V) 附近。V = 1024 时约 6.93。第一步的 loss 离这个数很远，先查初始化和展平有没有写错。
+--- code
+torch.manual_seed(0)
+B, n_q, T, V = 1, 2, 3, 5
+logits = torch.randn(B, n_q, T, V) * 0.01   # 都接近 0：刚初始化的模型差不多就是这样
+targets = torch.tensor([[[1, 2, -100],
+                         [-100, 4, 0]]])    # delay 之后的 (n_q=2, T=2)，pad 位置写成 -100
+flat_logits = logits.reshape(-1, V)
+flat_targets = targets.reshape(-1)
+print(tuple(flat_logits.shape), tuple(flat_targets.shape))
+loss = F.cross_entropy(flat_logits, flat_targets, ignore_index=-100)
+keep = flat_targets != -100                   # 手动去掉 pad 再算一遍
+manual = F.cross_entropy(flat_logits[keep], flat_targets[keep])
+print(round(loss.item(), 4), round(manual.item(), 4))
+print("ln(V) =", round(math.log(V), 4))
+
+@@ concept
+title: AudioLM：Day 4 的 GPT 换了头和尾
+ref: day13
+--- body
+把 Day 4 的 GPT 和今天的音频 LM 并排放：
+
+- GPT：idx (B, T) → wte + wpe → n 个 Block → ln_f → lm_head → (B, T, V)
+- AudioLM：codes (B, n_q, T) → CodeEmbedding（n_q 张表相加）+ pos → n 个 Block → ln_f → MultiHead → (B, n_q, T, V)
+
+只有头（输入层）和尾（输出层）换了，中间的 Block 一行没改。今天题目的隐藏准备代码里已经放好了 Block，直接写 `Block(dim, n_head)` 就能用。它就是 Day 4 的 pre-LN Block，只是把 attention 和 MLP 写进了一个类，attention 用的是 `F.scaled_dot_product_attention(..., is_causal=True)`：
+
+```
+class Block(nn.Module):
+    def __init__(self, dim, n_head):
+        super().__init__()
+        self.ln1, self.ln2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+        self.n_head = n_head
+
+    def forward(self, x):
+        B, T, C = x.shape
+        h = self.ln1(x)
+        q, k, v = self.qkv(h).split(C, dim=-1)
+        q, k, v = (t.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) for t in (q, k, v))
+        a = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        x = x + self.proj(a.transpose(1, 2).reshape(B, T, C))
+        return x + self.mlp(self.ln2(x))
+```
+
+组装时注意三点：
+
+- 位置嵌入按时间步算：`self.pos(torch.arange(T, device=codes.device))` 是 (T, dim)，加到 (B, T, dim) 上会自动广播。T 是 codes 的最后一维。
+- 因果性由 Block 里的 is_causal=True 保证：第 t 步的输出只看第 0 到 t 步。改了后面的码，前面的预测不会变。
+- 文本 LLM 和音频 LM 的差别，只在「进」（token 怎么变成向量）和「出」（向量怎么变成 logits）。
+--- code
+torch.manual_seed(0)
+blk = Block(64, 4)                        # 隐藏准备代码里的 Block
+x = torch.randn(1, 6, 64)
+x2 = x.clone()
+x2[:, 3:] = torch.randn(1, 3, 64)         # 只改第 3、4、5 步
+y, y2 = blk(x), blk(x2)
+print("shape:", tuple(y.shape))
+print("steps 0-2 unchanged:", torch.allclose(y[:, :3], y2[:, :3], atol=1e-5))
+print("steps 3-5 unchanged:", torch.allclose(y[:, 3:], y2[:, 3:], atol=1e-5))
+print("params per Block:", sum(p.numel() for p in blk.parameters()))
+
+@@ concept
+title: 文本条件：cross-attention 又来了
+--- body
+「文生音」模型（比如 MusicGen：输入「欢快的钢琴曲」，输出一段音乐）要让音频听文字描述的话。办法和 Day 9 的文生图一模一样：cross-attention。
+
+- Q 来自正在生成的音频：`audio_h @ wq`，audio_h 是 (B, Ta, C)
+- K、V 来自文本编码器的输出：`text_emb @ wk`、`text_emb @ wv`，text_emb 是 (B, Tt, C)
+- 拆成多头：(B, T, C) → `.view(B, T, n_head, hd)` → `.transpose(1, 2)` → (B, n_head, T, hd)，其中 hd = C // n_head。Q 用 Ta，K、V 用 Tt。
+- `F.scaled_dot_product_attention(q, k, v)`，**不加** causal mask：文本一开始就全部给定，每个音频位置都可以看全部文本。
+- 合并多头：`.transpose(1, 2)` → `.reshape(B, Ta, C)`
+
+输出的长度跟着 Q（音频）走，是 (B, Ta, C)；文本多长都行。注意力权重是 (B, n_head, Ta, Tt)：每个音频位置在 Tt 个文本 token 上分配注意力，每一行加起来是 1。在真实模型里，这一层插在每个 Block 的 self-attention 和 MLP 之间，同样是 pre-LN 加残差。
+--- code
+torch.manual_seed(0)
+B, Ta, Tt, C, n_head = 1, 6, 3, 8, 2
+hd = C // n_head
+audio_h = torch.randn(B, Ta, C)
+text_emb = torch.randn(B, Tt, C)
+# 为了短，这里省掉了 wq / wk 投影
+q = audio_h.view(B, Ta, n_head, hd).transpose(1, 2)     # (1, 2, 6, 4)
+k = text_emb.view(B, Tt, n_head, hd).transpose(1, 2)    # (1, 2, 3, 4)
+att = (q @ k.transpose(-2, -1) / math.sqrt(hd)).softmax(-1)
+print("q:", tuple(q.shape), " k:", tuple(k.shape))
+print("attention weights:", tuple(att.shape))           # 每个音频位置 × 3 个文本 token
+print("row sums:", att[0, 0].sum(-1))
+
+@@ concept
+title: 生成：每一步同时吐出 n_q 个码
+--- body
+生成和 Day 4 的贪心生成是同一个循环，只是每一步出来的是 n_q 个码：
+
+1. `logits = model(seq)`：seq 是 (1, n_q, T)，logits 是 (1, n_q, T, V)
+2. 只要最后一个时间步：`logits[:, :, -1]` 得到 (1, n_q, V)
+3. 每个码本各取分数最高的：`.argmax(-1)` 得到 (1, n_q)
+4. 补一个时间轴：`.unsqueeze(-1)` 得到 (1, n_q, 1)，再在最后一维 `torch.cat` 到 seq 末尾
+
+重复 n_new 次，得到 (1, n_q, T0 + n_new)。
+
+- 用 `@torch.no_grad()` 和 `model.eval()`：生成不需要梯度，省内存也更快。
+- argmax 是贪心，同样的输入每次结果一样。真实系统会用温度和 top-k 采样（Day 5）。
+- 这里每一步都把整个序列重新算一遍，简单但慢。真实系统用 KV cache（Day 5）。
+- 如果训练时用了 delay pattern，生成出来的是错开的序列：先 undo_delay 对齐，再交给 codec 的 decoder 变回波形。
+--- code
+torch.manual_seed(0)
+seq = torch.randint(0, 50, (1, 4, 5))          # (1, n_q=4, T=5)
+logits = torch.randn(1, 4, 5, 50)              # 假装这是 model(seq) 的输出
+last = logits[:, :, -1]
+nxt = last.argmax(-1)
+print("last:", tuple(last.shape))
+print("next codes:", tuple(nxt.shape), nxt.tolist())
+seq = torch.cat([seq, nxt.unsqueeze(-1)], dim=-1)
+print("seq:", tuple(seq.shape))
 
 @@ item d13-01
 type: code
 title: codec 码率
-level: 2
+level: 1
+cards: 神经 codec：音频变成整数矩阵
 targets: codec_bitrate, tokens_per_second
 ref: day13
 --- context
-TODO
+选 codec 时，码率决定音质和文件大小，token 数决定语言模型的上下文能装几秒、生成要走多少步。「EnCodec 一秒音频是多少个 token」是面试里常见的估算题。
 --- prompt
-01  码率账 —— 音频"一秒钟等于多少 token"
+写两个函数：
+
+- `codec_bitrate(frame_rate, n_q, codebook_size)`：一秒音频要多少比特。公式是 frame_rate × n_q × log2(codebook_size)。
+- `tokens_per_second(frame_rate, n_q)`：在语言模型眼里，一秒音频是多少个 token（一个码 = 一个 token）。
+
+例子：EnCodec 24 kHz，frame_rate = 75，n_q = 8，codebook_size = 1024，码率是 6000.0 bps，一秒是 600 个 token。
 --- starter
 def codec_bitrate(frame_rate, n_q, codebook_size):
     """每秒比特数 = frame_rate * n_q * log2(codebook_size)"""
-    # --- TODO 01 ---
     raise todo()
 
 def tokens_per_second(frame_rate, n_q):
-    """LM 视角: 一秒音频等于多少个 token。"""
-    # --- TODO 01b ---
+    """LM 视角：一秒音频等于多少个 token。"""
     raise todo()
 --- solution
 def codec_bitrate(frame_rate, n_q, codebook_size):
@@ -39,27 +299,34 @@ def tokens_per_second(frame_rate, n_q):
 @check("codec 码率")
 def t01():
     # EnCodec 24kHz: 75 帧/秒, 8 个码本, 每本 1024
-    true(close(codec_bitrate(75, 8, 1024), 6000.0), f"应为 6000 bps, 你算出 {codec_bitrate(75, 8, 1024)}")
+    true(close(codec_bitrate(75, 8, 1024), 6000.0),
+         f"应为 6000 bps，你算出 {codec_bitrate(75, 8, 1024)}。提示：log2(1024) = 10")
     true(tokens_per_second(75, 8) == 600,
-         "一秒音频 = 600 个 token。对比一下：一秒说话大约 3 个汉字。"
-         "这就是音频 LM 上下文吃紧的原因")
+         f"tokens_per_second(75, 8) 应为 600，你算出 {tokens_per_second(75, 8)}。"
+         "一秒音频 = 600 个 token，而一秒说话写成文字只有四五个字，这就是音频 LM 上下文吃紧的原因")
 --- hints
-- TODO
+- 一个码有 K 种可能，存它要 log2(K) 比特。math.log2 可以直接用。
+- 一秒有 frame_rate 帧，每帧 n_q 个码。码率 = 码的个数 × 每个码的比特数；token 数就是码的个数。
+- `return frame_rate * n_q * math.log2(codebook_size)`；token 数把最后那个乘数去掉。
 
 @@ item d13-02
 type: code
 title: codes 的形状
-level: 2
+level: 1
+cards: 神经 codec：音频变成整数矩阵
 targets: code_shape
 ref: day13
 --- context
-TODO
+数据管线的第一件事就是算形状：几秒音频、几帧、几个码本。这里算错，后面的 batch、padding、位置嵌入的长度全都会跟着错。
 --- prompt
-02  离散码的形状
+写 `code_shape(seconds, frame_rate, n_q)`，返回一段音频经过 codec 以后，码矩阵的形状：一个 tuple `(n_q, T)`，其中 T = int(seconds × frame_rate)。
+
+例子：2 秒、每秒 75 帧、8 个码本，返回 (8, 150)。
+
+注意返回的是 Python 的 tuple，不是 tensor。
 --- starter
 def code_shape(seconds, frame_rate, n_q):
     """返回 (n_q, T) 这个 tuple，T = int(seconds * frame_rate)。"""
-    # --- TODO 02 ---
     raise todo()
 --- solution
 def code_shape(seconds, frame_rate, n_q):
@@ -67,28 +334,42 @@ def code_shape(seconds, frame_rate, n_q):
 --- tests
 @check("codes 的形状")
 def t02():
-    true(code_shape(2.0, 75, 8) == (8, 150))
-    true(code_shape(0.5, 50, 4) == (4, 25))
+    true(code_shape(2.0, 75, 8) == (8, 150),
+         f"2 秒、75 帧/秒、8 个码本应为 (8, 150)，你返回 {code_shape(2.0, 75, 8)!r}。行是码本，列是帧")
+    true(code_shape(0.5, 50, 4) == (4, 25),
+         f"0.5 秒、50 帧/秒、4 个码本应为 (4, 25)，你返回 {code_shape(0.5, 50, 4)!r}。T 要用 int(...) 取整")
 --- hints
-- TODO
+- 行是码本（n_q 行），列是时间帧（T 列）。
+- T = int(seconds * frame_rate)，然后 `return (n_q, T)`。
 
 @@ item d13-03
 type: code
 title: 构造 delay pattern
 level: 2
+cards: delay pattern：每个码本多等一步
 targets: build_delay
 ref: day13
 --- context
-TODO
+MusicGen 这类模型用 delay pattern 训练多码本 LM：只多走 n_q − 1 步，就让后面的码本看得到前面码本的结果。数据预处理里这一步写错，模型学到的就是错位的声音。
 --- prompt
-03  delay pattern：多码本自回归的关键技巧
+写 `build_delay(codes, pad_id)`：
+
+- 输入 codes：(B, n_q, T) 的整数 tensor
+- 输出：(B, n_q, T + n_q − 1)。先全部填 pad_id，再把第 k 个码本整体往右挪 k 格：它的 T 个码放在第 k 列到第 k + T − 1 列
+- 输出的 dtype 和 device 要和输入一样
+
+例子（B = 1，n_q = 2，T = 3，pad_id = 0）：
+
+```
+[[1, 2, 3],        [[1, 2, 3, 0],
+ [4, 5, 6]]   ->    [0, 4, 5, 6]]
+```
 --- starter
 def build_delay(codes, pad_id):
     """codes: (B, n_q, T) -> (B, n_q, T + n_q - 1)
     第 k 个码本整体右移 k 步，空出来的位置填 pad_id。
     这样第 t 步预测时，第 k 个码本能看到第 k-1 个码本同一帧的结果。
     """
-    # --- TODO 03 ---
     raise todo()
 --- solution
 def build_delay(codes, pad_id):
@@ -106,22 +387,30 @@ def t03():
     eq(d[0, 0], torch.tensor([1, 2, 3, 0]), msg="第 0 个码本不移动，尾部补 pad")
     eq(d[0, 1], torch.tensor([0, 4, 5, 6]), msg="第 1 个码本右移 1 步，头部补 pad")
 --- hints
-- TODO
+- 先造一个全是 pad 的结果：`torch.full((B, n_q, T + n_q - 1), pad_id, dtype=codes.dtype, device=codes.device)`。
+- 对每个 k 循环，把 codes[:, k]（形状 (B, T)）写进结果的第 k 行、从第 k 列开始的 T 格。
+- `out[:, k, k:k + T] = codes[:, k]`
 
 @@ item d13-04
 type: code
 title: delay pattern 往返
 level: 2
+cards: delay pattern：每个码本多等一步
 targets: undo_delay
 ref: day13
 --- context
-TODO
+模型生成的是错开的序列，codec 的 decoder 要的是对齐的 (n_q, T)。undo 必须和 build 严丝合缝，错一格，声音就错位、发糊。往返测试（先变过去再变回来，必须一模一样）是检查这类变换最可靠的办法。
 --- prompt
-04  还原 delay —— 往返必须无损
+写 `undo_delay(delayed, T)`，它是 build_delay 的逆操作：
+
+- 输入 delayed：(B, n_q, T + n_q − 1)
+- 输出：(B, n_q, T)。第 k 行从第 k 列开始，取 T 个
+- 要求：对任何 codes，`undo_delay(build_delay(codes, pad_id), T)` 和 codes 完全相等
+
+build_delay 已经在隐藏的准备代码里（参考实现），检查会用它来做往返。
 --- starter
 def undo_delay(delayed, T):
-    """build_delay 的逆操作: (B, n_q, T + n_q - 1) -> (B, n_q, T)"""
-    # --- TODO 04 ---
+    """build_delay 的逆操作：(B, n_q, T + n_q - 1) -> (B, n_q, T)"""
     raise todo()
 --- solution
 def undo_delay(delayed, T):
@@ -135,18 +424,27 @@ def t04():
         c = torch.randint(1, 100, (3, n_q, 20))
         eq(undo_delay(build_delay(c, 0), 20), c, msg=f"n_q={n_q} 时往返不一致")
 --- hints
-- TODO
+- n_q 可以从 delayed.size(1) 拿到。
+- 每个码本取出来是 (B, T)。把 n_q 个这样的 tensor 在 dim=1 上 torch.stack，就是 (B, n_q, T)。
+- `torch.stack([delayed[:, k, k:k + T] for k in range(n_q)], dim=1)`
 
 @@ item d13-05
 type: code
 title: 多码本嵌入求和
 level: 2
+cards: 多码本嵌入：每本一张表，查完相加
 targets: CodeEmbedding
 ref: day13
 --- context
-TODO
+音频 LM 的输入每一步有 n_q 个码。每个码本各查一张表再相加，就得到和文本 token 一样的 (B, T, dim)，后面的 Transformer 一行不用改。MusicGen 的输入层就是这么做的。
 --- prompt
-05  多码本嵌入：n_q 张表求和
+写 `CodeEmbedding(n_q, vocab, dim)`：
+
+- `__init__`：n_q 张独立的 `nn.Embedding(vocab, dim)`，放进 nn.ModuleList
+- `forward(codes)`：codes 是 (B, n_q, T)。第 k 个码本用第 k 张表查 codes[:, k]，得到 n_q 个 (B, T, dim)，全部相加，返回 (B, T, dim)
+- 参数量应该正好是 n_q × vocab × dim
+
+检查会逐个改动每个码本的码：改了哪个码本，输出都必须跟着变（说明每张表都用上了）。
 --- starter
 class CodeEmbedding(nn.Module):
     """n_q 个 nn.Embedding(vocab, dim)，forward(codes) 把每个码本查表后**相加**。
@@ -155,7 +453,9 @@ class CodeEmbedding(nn.Module):
 
     def __init__(self, n_q, vocab, dim):
         super().__init__()
-        # --- TODO 05 ---
+        raise todo()
+
+    def forward(self, codes):
         raise todo()
 --- solution
 class CodeEmbedding(nn.Module):
@@ -173,32 +473,45 @@ def t05():
     codes = torch.randint(0, 50, (2, 4, 9))
     out = m(codes)
     shape_is(out, (2, 9, 32))
-    true(params(m) == 4 * 50 * 32, f"应该是 4 张独立的表: {params(m)}")
+    true(params(m) == 4 * 50 * 32,
+         f"参数量是 {params(m)}，应为 4 × 50 × 32 = 6400（4 张独立的表）。"
+         "如果是 0：你把表放进了普通 list，要用 nn.ModuleList")
     # 换掉任意一个码本的内容，输出都必须变
     for k in range(4):
         c2 = codes.clone()
         c2[:, k] = (c2[:, k] + 1) % 50
         true(not torch.allclose(m(c2), out), f"改了第 {k} 个码本输出没变 —— 那张表没用上")
 --- hints
-- TODO
+- `self.tables = nn.ModuleList([nn.Embedding(vocab, dim) for _ in range(n_q)])`
+- codes[:, k] 的形状是 (B, T)，喂给第 k 张表得到 (B, T, dim)。
+- forward 一行：`return sum(tab(codes[:, k]) for k, tab in enumerate(self.tables))`
 
 @@ item d13-06
 type: code
 title: n_q 个输出头
 level: 2
+cards: n_q 个输出头：先 view 再 permute
 targets: MultiHead
 ref: day13
 --- context
-TODO
+每个时间步要同时给 n_q 个码本打分。一个大 Linear 再切开，只做一次矩阵乘法，比 n_q 个小 Linear 快。但切法错了不会报错，loss 也会降，只是模型学不好，这是最难查的一类 bug。
 --- prompt
-06  n_q 个输出头
+写 `MultiHead(dim, n_q, vocab)`：
+
+- `__init__`：只用**一个** `nn.Linear(dim, n_q * vocab)`
+- `forward(h)`：h 是 (B, T, dim)。过 Linear 得到 (B, T, n_q·vocab)，再变成 (B, n_q, T, vocab)
+- 每个时间步那 n_q·vocab 个数里，第 k 段（第 k·vocab 到第 (k+1)·vocab − 1 个）是码本 k 的 logits
+
+检查不只看形状，还会核对 out[:, k, t] 是不是真的来自第 t 帧的第 k 段。
 --- starter
 class MultiHead(nn.Module):
-    """一个 Linear(dim, n_q * vocab)，输出 reshape 成 (B, n_q, T, vocab)。"""
+    """一个 Linear(dim, n_q * vocab)，输出变成 (B, n_q, T, vocab)。"""
 
     def __init__(self, dim, n_q, vocab):
         super().__init__()
-        # --- TODO 06 ---
+        raise todo()
+
+    def forward(self, h):
         raise todo()
 --- solution
 class MultiHead(nn.Module):
@@ -214,26 +527,43 @@ class MultiHead(nn.Module):
 @check("n_q 个输出头")
 def t06():
     m = MultiHead(32, 4, 50)
-    shape_is(m(torch.randn(2, 9, 32)), (2, 4, 9, 50))
+    h = torch.randn(2, 9, 32)
+    out = m(h)
+    shape_is(out, (2, 4, 9, 50))
+    lins = [x for x in m.modules() if isinstance(x, nn.Linear)]
+    true(len(lins) == 1 and lins[0].out_features == 4 * 50, "要求只用一个 nn.Linear(dim, n_q * vocab)")
+    y = lins[0](h)                                     # (2, 9, 200)：每帧 200 个数，每 50 个一段
+    want = torch.stack([y[:, :, k * 50:(k + 1) * 50] for k in range(4)], dim=1)   # (2, 4, 9, 50)
+    eq(out, want,
+       msg="形状对了，内容不对：out[:, k, t] 应该是第 t 帧里第 k 段的 50 个数。"
+           "直接 view 成 (B, n_q, T, V) 会把时间和码本搅在一起，要先 view(B, T, n_q, V) 再 permute(0, 2, 1, 3)")
 --- hints
-- TODO
+- 在 `__init__` 里记下 n_q 和 vocab（比如 `self.n_q, self.vocab = n_q, vocab`），forward 要用。
+- 先 `.view(B, T, self.n_q, self.vocab)`，再把 T 和 n_q 两个轴换位置。
+- `return self.lin(h).view(B, T, self.n_q, self.vocab).permute(0, 2, 1, 3)`
 
 @@ item d13-07
 type: code
 title: 多码本 loss
 level: 2
+cards: 多码本 loss：展平 + ignore_index
 targets: codebook_loss
 ref: day13
 --- context
-TODO
+多码本 LM 的 loss 就是所有码本、所有时间步的交叉熵取平均。delay pattern 补出来的 pad 不是真数据，要用 ignore_index 排除，不然模型会去学「预测 pad」，loss 降了，声音没变好。
 --- prompt
-07  多码本的 loss
+写 `codebook_loss(logits, targets, ignore_index=-100)`：
+
+- logits 是 (B, n_q, T, V)，targets 是 (B, n_q, T) 的整数
+- 展平成 (B·n_q·T, V) 和 (B·n_q·T,)，调用 F.cross_entropy，并把 ignore_index 传进去
+- 返回一个标量（0 维 tensor）
+
+target 等于 ignore_index 的位置，不参与 loss，也不算进平均的分母。
 --- starter
 def codebook_loss(logits, targets, ignore_index=-100):
     """logits: (B, n_q, T, V)   targets: (B, n_q, T)
     对所有码本一起算交叉熵（先展平成 (B*n_q*T, V)），ignore_index 用于跳过 delay 补出来的位置。
     """
-    # --- TODO 07 ---
     raise todo()
 --- solution
 def codebook_loss(logits, targets, ignore_index=-100):
@@ -253,24 +583,37 @@ def t07():
     ref2 = F.cross_entropy(logits[:, :, 1:].reshape(-1, 50), tgt[:, :, 1:].reshape(-1))
     eq(codebook_loss(logits, tgt2), ref2, msg="ignore_index 没生效")
 --- hints
-- TODO
+- 词表大小 V = logits.size(-1)。
+- 用 .reshape 而不是 .view：从 MultiHead 出来的 logits 经过了 permute，内存不连续，.view 会报错。
+- `return F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1), ignore_index=ignore_index)`
 
 @@ item d13-08
 type: code
 title: AudioLM 前向
-level: 2
+level: 3
+cards: AudioLM：Day 4 的 GPT 换了头和尾; 多码本嵌入：每本一张表，查完相加; n_q 个输出头：先 view 再 permute
 targets: AudioLM
 ref: day13
 --- context
-TODO
+这是今天的核心：一个音频语言模型，就是 Day 4 的 GPT 换掉输入层和输出层。能说清「哪些变了、哪些没变」，面试里聊 MusicGen 这类模型就有底了。
 --- prompt
-08  完整的 audio LM —— 就是 Day 4 的 GPT 换了输入输出
+写 `AudioLM(n_q=4, vocab=50, dim=64, n_layer=2, n_head=4, max_len=256)`：
+
+- `self.emb = CodeEmbedding(n_q, vocab, dim)`
+- `self.pos = nn.Embedding(max_len, dim)`
+- `self.h`：nn.ModuleList，里面是 n_layer 个 `Block(dim, n_head)`
+- `self.ln_f = nn.LayerNorm(dim)`
+- `self.head = MultiHead(dim, n_q, vocab)`
+
+`forward(codes)`：codes 是 (B, n_q, T)。嵌入 + 位置嵌入 → 依次过每个 Block → ln_f → head，返回 (B, n_q, T, vocab)。
+
+CodeEmbedding、MultiHead、Block 都已经在隐藏的准备代码里（参考实现），直接用。检查会看三件事：输出形状；因果性（改了后面的码，前面的预测不变）；随机初始化时 loss 在 ln(50) ≈ 3.91 附近。
 --- starter
 class AudioLM(nn.Module):
     """结构:
         emb  = CodeEmbedding(n_q, vocab, dim)
         pos  = nn.Embedding(max_len, dim)
-        h    = n_layer 个 Block(dim, n_head)     <-- 顶部给出的那个，一个字没改
+        h    = n_layer 个 Block(dim, n_head)     <-- 就是 Day 4 的 Block，一个字没改
         ln_f = LayerNorm(dim)
         head = MultiHead(dim, n_q, vocab)
     forward(codes) -> (B, n_q, T, vocab)
@@ -278,7 +621,9 @@ class AudioLM(nn.Module):
 
     def __init__(self, n_q=4, vocab=50, dim=64, n_layer=2, n_head=4, max_len=256):
         super().__init__()
-        # --- TODO 08 ---
+        raise todo()
+
+    def forward(self, codes):
         raise todo()
 --- solution
 class AudioLM(nn.Module):
@@ -308,31 +653,39 @@ def t08():
     c2 = codes.clone()
     c2[:, :, 8:] = torch.randint(0, 50, (2, 4, 8))
     eq(m(codes)[:, :, :8], m(c2)[:, :, :8], tol=1e-4,
-       msg="因果性挂了 —— Block 里的 is_causal 是不是丢了？")
+       msg="因果性挂了 —— 前面的预测被后面的码影响了。Block 要用准备代码里的那个（带 is_causal=True）")
     # 初始 loss 应该在 ln(V) 附近
     loss = codebook_loss(out, codes)
     true(abs(loss.item() - math.log(50)) < 1.5,
          f"初始 loss={loss.item():.2f}, 应该在 ln(50)={math.log(50):.2f} 附近")
 --- hints
-- TODO
+- 位置：`T = codes.size(-1)`，`self.pos(torch.arange(T, device=codes.device))` 是 (T, dim)，加到 (B, T, dim) 上会自动广播。
+- forward 就几行：`x = self.emb(codes) + 位置嵌入`；`for b in self.h: x = b(x)`；`return self.head(self.ln_f(x))`。
+- 对照 Day 4 GPT 的 forward 写：wte 换成 self.emb，lm_head 换成 self.head，其余照抄。
 
 @@ item d13-09
 type: code
 title: 文本条件 cross-attn
 level: 2
+cards: 文本条件：cross-attention 又来了
 targets: text_cross_attn
 ref: day13
 --- context
-TODO
+「文生音」模型（比如 MusicGen）要让音频听文字描述的话，做法和文生图一样：cross-attention，Q 来自音频，K、V 来自文本。同一段代码在 LLM、图像、音频里反复出现。
 --- prompt
-09  文本条件：和 Day 9 的 cross-attn 一模一样
+写 `text_cross_attn(audio_h, text_emb, wq, wk, wv, n_head)`：
+
+- audio_h 是 (B, Ta, C)：音频的隐藏状态。text_emb 是 (B, Tt, C)：文本编码器的输出。Ta 和 Tt 没有关系。
+- wq、wk、wv 都是 (C, C) 的矩阵：q = audio_h @ wq，k = text_emb @ wk，v = text_emb @ wv
+- 拆成 n_head 个头（hd = C // n_head），用 F.scaled_dot_product_attention，**不加** causal mask
+- 合并多头，返回 (B, Ta, C)
+
+对照一下 Day 9 的 cross_attention：除了变量名，代码完全一样。
 --- starter
 def text_cross_attn(audio_h, text_emb, wq, wk, wv, n_head):
     """audio_h: (B, Ta, C)   text_emb: (B, Tt, C)
     Q 来自音频，KV 来自文本。返回 (B, Ta, C)。
-    对照一下 Day 9 的 cross_attention —— 除了变量名，代码完全一样。
     """
-    # --- TODO 09 ---
     raise todo()
 --- solution
 def text_cross_attn(audio_h, text_emb, wq, wk, wv, n_head):
@@ -359,18 +712,28 @@ def t09():
     ref = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, Ta, C)
     eq(out, ref, tol=1e-4)
 --- hints
-- TODO
+- 拆头：(B, T, C) → `.view(B, T, n_head, hd)` → `.transpose(1, 2)` → (B, n_head, T, hd)。q 用 Ta，k 和 v 用 Tt。
+- SDPA 的输出是 (B, n_head, Ta, hd)：`.transpose(1, 2)` 回到 (B, Ta, n_head, hd)，再 `.reshape(B, Ta, C)`。
+- 文本一开始就全部给定，每个音频位置都能看全部文本，所以不要 is_causal=True。
 
 @@ item d13-10
 type: code
 title: 多码本生成
 level: 2
+cards: 生成：每一步同时吐出 n_q 个码
 targets: generate_codes
 ref: day13
 --- context
-TODO
+训练好的音频 LM 就靠这个循环出声：每一步同时出 n_q 个码，拼回序列再喂进去。形状在循环里每一步都在变，最容易出错的地方是取错轴、拼错维度。
 --- prompt
-10  生成一步：n_q 个码本同时采
+写 `generate_codes(model, prompt, n_new, vocab)`，做贪心生成：
+
+- prompt 是 (1, n_q, T0)，已有的码。model(seq) 返回 (1, n_q, T, vocab)
+- 循环 n_new 次：取最后一个时间步的 logits (1, n_q, vocab) → 每个码本各取 argmax，得到 (1, n_q) → 拼到序列末尾
+- 返回 (1, n_q, T0 + n_new)，前 T0 个时间步就是 prompt，原样不动
+- 函数上面的 `@torch.no_grad()` 保留
+
+检查用的 model 是参考实现的 AudioLM。参数 vocab 这题用不上，留在签名里就行。
 --- starter
 @torch.no_grad()
 def generate_codes(model, prompt, n_new, vocab):
@@ -381,7 +744,6 @@ def generate_codes(model, prompt, n_new, vocab):
         4) 拼到序列末尾
     返回 (1, n_q, T0 + n_new)。
     """
-    # --- TODO 10 ---
     raise todo()
 --- solution
 @torch.no_grad()
@@ -401,23 +763,233 @@ def t10():
     out = generate_codes(m, p, 5, 50)
     shape_is(out, (1, 4, 11))
     eq(out[:, :, :6], p, msg="前缀被改了")
-    true(out.dtype == torch.long and out.max() < 50 and out.min() >= 0)
+    true(out.dtype == torch.long and out.max() < 50 and out.min() >= 0,
+         f"生成的码应该是 0～49 的整数（torch.long），你的 dtype 是 {out.dtype}")
     eq(out, generate_codes(m, p, 5, 50), msg="贪心生成必须确定性")
 --- hints
-- TODO
+- `logits[:, :, -1]` 取最后一个时间步，得到 (1, n_q, vocab)。
+- `.argmax(-1)` 得到 (1, n_q)；再 `.unsqueeze(-1)` 变成 (1, n_q, 1)，才能在 dim=-1 上 torch.cat。
+- 循环体两行：`nxt = model(seq)[:, :, -1].argmax(-1)`，然后 `seq = torch.cat([seq, nxt.unsqueeze(-1)], dim=-1)`。
 
 @@ item d13-11
 type: self
 title: 三线合流（自评）
 level: 1
+cards: AudioLM：Day 4 的 GPT 换了头和尾; 文本条件：cross-attention 又来了
 --- context
-TODO
+这两周走了三条线：文本 LLM、文生图、文生音。面试官想听的不是三套东西，而是你看得出它们共用同一种 Block。这一题检查你是不是真的看出来了。
 --- prompt
-11  合流自评 —— 今天唯一真正重要的一题
-逐条确认，全部为真之后把 CONVERGED 改成 True:
-  [ ] 本文件顶部的 Block，和你 Day 4 写的 CausalSelfAttention+MLP 是同一段代码
-  [ ] AudioLM 和 GPT 的差别只有: 输入是 n_q 张嵌入表求和、输出是 n_q 个头
-  [ ] text_cross_attn 和 Day 9 图像那边的 cross_attention 除了变量名完全一样
-  [ ] 所以 LLM / 文生图 / 文生音 三条线，最后落到代码上是同一个 Block
+合上答案，逐条问自己。每一条都能用自己的话说清楚，再打勾。这几句话就是 Day 4 到 Day 13 的结论。
 --- checklist
-- TODO: 从 prompt 里的 [ ] 清单搬过来
+- 今天的 Block 和 Day 4 的 Block 是同一个东西：pre-LN、causal self-attention、残差、MLP、残差，只是写得更紧凑
+- AudioLM 和 GPT 的差别只在两头：输入是 n_q 张嵌入表查完相加，输出是 n_q 个头；中间的 Block 一行没改
+- text_cross_attn 和 Day 9 的 cross_attention 除了变量名完全一样：Q 来自正在生成的东西，K、V 来自文本
+- 所以 LLM、文生图、文生音三条线，落到代码上是同一种 Block，只换了「进」和「出」
+- 不看页面，我能在纸上写出 AudioLM 的形状流：(B, n_q, T) → (B, T, dim) → n 个 Block → (B, n_q, T, V)
+--- hints
+- 把「AudioLM：Day 4 的 GPT 换了头和尾」卡片里的两行对照，和 Day 4 的 GPT 放在一起看。
+- 把 d13-09 的答案和 Day 9 的 cross_attention 并排放，逐行对比。
+
+@@ item d13-12
+type: predict
+title: delay 之后长什么样
+level: 2
+cards: delay pattern：每个码本多等一步
+ref: day13
+--- context
+训练前把处理好的数据打印出来看一眼，是发现预处理 bug 最快的办法。能在脑子里把 delay pattern 跑一遍，调试时一眼就能看出哪里错位了。
+--- prompt
+下面的代码用的是参考实现的 build_delay。写出它打印的全部 7 行。
+--- code
+codes = torch.tensor([[[1, 2],
+                       [3, 4],
+                       [5, 6],
+                       [7, 8]]])            # (B=1, n_q=4, T=2)
+d = build_delay(codes, pad_id=-1)
+print(tuple(d.shape))
+for row in d[0].tolist():
+    print(row)
+print(d[0, :, 3].tolist())                  # 时间步 3 同时生成的 4 个码
+print((d == -1).sum().item())
+--- explain
+- 长度是 T + n_q − 1 = 2 + 4 − 1 = 5，所以形状是 (1, 4, 5)。
+- 第 k 行往右挪 k 格：前面 k 个 -1，接着 2 个码，后面补 -1 到 5 格。
+- 第 3 列是时间步 3 同时生成的码：码本 0、1 在这一列已经结束了（-1），码本 2 是它的帧 1（6），码本 3 是它的帧 0（7）。
+- 每一行正好有 n_q − 1 = 3 个 pad，4 行一共 12 个。训练时这 12 个位置的 target 要换成 -100，不算 loss。
+--- hints
+- 先算长度：T + n_q − 1。
+- 第 k 行的前面有 k 个 -1，每行一共有 n_q − 1 个 -1。
+
+@@ item d13-13
+type: choice
+title: 为什么要错开
+level: 2
+cards: delay pattern：每个码本多等一步
+--- context
+面试里聊多码本音频 LM，几乎一定会被问「码本之间的依赖怎么建模」。delay pattern 是 MusicGen 给的答案，要能说出它换来了什么、付出了什么。
+--- prompt
+多码本音频 LM 最简单的做法是「并行」：每一步同时预测同一帧的 n_q 个码。delay pattern 则把第 k 个码本往右挪 k 步。delay pattern 主要解决了什么问题？
+--- options
+- 让序列变短，省显存
+- 预测码本 k 的某一帧时，同一帧码本 k − 1 的码已经在前一步生成好了，模型看得到；代价只是多走 n_q − 1 步
+- codec 的 decoder 只接受错开的输入
+- 让所有码本可以共用同一张嵌入表
+answer: 2
+--- explain
+「并行」的问题：同一帧的 n_q 个码在同一步里一起预测，码本 1 看不到码本 0 这一帧选了什么，可后面的码本本来就是在补前面码本的细节。delay 以后，码本 k 的帧 t 在第 t + k 步生成，码本 k − 1 的帧 t 在第 t + k − 1 步就已经生成了，因果 attention 看得到它。
+
+其他选项：序列反而变长了 n_q − 1 格（选项 1 错）；decoder 要的是对齐的码，所以生成完要先 undo_delay（选项 3 错）；每个码本仍然各用一张表（选项 4 错）。
+--- hints
+- 想想「并行」时，码本 1 在预测帧 t 的那一刻，能看到帧 t 的码本 0 吗？
+- delay 以后，序列是变长了还是变短了？
+
+@@ item d13-14
+type: choice
+title: 生成 10 秒要多少步
+level: 2
+cards: delay pattern：每个码本多等一步; 神经 codec：音频变成整数矩阵
+--- context
+生成的延迟主要看语言模型要前向多少步。同一个 codec，排法不同，步数能差将近 8 倍。这笔账决定一个音频模型能不能做到实时。
+--- prompt
+EnCodec 24 kHz：每秒 75 帧，n_q = 8。用 delay pattern 生成 10 秒音频（不算 prompt），模型要生成多少步？
+--- options
+- 750
+- 757
+- 6000
+- 6007
+answer: 2
+--- explain
+10 秒 = 10 × 75 = 750 帧。delay pattern 要 T + n_q − 1 = 750 + 7 = 757 步，每一步同时出 8 个码（开头和结尾有的是 pad）。
+
+对比：「并行」只要 750 步，但同一帧的码本之间看不到彼此；把 8 个码本展平成一条长队要 750 × 8 = 6000 步，是 delay pattern 的将近 8 倍。
+--- hints
+- 先算帧数：秒数 × frame_rate。
+- delay pattern 的长度是 T + n_q − 1。
+
+@@ item d13-15
+type: predict
+title: view 还是 permute
+level: 2
+cards: n_q 个输出头：先 view 再 permute
+--- context
+「形状对了，值错了」是深度学习里最难查的 bug：不报错，loss 也在降，只是模型学不好。能在纸上推出 view 和 permute 的区别，写 reshape 时才心里有底。
+--- prompt
+y 假装是 Linear 的输出：1 个样本、3 帧，每帧 4 个数（n_q = 2 个码本，每个码本 V = 2 个 logits，前 2 个属于码本 0，后 2 个属于码本 1）。写出打印的 3 行。
+--- code
+y = torch.arange(12).view(1, 3, 4)                  # (B=1, T=3, n_q*V=4)
+right = y.view(1, 3, 2, 2).permute(0, 2, 1, 3)      # (B, n_q, T, V)
+wrong = y.view(1, 2, 3, 2)                          # 形状一样
+print(tuple(right.shape), tuple(wrong.shape))
+print(right[0, 1].tolist())
+print(wrong[0, 1].tolist())
+--- explain
+y[0] 的三行是三帧：[0, 1, 2, 3]、[4, 5, 6, 7]、[8, 9, 10, 11]。每帧的前 2 个数属于码本 0，后 2 个属于码本 1。
+
+- right[0, 1] 是码本 1 在每一帧的那一段：[2, 3]、[6, 7]、[10, 11]。
+- wrong 直接按内存顺序把 12 个数切成 2 块，每块 6 个。第 2 块是 6～11，被当成了「码本 1」：里面混着帧 1 的码本 1（6、7）、帧 2 的码本 0（8、9）和帧 2 的码本 1（10、11）。
+
+两者形状完全一样，不会报错。这就是 d13-06 的检查要核对数值的原因。
+--- hints
+- 先把 y[0] 写成 3 行，每行 4 个数；每行的后 2 个数属于码本 1。
+- view 只按内存顺序重新分组，不会搬动数据；只有 permute 才会交换轴。
+
+@@ item d13-16
+type: code
+title: 闭卷：build_delay
+level: 2
+exam: yes
+cards: delay pattern：每个码本多等一步
+targets: build_delay
+ref: day13
+--- context
+delay pattern 是多码本音频 LM 最有代表性的一步数据处理。能闭卷写出来，说明你真的懂每一行码被排到了哪里。
+--- prompt
+不看卡片，写出 `build_delay(codes, pad_id)`：
+
+- codes 是 (B, n_q, T) 的整数 tensor
+- 返回 (B, n_q, T + n_q − 1)：第 k 个码本整体右移 k 格，空位填 pad_id
+- dtype 和 device 和输入一样
+--- starter
+def build_delay(codes, pad_id):
+    raise todo()
+--- solution
+def build_delay(codes, pad_id):
+    B, n_q, T = codes.shape
+    out = torch.full((B, n_q, T + n_q - 1), pad_id, dtype=codes.dtype, device=codes.device)
+    for k in range(n_q):
+        out[:, k, k:k + T] = codes[:, k]
+    return out
+--- tests
+@check("构造 delay pattern")
+def t03():
+    c = torch.tensor([[[1, 2, 3], [4, 5, 6]]])       # (1, 2, 3)
+    d = build_delay(c, pad_id=0)
+    shape_is(d, (1, 2, 4))
+    eq(d[0, 0], torch.tensor([1, 2, 3, 0]), msg="第 0 个码本不移动，尾部补 pad")
+    eq(d[0, 1], torch.tensor([0, 4, 5, 6]), msg="第 1 个码本右移 1 步，头部补 pad")
+--- hints
+- 先造一个全是 pad_id 的结果，长度 T + n_q − 1。
+- 第 k 行从第 k 列开始放 T 个码。
+
+@@ item d13-17
+type: code
+title: 闭卷：AudioLM
+level: 3
+exam: yes
+cards: AudioLM：Day 4 的 GPT 换了头和尾
+targets: AudioLM
+ref: day13
+--- context
+「音频 LM = GPT 换头换尾」是今天最重要的一句话。能从空白写出 AudioLM，Day 4 的 GPT 和今天的多码本输入输出你就都掌握了。
+--- prompt
+不看卡片，写出 `AudioLM(n_q=4, vocab=50, dim=64, n_layer=2, n_head=4, max_len=256)`：
+
+- `forward(codes)`：codes 是 (B, n_q, T)，返回 (B, n_q, T, vocab)
+- 可以直接用准备代码里的 CodeEmbedding(n_q, vocab, dim)、MultiHead(dim, n_q, vocab)、Block(dim, n_head)
+- 要有位置嵌入（最长 max_len）、n_layer 个 Block 和最后的 LayerNorm
+
+检查和 d13-08 一样：输出形状、因果性、初始 loss 在 ln(50) 附近。
+--- starter
+class AudioLM(nn.Module):
+    def __init__(self, n_q=4, vocab=50, dim=64, n_layer=2, n_head=4, max_len=256):
+        super().__init__()
+        raise todo()
+
+    def forward(self, codes):
+        raise todo()
+--- solution
+class AudioLM(nn.Module):
+    def __init__(self, n_q=4, vocab=50, dim=64, n_layer=2, n_head=4, max_len=256):
+        super().__init__()
+        self.emb = CodeEmbedding(n_q, vocab, dim)
+        self.pos = nn.Embedding(max_len, dim)
+        self.h = nn.ModuleList([Block(dim, n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(dim)
+        self.head = MultiHead(dim, n_q, vocab)
+
+    def forward(self, codes):
+        T = codes.size(-1)
+        x = self.emb(codes) + self.pos(torch.arange(T, device=codes.device))
+        for b in self.h:
+            x = b(x)
+        return self.head(self.ln_f(x))
+--- tests
+@check("AudioLM 前向")
+def t08():
+    seed(3)
+    m = AudioLM(n_q=4, vocab=50, dim=64, n_layer=2)
+    codes = torch.randint(0, 50, (2, 4, 16))
+    out = m(codes)
+    shape_is(out, (2, 4, 16, 50))
+    # 因果性：改了后面的 token，前面的预测不能变
+    c2 = codes.clone()
+    c2[:, :, 8:] = torch.randint(0, 50, (2, 4, 8))
+    eq(m(codes)[:, :, :8], m(c2)[:, :, :8], tol=1e-4,
+       msg="因果性挂了 —— 前面的预测被后面的码影响了。Block 要用准备代码里的那个（带 is_causal=True）")
+    # 初始 loss 应该在 ln(V) 附近
+    loss = codebook_loss(out, codes)
+    true(abs(loss.item() - math.log(50)) < 1.5,
+         f"初始 loss={loss.item():.2f}, 应该在 ln(50)={math.log(50):.2f} 附近")
+--- hints
+- 五个部件：CodeEmbedding、位置嵌入、n_layer 个 Block（放进 nn.ModuleList）、LayerNorm、MultiHead。
+- forward：嵌入 + 位置嵌入 → 每个 Block → ln_f → head。

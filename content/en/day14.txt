@@ -1,0 +1,955 @@
+@@ day 14
+title: Turning any paper into code
+part: Meta-skills
+hours: 3–4 hours
+--- goal
+Given a paper you have never seen, you can use the "five questions" to find what you need to write, turn a brand-new module (today: VQ) from formulas into code, and prove it can actually train with a smoke test and by overfitting one batch.
+--- checklist
+- Clear your Review list first (redo from blank anything you looked up yesterday)
+- Read the 8 knowledge cards; change one number in each example and run it again
+- Pass every practice exercise, and be able to say where the gradients go in the VQ ones
+- Closed book: rewrite vq_quantize and overfit_one_batch without any reference
+
+@@ concept
+title: The five questions: what to pull out of a paper
+--- body
+A paper can run to 20 or 30 pages, but to write the code you only need five answers. On the first pass, do not read from start to end. Go hunting for these five:
+
+1. **What are the input and output shapes?** Write them with real numbers, like (8, 3, 64, 64), not just "an image".
+2. **What is the shape of the middle representation (the latent)?** The latent is the compressed version the model builds inside. Is it a continuous vector, or discrete integer ids?
+3. **How many loss terms are there, and what does each one push?** Count the terms in the loss formula. For each one, work out which parameters its gradient updates.
+4. **How does the condition get in?** A condition is extra control information, such as a class, a text or a time step. There are 5 common ways: `add` (added to the features), `cross-attn` (cross-attention), `adaln` (the condition produces the scale and shift of a LayerNorm), `concat` (joined to the input), `none` (no condition).
+5. **How does sampling (generation) work?** 3 common ways: `single` (one forward pass gives the result), `autoregressive` (one piece at a time, each step looking at what was generated before), `iterative-denoise` (start from noise and remove it step by step).
+
+Where to look: the architecture figure in the method section, the loss equation, the algorithm box (Algorithm 1), the hyperparameter table in the appendix. Related work and ablations can wait until your code runs.
+
+Once the five answers are written down, they are your first tests: the shapes become the `expect_shape` of a smoke test, each loss term becomes a function, and the sampling style decides what the inference loop looks like.
+
+Below is the example of DDPM from day 8: trained on 32×32 colour images, batch 16.
+--- code
+ddpm = {
+    "input shape": (16, 3, 32, 32),     # the noisy image x_t (plus the time step t)
+    "output shape": (16, 3, 32, 32),    # the predicted noise, same size as the input
+    "latent shape": (16, 3, 32, 32),    # no compression: x_1 ... x_T are as big as the image
+    "loss terms": 1,                    # just MSE(predicted noise, true noise)
+    "condition injection": "add",       # the time-step embedding is added to every ResBlock's features
+    "sampling": "iterative-denoise",    # start from pure noise, denoise step by step
+}
+for k, v in ddpm.items():
+    print(f"{k}: {v}")
+
+# the answers turn into code right away
+x = torch.randn(ddpm["input shape"])
+print("input built from the answers:", tuple(x.shape))
+
+@@ concept
+title: Smoke test: run the forward pass once first
+--- body
+The name "smoke test" comes from hardware: the first time you power a new circuit board, you check whether smoke comes out. Models are the same. When the forward pass is written, feed it random data once before you start training.
+
+It checks only three things:
+
+1. It runs to the end without an error.
+2. The output shape matches what you wrote down in the five questions.
+3. The output has no `nan` (not a number) and no `inf` (infinity).
+
+For point 3, use `torch.isfinite(t)`: True for every normal number, False for nan or inf. Add `.all()` and you get True only if every element is True.
+
+nan spreads: anything computed with a nan becomes nan. So if a nan appears anywhere inside the forward pass, you will see it in the output.
+
+In a helper function, `*input_shapes` collects "any number of input shapes": for the call `f((2, 4), (2, 3))`, `input_shapes` inside the function is `((2, 4), (2, 3))`. The other way round, `model(*xs)` unpacks the list `xs` and passes each element as its own argument.
+
+When a check fails, `raise AssertionError("say which check failed")`.
+--- code
+t = torch.tensor([1.0, float("nan"), float("inf"), -2.0])
+print(torch.isfinite(t))
+print("all finite:", torch.isfinite(t).all().item())
+
+def make_inputs(*input_shapes):
+    print("shapes received:", input_shapes)
+    return [torch.randn(s) for s in input_shapes]
+
+xs = make_inputs((2, 4))
+out = nn.Linear(4, 3)(*xs)
+print("output shape:", tuple(out.shape))
+print("nan spreads:", (out * float("nan")).sum().item())
+
+@@ concept
+title: Overfit one batch: the fastest bug detector
+--- body
+Your model is written. Can it learn? The quickest test: take one small batch and train on it again and again for a few hundred steps.
+
+A batch has only a dozen or so examples. Any correctly written model can memorise them, so the loss should fall close to 0.
+
+- It falls close to 0: the chain forward → loss → backward → optimizer works. You can start real training.
+- It does not fall: there is a bug in the code. Tuning the learning rate, adding data or trying a bigger model is wasted time. Go back and check the code first.
+
+The order inside each step: compute the loss → `opt.zero_grad(set_to_none=True)` (clear the previous step's gradients) → `loss.backward()` (compute this step's gradients) → `opt.step()` (update the parameters). Create the optimizer once, outside the loop.
+
+When you record the loss, store `loss.item()` (a Python float), not `loss` itself: the tensor keeps its whole computation graph alive in memory.
+
+For classification, the loss at the start is about ln(number of classes): the model is still guessing, with about the same probability for every class. With 5 classes that is ln 5 ≈ 1.609. A starting value far from that also tells you something is wrong.
+
+What to check, step by step, when the loss will not go down? That is day 15. Today you turn this check into a tool you can use any time.
+--- code
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(8, 32), nn.ReLU(), nn.Linear(32, 5))
+x, y = torch.randn(16, 8), torch.randint(0, 5, (16,))
+opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
+print("ln 5 =", round(math.log(5), 3))
+for step in range(201):
+    loss = F.cross_entropy(model(x), y)
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    opt.step()
+    if step % 50 == 0:
+        print("step", step, "loss", round(loss.item(), 4))
+
+@@ concept
+title: Gradient clipping: log the norm, then clip
+--- body
+Now and then one training step gets a very large gradient (a strange example, or a learning rate that is too high). That update pushes the parameters too far, the loss jumps up, and it may even become nan.
+
+Gradient clipping works like this:
+
+1. Put every gradient element of every parameter together and compute the total norm: total_norm = sqrt(sum of the squares of all gradient elements).
+2. If total_norm > max_norm, multiply all gradients by max_norm / total_norm. The direction stays the same; only the length shrinks to max_norm.
+3. If not, do nothing.
+
+In PyTorch it is one line: `torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)`.
+
+- The trailing `_` means "in place": it changes each parameter's `.grad` directly.
+- It returns the total norm from **before** clipping (a 0-dimensional tensor). Log it: a sudden jump in this number often comes right before the loss turns into nan.
+- Call it after `loss.backward()` and before `opt.step()`.
+
+Example: two parameters with gradients [6, 8] and [0]. Total norm = sqrt(36 + 64 + 0) = 10. With max_norm = 2, everything is multiplied by 2 / 10 = 0.2 and becomes [1.2, 1.6] and [0].
+--- code
+m = nn.Linear(2, 1)
+m.weight.grad = torch.tensor([[6.0, 8.0]])
+m.bias.grad = torch.tensor([0.0])
+before = torch.nn.utils.clip_grad_norm_(m.parameters(), max_norm=2.0)
+print("total norm before clipping:", before.item())
+print("weight.grad after clipping:", m.weight.grad)
+print("total norm after clipping:", round(m.weight.grad.norm().item(), 4))
+
+@@ concept
+title: VQ part 1: nearest code and the straight-through estimator
+--- body
+VQ (vector quantization) did not appear in the first 13 days. Today you write it as "a new module from a new paper". It comes from the VQ-VAE paper; the discrete codes that the day-13 audio codecs produce are made with this kind of method too.
+
+**Codebook**: a learnable (K, D) matrix holding K "reference vectors", each of length D.
+**Quantization**: replace each encoder output vector z (length D) with the codebook vector e that is closest to it, and remember e's index.
+
+In code, that is three steps:
+
+1. `d = torch.cdist(z, codebook)`: z is (B, D), codebook is (K, D), d is (B, K). d[i, k] is the distance from vector i to code k.
+2. `idx = d.argmin(-1)`: the position of the smallest distance in each row, shape (B,), dtype int64.
+3. `e = codebook[idx]`: pick the codebook vectors by index, shape (B, D).
+
+The problem: argmin "picks one", and picking has no derivative. The gradient stops here, and the encoder learns nothing.
+
+The fix is called the **straight-through estimator**: `z_q = z + (e - z).detach()`
+
+- Forward: z + e − z = e, so the value is exactly the codebook vector.
+- Backward: the `.detach()` part counts as a constant, so the derivative of z_q with respect to z is 1. The gradient goes "straight through" to z, as if the quantization step were not there.
+
+The sg[·] (stop-gradient) you see in papers is `.detach()` in PyTorch: the value stays the same, the gradient stops there.
+--- code
+codebook = torch.tensor([[0.0, 0.0], [2.0, 2.0]])   # K=2 codes, each D=2
+z = torch.tensor([[0.3, -0.2], [1.5, 2.5], [1.2, 0.9]], requires_grad=True)
+d = torch.cdist(z, codebook)
+print("distances d, shape", tuple(d.shape))
+print(d.detach().round(decimals=3))
+idx = d.argmin(-1)
+print("indices:", idx.tolist(), idx.dtype)
+e = codebook[idx]
+z_q = z + (e - z).detach()
+print("values of z_q (equal to e):")
+print(z_q.detach())
+z_q.sum().backward()
+print("z.grad (the gradient comes straight through: all ones):")
+print(z.grad)
+
+@@ concept
+title: VQ part 2: the two stop-gradient terms
+--- body
+The straight-through estimator has a side effect: in `z + (e - z).detach()`, the codebook vector e sits entirely inside the detach. So whatever loss comes after it (a reconstruction error, for example), its gradient **never reaches the codebook**. The codebook will not move by itself.
+
+That is why the VQ-VAE paper adds two terms to the loss. The sg[·] in the formulas is `.detach()`:
+
+- **Codebook term**: ‖sg[z] − e‖². z is blocked, so only e gets a gradient. Job: pull the codebook vectors towards the encoder outputs.
+- **Commitment term**: β‖z − sg[e]‖². e is blocked, so only z gets a gradient. Job: keep the encoder outputs close to the code they picked (they "commit" to it). The paper uses β = 0.25.
+
+In code, ‖a − b‖² is `F.mse_loss(a, b)`, which by default averages over all elements.
+
+With the reconstruction error, the VQ-VAE loss has three terms. Where the gradients go:
+
+- reconstruction term → the decoder, then through the straight-through path to the encoder; **never the codebook**
+- codebook term → only the codebook
+- commitment term → only the encoder
+
+To tell what a loss term updates, look at which quantities in its formula are **not** wrapped in sg.
+
+The example below: z = [3, 2], e = [1, 1]. Codebook term = mean(2², 1²) = 2.5, commitment term = 0.25 × 2.5 = 0.625.
+--- code
+z = torch.tensor([[3.0, 2.0]], requires_grad=True)   # plays the encoder output
+e = torch.tensor([[1.0, 1.0]], requires_grad=True)   # plays the chosen codebook vector
+
+codebook_term = F.mse_loss(z.detach(), e)
+codebook_term.backward()
+print("codebook term:", codebook_term.item(), " e.grad:", e.grad.tolist(), " z.grad:", z.grad)
+
+e.grad = None
+commit_term = 0.25 * F.mse_loss(z, e.detach())
+commit_term.backward()
+print("commitment term:", commit_term.item(), " z.grad:", z.grad.tolist(), " e.grad:", e.grad)
+
+@@ concept
+title: Plugging a new module into a training loop
+ref: day14
+--- body
+Once the new module is a function and tested on its own, run a small experiment before it goes into the real training loop: data so simple that you know the right answer, to see whether it can learn it.
+
+Today's experiment uses `_toy_data()`: 64 one-dimensional points around four centres -3, -1, 1 and 3, 16 points per centre, noise with standard deviation 0.1. Shape (64, 1).
+
+The codebook has 4 codes, deliberately squeezed near 0 at the start: [-0.3, -0.1, 0.1, 0.3]. If VQ is written correctly, after training each of the 4 codes should sit near one centre.
+
+There is no encoder or decoder here; the data itself plays z. loss = reconstruction term + `vq_loss(..., beta=0.0)` (no encoder, so no commitment term needed). The optimizer only updates the codebook.
+
+**The counter-intuitive part**: the reconstruction term `F.mse_loss(z_q, data)` has **no gradient** to the codebook. The data needs no gradient, and the codebook is blocked by the straight-through estimator's detach, so this term's `requires_grad` is False. It is just a number to watch. What actually moves the codebook is the codebook term inside vq_loss. In the example below the two terms have exactly the same value (z_q's value is e), yet only the codebook term carries a gradient.
+
+One more detail: at the start every point picks one of the two outer codes (-0.3 or 0.3). Nobody picks the two middle codes, so their gradient is 0. Only after the outer codes move outwards do the middle codes start getting picked.
+
+To find out whether a loss can train a parameter, check directly: `loss.requires_grad`, `loss.grad_fn`, or the parameter's `.grad` after backward.
+--- code
+data = _toy_data()
+cb = nn.Parameter(torch.linspace(-0.3, 0.3, 4).reshape(4, 1))
+print("data:", tuple(data.shape), " codebook:", cb.detach().flatten())
+
+zq, idx = vq_quantize(data, cb)
+print("times each code was picked:", torch.bincount(idx, minlength=4).tolist())
+recon = F.mse_loss(zq, data)
+print("reconstruction term:", round(recon.item(), 3), " requires_grad:", recon.requires_grad)
+
+book = F.mse_loss(data.detach(), cb[idx])     # the codebook term
+book.backward()
+print("codebook term:", round(book.item(), 3))
+print("gradient of the codebook:", cb.grad.flatten())
+
+@@ concept
+title: Symptom → cause: five patterns to recognise
+--- body
+Once a new module is plugged in, training rarely works on the first try. An experienced engineer looks at the symptom and has a good guess about what broke. Learn to recognise these five first; days 15–17 show how to track them down step by step.
+
+- **The model learns nothing**: it gives every token about the same probability. Guessing evenly over V words gives a cross-entropy of exactly ln V, so the loss sits at ln(vocab size). Common reasons: the gradient does not reach the parameters, the learning rate is too small, `opt.step()` is missing.
+- **lr too high or fp16 overflow**: one update is far too big; or half precision fp16 (largest value 65504) cannot hold some intermediate value, which becomes inf, and nan follows in the next step. It usually shows up within the first few steps.
+- **Label leakage**: during training the model can see the answer. For example the causal mask is flipped or missing, or the inputs and labels are not shifted by one position. The training loss gets absurdly low, but real generation (where the answer is not visible) produces garbage.
+- **Forgot model.eval()**: dropout is still on at inference and randomly switches off some neurons on every call. Greedy decoding (always pick the most likely token) should give the same result every time; now the same input gives a different output each time.
+- **Tensors with graphs kept in a loop**: for example `total += loss` instead of `total += loss.item()`. Every step's computation graph stays in memory and piles up, until later in training the GPU runs out of memory (OOM).
+--- code
+for name, V in [("character-level Shakespeare", 65), ("GPT-2 vocabulary", 50257), ("5 classes", 5)]:
+    print(f"{name}: V = {V}, loss when guessing = ln V = {math.log(V):.3f}")
+print("largest fp16 value:", torch.finfo(torch.float16).max)
+print("anything bigger becomes:", torch.tensor(70000.0).half())
+
+@@ item d14-01
+type: code
+title: Fill in the five questions
+level: 2
+cards: The five questions: what to pull out of a paper
+targets: FIVE_QUESTIONS
+ref: day14
+--- context
+Papers are often 20 or 30 pages long, but before you write code you only need five answers. Find them first and write them with real numbers. Your smoke test and your tests follow from them, and you will not get lost in the paper.
+--- prompt
+Here is the core description of a paper you have not read (VQ-VAE):
+
+"We encode the image into H×W feature vectors and quantize each vector to its nearest neighbour in a learnable codebook of size K, passing gradients back with a straight-through estimator. The training objective is the reconstruction error plus two stop-gradient terms: ‖sg[z_e] − e‖² and β‖z_e − sg[e]‖². For generation, we first train an autoregressive prior over the discrete codes, sample from it, and decode the result into an image."
+
+Fill in the dictionary `FIVE_QUESTIONS` using the five questions. The concrete setting: batch 8, RGB colour images (3 channels), 64×64; after encoding, each image becomes 16×16 discrete codes.
+
+- The three shapes are tuples with real numbers, written like `(8, 3, 64, 64)`. Discrete codes are integer ids, so they have no channel dimension.
+- "loss terms" is an int.
+- For "condition injection", pick one of `"add"`, `"cross-attn"`, `"adaln"`, `"concat"`, `"none"`.
+- For "sampling", pick one of `"single"`, `"autoregressive"`, `"iterative-denoise"`.
+--- starter
+FIVE_QUESTIONS = {
+    "input shape":          None,   # a tuple: batch 8, RGB, 64x64
+    "output shape":         None,   # the reconstructed image
+    "latent shape":         None,   # 16x16 discrete codes per image, batch 8 (discrete codes have no channel dim)
+    "loss terms":           None,   # an int
+    "condition injection":  None,
+    "sampling":             None,
+}
+--- solution
+FIVE_QUESTIONS = {
+    "input shape": (8, 3, 64, 64),
+    "output shape": (8, 3, 64, 64),
+    "latent shape": (8, 16, 16),
+    "loss terms": 3,
+    "condition injection": "none",
+    "sampling": "autoregressive",
+}
+--- tests
+@check("all five answers are right")
+def t01():
+    want = {
+        "input shape": (8, 3, 64, 64),
+        "output shape": (8, 3, 64, 64),
+        "latent shape": (8, 16, 16),
+        "loss terms": 3,
+        "condition injection": "none",
+        "sampling": "autoregressive",
+    }
+    wrong = []
+    for k, w in want.items():
+        if k not in FIVE_QUESTIONS:
+            wrong.append(f"{k!r}: this key is missing (keep the key names exactly as given)")
+            continue
+        v = FIVE_QUESTIONS[k]
+        got = tuple(v) if isinstance(v, (list, tuple)) else v
+        if v is None or got != w:
+            wrong.append(f"{k!r}: you wrote {v}, it should be {w}")
+    true(not wrong, "these are wrong:\n       " + "\n       ".join(wrong))
+--- hints
+- VQ-VAE is an autoencoder: the output is the reconstructed image, the same size as the input.
+- The latent: 16×16 integer ids per image, plus the batch dimension. Count the loss terms: the reconstruction error plus two terms with sg.
+- The description mentions no class or text condition, so it is `"none"`; "an autoregressive prior over the discrete codes" means `"autoregressive"`.
+
+@@ item d14-02
+type: code
+title: A smoke-test tool
+level: 2
+cards: Smoke test: run the forward pass once first
+targets: smoke_test
+ref: day14
+--- context
+When a new model is written, the first thing to do is feed it random data once. In seconds you find a wrong shape, a mismatched dimension or values that turned into nan. Finding them after hours of real training is far too late.
+--- prompt
+Write `smoke_test(model, *input_shapes, expect_shape=None)`:
+
+1. For each shape in `input_shapes`, build an input with `torch.randn`.
+2. Pass them all to the model: `out = model(*xs)`.
+3. If `expect_shape` is given, check `tuple(out.shape) == tuple(expect_shape)`. If not equal, `raise AssertionError` with a message showing the actual and the expected shape.
+4. Check that `out` has no nan / inf. If it does, `raise AssertionError` with a message saying the values are the problem.
+5. If everything passes, return `True`.
+
+Example: `smoke_test(nn.Linear(4, 3), (2, 4), expect_shape=(2, 3))` returns True. For a model with two inputs, pass two shapes: `smoke_test(model, (2, 3), (2, 3))`.
+--- starter
+def smoke_test(model, *input_shapes, expect_shape=None):
+    """Run the forward pass once on random tensors and check:
+      1) no error
+      2) output shape == expect_shape (if given)
+      3) no nan / inf in the output
+    Return True; if any check fails, raise AssertionError (the message says which one).
+    Build the inputs with torch.randn, one per shape in input_shapes.
+    """
+    raise todo()
+--- solution
+def smoke_test(model, *input_shapes, expect_shape=None):
+    xs = [torch.randn(s) for s in input_shapes]
+    out = model(*xs)
+    if expect_shape is not None and tuple(out.shape) != tuple(expect_shape):
+        raise AssertionError(f"output shape {tuple(out.shape)} != expected {tuple(expect_shape)}")
+    if not torch.isfinite(out).all():
+        raise AssertionError("the output contains nan / inf")
+    return True
+--- tests
+@check("a healthy model returns True (one input or two)")
+def t02():
+    ok = nn.Linear(4, 3)
+    true(smoke_test(ok, (2, 4), expect_shape=(2, 3)) is True, "return True when the shape is right and the values are finite")
+
+    class Add(nn.Module):
+        def forward(self, a, b):
+            return a + b
+    true(smoke_test(Add(), (2, 3), (2, 3), expect_shape=(2, 3)) is True,
+         "with two inputs, build one input per shape and pass them together with model(*xs)")
+
+@check("a wrong shape raises AssertionError")
+def t02_shape():
+    class BadShape(nn.Module):
+        def forward(self, x):
+            return x
+    raised = False
+    try:
+        smoke_test(BadShape(), (2, 4), expect_shape=(2, 3))
+    except AssertionError:
+        raised = True
+    true(raised, "the model outputs (2, 4) but (2, 3) was expected, and your smoke_test did not raise AssertionError")
+
+@check("nan in the output raises AssertionError")
+def t02_nan():
+    class Nan(nn.Module):
+        def forward(self, x):
+            return x * float("nan")
+    raised = False
+    try:
+        smoke_test(Nan(), (2, 4), expect_shape=(2, 4))
+    except AssertionError:
+        raised = True
+    true(raised, "the model outputs only nan, and your smoke_test did not raise AssertionError. Check with torch.isfinite(out).all()")
+--- hints
+- Build the inputs first: `xs = [torch.randn(s) for s in input_shapes]`, then `out = model(*xs)`.
+- Shape: `if expect_shape is not None and tuple(out.shape) != tuple(expect_shape): raise AssertionError(...)`.
+- Values: `if not torch.isfinite(out).all(): raise AssertionError("the output contains nan / inf")`, then `return True`.
+
+@@ item d14-03
+type: code
+title: Overfit a single batch
+level: 2
+cards: Overfit one batch: the fastest bug detector
+targets: overfit_one_batch
+ref: day14
+--- context
+Overfitting one batch is the cheapest bug test there is: in seconds it proves that forward, loss, backward and the optimizer work together. If the loss will not get close to 0, go back to the code first; do not tune hyperparameters or add data.
+--- prompt
+Write `overfit_one_batch(model, x, y, steps=300, lr=1e-2)`:
+
+- Create the optimizer with `torch.optim.AdamW(model.parameters(), lr=lr)`.
+- Train `steps` steps on the same `(x, y)`, with the loss `F.cross_entropy(model(x), y)`.
+- The order in each step: compute the loss → `zero_grad` → `backward` → `step`.
+- Return the list of the losses of every step, as Python floats (use `loss.item()`).
+
+The grader uses a small 8 → 32 → 5 MLP and 16 examples, and wants the last loss below 0.01.
+--- starter
+def overfit_one_batch(model, x, y, steps=300, lr=1e-2):
+    """Train again and again on the same (x, y). Return the list of losses (floats).
+    Use AdamW + F.cross_entropy. If this does not get close to 0, the model or the loss is wrong:
+    do not touch the data or the hyperparameters, fix the code first.
+    """
+    raise todo()
+--- solution
+def overfit_one_batch(model, x, y, steps=300, lr=1e-2):
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    losses = []
+    for _ in range(steps):
+        loss = F.cross_entropy(model(x), y)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+--- tests
+@check("16 examples get memorised: the loss falls below 0.01")
+def t03():
+    seed(0)
+    model = nn.Sequential(nn.Linear(8, 32), nn.ReLU(), nn.Linear(32, 5))
+    x, y = torch.randn(16, 8), torch.randint(0, 5, (16,))
+    losses = overfit_one_batch(model, x, y)
+    true(isinstance(losses[0], float), "store loss.item() (a Python float) in the list, not the tensor")
+    true(losses[-1] < 0.01,
+         f"the last loss is {losses[-1]:.4f}. A batch of 16 examples should be easy to memorise; "
+         "if it is not, the code has a bug (optimizer created inside the loop? step missing?)")
+    true(losses[-1] < losses[0], "the loss did not go down")
+--- hints
+- Create the optimizer once, outside the loop: `opt = torch.optim.AdamW(model.parameters(), lr=lr)`.
+- In the loop: `loss = F.cross_entropy(model(x), y)`, then `opt.zero_grad(set_to_none=True)`, `loss.backward()`, `opt.step()`.
+- Each step, `losses.append(loss.item())`; after the loop, `return losses`.
+
+@@ item d14-04
+type: code
+title: Clip the gradients and report the norm before clipping
+level: 1
+cards: Gradient clipping: log the norm, then clip
+targets: clip_and_report
+ref: day14
+--- context
+One step with a huge gradient can wreck a training run (the loss jumps or becomes nan). Gradient clipping shrinks the gradient on such steps. Logging the norm from before clipping also helps: a sudden jump in that number is often the first sign of trouble.
+--- prompt
+Write `clip_and_report(model, max_norm)`:
+
+- Clip the gradients of all the model's parameters by their total norm, so that the total norm is at most `max_norm` (change `.grad` in place).
+- Return the total gradient norm from **before** clipping, as a Python float.
+- Use `torch.nn.utils.clip_grad_norm_`: its return value is exactly the total norm before clipping (a 0-dimensional tensor).
+
+The grader uses an `nn.Linear(4, 2)`: all 8 weight gradients are 3 and the bias gradient is 0. The total norm before clipping is sqrt(8 × 9) = sqrt(72) ≈ 8.485; with `max_norm=1.0`, the norm after clipping should be exactly 1.
+--- starter
+def clip_and_report(model, max_norm):
+    """Clip the gradients and return the total gradient norm from **before** clipping (a float).
+    Use torch.nn.utils.clip_grad_norm_; note that its return value is exactly that norm.
+    """
+    raise todo()
+--- solution
+def clip_and_report(model, max_norm):
+    return float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm))
+--- tests
+@check("returns the norm before clipping, and the gradients shrink to max_norm")
+def t04():
+    m = nn.Linear(4, 2)
+    m.weight.grad = torch.full_like(m.weight, 3.0)
+    m.bias.grad = torch.zeros_like(m.bias)
+    before = clip_and_report(m, 1.0)
+    true(close(before, math.sqrt(8 * 9), 1e-4), f"the norm before clipping should be sqrt(72) ≈ 8.485; you returned {before}")
+    after = m.weight.grad.norm().item()
+    true(close(after, 1.0, 1e-4), f"the norm after clipping should be 1.0; it is {after:.4f}. Were the gradients really clipped?")
+--- hints
+- One line does the clipping: `torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)`.
+- Its return value is a tensor; wrap it in `float(...)` before you return it.
+
+@@ item d14-05
+type: code
+title: VQ quantization + straight-through estimator
+level: 2
+cards: VQ part 1: nearest code and the straight-through estimator
+targets: vq_quantize
+ref: day14
+--- context
+The most common situation when reading a paper: a module you have never written, and nothing but formulas. VQ is such a module. If you can turn "argmin + straight-through estimator" into a few correct lines, you can handle operations that have no derivative.
+--- prompt
+Write `vq_quantize(z, codebook)` by turning these two formulas into code:
+
+- Quantize: `e = codebook[argmin_k ‖z − codebook[k]‖]`, the nearest code for each row of z
+- Straight through: `z_q = z + (e − z).detach()`, so the forward value is e and the backward gradient skips the quantization and goes straight to z
+
+Inputs: `z` is (B, D), `codebook` is (K, D).
+Return `(z_q, indices)`: `z_q` is (B, D), `indices` is (B,) int64.
+
+Example: the codebook is `[[0, 0], [1, 1], [-1, 2]]` and the first row of z is `[0.1, 0.1]`. The nearest code is code 0, so `indices[0] == 0` and `z_q[0]` equals `[0, 0]`.
+--- starter
+def vq_quantize(z, codebook):
+    """z: (B, D)   codebook: (K, D)
+    Return (z_q, indices): z_q is (B, D), indices is (B,) int64.
+    z_q must use the straight-through estimator so that the gradient reaches z.
+    """
+    raise todo()
+--- solution
+def vq_quantize(z, codebook):
+    d = torch.cdist(z, codebook)             # (B, K)
+    idx = d.argmin(-1)
+    e = codebook[idx]
+    return z + (e - z).detach(), idx         # straight through: forward is e, backward skips the quantization
+--- tests
+@check("the nearest-code indices are right")
+def t05_idx():
+    cb = torch.tensor([[0.0, 0.0], [1.0, 1.0], [-1.0, 2.0]])
+    z = torch.tensor([[0.1, 0.1], [0.9, 1.2], [-0.8, 1.9]], requires_grad=True)
+    zq, idx = vq_quantize(z, cb)
+    eq(idx, torch.tensor([0, 1, 2]), msg="wrong nearest code: for each row of z, find the code with the smallest distance")
+    true(idx.dtype == torch.int64, f"indices must be int64; yours are {idx.dtype}")
+
+@check("the forward value equals the codebook vector")
+def t05_forward():
+    cb = torch.tensor([[0.0, 0.0], [1.0, 1.0], [-1.0, 2.0]])
+    z = torch.tensor([[0.1, 0.1], [0.9, 1.2], [-0.8, 1.9]], requires_grad=True)
+    zq, idx = vq_quantize(z, cb)
+    eq(zq, cb[idx], msg="the values of z_q must be exactly the chosen codebook vectors")
+
+@check("the gradient goes straight through to z")
+def t05_grad():
+    cb = torch.tensor([[0.0, 0.0], [1.0, 1.0], [-1.0, 2.0]])
+    z = torch.tensor([[0.1, 0.1], [0.9, 1.2], [-0.8, 1.9]], requires_grad=True)
+    zq, idx = vq_quantize(z, cb)
+    true(zq.requires_grad, "z_q has no gradient: you returned the codebook vector e directly; write z + (e - z).detach()")
+    zq.sum().backward()
+    eq(z.grad, torch.ones_like(z),
+       msg="the gradient must pass through the quantization to z unchanged. If it is 0, the straight-through part is missing (z + (e - z).detach())")
+--- hints
+- The distance matrix: `d = torch.cdist(z, codebook)`, shape (B, K).
+- `idx = d.argmin(-1)`, `e = codebook[idx]`.
+- Finally `return z + (e - z).detach(), idx`. If you return e directly, the forward value is right but z gets no gradient.
+
+@@ item d14-06
+type: code
+title: The two stop-gradient terms of VQ
+level: 2
+cards: VQ part 2: the two stop-gradient terms; Plugging a new module into a training loop
+targets: vq_loss
+ref: day14
+--- context
+In VQ-VAE the codebook can only learn through the stop-gradient terms of the loss. Put one sg in the wrong place and the code still runs and the loss still falls, but the parameters that should learn never move. So check the values and also check where the gradients go.
+--- prompt
+Write `vq_loss(z, z_q_hard, beta=0.25)` and return the sum of these two terms:
+
+- codebook term: ‖sg[z] − e‖², updates only the codebook (z is blocked)
+- commitment term: β‖z − sg[e]‖², updates only the encoder (e is blocked)
+
+`z` is the encoder output (B, D) and has a gradient. `z_q_hard` is the e of the formulas: the chosen codebook vectors (B, D), **not** passed through the straight-through step. Write sg[x] as `x.detach()` and ‖a − b‖² as `F.mse_loss(a, b)` (which averages by default).
+
+Example: z = [[1, 0]], e = [[0, 0]], β = 0.25. Codebook term = mean(1², 0²) = 0.5, commitment term = 0.25 × 0.5 = 0.125, total 0.625.
+
+The grader also checks where the gradients go, plus one counter-intuitive fact: after the straight-through step, the reconstruction error has no gradient to the codebook. That is exactly why the codebook term is needed.
+--- starter
+def vq_loss(z, z_q_hard, beta=0.25):
+    """z: encoder output (B, D) (with gradient)   z_q_hard: the chosen codebook vectors (B, D)
+    codebook loss  = ||sg[z] - e||²        (updates only the codebook)
+    commitment loss= beta * ||z - sg[e]||²  (updates only the encoder)
+    Return the sum of the two (both with mse_loss's default mean).
+    """
+    raise todo()
+--- solution
+def vq_loss(z, z_q_hard, beta=0.25):
+    codebook = F.mse_loss(z.detach(), z_q_hard)
+    commit = beta * F.mse_loss(z, z_q_hard.detach())
+    return codebook + commit
+--- tests
+@check("values: both terms use mse_loss's mean, then add up")
+def t06():
+    z = torch.tensor([[1.0, 0.0]], requires_grad=True)
+    e = torch.tensor([[0.0, 0.0]], requires_grad=True)
+    # codebook term = mean((1-0)^2, (0-0)^2) = 0.5
+    # commitment    = 0.25 * 0.5 = 0.125
+    eq(vq_loss(z, e, beta=0.25), torch.tensor(0.625),
+       msg="both terms use mse_loss's default mean, the commitment term is multiplied by beta, then they are added")
+    eq(vq_loss(z, e, beta=0.0), torch.tensor(0.5), msg="with beta=0 only the codebook term is left")
+
+@check("gradient flow: the codebook term reaches only e, the commitment term only z")
+def t07():
+    z = torch.tensor([[2.0, 0.0]], requires_grad=True)
+    e = torch.tensor([[0.0, 0.0]], requires_grad=True)
+    l = vq_loss(z, e, beta=0.25)
+    l.backward()
+    # gradient of ||sg[z]-e||^2 w.r.t. e = -2(z-e)/D = -2*2/2 = -2  (mse_loss averages, D=2)
+    eq(e.grad, torch.tensor([[-2.0, 0.0]]),
+       msg="wrong gradient for e: it should come only from the codebook term ||sg[z] - e||². Detach e in the commitment term")
+    # gradient of beta*||z-sg[e]||^2 w.r.t. z = beta*2(z-e)/D = 0.25*2*2/2 = 0.5
+    eq(z.grad, torch.tensor([[0.5, 0.0]]),
+       msg="wrong gradient for z: it should come only from the commitment term beta*||z - sg[e]||². Detach z in the codebook term")
+
+@check("counter-intuitive: the reconstruction term has no gradient to the codebook; only the codebook term moves it")
+def t10():
+    data = _toy_data()
+    cb = nn.Parameter(torch.linspace(-0.3, 0.3, 4).reshape(4, 1))
+    zq, idx = vq_quantize(data, cb)
+    recon = F.mse_loss(zq, data)
+    true(recon.requires_grad is False and recon.grad_fn is None,
+         "the reconstruction term has a gradient. The straight-through z + (e - z).detach() keeps the whole codebook inside the detach, "
+         "so the reconstruction term cannot give the codebook a gradient. If you defined your own vq_quantize in your answer, check where the detach is")
+    l = vq_loss(data, cb[idx], beta=0.0)
+    l.backward()
+    true(cb.grad is not None and cb.grad.abs().sum() > 0,
+         "the codebook term gave the codebook no gradient: it is mse_loss(z.detach(), z_q_hard), and the z_q_hard side must not be detached")
+--- hints
+- sg[z] is `z.detach()`, sg[e] is `z_q_hard.detach()`.
+- `codebook = F.mse_loss(z.detach(), z_q_hard)`.
+- `commit = beta * F.mse_loss(z, z_q_hard.detach())`, then `return codebook + commit`.
+
+@@ item d14-07
+type: code
+title: Symptom → cause
+level: 2
+cards: Symptom → cause: five patterns to recognise
+targets: DIAGNOSIS
+ref: day14
+--- context
+When training goes wrong, experienced engineers guess the cause from the symptom and then verify it, instead of changing things at random. Learn these five most common pairs by heart first; days 15–17 show how to track problems down step by step.
+--- prompt
+For each symptom in the dictionary `DIAGNOSIS`, fill in the most likely cause. Pick the causes from these five strings, each exactly once (copy them exactly, do not change a character):
+
+- `"model learns nothing"`
+- `"lr too high or fp16 overflow"`
+- `"label leakage"`
+- `"forgot model.eval"`
+- `"tensors with graphs kept in a loop"`
+
+Greedy decoding means: at every step, pick the most likely token, with no randomness at all.
+--- starter
+# the possible causes (copy them, use each once):
+#   "model learns nothing"   "lr too high or fp16 overflow"   "label leakage"
+#   "forgot model.eval"      "tensors with graphs kept in a loop"
+DIAGNOSIS = {
+    "loss stays flat at ln(vocab_size)":                                         None,
+    "loss becomes nan at step 3":                                                None,
+    "training loss drops to 0.001, generated text is garbage":                   None,
+    "training looks fine, greedy decoding gives a different output each time":   None,
+    "epoch 1 is fine, epoch 2 runs out of memory (OOM)":                         None,
+}
+--- solution
+DIAGNOSIS = {
+    "loss stays flat at ln(vocab_size)": "model learns nothing",
+    "loss becomes nan at step 3": "lr too high or fp16 overflow",
+    "training loss drops to 0.001, generated text is garbage": "label leakage",
+    "training looks fine, greedy decoding gives a different output each time": "forgot model.eval",
+    "epoch 1 is fine, epoch 2 runs out of memory (OOM)": "tensors with graphs kept in a loop",
+}
+--- tests
+@check("all five symptoms are matched")
+def t08():
+    want = {
+        "loss stays flat at ln(vocab_size)": "model learns nothing",
+        "loss becomes nan at step 3": "lr too high or fp16 overflow",
+        "training loss drops to 0.001, generated text is garbage": "label leakage",
+        "training looks fine, greedy decoding gives a different output each time": "forgot model.eval",
+        "epoch 1 is fine, epoch 2 runs out of memory (OOM)": "tensors with graphs kept in a loop",
+    }
+    wrong = [f"{k!r}: you wrote {DIAGNOSIS.get(k, '(this key is missing)')!r}, it should be {w!r}"
+             for k, w in want.items() if DIAGNOSIS.get(k) != w]
+    true(not wrong, "these are wrong:\n       " + "\n       ".join(wrong))
+--- hints
+- ln(vocab_size) is the cross-entropy when every token gets the same guess: the model has learned nothing.
+- An absurdly low training loss with bad generation: the model saw the answers during training. A different output each time for the same input: something random is still switched on at inference.
+- nan within the first few steps: an update that is too big, or a number that overflows. Memory that keeps growing until a late OOM: something from every step stays in memory.
+
+@@ item d14-08
+type: code
+title: Plug VQ into a training loop
+level: 2
+cards: Plugging a new module into a training loop; VQ part 2: the two stop-gradient terms; Overfit one batch: the fastest bug detector
+targets: train_vq_toy
+ref: day14
+--- context
+After the new module passes its own tests, it has to go into a training loop so you can see that it really learns. With tiny data whose answer you know (4 cluster centres), a few seconds tell you whether the codebook moves, and whether it moves to the right place.
+--- prompt
+Write `train_vq_toy(steps=300, lr=1e-1)`, which learns the 4 cluster centres with VQ:
+
+- Data: `data = _toy_data()`, shape (64, 1), around the four centres -3, -1, 1 and 3.
+- Codebook: `codebook = nn.Parameter(torch.linspace(-0.3, 0.3, 4).reshape(4, 1))`, deliberately squeezed near 0, to see whether it spreads out to the 4 clusters on its own.
+- Optimizer: `torch.optim.AdamW([codebook], lr=lr)`, which updates only the codebook.
+- In each step, compute the two lines below, then zero_grad → backward → step, then record `loss.item()`:
+
+```
+zq, idx = vq_quantize(data, codebook)
+loss = F.mse_loss(zq, data) + vq_loss(data, codebook[idx], beta=0.0)
+```
+
+Return the list of the losses of every step (Python floats). `_toy_data`, `vq_quantize` and `vq_loss` are already defined (reference versions); just call them.
+
+The grader: the first loss should be > 5 (the codebook is near 0, the data is out at ±3), the last one < 0.03 (the codes reached the centres; only the noise is left).
+--- starter
+def train_vq_toy(steps=300, lr=1e-1):
+    """Learn the 4 cluster centres with VQ.
+      - data = _toy_data()                       (64, 1)
+      - codebook = nn.Parameter(torch.linspace(-0.3, 0.3, 4).reshape(4, 1))
+        (deliberately squeezed near the origin: can it spread out to the 4 clusters?)
+      - each step:  zq, idx = vq_quantize(data, codebook)
+                    loss = F.mse_loss(zq, data) + vq_loss(data, codebook[idx], beta=0.0)
+      - AdamW updates only the codebook
+    Return the list of losses (floats).
+    """
+    raise todo()
+--- solution
+def train_vq_toy(steps=300, lr=1e-1):
+    data = _toy_data()
+    codebook = nn.Parameter(torch.linspace(-0.3, 0.3, 4).reshape(4, 1))
+    opt = torch.optim.AdamW([codebook], lr=lr)
+    losses = []
+    for _ in range(steps):
+        zq, idx = vq_quantize(data, codebook)
+        # the first term has a value but no gradient to the codebook (see the 3rd check of d14-06);
+        # the second term is what moves the codebook
+        loss = F.mse_loss(zq, data) + vq_loss(data, codebook[idx], beta=0.0)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+--- tests
+@check("the codebook spreads from near 0 to the 4 centres: loss goes from > 5 to < 0.03")
+def t09():
+    losses = train_vq_toy()
+    true(isinstance(losses[0], float), "store loss.item() (a Python float) in the list")
+    true(losses[0] > 5.0, f"the first loss should be large (codebook near 0, data out at ±3); it is {losses[0]:.4f}. Did you add both terms to the loss?")
+    true(losses[-1] < 0.03,
+         f"the last loss is {losses[-1]:.5f}; it should be < 0.03 (about twice the noise variance). "
+         "If it does not fall: check that vq_loss gets codebook[idx] (not zq) and that the optimizer is created only once")
+--- hints
+- Same structure as overfit_one_batch in d14-03: create the optimizer once; in the loop, loss → zero_grad → backward → step.
+- The codebook changes every step, so call `vq_quantize` again in every step; do not quantize outside the loop.
+- The first term `F.mse_loss(zq, data)` has no gradient to the codebook; the second term moves it, so the second term must use `codebook[idx]`, not zq (with zq you get `element 0 of tensors does not require grad`). Still add both terms to the loss: the grader looks at their sum.
+
+@@ item d14-09
+type: self
+title: Graduation self-check: days 1–14
+level: 1
+cards: The five questions: what to pull out of a paper; Smoke test: run the forward pass once first
+--- context
+Days 1–14 were about writing models. From day 15 the course moves on to debugging, shipping and running them. Before the next part, check yourself honestly. The last line, getting a smoke test to pass on a new paper you chose yourself, is the real graduation exam.
+--- prompt
+Tick a line only when you have really done it. The first three are review; the fourth is the graduation exam: pick a paper this course did not cover, read it with the five questions, write the smallest model code for it, and get a smoke test to pass within 4 hours.
+--- checklist
+- All practice exercises of days 1–13 pass (closed-book ones included)
+- I can write a Transformer block from memory, without any reference
+- I can explain which lines of code differ between DDPM and flow matching
+- I picked a paper this course did not cover (VQ-VAE / Consistency Models / Mamba / SigLIP / Whisper encoder), read it with the five questions, and got a smoke test to pass within 4 hours
+--- hints
+- For the fourth line, aim only for a passing smoke test: right shape, no nan. You do not need good training results.
+- When you are stuck, go back to the five questions: usually one shape is still unclear.
+
+@@ item d14-10
+type: predict
+title: Straight-through estimator: forward value and gradient
+level: 2
+cards: VQ part 1: nearest code and the straight-through estimator
+--- context
+The straight-through estimator is a core trick of many discrete models (VQ-VAE, audio codecs). Work out its forward value and its gradient in your head first, and you will not put the detach in the wrong place when you write the code.
+--- prompt
+Do not run it yet. Write the three lines this code prints.
+--- code
+z = torch.tensor([[0.25, 0.75]], requires_grad=True)
+e = torch.tensor([[0.0, 1.0]])            # the chosen codebook vector
+z_q = z + (e - z).detach()
+print(z_q.tolist())
+(z_q * torch.tensor([[2.0, 3.0]])).sum().backward()
+print(z.grad.tolist())
+hard = e.clone()                          # no straight-through: return e directly
+print(hard.requires_grad)
+--- explain
+- Line 1: the forward value is z + e − z = e, so it is the value of e, `[[0.0, 1.0]]`.
+- Line 2: `(e − z).detach()` counts as a constant, so the derivative of z_q with respect to z is 1. The two elements were multiplied by 2 and 3, so z's gradient is `[[2.0, 3.0]]`, exactly as if there were no quantization: the gradient went straight through.
+- Line 3: e is a constant that has nothing to do with z, and its clone needs no gradient either. If vq_quantize returned e directly, the encoder would get no gradient at all.
+--- hints
+- Forward: treat the detach as an ordinary number. What is z + (e − z)?
+- Backward: the detached part is a constant, so its derivative with respect to z is 0.
+
+@@ item d14-11
+type: choice
+title: Where does the reconstruction gradient go?
+level: 2
+cards: VQ part 2: the two stop-gradient terms; VQ part 1: nearest code and the straight-through estimator
+--- context
+The key to understanding a paper's loss design is knowing where each term's gradient goes. An extra term in a paper is usually there to give a signal to some part that would otherwise get no gradient.
+--- prompt
+A standard VQ-VAE: `z = encoder(x)`, the straight-through estimator gives `z_q = z + (e − z).detach()`, then `x_hat = decoder(z_q)`.
+
+When the reconstruction error `F.mse_loss(x_hat, x)` is backpropagated, which parts does the gradient reach? (More than one answer.)
+--- options
+- the encoder's parameters
+- the decoder's parameters
+- the codebook
+- the input image x
+answer: 1,2
+--- explain
+The reconstruction error reaches the decoder first: its parameters take part in the computation directly. Going further back, the straight-through estimator passes the gradient to z unchanged, so it reaches the encoder.
+
+The codebook vector e sits entirely inside `.detach()` and gets no gradient. That is why the paper adds the codebook term ‖sg[z] − e‖², just to update the codebook. x is data and never needed a gradient.
+--- hints
+- Look at `z + (e − z).detach()`: which quantity is outside the detach?
+- The codebook needs an extra loss term to learn. What does that tell you?
+
+@@ item d14-12
+type: predict
+title: What clip_grad_norm_ returns and what it changes
+level: 1
+cards: Gradient clipping: log the norm, then clip
+--- context
+A gradient-clipping mistake is hard to notice, because training still runs. Know when it really changes the gradients and which number it returns, and the logs you keep become useful.
+--- prompt
+Do not run it yet. Write the two lines this code prints.
+--- code
+m = nn.Linear(2, 1)
+m.weight.grad = torch.tensor([[3.0, 4.0]])
+m.bias.grad = torch.tensor([0.0])
+n1 = torch.nn.utils.clip_grad_norm_(m.parameters(), max_norm=10.0)
+print(n1.item(), m.weight.grad.tolist())
+n2 = torch.nn.utils.clip_grad_norm_(m.parameters(), max_norm=1.0)
+print(n2.item(), m.weight.grad)
+--- explain
+- Total norm = sqrt(3² + 4² + 0²) = 5. `clip_grad_norm_` returns the norm from **before** clipping.
+- First call, max_norm = 10: 5 is not above it, so the gradients stay the same: `5.0 [[3.0, 4.0]]`.
+- Second call, max_norm = 1: every gradient is multiplied by 1/5, so [3, 4] becomes [0.6, 0.8]. The return value is still the norm before clipping, 5.0. A printed tensor shows 4 decimal places.
+--- hints
+- Compute the total norm first; the bias gradient counts too.
+- If the norm is not above max_norm, the gradients do not change.
+
+@@ item d14-13
+type: choice
+title: From paper to code: which order saves the most time?
+level: 1
+cards: The five questions: what to pull out of a paper; Smoke test: run the forward pass once first; Overfit one batch: the fastest bug detector
+--- context
+The biggest time sink when reproducing a paper is starting a big training run right after writing the code, then finding out hours later that a shape was wrong or the loss never falls. Pass the cheapest check at each stage before moving on.
+--- prompt
+You want to reproduce a new paper. Which order makes the most sense?
+--- options
+- Download the full dataset → write the model → start a long training run → if results are bad, go back and read the paper's details
+- Read the paper with the five questions → write the model → smoke test → overfit one batch → real training
+- Write the model → real training → if the loss does not fall, tune the learning rate → if it still does not fall, use a bigger model
+- Read the paper with the five questions → write the model → real training → smoke test after training
+answer: 2
+--- explain
+From cheap to expensive: the five questions (tens of minutes) tell you what to write and what the shapes are; a smoke test (seconds) catches shape errors and nan; overfitting one batch (tens of seconds) proves the model and loss can learn; only then comes hours of real training.
+
+If even overfitting one batch fails, go back to the code instead of tuning the learning rate or changing the model. Option 3 falls right into that trap.
+--- hints
+- How long does each check take?
+- The cheaper a check, the earlier it belongs.
+
+@@ item d14-14
+type: code
+title: Closed book: VQ quantization + straight-through estimator
+level: 2
+exam: yes
+cards: VQ part 1: nearest code and the straight-through estimator
+targets: vq_quantize
+ref: day14
+--- context
+Today's most important new idea: getting "pick the nearest code", which has no derivative, into backpropagation. Write it once without the cards to make sure you really have it.
+--- prompt
+Write `vq_quantize(z, codebook)`: `z` is (B, D), `codebook` is (K, D).
+
+Return `(z_q, indices)`:
+- `indices` is (B,) int64: for each row of z, the index of the nearest code in the codebook;
+- `z_q` is (B, D): its forward value equals the chosen codebook vectors, and in the backward pass the gradient goes to z unchanged (straight-through estimator).
+--- starter
+def vq_quantize(z, codebook):
+    raise todo()
+--- solution
+def vq_quantize(z, codebook):
+    d = torch.cdist(z, codebook)             # (B, K)
+    idx = d.argmin(-1)
+    e = codebook[idx]
+    return z + (e - z).detach(), idx         # straight through: forward is e, backward skips the quantization
+--- tests
+@check("the nearest-code indices are right")
+def t05_idx():
+    cb = torch.tensor([[0.0, 0.0], [1.0, 1.0], [-1.0, 2.0]])
+    z = torch.tensor([[0.1, 0.1], [0.9, 1.2], [-0.8, 1.9]], requires_grad=True)
+    zq, idx = vq_quantize(z, cb)
+    eq(idx, torch.tensor([0, 1, 2]), msg="wrong nearest code: for each row of z, find the code with the smallest distance")
+    true(idx.dtype == torch.int64, f"indices must be int64; yours are {idx.dtype}")
+
+@check("the forward value equals the codebook vector")
+def t05_forward():
+    cb = torch.tensor([[0.0, 0.0], [1.0, 1.0], [-1.0, 2.0]])
+    z = torch.tensor([[0.1, 0.1], [0.9, 1.2], [-0.8, 1.9]], requires_grad=True)
+    zq, idx = vq_quantize(z, cb)
+    eq(zq, cb[idx], msg="the values of z_q must be exactly the chosen codebook vectors")
+
+@check("the gradient goes straight through to z")
+def t05_grad():
+    cb = torch.tensor([[0.0, 0.0], [1.0, 1.0], [-1.0, 2.0]])
+    z = torch.tensor([[0.1, 0.1], [0.9, 1.2], [-0.8, 1.9]], requires_grad=True)
+    zq, idx = vq_quantize(z, cb)
+    true(zq.requires_grad, "z_q has no gradient: you returned the codebook vector e directly; write z + (e - z).detach()")
+    zq.sum().backward()
+    eq(z.grad, torch.ones_like(z),
+       msg="the gradient must pass through the quantization to z unchanged. If it is 0, the straight-through part is missing (z + (e - z).detach())")
+
+@@ item d14-15
+type: code
+title: Closed book: overfit a single batch
+level: 2
+exam: yes
+cards: Overfit one batch: the fastest bug detector
+targets: overfit_one_batch
+ref: day14
+--- context
+Whatever paper you reproduce, once the new model is connected to its loss, the first thing you do is overfit one batch. You should be able to write this loop without thinking.
+--- prompt
+Write `overfit_one_batch(model, x, y, steps=300, lr=1e-2)`: with AdamW and `F.cross_entropy`, train `steps` steps on the same `(x, y)` and return the list of the losses of every step (Python floats).
+--- starter
+def overfit_one_batch(model, x, y, steps=300, lr=1e-2):
+    raise todo()
+--- solution
+def overfit_one_batch(model, x, y, steps=300, lr=1e-2):
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    losses = []
+    for _ in range(steps):
+        loss = F.cross_entropy(model(x), y)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+--- tests
+@check("16 examples get memorised: the loss falls below 0.01")
+def t03():
+    seed(0)
+    model = nn.Sequential(nn.Linear(8, 32), nn.ReLU(), nn.Linear(32, 5))
+    x, y = torch.randn(16, 8), torch.randint(0, 5, (16,))
+    losses = overfit_one_batch(model, x, y)
+    true(isinstance(losses[0], float), "store loss.item() (a Python float) in the list, not the tensor")
+    true(losses[-1] < 0.01,
+         f"the last loss is {losses[-1]:.4f}. A batch of 16 examples should be easy to memorise; "
+         "if it is not, the code has a bug (optimizer created inside the loop? step missing?)")
+    true(losses[-1] < losses[0], "the loss did not go down")

@@ -1,0 +1,1229 @@
+@@ day 8
+title: DDPM from scratch: noising, UNet, denoising
+part: Image generation
+hours: 3–4 hours
+--- goal
+Write every part of DDPM yourself: the noise schedule, q_sample (noise in one step), a UNet that knows the timestep, the training loss and one reverse denoising step. Afterwards you can read the scheduler and the unet of any diffusion codebase and know what they do.
+--- checklist
+- Clear the review queue first (redo from scratch any item whose answer you looked at)
+- Read all 8 cards; press Run on each example, change one number and run it again
+- Make sure you pass item 4 (closed form == step-by-step noising); the whole of diffusion rests on it
+- Pass every practice item, then do the closed-book items
+
+@@ concept
+title: Diffusion: add noise, then learn to remove it
+--- body
+DDPM (Denoising Diffusion Probabilistic Models) is the foundation of image generators like Stable Diffusion. It does only two things:
+
+- **Forward process (adding noise)**: take a real image `x0` and add a little Gaussian noise to it, T times (T = 1000 is common). After the last step the image is pure noise. This is a fixed formula. Nothing is learned here.
+- **Reverse process (removing noise)**: train a network that looks at a noisy image and guesses "which noise was added". To make a new image, start from pure noise and subtract the predicted noise, one step at a time.
+
+Names we use all day:
+
+- `t`: the timestep, an integer from 0 to T-1. Larger t means more noise.
+- `x0` is the clean image; `x_t` is the noisy image at step t.
+- `noise` (written ε, "epsilon", in papers): standard Gaussian noise, mean 0, standard deviation 1.
+- `beta_t`: how much noise step t adds. It is a small number, for example growing from 0.0001 to 0.02.
+
+One step of noising:
+
+```
+x_t = sqrt(1 - beta_t) * x_{t-1} + sqrt(beta_t) * noise
+```
+
+First shrink the previous image a tiny bit, then add a tiny bit of new noise. Why shrink? The squares of the two coefficients add up to exactly 1. That keeps the variance near 1, so it does not grow step after step.
+
+The code below takes a "flat grey image" (10,000 pixels, all 2.0) and noises it for 1000 steps. Watch the mean fall from 2 to 0 and the standard deviation rise from 0 to 1.
+--- code
+torch.manual_seed(0)
+T = 1000
+betas = torch.linspace(1e-4, 0.02, T)      # beta for every step: from 0.0001 up to 0.02
+x = torch.full((10000,), 2.0)              # 10,000 pixels, all 2.0
+for t in range(T):
+    x = (1 - betas[t]).sqrt() * x + betas[t].sqrt() * torch.randn_like(x)
+    if t in (0, 99, 299, 599, 999):
+        print(f"t={t:4d}   mean {x.mean():.3f}   std {x.std():.3f}")
+
+@@ concept
+title: Beta schedules: linear and cosine
+ref: day8
+--- body
+A "schedule" is three tables computed in advance, each of length T:
+
+- `betas`: how much noise each step adds.
+- `alphas = 1 - betas`: how much signal each step keeps.
+- `alphas_cumprod`: the cumulative product of alphas, called alpha_bar (ᾱ) in papers. Entry t = alphas[0] × alphas[1] × … × alphas[t]. It means: going from the clean image to step t, how much signal is left in total.
+
+Small example: alphas = [0.9, 0.8, 0.7] gives the cumulative product [0.9, 0.9×0.8, 0.9×0.8×0.7] = [0.9, 0.72, 0.504]. In PyTorch it is one line: `alphas.cumprod(0)` (0 means along dimension 0).
+
+### Linear schedule (the original DDPM paper)
+betas are T evenly spaced points from 0.0001 to 0.02: `torch.linspace(1e-4, 0.02, T)`.
+
+### Cosine schedule (Improved DDPM)
+Linear has a problem: the signal disappears too early. With T = 1000, alpha_bar is only about 0.08 at step 500. For the last few hundred steps the network is mostly "guessing pure noise from pure noise", so those training steps are wasted. This hurts most on small images (32×32, 64×64).
+
+The cosine schedule works the other way round. It first defines the alpha_bar curve directly, then derives the betas from it:
+
+1. `f(t) = cos((t/T + s) / (1 + s) · π/2)²` for t = 0, 1, …, T (T+1 points); s = 0.008 is a small offset
+2. `alpha_bar[i] = f(i+1) / f(0)` for i = 0 … T-1
+3. `beta[i] = 1 - alpha_bar[i] / alpha_bar[i-1]`; for i = 0 the "previous" value is 1
+4. The betas of the last few steps get close to 1, so clip them to [0, 0.999]
+
+The code below compares alpha_bar for both schedules. `linear_schedule` and `cosine_schedule` are hidden reference versions; you write them yourself in items 1 and 2.
+--- code
+alphas = torch.tensor([0.9, 0.8, 0.7])
+print("cumulative product:", alphas.cumprod(0))
+
+lin = linear_schedule(1000)["alphas_cumprod"]
+cos = cosine_schedule(1000)["alphas_cumprod"]
+for t in (0, 250, 500, 750, 999):
+    print(f"t={t:4d}   linear {lin[t]:.4f}   cosine {cos[t]:.4f}")
+
+@@ concept
+title: extract: each sample gets its own coefficient
+--- body
+In a batch, every image has its own random t. So coefficients must be looked up per sample:
+
+- The coefficient table `arr` has shape `(T,)`. The timesteps `t` have shape `(B,)`.
+- `arr.gather(0, t)` (or `arr[t]`) picks each sample's coefficient. The result has shape `(B,)`.
+
+Here is the catch. The image x has shape `(B, C, H, W)`. Multiplying it by a `(B,)` tensor goes wrong. Broadcasting (automatically lining up tensors of different shapes) matches dimensions **from the right**. So `(B,)` lines up with W, not with B.
+
+- If W ≠ B: you get an error. At least you notice.
+- If W == B: no error, just silently wrong numbers. This is the dangerous case.
+
+The fix: reshape to `(B, 1, 1, 1)`. Then each sample's coefficient multiplies all of its own pixels. The number of 1s = number of dimensions of x − 1. The general form:
+
+```
+out.reshape(B, *([1] * (len(x_shape) - 1)))
+```
+
+`[1] * 3` is `[1, 1, 1]`. The `*` in front unpacks the list into separate arguments, so this is `out.reshape(B, 1, 1, 1)`.
+
+One more thing: the table is usually built on the CPU, but during training t lives on the GPU. Call `arr.to(t.device)` first, or you get a device mismatch error.
+--- code
+arr = torch.tensor([10., 20., 30., 40.])      # a coefficient table with T = 4
+t = torch.tensor([3, 0])                      # two images in the batch, with t = 3 and t = 0
+c = arr.gather(0, t)
+print("picked:", c, tuple(c.shape))
+
+x = torch.ones(2, 3, 4, 4)
+try:
+    x * c
+except RuntimeError as e:
+    print("(2,3,4,4) times (2,) fails:", str(e)[:60])
+
+x2 = torch.ones(2, 3, 2, 2)                   # here W happens to be 2 as well
+wrong = x2 * c                                # no error! but c lines up with W
+print("silently wrong, image 0:\n", wrong[0, 0])
+right = x2 * c.reshape(2, 1, 1, 1)
+print("reshaped to (2,1,1,1), image 0:\n", right[0, 0])
+
+@@ concept
+title: q_sample: jump to step t in one go, and SNR
+--- body
+During training every sample gets a random t. Noising from x0 step by step up to t would take 500 loop iterations on average. Far too slow.
+
+The good news: Gaussian noise plus Gaussian noise is still Gaussian noise. So t steps collapse into one:
+
+```
+x_t = sqrt(alpha_bar_t) * x0 + sqrt(1 - alpha_bar_t) * noise
+```
+
+- The signal coefficient is `sqrt(alpha_bar_t)`; the noise coefficient is `sqrt(1 - alpha_bar_t)`. Their squares add up to 1.
+- t = 0: alpha_bar ≈ 0.9999, so x_t is almost the clean image.
+- t = 999 (linear schedule): alpha_bar ≈ 0.00004, so x_t is almost pure noise.
+
+Why does it work? Look at the first two steps. Call the alphas a0 and a1, and the two noise samples e0 and e1:
+
+```
+x_1 = sqrt(a1) * (sqrt(a0) * x0 + sqrt(1-a0) * e0) + sqrt(1-a1) * e1
+    = sqrt(a0*a1) * x0 + [ sqrt(a1*(1-a0)) * e0 + sqrt(1-a1) * e1 ]
+```
+
+Inside the brackets are two independent Gaussian noises added together. For independent noise, the variances simply add: a1(1-a0) + (1-a1) = 1 - a0·a1. So the brackets equal `sqrt(1 - a0*a1) * e`, where e is one new standard Gaussian noise. And a0·a1 is exactly alpha_bar_1. More steps work the same way.
+
+### Signal-to-noise ratio (SNR)
+`SNR(t) = alpha_bar_t / (1 - alpha_bar_t)`, that is, "signal power ÷ noise power". SNR falls as t grows. It only describes "how noisy is this step", whatever schedule you use. That is why papers use it to compare schedules and to weight the loss.
+
+The code below checks the closed form against two real noising steps. The mean and the standard deviation match.
+--- code
+torch.manual_seed(0)
+betas = torch.tensor([0.1, 0.2])
+ab = (1 - betas).cumprod(0)                   # alpha_bar = [0.9, 0.72]
+x0 = torch.full((100000,), 1.0)
+
+x = x0                                        # two noising steps, one after the other
+for b in betas:
+    x = (1 - b).sqrt() * x + b.sqrt() * torch.randn_like(x)
+xj = ab[1].sqrt() * x0 + (1 - ab[1]).sqrt() * torch.randn_like(x0)   # one jump to t=1
+
+print(f"two steps   mean {x.mean():.3f}   std {x.std():.3f}")
+print(f"one jump    mean {xj.mean():.3f}   std {xj.std():.3f}")
+print(f"formula     mean {ab[1].sqrt():.3f}   std {(1 - ab[1]).sqrt():.3f}")
+print("SNR:", ab / (1 - ab))
+
+@@ concept
+title: Timestep embedding: turning t into a vector
+--- body
+The UNet has to know how much noise is in its input, so it knows how much to remove. So besides the noisy image, we also tell it t.
+
+Feeding a raw integer (say 537) works badly: the number is large, and neighbouring t values look almost the same. The usual trick is the same as the positional encoding in Transformers: describe t with a set of cos and sin waves of **different frequencies**.
+
+```
+half  = dim // 2
+freqs = exp(-ln(max_period) * [0, 1, ..., half-1] / half)   # from 1 down to about 1/max_period
+args  = t[:, None] * freqs[None]                              # (B, 1) * (1, half) -> (B, half)
+emb   = cat([cos(args), sin(args)], dim=-1)                   # (B, dim)
+```
+
+- Frequency 0 is 1: when t changes by 1, cos(t) changes a lot (high frequency). It tells neighbouring t values apart.
+- Later frequencies are lower: the last dimensions change slowly with t (low frequency). They encode the rough position.
+- At t = 0: the cos half is all 1s and the sin half is all 0s.
+- The order is **cos first, then sin**. Codebases differ here. When you load someone else's pretrained weights, the order must match theirs.
+- `torch.arange` creates its tensor on the CPU by default. If t is on the GPU, multiplying them raises "Expected all tensors to be on the same device". So write `device=t.device`. You will never catch this bug with CPU-only tests.
+
+Here are the frequencies for half = 4, and the args for t = 0, 1 and 100:
+--- code
+half, max_period = 4, 10000
+freqs = torch.exp(-math.log(max_period) * torch.arange(half, dtype=torch.float) / half)
+print("freqs:", freqs)                        # 1, 0.1, 0.01, 0.001
+
+t = torch.tensor([0, 1, 100])
+args = t.float()[:, None] * freqs[None]
+print("args shape:", tuple(args.shape))
+print(args)
+print("cos of the t=0 row:", args.cos()[0])   # all 1s
+
+@@ concept
+title: FiLM and ResBlock: feeding t into conv features
+--- body
+Now t is a vector `emb` of shape `(B, t_dim)`. The conv features `h` have shape `(B, ch, H, W)`. How does emb get to influence h?
+
+### FiLM: scale and shift each channel
+1. Pass `emb` through SiLU (a smooth activation, x · sigmoid(x)), then through `nn.Linear(t_dim, 2*ch)`. That gives `(B, 2*ch)`.
+2. Add two dimensions to get `(B, 2*ch, 1, 1)` and split it in half along the channel dimension: `scale` and `shift`, each `(B, ch, 1, 1)`.
+3. Output `h * (1 + scale) + shift`. The `(B, ch, 1, 1)` tensors broadcast over every pixel.
+
+Why `1 + scale` and not just `scale`? When the Linear layer outputs values near 0 (for example, when its weights are zero), `1 + scale` makes the layer do almost nothing (an identity mapping), so features pass through unchanged. With plain `scale`, the features would be multiplied by 0 and everything would be lost.
+
+### ResBlock: the residual block
+The building block of a diffusion UNet. Its structure:
+
+```
+h = Conv3x3( SiLU( GroupNorm(x) ) )     # channels in_ch -> out_ch
+h = FiLM(h, emb)                        # feed in the time
+h = Conv3x3( SiLU( GroupNorm(h) ) )     # channels out_ch -> out_ch
+return h + skip(x)                      # residual: add the input back
+```
+
+- `nn.Conv2d(in_ch, out_ch, 3, 1, 1)`: a 3×3 convolution with stride 1 and padding 1. H and W stay the same.
+- `nn.GroupNorm(8, ch)`: splits the channels into 8 groups and normalizes each sample on its own. It does not depend on the batch size, so it is more stable than BatchNorm with tiny batches. ch must be divisible by 8.
+- `skip`: x must be addable to h. If the channel counts differ (in_ch ≠ out_ch), a 1×1 convolution `nn.Conv2d(in_ch, out_ch, 1)` changes the channel count. If they are the same, use `nn.Identity()` (returns its input unchanged).
+--- code
+emb = torch.randn(2, 16)                      # B=2, t_dim=16
+proj = nn.Linear(16, 2 * 8)                   # ch = 8
+p = proj(F.silu(emb))
+print("after Linear:", tuple(p.shape))
+p4 = p[:, :, None, None]
+print("two dims added:", tuple(p4.shape))
+scale, shift = p4.chunk(2, dim=1)
+print("scale / shift:", tuple(scale.shape), tuple(shift.shape))
+
+h = torch.randn(2, 8, 4, 4)
+zero = torch.zeros(2, 8, 1, 1)
+print("scale=shift=0: is h*(1+scale)+shift equal to h?", torch.equal(h * (1 + zero) + zero, h))
+print("scale=shift=0: sum of |h*scale+shift| =", (h * zero + zero).abs().sum().item())
+
+print("3x3 conv 8->16:", tuple(nn.Conv2d(8, 16, 3, 1, 1)(h).shape))
+print("1x1 conv 8->16:", tuple(nn.Conv2d(8, 16, 1)(h).shape))
+print("GroupNorm(8, 8):", tuple(nn.GroupNorm(8, 8)(h).shape))
+
+@@ concept
+title: UNet: downsample, upsample, skip concat
+--- body
+A diffusion network takes a noisy image and outputs a "noise prediction" of **the same shape**. A UNet fits this well:
+
+- **Encoder (going down)**: the resolution halves at each level (32 → 16 → 8) while the number of channels grows. Each pixel "sees" a larger area.
+- **Middle**: one more block at the smallest resolution.
+- **Decoder (going up)**: the resolution doubles at each level (8 → 16 → 32), back to the original size.
+- **Skip connections**: the encoder's output at each level is saved and sent to the decoder level with the same resolution, where the two are concatenated along the channel dimension. Details lost by downsampling come back this way. Drawn out, it looks like a U, hence the name.
+
+The shapes of the three operations:
+
+- Downsample `nn.Conv2d(ch, ch, 4, 2, 1)`: kernel 4, stride 2, padding 1. Output side = (H + 2×1 − 4) // 2 + 1, which is exactly H / 2 when H is even.
+- Upsample `nn.Upsample(scale_factor=2, mode="nearest")`: copies every pixel into a 2×2 block, doubling each side. It has no parameters.
+- Concatenate `torch.cat([up, skip], dim=1)`: dim=1 is the channel dimension, so the channel counts add up (for example 64 + 64 = 128). The ResBlock after the concat must take that sum as its input channels.
+
+The odd-size trap: 7 downsamples to 3 (rounded down), which upsamples to 6. That does not match the skip's 7, and cat fails. The fix: pad the upsampled tensor with zeros first. `F.pad(x, (left, right, top, bottom))` lists the dimensions **starting from the last one**: first W's left and right, then H's top and bottom.
+--- code
+x = torch.randn(1, 32, 32, 32)
+down = nn.Conv2d(32, 32, 4, 2, 1)
+up = nn.Upsample(scale_factor=2, mode="nearest")
+d = down(x)
+print("downsample:", tuple(d.shape))
+u = up(d)
+print("upsample:", tuple(u.shape))
+print("concat with skip:", tuple(torch.cat([u, x], dim=1).shape))
+
+odd = torch.randn(1, 8, 7, 7)
+u2 = up(nn.Conv2d(8, 8, 4, 2, 1)(odd))
+print("7x7 down then up:", tuple(u2.shape))
+print("pad 1 right and 1 bottom:", tuple(F.pad(u2, (0, 1, 0, 1)).shape))
+
+@@ concept
+title: The training loss and one reverse step
+--- body
+### Training: the network predicts the noise
+One training step is just four lines:
+
+1. A random t for every sample: `torch.randint(0, T, (B,))`
+2. Sample noise: `noise = torch.randn_like(x0)`
+3. Add it: `x_t = q_sample(x0, t, noise, sched)`
+4. loss = `F.mse_loss(model(x_t, t), noise)`
+
+The target is the **noise**, not x0. The noise is always standard Gaussian, so the target has the same size at every t. That makes it easy to learn.
+
+A very useful baseline: a model that always outputs 0 gets loss = mean of noise² ≈ 1. If your training loss stays around 1, the model has learned nothing.
+
+### Sampling: one reverse step
+From x_t to x_{t-1}:
+
+```
+mean    = (x_t - beta_t / sqrt(1 - alpha_bar_t) * eps_pred) / sqrt(alpha_t)
+x_{t-1} = mean + sqrt(beta_t) * z     # t > 0; z is fresh standard Gaussian noise
+x_0     = mean                        # t = 0: no noise on the last step
+```
+
+- `eps_pred` is the network's predicted noise. `mean` means "remove part of the predicted noise, then scale back up".
+- The last step outputs the finished image, so no random noise should be sprinkled on top.
+- Samples in a batch can have different t, so "add noise or not" is decided per sample: `(t > 0).float()` gives 0/1, reshaped to `(B, 1, 1, 1)` and multiplied in.
+
+To generate an image: start from pure noise and go from t = T-1 down to 0, calling the network once per step. T = 1000 means 1000 network calls, which is why DDPM sampling is slow. Day 9's DDIM uses far fewer steps.
+--- code
+torch.manual_seed(0)
+x0 = torch.randn(64, 1, 8, 8) * 10           # a batch of "images", scaled up 10x on purpose
+noise = torch.randn_like(x0)
+zero_pred = torch.zeros_like(noise)           # a "model" that always outputs 0
+print(f"target = noise:  loss = {F.mse_loss(zero_pred, noise).item():.3f}")
+print(f"target = x0:     loss = {F.mse_loss(zero_pred, x0).item():.1f}")
+
+print("random t:", torch.randint(0, 1000, (4,)))
+t = torch.tensor([0, 5, 0, 9])
+keep = (t > 0).float().reshape(-1, 1, 1, 1)
+print("noise switch:", keep.flatten(), "shape", tuple(keep.shape))
+
+@@ item d8-01
+type: code
+title: Linear beta schedule
+level: 1
+cards: Beta schedules: linear and cosine; Diffusion: add noise, then learn to remove it
+targets: linear_schedule
+ref: day8
+--- context
+Every diffusion codebase has a scheduler, and at its heart are three tables of length T. Noising, sampling and SNR all just look things up in these tables.
+--- prompt
+Write `linear_schedule(T, beta_start=1e-4, beta_end=0.02)`. It returns a dict with three tensors, each of shape `(T,)`:
+
+- `"betas"`: T evenly spaced points from beta_start to beta_end (both ends included)
+- `"alphas"`: `1 - betas`
+- `"alphas_cumprod"`: the cumulative product of alphas (alpha_bar). Entry i = alphas[0] × alphas[1] × … × alphas[i]
+
+Each one is a single torch call. You do not need a for loop.
+--- starter
+def linear_schedule(T, beta_start=1e-4, beta_end=0.02):
+    """Returns {"betas": (T,), "alphas": (T,), "alphas_cumprod": (T,)}"""
+    raise todo()
+--- solution
+def linear_schedule(T, beta_start=1e-4, beta_end=0.02):
+    betas = torch.linspace(beta_start, beta_end, T)
+    alphas = 1.0 - betas
+    return {"betas": betas, "alphas": alphas, "alphas_cumprod": alphas.cumprod(0)}
+--- tests
+@check("linear beta schedule")
+def t01():
+    s = linear_schedule(1000)
+    shape_is(s["betas"], (1000,))
+    eq(s["betas"][0], torch.tensor(1e-4), msg="the first beta should be beta_start")
+    eq(s["betas"][-1], torch.tensor(0.02), msg="the last beta should be beta_end")
+    eq(s["alphas"], 1 - s["betas"], msg="alphas should equal 1 - betas")
+    eq(s["alphas_cumprod"][0], s["alphas"][0], msg="alphas_cumprod[0] should be alphas[0]")
+    eq(s["alphas_cumprod"][4], s["alphas"][:5].prod(), msg="alphas_cumprod[4] should be the product of the first 5 alphas")
+    ab = s["alphas_cumprod"]
+    true((ab[1:] < ab[:-1]).all(), "alpha_bar must keep getting smaller (less and less signal)")
+    true(ab[-1] < 0.01, f"alpha_bar at the last step should be close to 0 (the signal is drowned in noise); got {ab[-1]:.4f}")
+--- hints
+- Evenly spaced points: `torch.linspace(start, end, steps)`, which includes both ends.
+- Cumulative product: `alphas.cumprod(0)`.
+- `return {"betas": betas, "alphas": alphas, "alphas_cumprod": alphas.cumprod(0)}`
+
+@@ item d8-02
+type: code
+title: Cosine schedule
+level: 2
+cards: Beta schedules: linear and cosine
+targets: cosine_schedule
+ref: day8
+--- context
+With the linear schedule the signal disappears too early, so many training steps in the second half are spent "guessing pure noise from pure noise". The cosine schedule from Improved DDPM removes the signal more evenly. It is clearly better on small images like 32×32 and 64×64, and many codebases use it.
+--- prompt
+Write `cosine_schedule(T, s=0.008)`. It returns a dict with the same structure as in item 1 (three `(T,)` tensors). Steps:
+
+1. `t = 0, 1, …, T`: T+1 float values
+2. `f = cos((t/T + s) / (1 + s) · π/2) ** 2`
+3. `alphas_cumprod[i] = f[i+1] / f[0]` for i = 0 … T-1 (drop entry 0, so the shape becomes `(T,)`)
+4. `betas[i] = 1 - alphas_cumprod[i] / alphas_cumprod[i-1]`; for i = 0 the "previous" value is 1. Then clip betas to [0, 0.999]
+5. `alphas = 1 - betas`
+
+Use the result of step 3 directly as `"alphas_cumprod"`. `linear_schedule` is provided (a check compares against it).
+--- starter
+def cosine_schedule(T, s=0.008):
+    """Returns {"betas": (T,), "alphas": (T,), "alphas_cumprod": (T,)}, with alphas_cumprod from the cosine curve"""
+    raise todo()
+--- solution
+def cosine_schedule(T, s=0.008):
+    t = torch.arange(T + 1, dtype=torch.float)
+    f = torch.cos((t / T + s) / (1 + s) * math.pi / 2) ** 2
+    ab = (f / f[0])[1:]
+    prev = torch.cat([torch.ones(1), ab[:-1]])
+    betas = (1 - ab / prev).clamp(0, 0.999)
+    return {"betas": betas, "alphas": 1 - betas, "alphas_cumprod": ab}
+--- tests
+@check("cosine schedule")
+def t02():
+    c = cosine_schedule(1000)
+    ab = c["alphas_cumprod"]
+    shape_is(ab, (1000,), "alphas_cumprod should be (T,): remember to drop entry 0 of f")
+    true(ab[0] > 0.999, f"the first step adds almost no noise, so alpha_bar[0] should be > 0.999; got {ab[0]:.5f}")
+    true(ab[-1] < 0.01, f"alpha_bar at the last step should be close to 0; got {ab[-1]:.4f}")
+    true((ab[1:] <= ab[:-1]).all(), "alpha_bar must never grow (it must be non-increasing)")
+    true((c["betas"] >= 0).all() and (c["betas"] <= 0.999).all(), "betas must be clipped to [0, 0.999]")
+    # what makes cosine special: in the middle the signal falls more slowly than with linear
+    lin = linear_schedule(1000)["alphas_cumprod"]
+    true(ab[500] > lin[500], "at t=500 cosine should keep more signal than linear; that is exactly why it works better")
+--- hints
+- `t = torch.arange(T + 1, dtype=torch.float)`; `f = torch.cos(...) ** 2`; π is `math.pi`; `ab = (f / f[0])[1:]`.
+- The "previous" table: put a 1 in front of ab and drop its last entry: `prev = torch.cat([torch.ones(1), ab[:-1]])`.
+- `betas = (1 - ab / prev).clamp(0, 0.999)`, then `return {"betas": betas, "alphas": 1 - betas, "alphas_cumprod": ab}`.
+
+@@ item d8-03
+type: code
+title: extract, the broadcasting helper
+level: 2
+cards: extract: each sample gets its own coefficient
+targets: extract
+ref: day8
+--- context
+Nearly every formula in diffusion code does "look up the coefficient for each sample's own t, then multiply it into the whole image". extract does exactly that, and almost every DDPM codebase has it. When the shape is wrong there is often no error, just silently wrong numbers.
+--- prompt
+Write `extract(arr, t, x_shape)`:
+
+- `arr`: a coefficient table of shape `(T,)`, for example alphas_cumprod
+- `t`: int64 timesteps of shape `(B,)`, one per sample
+- `x_shape`: the shape of the tensor it will multiply, for example `(B, C, H, W)`, or `(B, D)`
+
+Return each sample's coefficient `arr[t]`, reshaped to `(B, 1, 1, 1)` (the number of 1s = `len(x_shape) - 1`) so it broadcasts against x.
+
+Example: arr = [0, 1, …, 9], t = [3, 7], x_shape = (2, 3, 4, 4) → shape (2, 1, 1, 1) with values 3 and 7; x_shape = (2, 5) → shape (2, 1).
+
+First move arr to t's device: `arr.to(t.device)`.
+--- starter
+def extract(arr, t, x_shape):
+    """arr (T,), t (B,) -> (B, 1, 1, ...), broadcastable against a tensor of shape x_shape"""
+    raise todo()
+--- solution
+def extract(arr, t, x_shape):
+    out = arr.to(t.device).gather(0, t)
+    return out.reshape(t.shape[0], *([1] * (len(x_shape) - 1)))
+--- tests
+@check("extract, the broadcasting helper")
+def t03():
+    arr = torch.arange(10).float()
+    t = torch.tensor([3, 7])
+    o = extract(arr, t, (2, 3, 4, 4))
+    shape_is(o, (2, 1, 1, 1), "for a 4-D input it should be (B, 1, 1, 1)")
+    eq(o.flatten(), torch.tensor([3.0, 7.0]), msg="wrong values: they should be arr[3] and arr[7]")
+    o2 = extract(arr, t, (2, 5))
+    shape_is(o2, (2, 1), "for a 2-D input it should be (B, 1): the number of 1s must follow len(x_shape)")
+    true((o * torch.ones(2, 3, 4, 4)).shape == (2, 3, 4, 4), "the result must broadcast against x")
+--- hints
+- Picking values: `arr.gather(0, t)` or `arr[t]`, both give `(B,)`.
+- `[1] * (len(x_shape) - 1)` is a list; a `*` in front unpacks it: `out.reshape(B, *[1, 1, 1])` is the same as `out.reshape(B, 1, 1, 1)`.
+- `out = arr.to(t.device).gather(0, t)`, then `return out.reshape(t.shape[0], *([1] * (len(x_shape) - 1)))`.
+
+@@ item d8-04
+type: code
+title: q_sample in closed form
+level: 2
+cards: q_sample: jump to step t in one go, and SNR; extract: each sample gets its own coefficient
+targets: q_sample
+ref: day8
+--- context
+During training every sample gets a random t. Noising from x0 step by step would take 500 loop iterations on average, which is too slow. The closed form jumps to any t in one step. The second check proves that the jump and step-by-step noising give exactly the same distribution. The whole of diffusion rests on this.
+--- prompt
+Write `q_sample(x0, t, noise, sched)`, which computes the noisy image at step t in one go:
+
+```
+x_t = sqrt(alpha_bar_t) * x0 + sqrt(1 - alpha_bar_t) * noise
+```
+
+- `x0`, `noise`: `(B, C, H, W)`; `t`: `(B,)`, and each sample may have a different t
+- `sched`: the dict from item 1; alpha_bar is `sched["alphas_cumprod"]`
+- use `extract` (provided) to get `(B, 1, 1, 1)` coefficients
+- the result has the same shape as x0
+
+The second check first noises 20,000 samples step by step for 61 steps, then jumps there with your q_sample and compares the means and standard deviations.
+--- starter
+def q_sample(x0, t, noise, sched):
+    """x0, noise: (B, C, H, W); t: (B,)  ->  x_t, same shape as x0"""
+    raise todo()
+--- solution
+def q_sample(x0, t, noise, sched):
+    ab = extract(sched["alphas_cumprod"], t, x0.shape)
+    return ab.sqrt() * x0 + (1 - ab).sqrt() * noise
+--- tests
+@check("q_sample in closed form")
+def t04():
+    seed(0)
+    s = linear_schedule(1000)
+    x0 = torch.randn(4, 3, 8, 8)
+    n = torch.randn_like(x0)
+    t0 = torch.zeros(4, dtype=torch.long)
+    xt = q_sample(x0, t0, n, s)
+    true((xt - x0).abs().mean() < 0.02, "at t=0, x_t should still be almost exactly x0")
+    tT = torch.full((4,), 999, dtype=torch.long)
+    xT = q_sample(x0, tT, n, s)
+    true((xT - n).abs().mean() < 0.1, "at t=999, x_t should be almost pure noise")
+    # samples in one batch may have different t
+    tm = torch.tensor([0, 500, 999, 250])
+    shape_is(q_sample(x0, tm, n, s), x0.shape, "with a different t per sample, the output must still have x0's shape")
+
+@check("closed form == step-by-step noising")
+def t05():
+    seed(1)
+    T = 200
+    s = linear_schedule(T, 1e-4, 0.05)
+    N = 20000
+    x0 = torch.full((N, 1), 2.0)                 # a fixed signal makes the statistics easy to read
+    step = 60
+
+    # step by step: x_t = sqrt(1-beta_t) * x_{t-1} + sqrt(beta_t) * eps
+    x = x0.clone()
+    for i in range(step + 1):
+        b = s["betas"][i]
+        x = (1 - b).sqrt() * x + b.sqrt() * torch.randn_like(x)
+
+    ab = s["alphas_cumprod"][step]
+    want_mean = (ab.sqrt() * 2.0).item()
+    want_std = (1 - ab).sqrt().item()
+    true(abs(x.mean().item() - want_mean) < 0.02,
+         f"the step-by-step mean {x.mean().item():.4f} should be ≈ sqrt(alpha_bar)*x0 = {want_mean:.4f}")
+    true(abs(x.std().item() - want_std) < 0.02,
+         f"the step-by-step std {x.std().item():.4f} should be ≈ sqrt(1-alpha_bar) = {want_std:.4f}")
+
+    # your q_sample must give the same statistics
+    xt = q_sample(x0, torch.full((N,), step, dtype=torch.long), torch.randn(N, 1), s)
+    true(abs(xt.mean().item() - want_mean) < 0.02,
+         f"q_sample's mean {xt.mean().item():.4f} does not match the step-by-step {want_mean:.4f}: the signal coefficient should be sqrt(alpha_bar)")
+    true(abs(xt.std().item() - want_std) < 0.02,
+         f"q_sample's std {xt.std().item():.4f} does not match the step-by-step {want_std:.4f}: the noise coefficient should be sqrt(1-alpha_bar)")
+--- hints
+- Get the coefficient first: `ab = extract(sched["alphas_cumprod"], t, x0.shape)`, shape `(B, 1, 1, 1)`.
+- Both coefficients need a square root: `ab.sqrt()` and `(1 - ab).sqrt()`.
+- `return ab.sqrt() * x0 + (1 - ab).sqrt() * noise`
+
+@@ item d8-05
+type: code
+title: Sinusoidal timestep embedding
+level: 2
+cards: Timestep embedding: turning t into a vector
+targets: timestep_embedding
+ref: day8
+--- context
+The UNet has to know how much noise is in its input to know how much to remove. t is a single integer, and feeding it in raw works badly, so we first encode it as a set of cos/sin waves of different frequencies. Almost every diffusion model (DiT included) uses this function.
+--- prompt
+Write `timestep_embedding(t, dim, max_period=10000)`: t holds integer timesteps of shape `(B,)`; return `(B, dim)`.
+
+1. `half = dim // 2`
+2. `freqs = exp(-ln(max_period) * [0, 1, …, half-1] / half)`, shape `(half,)`
+3. `args = t[:, None] * freqs[None]`, shape `(B, half)`
+4. return `cat([cos(args), sin(args)], dim=-1)`: **cos first, then sin**
+
+Give `torch.arange` a `device=t.device`. Without it you still pass the checks on the CPU, but as soon as the model moves to a GPU you get "Expected all tensors to be on the same device".
+--- starter
+def timestep_embedding(t, dim, max_period=10000):
+    """t: (B,) integer timesteps  ->  (B, dim); first half cos, second half sin"""
+    raise todo()
+--- solution
+def timestep_embedding(t, dim, max_period=10000):
+    half = dim // 2
+    # the device must follow t, otherwise this line fails with "two devices" once the model is on a GPU;
+    # CPU-only tests never catch this kind of bug
+    freqs = torch.exp(-math.log(max_period)
+                      * torch.arange(half, dtype=torch.float, device=t.device) / half)
+    args = t.float()[:, None] * freqs[None]
+    return torch.cat([args.cos(), args.sin()], dim=-1)
+--- tests
+@check("sinusoidal timestep embedding")
+def t06():
+    e = timestep_embedding(torch.tensor([0, 1, 100]), 64)
+    shape_is(e, (3, 64))
+    eq(e[0, :32], torch.ones(32), msg="at t=0 the first half (cos) should be all 1s. Did you put sin first?")
+    eq(e[0, 32:], torch.zeros(32), msg="at t=0 the second half (sin) should be all 0s")
+    true(not torch.allclose(e[1], e[2]), "different t must give different embeddings")
+    # later dimensions have lower frequencies, so they react less to a change in t
+    true((e[1, 31] - e[2, 31]).abs() < (e[1, 0] - e[2, 0]).abs(),
+         "later dimensions should have lower frequencies: freqs should fall from 1 downwards (there is a minus sign in the exponent)")
+--- hints
+- `freqs = torch.exp(-math.log(max_period) * torch.arange(half, dtype=torch.float, device=t.device) / half)`
+- t is an integer tensor, so use `t.float()` first. `[:, None]` turns `(B,)` into `(B, 1)`; `freqs[None]` is `(1, half)`; the product broadcasts to `(B, half)`.
+- `return torch.cat([args.cos(), args.sin()], dim=-1)`
+
+@@ item d8-06
+type: code
+title: FiLM conditioning
+level: 2
+cards: FiLM and ResBlock: feeding t into conv features
+targets: FiLM
+ref: day8
+--- context
+Every ResBlock in the UNet needs to know the current t. FiLM is the most common way to feed it in: the time vector produces a scale and a shift for each channel. OpenAI's guided-diffusion UNet does exactly this, and the adaLN in day 10's DiT is the same idea.
+--- prompt
+Write `class FiLM(nn.Module)`:
+
+- `__init__(self, t_dim, ch)`: create one `nn.Linear(t_dim, 2 * ch)`
+- `forward(self, h, emb)`: h is `(B, ch, H, W)`, emb is `(B, t_dim)`
+  1. pass `emb` through SiLU, then through the Linear layer, to get `(B, 2*ch)`
+  2. turn it into `(B, 2*ch, 1, 1)` and split it along dim=1 into scale and shift, each `(B, ch, 1, 1)`
+  3. return `h * (1 + scale) + shift`
+
+A check sets all of the Linear layer's weights and biases to zero; the output must then be exactly h.
+--- starter
+class FiLM(nn.Module):
+    """emb (B, t_dim) -> a scale and a shift per channel; output h * (1 + scale) + shift"""
+
+    def __init__(self, t_dim, ch):
+        super().__init__()
+        raise todo()
+
+    def forward(self, h, emb):
+        raise todo()
+--- solution
+class FiLM(nn.Module):
+    def __init__(self, t_dim, ch):
+        super().__init__()
+        self.proj = nn.Linear(t_dim, 2 * ch)
+
+    def forward(self, h, emb):
+        scale, shift = self.proj(F.silu(emb))[:, :, None, None].chunk(2, dim=1)
+        return h * (1 + scale) + shift
+--- tests
+@check("FiLM conditioning")
+def t07():
+    m = FiLM(16, 8)
+    h = torch.randn(2, 8, 4, 4)
+    emb = torch.randn(2, 16)
+    shape_is(m(h, emb), (2, 8, 4, 4))
+    with torch.no_grad():                    # zero the Linear weights -> scale = shift = 0 -> identity
+        for p in m.parameters():
+            p.zero_()
+    eq(m(h, emb), h, msg="with scale and shift both 0 the output should be h unchanged (that is why you write 1 + scale)")
+--- hints
+- `__init__` needs one line: `self.proj = nn.Linear(t_dim, 2 * ch)`.
+- `self.proj(F.silu(emb))` is `(B, 2*ch)`; `[:, :, None, None]` adds two dimensions; `.chunk(2, dim=1)` splits it in half.
+- `scale, shift = self.proj(F.silu(emb))[:, :, None, None].chunk(2, dim=1)`, then `return h * (1 + scale) + shift`.
+
+@@ item d8-07
+type: code
+title: ResBlock
+level: 2
+cards: FiLM and ResBlock: feeding t into conv features
+targets: ResBlock
+ref: day8
+--- context
+The ResBlock is the building block of a diffusion UNet: the whole network is a chain of ResBlocks plus downsampling and upsampling. The residual connection (output = transformation + input) is what lets very deep networks train.
+--- prompt
+Write `class ResBlock(nn.Module)` with `__init__(self, in_ch, out_ch, t_dim)` and `forward(self, x, emb)`:
+
+```
+h = conv1( SiLU( GroupNorm(8, in_ch)(x) ) )     # conv1: 3x3, in_ch -> out_ch
+h = film(h, emb)                                 # FiLM(t_dim, out_ch)
+h = conv2( SiLU( GroupNorm(8, out_ch)(h) ) )     # conv2: 3x3, out_ch -> out_ch
+return h + skip(x)
+```
+
+- 3×3 convolutions: `nn.Conv2d(..., 3, 1, 1)` (padding 1, so H and W stay the same)
+- `skip`: `nn.Conv2d(in_ch, out_ch, 1)` when in_ch ≠ out_ch, otherwise `nn.Identity()`
+- x is `(B, in_ch, H, W)`, emb is `(B, t_dim)`, the output is `(B, out_ch, H, W)`
+- `FiLM` is provided (the reference version)
+--- starter
+class ResBlock(nn.Module):
+    """x (B, in_ch, H, W), emb (B, t_dim) -> (B, out_ch, H, W)"""
+
+    def __init__(self, in_ch, out_ch, t_dim):
+        super().__init__()
+        raise todo()
+
+    def forward(self, x, emb):
+        raise todo()
+--- solution
+class ResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, t_dim):
+        super().__init__()
+        self.n1 = nn.GroupNorm(8, in_ch)
+        self.c1 = nn.Conv2d(in_ch, out_ch, 3, 1, 1)
+        self.film = FiLM(t_dim, out_ch)
+        self.n2 = nn.GroupNorm(8, out_ch)
+        self.c2 = nn.Conv2d(out_ch, out_ch, 3, 1, 1)
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x, emb):
+        h = self.c1(F.silu(self.n1(x)))
+        h = self.film(h, emb)
+        h = self.c2(F.silu(self.n2(h)))
+        return h + self.skip(x)
+--- tests
+@check("ResBlock")
+def t08():
+    m = ResBlock(8, 8, 16)
+    shape_is(m(torch.randn(2, 8, 16, 16), torch.randn(2, 16)), (2, 8, 16, 16))
+    m2 = ResBlock(8, 16, 16)
+    shape_is(m2(torch.randn(2, 8, 16, 16), torch.randn(2, 16)), (2, 16, 16, 16),
+             "with in_ch=8 and out_ch=16 the output should have 16 channels")
+    true(any(isinstance(mm, nn.Conv2d) and mm.kernel_size == (1, 1) for mm in m2.modules()),
+         "the channel count changes, so the skip branch needs a 1x1 convolution")
+--- hints
+- Build 6 submodules in `__init__`: `n1`, `c1`, `film`, `n2`, `c2`, `skip`. Note that the second GroupNorm has out_ch channels.
+- `self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()`
+- forward: `h = self.c1(F.silu(self.n1(x)))`, `h = self.film(h, emb)`, `h = self.c2(F.silu(self.n2(h)))`, `return h + self.skip(x)`.
+
+@@ item d8-08
+type: code
+title: Skip concat
+level: 1
+cards: UNet: downsample, upsample, skip concat
+targets: unet_skip_concat
+ref: day8
+--- context
+The U in UNet comes from skip connections: encoder features go straight to the decoder and are concatenated with the upsampled features, which brings back the details lost by downsampling. Mismatched odd sizes are one of the most common errors when you put a UNet together.
+--- prompt
+Write `unet_skip_concat(up_feat, skip_feat)`:
+
+- `up_feat`: `(B, C1, H', W')`, the upsampled features from the decoder
+- `skip_feat`: `(B, C2, H, W)`, the features the encoder saved
+- return their concatenation along the channel dimension, `(B, C1+C2, H, W)`, with up_feat first and skip_feat second
+
+If H' or W' is smaller than the skip's size (after downsampling and upsampling an odd size they are often 1 short), first pad up_feat with zeros on the right and at the bottom until it matches skip_feat, then concatenate.
+--- starter
+def unet_skip_concat(up_feat, skip_feat):
+    """(B, C1, H', W') + (B, C2, H, W) -> (B, C1+C2, H, W)"""
+    raise todo()
+--- solution
+def unet_skip_concat(up_feat, skip_feat):
+    dh = skip_feat.size(-2) - up_feat.size(-2)
+    dw = skip_feat.size(-1) - up_feat.size(-1)
+    if dh or dw:
+        up_feat = F.pad(up_feat, (0, dw, 0, dh))
+    return torch.cat([up_feat, skip_feat], dim=1)
+--- tests
+@check("skip concat")
+def t09():
+    a, b = torch.randn(2, 8, 16, 16), torch.randn(2, 4, 16, 16)
+    shape_is(unet_skip_concat(a, b), (2, 12, 16, 16), "concatenate along the channel dimension (dim=1)")
+    # sizes that do not line up
+    a2 = torch.randn(2, 8, 7, 7)
+    b2 = torch.randn(2, 4, 8, 8)
+    shape_is(unet_skip_concat(a2, b2), (2, 12, 8, 8), "when the sizes differ, pad with F.pad first")
+--- hints
+- How much is missing: `dh = skip_feat.size(-2) - up_feat.size(-2)`, `dw = skip_feat.size(-1) - up_feat.size(-1)`.
+- The second argument of `F.pad` starts from the last dimension: (left, right, top, bottom). So it is `F.pad(up_feat, (0, dw, 0, dh))`.
+- Finally `return torch.cat([up_feat, skip_feat], dim=1)`.
+
+@@ item d8-09
+type: code
+title: MiniUNet forward pass
+level: 3
+cards: UNet: downsample, upsample, skip concat; FiLM and ResBlock: feeding t into conv features; Timestep embedding: turning t into a vector
+targets: MiniUNet
+ref: day8
+--- context
+You now have every part. This item puts them together into a UNet that predicts noise. It follows the same pattern as the UNets in the original DDPM paper and in Stable Diffusion, only much smaller. Once you have built one yourself, you know where every piece is when you read a big model's code.
+--- prompt
+Write `class MiniUNet(nn.Module)` with `__init__(self, in_ch=1, t_dim=128)` and `forward(self, x, t)`: x is `(B, in_ch, 32, 32)`, t is `(B,)`; return a tensor with x's shape (the predicted noise).
+
+Structure (the right column is the resolution after that step):
+
+```
+t_mlp : timestep_embedding(t, 64) -> Linear(64, t_dim) -> SiLU -> Linear(t_dim, t_dim)  = emb
+stem  : Conv2d(in_ch, 32, 3, 1, 1)                                32x32
+rb1   : ResBlock(32, 32, t_dim), save the result as s1            32x32
+ds1   : Conv2d(32, 32, 4, 2, 1)                                   16x16
+rb2   : ResBlock(32, 64, t_dim), save the result as s2            16x16
+ds2   : Conv2d(64, 64, 4, 2, 1)                                   8x8
+mid   : ResBlock(64, 64, t_dim)                                   8x8
+rb3   : upsample -> unet_skip_concat(., s2) -> ResBlock(64+64, 32, t_dim)   16x16
+rb4   : upsample -> unet_skip_concat(., s1) -> ResBlock(32+32, 32, t_dim)   32x32
+out   : GroupNorm(8, 32) -> SiLU -> Conv2d(32, in_ch, 3, 1, 1)
+```
+
+- Upsample with `nn.Upsample(scale_factor=2, mode="nearest")`
+- Every ResBlock gets the same emb
+- `timestep_embedding`, `ResBlock` and `unet_skip_concat` are provided (reference versions)
+
+Checks: the output has x's shape; a different t must change the output (proof that the time conditioning is wired in).
+--- starter
+class MiniUNet(nn.Module):
+    """forward(x, t): x (B, in_ch, 32, 32), t (B,) -> same shape as x (the predicted noise). Structure: see the task."""
+
+    def __init__(self, in_ch=1, t_dim=128):
+        super().__init__()
+        raise todo()
+
+    def forward(self, x, t):
+        raise todo()
+--- solution
+class MiniUNet(nn.Module):
+    def __init__(self, in_ch=1, t_dim=128):
+        super().__init__()
+        self.t_dim = t_dim
+        self.t_mlp = nn.Sequential(nn.Linear(64, t_dim), nn.SiLU(), nn.Linear(t_dim, t_dim))
+        self.stem = nn.Conv2d(in_ch, 32, 3, 1, 1)
+        self.rb1 = ResBlock(32, 32, t_dim)
+        self.ds1 = nn.Conv2d(32, 32, 4, 2, 1)
+        self.rb2 = ResBlock(32, 64, t_dim)
+        self.ds2 = nn.Conv2d(64, 64, 4, 2, 1)
+        self.mid = ResBlock(64, 64, t_dim)
+        self.up = nn.Upsample(scale_factor=2, mode="nearest")
+        self.rb3 = ResBlock(64 + 64, 32, t_dim)
+        self.rb4 = ResBlock(32 + 32, 32, t_dim)
+        self.out = nn.Sequential(nn.GroupNorm(8, 32), nn.SiLU(), nn.Conv2d(32, in_ch, 3, 1, 1))
+
+    def forward(self, x, t):
+        emb = self.t_mlp(timestep_embedding(t, 64))
+        h = self.stem(x)
+        s1 = self.rb1(h, emb)
+        h = self.ds1(s1)
+        s2 = self.rb2(h, emb)
+        h = self.ds2(s2)
+        h = self.mid(h, emb)
+        h = self.rb3(unet_skip_concat(self.up(h), s2), emb)
+        h = self.rb4(unet_skip_concat(self.up(h), s1), emb)
+        return self.out(h)
+--- tests
+@check("MiniUNet forward pass")
+def t10():
+    m = MiniUNet(1)
+    x = torch.randn(2, 1, 32, 32)
+    t = torch.randint(0, 1000, (2,))
+    shape_is(m(x, t), (2, 1, 32, 32), "the UNet's output must have the input's shape (it predicts the noise)")
+    # different t must give different outputs, otherwise the time conditioning is not connected at all
+    o1 = m(x, torch.zeros(2, dtype=torch.long))
+    o2 = m(x, torch.full((2,), 999, dtype=torch.long))
+    true(not torch.allclose(o1, o2, atol=1e-4), "the timestep changed but the output did not: the time embedding never reaches the network (pass emb to every ResBlock)")
+--- hints
+- `nn.Sequential(...)` is the easiest way to write `t_mlp` and `out`. `nn.Upsample` has no parameters, so one instance can be used twice.
+- In forward, first compute `emb = self.t_mlp(timestep_embedding(t, 64))`, then follow the table: `h = self.stem(x)`, `s1 = self.rb1(h, emb)`, `h = self.ds1(s1)`, …
+- Decoder: `h = self.rb3(unet_skip_concat(self.up(h), s2), emb)`, `h = self.rb4(unet_skip_concat(self.up(h), s1), emb)`, and finally `return self.out(h)`.
+
+@@ item d8-10
+type: code
+title: The DDPM training loss
+level: 2
+cards: The training loss and one reverse step; q_sample: jump to step t in one go, and SNR
+targets: ddpm_loss
+ref: day8
+--- context
+The real "algorithm" in a DDPM training loop is just these few lines. Using x0 as the target instead of the noise is one of the most common mistakes when people reimplement it: nothing crashes, the loss even goes down, but the model learns the wrong thing.
+--- prompt
+Write `ddpm_loss(model, x0, sched, T)`, which returns a scalar loss:
+
+1. A random t for every sample, in [0, T), shape `(B,)`, on x0's device
+2. `noise = torch.randn_like(x0)`
+3. `x_t = q_sample(x0, t, noise, sched)` (provided)
+4. return the MSE between `model(x_t, t)` and `noise`: the target is the noise, not x0
+
+One check uses a model that always outputs 0. Its loss should be about the variance of the noise, which is 1.
+--- starter
+def ddpm_loss(model, x0, sched, T):
+    """Returns a scalar loss: mse(model(x_t, t), noise)"""
+    raise todo()
+--- solution
+def ddpm_loss(model, x0, sched, T):
+    t = torch.randint(0, T, (x0.size(0),), device=x0.device)
+    noise = torch.randn_like(x0)
+    xt = q_sample(x0, t, noise, sched)
+    return F.mse_loss(model(xt, t), noise)      # the target is the noise, not x0
+--- tests
+@check("DDPM training loss")
+def t11():
+    seed(2)
+    s = linear_schedule(100)
+    m = MiniUNet(1)
+    loss = ddpm_loss(m, torch.randn(4, 1, 32, 32), s, 100)
+    true(loss.dim() == 0, "the loss must be a scalar (a 0-dim tensor)")
+    true(loss.item() > 0.1, "a randomly initialised model predicting noise should have a loss around 1")
+    # the target must be the noise, not x0
+    class Zero(nn.Module):
+        def forward(self, x, t):
+            return torch.zeros_like(x)
+    l0 = ddpm_loss(Zero(), torch.randn(64, 1, 8, 8) * 10, s, 100)
+    true(abs(l0.item() - 1.0) < 0.15,
+         f"a model that always outputs 0 should get loss ≈ variance of the noise = 1; got {l0.item():.3f}. "
+         "If it is far above 1, your target is x0")
+--- hints
+- `t = torch.randint(0, T, (x0.size(0),), device=x0.device)`
+- The model is called as `model(xt, t)` and returns the predicted noise.
+- Last line: `return F.mse_loss(model(xt, t), noise)`
+
+@@ item d8-11
+type: code
+title: One reverse step (p_sample)
+level: 3
+cards: The training loss and one reverse step; extract: each sample gets its own coefficient
+targets: p_sample_step
+ref: day8
+--- context
+Generating an image means starting from pure noise and repeating this step T times. The t = 0 step must not add noise, and when samples in a batch have different t, "add noise or not" must be decided per sample. These two points are where hand-written sampling loops most often go wrong.
+--- prompt
+Write `p_sample_step(x_t, t, eps_pred, sched, noise=None)`, one step from t to t-1:
+
+```
+mean    = (x_t - beta_t / sqrt(1 - alpha_bar_t) * eps_pred) / sqrt(alpha_t)
+x_{t-1} = mean + sqrt(beta_t) * noise     # t > 0
+x_0     = mean                            # t == 0: no noise on the last step
+```
+
+- `x_t`, `eps_pred`: `(B, C, H, W)`; `eps_pred` is the network's predicted noise
+- `t`: `(B,)`, and each sample may differ. So decide "add noise or not" per sample (a `(B, 1, 1, 1)` switch of 0s and 1s); do not write one Python `if` for the whole batch
+- if `noise` is None, sample it yourself with `torch.randn_like(x_t)`
+- get beta_t, alpha_t and alpha_bar_t from `sched["betas"]`, `sched["alphas"]` and `sched["alphas_cumprod"]` with `extract`
+--- starter
+def p_sample_step(x_t, t, eps_pred, sched, noise=None):
+    """One DDPM reverse step: x_t -> x_{t-1}. t: (B,); samples with t == 0 get no noise"""
+    raise todo()
+--- solution
+def p_sample_step(x_t, t, eps_pred, sched, noise=None):
+    beta = extract(sched["betas"], t, x_t.shape)
+    alpha = extract(sched["alphas"], t, x_t.shape)
+    ab = extract(sched["alphas_cumprod"], t, x_t.shape)
+    mean = (x_t - beta / (1 - ab).sqrt() * eps_pred) / alpha.sqrt()
+    if noise is None:
+        noise = torch.randn_like(x_t)
+    keep = (t > 0).float().reshape(-1, *([1] * (x_t.dim() - 1)))
+    return mean + keep * beta.sqrt() * noise    # no noise when t=0
+--- tests
+@check("one p_sample step")
+def t12():
+    seed(3)
+    s = linear_schedule(100)
+    x = torch.randn(4, 1, 4, 4)
+    eps = torch.randn_like(x)
+    n = torch.randn_like(x)
+    t50 = torch.full((4,), 50, dtype=torch.long)
+    a = p_sample_step(x, t50, eps, s, noise=n)
+    shape_is(a, x.shape)
+    b = p_sample_step(x, t50, eps, s, noise=torch.zeros_like(x))
+    true(not torch.allclose(a, b), "for t > 0 you should add sqrt(beta_t) * noise")
+    t0 = torch.zeros(4, dtype=torch.long)
+    c1 = p_sample_step(x, t0, eps, s, noise=n)
+    c2 = p_sample_step(x, t0, eps, s, noise=torch.randn_like(x))
+    eq(c1, c2, msg="the last step (t=0) must not add noise: it outputs the finished image, so a different noise must not change the result")
+    # feed in the true noise: one reverse step should land close to x0
+    x0 = torch.ones(1, 1, 2, 2)
+    tt = torch.tensor([1])
+    xt = q_sample(x0, tt, eps[:1, :, :2, :2], s)
+    back = p_sample_step(xt, tt, eps[:1, :, :2, :2], s, noise=torch.zeros_like(xt))
+    true((back - x0).abs().mean() < 0.2, "given the true noise, one reverse step should land close to x0: check the formula for mean")
+--- hints
+- The three coefficients: `beta = extract(sched["betas"], t, x_t.shape)`, and the same for `alpha` and `ab`; all are `(B, 1, 1, 1)`.
+- `mean = (x_t - beta / (1 - ab).sqrt() * eps_pred) / alpha.sqrt()`
+- The per-sample switch: `keep = (t > 0).float().reshape(-1, *([1] * (x_t.dim() - 1)))`, then `return mean + keep * beta.sqrt() * noise`.
+
+@@ item d8-12
+type: code
+title: Signal-to-noise ratio (SNR)
+level: 1
+cards: q_sample: jump to step t in one go, and SNR
+targets: snr
+ref: day8
+--- context
+SNR (signal-to-noise ratio) turns "how noisy is step t" into one number, whatever schedule you use. Papers that compare schedules, and loss-weighting methods like min-SNR, all talk in terms of it.
+--- prompt
+Write `snr(sched, t)`:
+
+```
+SNR(t) = alpha_bar_t / (1 - alpha_bar_t)
+```
+
+- `sched`: the dict from item 1; alpha_bar is `sched["alphas_cumprod"]`
+- `t`: timesteps of shape `(B,)`
+- return `(B,)` (no reshape to `(B, 1, 1, 1)` here)
+--- starter
+def snr(sched, t):
+    """t: (B,) -> (B,)"""
+    raise todo()
+--- solution
+def snr(sched, t):
+    ab = sched["alphas_cumprod"].gather(0, t)
+    return ab / (1 - ab)
+--- tests
+@check("signal-to-noise ratio")
+def t13():
+    s = linear_schedule(1000)
+    v = snr(s, torch.tensor([0, 500, 999]))
+    shape_is(v, (3,), "3 timesteps in, so 3 numbers out")
+    true(v[0] > v[1] > v[2], "SNR must fall as t grows")
+    true(v[0] > 1000, "at t=0 there is almost no noise, so SNR should be very large")
+    true(v[-1] < 0.01, "at t=999 it is almost all noise, so SNR should be very small")
+--- hints
+- Look up the values: `sched["alphas_cumprod"][t]` or `.gather(0, t)`.
+- `return ab / (1 - ab)`
+
+@@ item d8-13
+type: fix
+title: Find the bug: q_sample_buggy
+level: 2
+cards: q_sample: jump to step t in one go, and SNR; Beta schedules: linear and cosine
+targets: q_sample_buggy
+ref: day8
+--- context
+This code runs, raises no error and even gets the shape right, yet the model will never train well. Bugs like this are only caught by comparing against a reference implementation.
+--- prompt
+The noising function below has **2** mistakes. Fix it so its output is exactly the same as the correct `q_sample` (the check compares them at t = 0, 300 and 999). Do not rename the function.
+--- starter
+def q_sample_buggy(x0, t, noise, sched):
+    a = extract(sched["alphas"], t, x0.shape)
+    return a * x0 + (1 - a) * noise
+--- solution
+def q_sample_buggy(x0, t, noise, sched):
+    ab = extract(sched["alphas_cumprod"], t, x0.shape)   # fix 1: alphas -> alphas_cumprod
+    return ab.sqrt() * x0 + (1 - ab).sqrt() * noise      # fix 2: both coefficients need a square root
+--- tests
+@check("find the bug: q_sample_buggy")
+def t14():
+    seed(4)
+    s = linear_schedule(1000)
+    x0, n = torch.randn(4, 1, 8, 8), torch.randn(4, 1, 8, 8)
+    for tv in [0, 300, 999]:
+        t = torch.full((4,), tv, dtype=torch.long)
+        eq(q_sample_buggy(x0, t, n, s), q_sample(x0, t, n, s), tol=1e-5,
+           msg=f"at t={tv} the result differs from the correct one. Two places: the table should be alphas_cumprod, not alphas; both coefficients need a square root")
+--- hints
+- Look at which table it reads. Jumping to step t needs "how much signal is left in total from 0 to t".
+- Then compare with the formula: both the signal and the noise coefficients have a sqrt.
+- Switch to `alphas_cumprod`, and use `.sqrt()` and `(1 - ab).sqrt()`.
+
+@@ item d8-14
+type: predict
+title: alpha_bar by hand
+level: 1
+cards: Beta schedules: linear and cosine
+ref: day8
+--- context
+The fastest way to debug a schedule: take a tiny T, work out a few entries by hand and compare them with the code's output. Interviewers also like to ask you to compute a cumulative product by hand.
+--- prompt
+Work it out yourself first, then write the 3 lines this code prints. `linear_schedule` is the function from item 1.
+--- code
+s = linear_schedule(5, beta_start=0.1, beta_end=0.5)
+print(" ".join(f"{b:.1f}" for b in s["betas"].tolist()))
+print(" ".join(f"{a:.1f}" for a in s["alphas"].tolist()))
+print(" ".join(f"{ab:.3f}" for ab in s["alphas_cumprod"].tolist()))
+--- explain
+betas are 5 evenly spaced points from 0.1 to 0.5: 0.1 0.2 0.3 0.4 0.5. alphas = 1 - betas: 0.9 0.8 0.7 0.6 0.5.
+
+The cumulative product, one factor at a time: 0.9; 0.9 × 0.8 = 0.72; 0.72 × 0.7 = 0.504; 0.504 × 0.6 = 0.3024; 0.3024 × 0.5 = 0.1512. Rounded to 3 decimals, that is the last line. After only 5 steps, just 15% of the signal is left.
+
+@@ item d8-15
+type: predict
+title: UNet shape bookkeeping
+level: 2
+cards: UNet: downsample, upsample, skip concat
+--- context
+The most common error when putting a UNet together is a size or channel mismatch at a cat. Working the shapes out in your head is much faster than reading the error.
+--- prompt
+Work it out in your head first, then write the 4 lines this code prints (one shape per line).
+--- code
+x = torch.randn(1, 64, 8, 8)
+down = nn.Conv2d(64, 64, 4, 2, 1)
+up = nn.Upsample(scale_factor=2, mode="nearest")
+d = down(x)
+print(tuple(d.shape))
+u = up(d)
+print(tuple(u.shape))
+print(tuple(torch.cat([u, x], dim=1).shape))
+print(tuple(up(down(torch.randn(1, 64, 5, 5))).shape))
+--- explain
+- Downsample: (8 + 2 − 4) // 2 + 1 = 4, giving (1, 64, 4, 4).
+- Upsample: each side doubles back to 8, giving (1, 64, 8, 8).
+- Concatenate along dim=1: 64 + 64 = 128 channels, giving (1, 128, 8, 8).
+- The 5×5 input: (5 + 2 − 4) // 2 + 1 = 2, which upsamples to 4, one short of the original 5. That is why item 8 has to `F.pad` first.
+
+@@ item d8-16
+type: choice
+title: Why training uses the closed form
+level: 1
+cards: q_sample: jump to step t in one go, and SNR
+--- context
+A common interview question: "How do you get x_t during DDPM training?" The answer decides whether training is fast enough to run at all.
+--- prompt
+When training DDPM, we get x_t in one step with the closed-form `q_sample` instead of noising x0 step by step t times. What is the main reason?
+--- options
+- The closed form is more accurate; step-by-step noising accumulates errors
+- It gets there in one step with no loop, and a batch where every sample has a different random t is computed all at once
+- Step-by-step noising makes the variance grow until it explodes
+- The closed form does not need a beta schedule
+answer: 2
+--- explain
+Both ways give **the same distribution** (the second check of item 4 proves exactly that), so neither is "more accurate". Step-by-step noising does not explode either: every step first shrinks by sqrt(1 - beta), so the variance stays near 1. And the closed form still uses alpha_bar, which is computed from the betas.
+
+The real reason is speed. With a random t per sample, step-by-step noising needs 500 loop iterations on average; the closed form needs one multiply-add, and extract handles different t values across the batch in one go.
+
+@@ item d8-17
+type: choice
+title: How many network calls per batch
+level: 1
+cards: The training loss and one reverse step
+--- context
+When a diffusion model runs in production, almost all of the latency is network calls. Knowing how many calls DDPM makes explains why it is slow, and why everyone switched to samplers with fewer steps.
+--- prompt
+You use today's DDPM (T = 1000) to generate a batch of 16 images, from pure noise all the way to the final x0. How many times is the UNet called in total? (One call processes the whole batch.)
+--- options
+- 1: the network predicts all of the noise in one go
+- 16: once per image
+- 1000: once per timestep
+- 16000: once per image per timestep
+answer: 3
+--- explain
+The reverse process can only go one step at a time: computing x_{t-1} needs the network to look at x_t, and x_t is the result of the previous step. So the 1000 steps must run one after another, with one network call each. The 16 images in the batch are processed together in the same call, so it is not 16000.
+
+This is why DDPM sampling is slow. Day 9's DDIM walks only a few dozen of those steps and is many times faster.
+
+@@ item d8-18
+type: code
+title: Closed book: q_sample
+level: 2
+exam: yes
+cards: q_sample: jump to step t in one go, and SNR; extract: each sample gets its own coefficient
+targets: q_sample
+ref: day8
+--- context
+Closed-form noising is the foundation of diffusion models; every training step uses it. Interviewers often ask you to write it on the spot.
+--- prompt
+Without notes, write `q_sample(x0, t, noise, sched)`: compute the noisy image x_t at step t in one go (no step-by-step loop).
+
+- `x0`, `noise`: `(B, C, H, W)`; `t`: `(B,)`, and each sample may have a different t
+- `sched`: the dict returned by `linear_schedule`, with `"betas"`, `"alphas"` and `"alphas_cumprod"`
+- you may use `extract`
+--- starter
+def q_sample(x0, t, noise, sched):
+    raise todo()
+--- solution
+def q_sample(x0, t, noise, sched):
+    ab = extract(sched["alphas_cumprod"], t, x0.shape)
+    return ab.sqrt() * x0 + (1 - ab).sqrt() * noise
+--- tests
+@check("q_sample in closed form")
+def t04():
+    seed(0)
+    s = linear_schedule(1000)
+    x0 = torch.randn(4, 3, 8, 8)
+    n = torch.randn_like(x0)
+    t0 = torch.zeros(4, dtype=torch.long)
+    xt = q_sample(x0, t0, n, s)
+    true((xt - x0).abs().mean() < 0.02, "at t=0, x_t should still be almost exactly x0")
+    tT = torch.full((4,), 999, dtype=torch.long)
+    xT = q_sample(x0, tT, n, s)
+    true((xT - n).abs().mean() < 0.1, "at t=999, x_t should be almost pure noise")
+    # samples in one batch may have different t
+    tm = torch.tensor([0, 500, 999, 250])
+    shape_is(q_sample(x0, tm, n, s), x0.shape, "with a different t per sample, the output must still have x0's shape")
+
+@check("closed form == step-by-step noising")
+def t05():
+    seed(1)
+    T = 200
+    s = linear_schedule(T, 1e-4, 0.05)
+    N = 20000
+    x0 = torch.full((N, 1), 2.0)                 # a fixed signal makes the statistics easy to read
+    step = 60
+
+    # step by step: x_t = sqrt(1-beta_t) * x_{t-1} + sqrt(beta_t) * eps
+    x = x0.clone()
+    for i in range(step + 1):
+        b = s["betas"][i]
+        x = (1 - b).sqrt() * x + b.sqrt() * torch.randn_like(x)
+
+    ab = s["alphas_cumprod"][step]
+    want_mean = (ab.sqrt() * 2.0).item()
+    want_std = (1 - ab).sqrt().item()
+    true(abs(x.mean().item() - want_mean) < 0.02,
+         f"the step-by-step mean {x.mean().item():.4f} should be ≈ sqrt(alpha_bar)*x0 = {want_mean:.4f}")
+    true(abs(x.std().item() - want_std) < 0.02,
+         f"the step-by-step std {x.std().item():.4f} should be ≈ sqrt(1-alpha_bar) = {want_std:.4f}")
+
+    # your q_sample must give the same statistics
+    xt = q_sample(x0, torch.full((N,), step, dtype=torch.long), torch.randn(N, 1), s)
+    true(abs(xt.mean().item() - want_mean) < 0.02,
+         f"q_sample's mean {xt.mean().item():.4f} does not match the step-by-step {want_mean:.4f}: the signal coefficient should be sqrt(alpha_bar)")
+    true(abs(xt.std().item() - want_std) < 0.02,
+         f"q_sample's std {xt.std().item():.4f} does not match the step-by-step {want_std:.4f}: the noise coefficient should be sqrt(1-alpha_bar)")
+--- hints
+- Use the cumulative table; the looked-up coefficient is `(B, 1, 1, 1)`.
+- Both the signal and the noise coefficients need a square root; their squares add up to 1.
+
+@@ item d8-19
+type: code
+title: Closed book: p_sample_step
+level: 3
+exam: yes
+cards: The training loss and one reverse step; extract: each sample gets its own coefficient
+targets: p_sample_step
+ref: day8
+--- context
+This step is the heart of the sampling loop; repeat it T times and you have an image. If you can write the mean formula without notes and still remember "no noise on the last step", you really understand the reverse process.
+--- prompt
+Without notes, write `p_sample_step(x_t, t, eps_pred, sched, noise=None)`: one DDPM reverse step that computes x_{t-1} from x_t.
+
+- `x_t`, `eps_pred`: `(B, C, H, W)`; `eps_pred` is the network's predicted noise
+- `t`: `(B,)`, and each sample may differ. Samples with t > 0 get sqrt(beta_t) times the noise added; samples with t = 0 get none
+- if `noise` is None, sample it yourself
+- `sched` has `"betas"`, `"alphas"` and `"alphas_cumprod"`; you may use `extract`
+--- starter
+def p_sample_step(x_t, t, eps_pred, sched, noise=None):
+    raise todo()
+--- solution
+def p_sample_step(x_t, t, eps_pred, sched, noise=None):
+    beta = extract(sched["betas"], t, x_t.shape)
+    alpha = extract(sched["alphas"], t, x_t.shape)
+    ab = extract(sched["alphas_cumprod"], t, x_t.shape)
+    mean = (x_t - beta / (1 - ab).sqrt() * eps_pred) / alpha.sqrt()
+    if noise is None:
+        noise = torch.randn_like(x_t)
+    keep = (t > 0).float().reshape(-1, *([1] * (x_t.dim() - 1)))
+    return mean + keep * beta.sqrt() * noise    # no noise when t=0
+--- tests
+@check("one p_sample step")
+def t12():
+    seed(3)
+    s = linear_schedule(100)
+    x = torch.randn(4, 1, 4, 4)
+    eps = torch.randn_like(x)
+    n = torch.randn_like(x)
+    t50 = torch.full((4,), 50, dtype=torch.long)
+    a = p_sample_step(x, t50, eps, s, noise=n)
+    shape_is(a, x.shape)
+    b = p_sample_step(x, t50, eps, s, noise=torch.zeros_like(x))
+    true(not torch.allclose(a, b), "for t > 0 you should add sqrt(beta_t) * noise")
+    t0 = torch.zeros(4, dtype=torch.long)
+    c1 = p_sample_step(x, t0, eps, s, noise=n)
+    c2 = p_sample_step(x, t0, eps, s, noise=torch.randn_like(x))
+    eq(c1, c2, msg="the last step (t=0) must not add noise: it outputs the finished image, so a different noise must not change the result")
+    # feed in the true noise: one reverse step should land close to x0
+    x0 = torch.ones(1, 1, 2, 2)
+    tt = torch.tensor([1])
+    xt = q_sample(x0, tt, eps[:1, :, :2, :2], s)
+    back = p_sample_step(xt, tt, eps[:1, :, :2, :2], s, noise=torch.zeros_like(xt))
+    true((back - x0).abs().mean() < 0.2, "given the true noise, one reverse step should land close to x0: check the formula for mean")
+--- hints
+- The mean: subtract beta_t / sqrt(1 - alpha_bar_t) times the predicted noise from x_t, then divide by sqrt(alpha_t).
+- Reshape the switch `(t > 0).float()` to `(B, 1, 1, 1)` and multiply it into the noise term.

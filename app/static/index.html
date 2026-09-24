@@ -258,17 +258,6 @@ table.dayTable th { font: 600 12px var(--font-head); color: var(--muted); letter
 .tableWrap { overflow-x: auto; }
 .emptyNote { color: var(--muted); font-size: 14px; }
 .toast { position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 20px); transform: translateX(-50%); background: var(--ink); color: var(--surface); padding: 8px 16px; border-radius: 8px; font-size: 14px; z-index: 50; box-shadow: var(--shadow); }
-.sqlTable { border-collapse: collapse; font: 12.5px/1.5 var(--font-code); background: var(--code-bg); }
-.sqlTable th, .sqlTable td { padding: 4px 10px; border: 1px solid var(--line); text-align: left; white-space: nowrap; }
-.sqlTable th { background: var(--surface-2); font-weight: 600; }
-.sqlTable td.num { text-align: right; font-variant-numeric: tabular-nums; }
-.sqlTable td.null { color: var(--faint); font-style: italic; }
-details.schema { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; background: var(--surface-2); }
-details.schema > summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--muted); }
-details.schema[open] > summary { margin-bottom: 8px; }
-.schemaTable { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 12px; min-width: 0; }
-.schemaCols { font-size: 12px; color: var(--muted); white-space: normal; word-break: break-word; }
-.copyArea { width: 100%; min-height: 160px; font: 12px/1.5 var(--font-code); border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: var(--code-bg); }
 
 @media (max-width: 1020px) {
   .app { grid-template-columns: minmax(0, 1fr); padding-inline: 16px; }
@@ -582,15 +571,6 @@ const PY_GLOSS = {
   StopIteration: tr("迭代器已经没有下一个值了：常见于 next(...) 没有给默认值。", "The iterator has no next value: common with next(...) without a default."),
   NotImplementedError: tr("这个方法还没有实现（通常是留给你写的）。", "This method is not implemented yet (usually it is yours to write)."),
   TimeoutError: tr("等待超时：请求或操作在规定时间内没有完成。", "Timed out: the request or operation did not finish in time."),
-  ClientError: tr("AWS 返回了错误：看 e.response[\"Error\"][\"Code\"]，比如 NoSuchKey（对象不存在）、NoSuchBucket、AccessDenied（权限不够）、ThrottlingException（太频繁）。", "AWS returned an error: look at e.response[\"Error\"][\"Code\"], for example NoSuchKey (no such object), NoSuchBucket, AccessDenied (missing permission), ThrottlingException (too frequent)."),
-  NoCredentialsError: tr("boto3 找不到 AWS 凭证：本机要先配置（aws configure / 环境变量 / IAM 角色）。", "boto3 found no AWS credentials: configure them on your computer first (aws configure / environment variables / an IAM role)."),
-  NotFound: tr("Google Cloud 返回 404：桶、对象、表或密钥不存在，检查名字和项目。", "Google Cloud returned 404: the bucket, object, table or secret does not exist; check the name and the project."),
-  BadRequest: tr("Google Cloud 返回 400：请求本身有问题，BigQuery 里通常是 SQL 写错了或参数没传。", "Google Cloud returned 400: the request itself is wrong; in BigQuery it is usually a SQL mistake or a missing parameter."),
-  Forbidden: tr("Google Cloud 返回 403：服务账号没有这个权限（IAM）。", "Google Cloud returned 403: the service account lacks this permission (IAM)."),
-  TooManyRequests: tr("请求太频繁（429）：等一会儿再重试，最好用指数退避。", "Too many requests (429): wait and retry, ideally with exponential backoff."),
-  OperationalError: tr("SQL 执行出错：多半是表名或列名写错、SQL 语法错误。看报错里的 near 或 no such。", "The SQL failed: usually a wrong table or column name, or a syntax error. Look for near or no such in the message."),
-  IntegrityError: tr("违反数据库约束：主键重复、NOT NULL 列没给值，或外键指向不存在的行。", "A database constraint was violated: a duplicate primary key, no value for a NOT NULL column, or a foreign key pointing to a missing row."),
-  ProgrammingError: tr("数据库 API 用法不对：比如一次 execute 里写了多条语句，或参数个数和 ? 的个数不一致。", "The database API was used wrongly: for example several statements in one execute, or a different number of parameters than ? marks."),
 };
 // PyTorch errors are mostly RuntimeError / ValueError: explain them by their message
 const TORCH_GLOSS = [
@@ -1085,7 +1065,9 @@ function viewChoice(work, item, ctx) {
     box.append(b);
     return b;
   });
-  work.append(box, h("div", { class: "actions" }, h("button", { class: "btn primary", onclick: submit }, tr("提交", "Submit")), multi ? h("span", { class: "note" }, tr("多选题：选出所有正确项", "More than one answer: pick every correct option")) : ""), out);
+  work.append(box, h("div", { class: "actions" }, h("button", { class: "btn primary", onclick: submit }, tr("提交", "Submit")), multi ? h("span", { class: "note" }, tr("多选题：选出所有正确项", "More than one answer: pick every correct option")) : ""));
+  helpers(work, item, { exam: ctx.exam, solution: undefined, onRedo: null });
+  work.append(out);
   let wrongs = 0;
   function submit() {
     if (!picked.size) { toast(tr("先选一个", "Pick one first")); return; }
@@ -1116,7 +1098,9 @@ function viewPredict(work, item, ctx) {
   let wrongs = 0;
   work.append(h("p", { class: "panelLabel" }, tr("你的答案", "Your answer")), ta, h("div", { class: "actions" },
     h("button", { class: "btn primary", onclick: submit }, tr("提交", "Submit")),
-    h("button", { class: "btn ghost", onclick: runIt }, tr("运行看看（交卷后再用）", "Run it (after you submit)"))), out);
+    h("button", { class: "btn ghost", onclick: runIt }, tr("运行看看（交卷后再用）", "Run it (after you submit)"))));
+  helpers(work, item, { exam: ctx.exam, solution: undefined, onRedo: null });
+  work.append(out);
   function submit() {
     const want = normOut(item.expected), got = normOut(ta.value);
     const correct = want === got;
@@ -1254,7 +1238,9 @@ function viewSelf(work, item, ctx) {
       btn.disabled = !ticks.every(Boolean);
     } }),
     h("span", { html: inline(c) }))))),
-    h("div", { class: "actions" }, btn, h("span", { class: "note" }, tr("诚实打勾：这一题只有你自己能判。", "Tick honestly: only you can grade this one."))), out);
+    h("div", { class: "actions" }, btn, h("span", { class: "note" }, tr("诚实打勾：这一题只有你自己能判。", "Tick honestly: only you can grade this one."))));
+  helpers(work, item, { exam: ctx.exam, solution: undefined, onRedo: null });
+  work.append(out);
 }
 
 // ---------------------------------------------------------------- exam

@@ -1,0 +1,1341 @@
+@@ day 18
+title: 生产坑一：训练和推理不一致
+part: 生产环境常见坑
+hours: 3–4 小时
+--- goal
+让模型上线后给出和训练、评测时一样的结果：预处理和 tokenizer 跟着模型走；推理时用 eval() 加 inference_mode()；批量生成用左填充、attention mask 和 position ids；用测试确认结果不随 batch 变；设好种子；按精度选容差去比对输出。
+--- checklist
+- 先清空复习区（之前看过答案的题，从空白重做）
+- 8 张知识卡片：每张的代码都运行一遍，再改一个数字重新运行
+- 练习区全部通过；批量生成的三道题（左填充、修右填充、填生成循环）不看答案做出来
+- 闭卷区：默写 Preprocessor 和 left_pad
+
+@@ concept
+title: 训练和推理不一致：一份预处理，两边共用
+--- body
+**训练和推理不一致**（train/serve skew）：模型在训练、评测时看到的输入，和上线后在服务里看到的输入，处理方式不一样。它不报错，只是线上效果悄悄变差。
+
+最常见的来源：
+
+- 训练时在 notebook 里写了一段预处理，服务里又手写了一遍，细节不一样（顺序、默认值、要不要小写）
+- 标准化用的均值和标准差：训练时在训练集上算，服务里却拿「当前这批请求」现算
+- tokenizer 升级了，或者词表换了顺序（下一张卡）
+
+规则只有一条：**预处理只写一份代码**，训练和服务都 import 它。它需要的统计量（均值、标准差、词表）只在训练数据上算一次（为什么不能碰测试集，第 17 天讲过），和模型权重**存进同一个文件**，服务启动时一起加载，不再重新算。
+
+写成一个类，用起来是这样：
+
+```
+pre = Preprocessor().fit(train_x)          # 训练时：只在训练数据上 fit
+torch.save({"model": model.state_dict(), "pre": pre.state_dict()}, "bundle.pt")
+
+bundle = torch.load("bundle.pt")           # 服务启动时
+pre = Preprocessor()
+pre.load_state_dict(bundle["pre"])         # 加载统计量，不再 fit
+x = pre.transform(request_x)
+```
+
+下面的例子：服务里只来了 1 条请求。拿它自己算均值和标准差，结果是 nan（1 条数据减去自己的均值是 0，标准差也是 0，0/0 = nan）；用训练时存下的统计量才对。
+--- code
+torch.manual_seed(0)
+train = torch.randn(100, 2) * torch.tensor([10.0, 0.1]) + torch.tensor([50.0, 3.0])
+mean, std = train.mean(dim=0), train.std(dim=0)      # 只在训练数据上算一次
+bundle = {"pre": {"mean": mean, "std": std}}         # 和模型权重放进同一个文件
+
+req = torch.tensor([[60.0, 3.1]])                    # 服务里来了一条请求
+print("用训练时的统计量:  ", (req - mean) / std)
+print("用请求自己的统计量:", (req - req.mean(dim=0)) / req.std(dim=0, correction=0))
+
+@@ concept
+title: tokenizer 也有版本：用指纹对上号
+--- body
+模型 embedding 表的第 17 行，学的是训练时「id 为 17 的那个词」。如果服务里加载了另一版词表（tokenizer 升级了、重新建了词表、顺序变了），同一个词会变成另一个 id。代码不报错，模型收到的却是另一句话。
+
+做法：训练时给词表算一个**指纹**（一个短字符串，词表有任何变化它就会变），和 checkpoint 存在一起。服务启动时对当前词表再算一次，对不上就拒绝启动。
+
+怎么算指纹：
+
+1. `json.dumps(vocab, sort_keys=True)`：把 dict 变成一段文本。`sort_keys=True` 按 key 排序，这样结果和 dict 的插入顺序无关
+2. `hashlib.sha256(文本.encode("utf-8")).hexdigest()`：算出 64 个十六进制字符的摘要，取前 16 个就够用
+
+不要用 Python 自带的 `hash()`：字符串的 `hash()` 每次启动 Python 都不一样（为了安全故意随机化的），训练进程和服务进程算出来永远对不上。
+--- code
+import hashlib
+import json
+
+def fingerprint(vocab):
+    text = json.dumps(vocab, sort_keys=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+v1 = {"<pad>": 0, "hello": 1, "world": 2}
+v2 = {"world": 2, "hello": 1, "<pad>": 0}     # 同一份词表，只是插入顺序不同
+v3 = {"<pad>": 0, "world": 1, "hello": 2}     # 同样的词，id 换了
+print(json.dumps(v2, sort_keys=True))
+print("v1:", fingerprint(v1))
+print("v2:", fingerprint(v2))
+print("v3:", fingerprint(v3))
+
+@@ concept
+title: 推理两件套：eval() 和 inference_mode()
+--- body
+推理前要拨两个开关，它们管的是两件不同的事：
+
+- `model.eval()`：改变**层的行为**。Dropout 不再随机丢神经元；BatchNorm 改用训练时存下的 running mean / var，不再用当前 batch 的统计量（细节第 17 天讲过）。它不关梯度。
+- `with torch.inference_mode():`：关掉 autograd 的记账（不建计算图，不存反向传播要用的中间结果），更省内存、更快。它不改变任何层的行为。
+
+所以两个都要。只有 inference_mode：dropout 还在随机丢。只有 eval：每次推理还在白白建计算图。
+
+`torch.no_grad()` 也能关梯度。`inference_mode` 更彻底：在它里面算出来的张量，以后不能再拿去参与反向传播（会报错），所以只在纯推理时用。省多少内存、快多少，第 19 天再量。
+
+两个常见的坑：
+
+- 刚建好（或刚训练完）的模型默认是 train 模式。服务加载模型后忘了 `eval()`，线上就一直开着 dropout。
+- 训练循环里每个 epoch 末尾跑验证时调了 `model.eval()`，回到训练却忘了 `model.train()`。
+--- code
+torch.manual_seed(0)
+net = nn.Sequential(nn.Linear(4, 8), nn.Dropout(0.5), nn.Linear(8, 2))
+x = torch.randn(1, 4)
+
+with torch.inference_mode():
+    a, b = net(x), net(x)
+print("只有 inference_mode，两次一样吗:", torch.equal(a, b))
+
+net.eval()
+c = net(x)
+print("只有 eval，requires_grad =", c.requires_grad)
+
+with torch.inference_mode():
+    d, e = net(x), net(x)
+print("两个都有，两次一样吗:", torch.equal(d, e), " requires_grad =", d.requires_grad)
+
+@@ concept
+title: 结果不该随 batch 变
+--- body
+服务里常把几条请求拼成一个 batch 一起算。一条请求的结果，不应该取决于它和谁拼在一起、这个 batch 有多大。
+
+会破坏这一点的常见原因：
+
+- BatchNorm 还在 train 模式：它用「当前这个 batch」的均值和方差做标准化，伙伴一换，结果就变。（train 模式下 batch 里只有 1 条时，它甚至直接报错 `Expected more than 1 value per channel when training`，这常常是「忘了 eval()」最早露出来的信号。）
+- 按 batch 里最长的序列补 pad，而模型没用 attention mask，把 pad 也算了进去
+- 很小的浮点差：batch 大小不同，底层可能换一种计算顺序，结果差 1e-7 左右。这是正常的，比较时给一点容差就好（最后一张卡）
+
+检查方法叫 **batch 无关性测试**：同一批数据，一起算一次，再拆开算一次，比最大差值。差值在 1e-6 以下，就说明和 batch 无关。下面把 5 条数据拆成 3 + 2 两批来比。
+--- code
+torch.manual_seed(0)
+net = nn.Sequential(nn.Linear(4, 8), nn.BatchNorm1d(8), nn.Linear(8, 2))
+x = torch.randn(5, 4)
+
+for mode in ["train", "eval"]:
+    net.train(mode == "train")
+    with torch.inference_mode():
+        together = net(x)                                  # 5 条一起算
+        split = torch.cat([net(x[:3]), net(x[3:])])        # 拆成 3 条 + 2 条
+    print(mode, "最大差值:", (together - split).abs().max().item())
+
+@@ concept
+title: 批量生成（一）：右填充为什么出错
+ref: day18
+--- body
+decoder-only 模型（GPT、Llama 这类）生成时，每一步都是：把整段序列喂进去，取**最后一个位置**的 logits（模型给词表里每个词打的原始分数），挑分数最高的词，接到末尾，再来一次。
+
+一条一条生成很简单。把几条长度不同的 prompt 放进一个 batch，就得补 pad，让它们一样长。如果 pad 补在右边（右填充）：
+
+```
+[3, 7, 2, 9]
+[5, 1, 0, 0]      ← 0 是 pad
+```
+
+第二行的「最后一个位置」是 pad。模型接着 pad 往下预测，结果当然不对；新生成的词也会接在 pad 后面，中间留着两个洞。
+
+改成左填充，每一行的最后一个位置都是它真实的最后一个词：
+
+```
+[3, 7, 2, 9]
+[0, 0, 5, 1]
+```
+
+但只把 pad 挪到左边还不够，下一张卡讲另外两件事。
+
+下面的代码用一个很小的 decoder-only 模型 `tiny_lm()`（token 0 是 pad）。`generate_one(model, prompt, n)` 一条一条地贪心生成 n 个词，不补任何 pad，是「正确答案」。
+--- code
+model = tiny_lm()
+prompts = [[3, 7, 2, 9], [5, 1]]
+alone = [generate_one(model, p, 1)[0] for p in prompts]    # 一条一条算，没有 pad
+
+right = torch.tensor([[3, 7, 2, 9], [5, 1, 0, 0]])         # 右填充
+with torch.inference_mode():
+    batch = model(right)[:, -1].argmax(dim=-1).tolist()
+print("一条一条:  ", alone)
+print("右填充批量:", batch)
+
+@@ concept
+title: 批量生成（二）：左填充 + attention mask + position ids
+ref: day18
+--- body
+左填充之后，还要告诉模型两件事：
+
+1. **attention mask**：哪些位置是真的（1），哪些是 pad（0）。模型在 attention 里把 pad 这几列屏蔽掉，真实的词就看不到 pad。没有它，第二行的 5 和 1 会去 attend 左边的两个 pad，结果被污染。
+2. **position ids**：每个词在「自己那条序列」里的位置。左填充后，第二行的 5 站在第 2 格，但它其实是这条序列的第 0 个词。模型靠位置编码区分先后，位置错了，结果就错。
+
+以 `[[5, 6, 7], [8]]`、pad = 0 为例：
+
+```
+input_ids      = [[5, 6, 7], [0, 0, 8]]
+attention_mask = [[1, 1, 1], [0, 0, 1]]
+position_ids   = [[0, 1, 2], [0, 0, 0]]
+```
+
+mask 要按「这个位置是不是补出来的」来填，不能写 `ids != pad_id`：很多模型（比如 GPT-2）拿 eos 当 pad，真实的 eos 也会被当成 pad 屏蔽掉。
+
+position ids 用 mask 算：`mask.cumsum(-1) - 1` 在真实位置上正好是 0, 1, 2, …；pad 位置会得到 -1，用 `.clamp(min=0)` 改成 0。pad 位置反正会被 mask 掉，填几都行，但不能是负数，否则 embedding 查表会报错。
+
+生成的每一步，新词接到 `input_ids` 末尾，同时：
+
+- `attention_mask` 末尾接一列 1（新词是真的）
+- `position_ids` 末尾接「每行最后一个位置 + 1」
+
+在 Hugging Face 里，对应的是 `tokenizer.padding_side = "left"`，再把 `attention_mask` 传给 `generate`；很多模型的 `generate` 会用同样的 cumsum 办法替你算 position ids。
+
+下面的 `left_pad(seqs, pad_id)` 返回这三样东西（练习区里你要自己写它）。
+--- code
+mask = torch.tensor([[1, 1, 1], [0, 0, 1]])
+print(mask.cumsum(-1) - 1)
+print((mask.cumsum(-1) - 1).clamp(min=0))
+
+model = tiny_lm()
+prompts = [[3, 7, 2, 9], [5, 1]]
+ids, mask, pos = left_pad(prompts, pad_id=0)
+print(ids)
+with torch.inference_mode():
+    logits = model(ids, attention_mask=mask, position_ids=pos)
+print("一条一条:  ", [generate_one(model, p, 1)[0] for p in prompts])
+print("左填充批量:", logits[:, -1].argmax(dim=-1).tolist())
+
+@@ concept
+title: 可复现：种子和确定性开关
+--- body
+同一份代码跑两次，结果应该一样。这样出了问题才能复现、才能比较两次实验。随机数有三个来源，各有各的种子：
+
+- Python 的 `random`：`random.seed(seed)`
+- NumPy：`np.random.seed(seed)`
+- PyTorch：`torch.manual_seed(seed)`（CPU 和所有 GPU 一起播种；老代码里常见的 `torch.cuda.manual_seed_all(seed)` 多写一行也没坏处）
+
+`torch.manual_seed` 管不到另外两个。数据增强用 `random`、划分数据集用 NumPy 的代码很常见，只播 torch 的种子，每次运行还是不一样。
+
+种子一样，GPU 上的结果也不一定一样。还有三个开关：
+
+- `torch.backends.cudnn.benchmark = False`：设成 True 时，cuDNN 会先试跑几种卷积算法、挑最快的。不同次运行可能挑到不同的算法，结果差在最后几位。
+- `torch.backends.cudnn.deterministic = True`：卷积只用确定性的算法。
+- `torch.use_deterministic_algorithms(True)`：所有算子都必须用确定性实现；某个算子没有确定性版本，就直接报错，而不是悄悄给出不同的结果。在 GPU 上，还要在程序一开始（任何 GPU 计算之前）设置环境变量 `CUBLAS_WORKSPACE_CONFIG=:4096:8`，否则矩阵乘会报错。
+
+这些开关会让程序变慢，一般只在调试、写测试、需要严格复现时打开。
+
+还要记住：换了 GPU 型号、驱动、PyTorch 版本，或者 batch 大小变了，最后几位还是可能不同。所以比较两份结果时，永远带容差。
+--- code
+import random
+import numpy as np
+
+torch.manual_seed(0)
+a = (random.random(), np.random.rand(), torch.rand(1).item())
+torch.manual_seed(0)
+b = (random.random(), np.random.rand(), torch.rand(1).item())
+print("random, numpy, torch 两次一样吗:", [x == y for x, y in zip(a, b)])
+print("cudnn.benchmark =", torch.backends.cudnn.benchmark)
+print("确定性算法开着吗:", torch.are_deterministic_algorithms_enabled())
+
+@@ concept
+title: 精度和容差：fp32 / TF32 / bf16 / fp16
+--- body
+四种常见的浮点格式。尾数位决定精度（能分辨多小的差别），指数位决定范围（能表示多大的数）。eps 是「1 和比 1 大的下一个数」之差：
+
+- **fp32**：23 位尾数，eps ≈ 1.2e-7，最大约 3.4e38。PyTorch 的默认格式。
+- **TF32**：不是一种存储格式，而是 NVIDIA 显卡（Ampere 以后，比如 A100、RTX 30/40/50 系列）做 fp32 矩阵乘、卷积时的一种算法：输入只保留 10 位尾数再相乘，结果仍存成 fp32。快很多，但相对误差到 1e-3 左右。卷积默认允许用它（`torch.backends.cudnn.allow_tf32` 是 True）；矩阵乘默认不用，但很多训练脚本会写 `torch.set_float32_matmul_precision("high")` 把它打开。
+- **bf16**：7 位尾数，eps ≈ 7.8e-3，精度粗；指数位和 fp32 一样多，所以不容易溢出。训练和推理都常用。
+- **fp16**：10 位尾数，eps ≈ 9.8e-4，比 bf16 精细；但最大只有 65504，超过就变成 inf。
+
+比较两份输出（比如 bf16 的服务输出 vs fp32 的参考输出）时：
+
+1. 两边都转成 fp32 再相减：`(got.float() - ref.float()).abs()`
+2. 同时用绝对容差 atol 和相对容差 rtol：`|got - ref| <= atol + rtol * |ref|`。只用相对误差不行：ref 接近 0 的地方，相对误差会大得离谱（下面的例子里，bf16 的最大相对误差超过 10）。只用绝对误差也不行：数值大的地方，舍入误差本来就大。
+3. 按精度低的那一边选容差。给模型输出用的一组经验值：fp32 约 1e-5，fp16 约 1e-2，bf16 约 5e-2。单个运算可以更严，`torch.testing.assert_close` 按 dtype 自带默认容差。真正的 bug 通常差 0.1 以上，远远超过这些容差。
+4. 容差不是越松越好：拿 bf16 的容差去比 fp32 的输出，会把 bug 放过去。
+--- code
+for dt in (torch.float32, torch.float16, torch.bfloat16):
+    fi = torch.finfo(dt)
+    print(f"{str(dt):15s} eps={fi.eps:.1e}  max={fi.max:.1e}")
+
+torch.manual_seed(0)
+a, b = torch.randn(64, 64), torch.randn(64, 64)
+ref = a @ b                                    # fp32 参考
+for dt in (torch.float16, torch.bfloat16):
+    got = (a.to(dt) @ b.to(dt)).float()        # 低精度算，转回 fp32 再比
+    diff = (got - ref).abs()
+    print(dt, f"最大绝对误差 {diff.max():.3f}", f"最大相对误差 {(diff / ref.abs()).max():.1f}")
+
+@@ item d18-01
+type: code
+title: Preprocessor：统计量跟着模型走
+level: 2
+cards: 训练和推理不一致：一份预处理，两边共用
+targets: Preprocessor
+--- context
+线上效果比离线评测差一截，最常见的原因之一是服务里的预处理和训练时不一样。把预处理写成一个类，统计量随模型一起保存，训练和服务用同一份代码，这类 bug 就不会出现。
+--- prompt
+写一个 `Preprocessor` 类，做标准化 `(x - mean) / std`。x 的 shape 是 `(N, D)`：N 条数据，每条 D 个特征。
+
+- `fit(x)`：在训练数据上算每个特征的 `mean = x.mean(dim=0)` 和 `std = x.std(dim=0)`，std 再 `.clamp_min(1e-6)`（某一列是常数时 std 为 0，防止除以 0）。存进 `self.mean`、`self.std`，最后 `return self`。
+- `transform(x)`：返回 `(x - self.mean) / self.std`。**只用存下的统计量**，不能拿 x 自己现算。既没 fit 也没加载过就调用，要 `raise RuntimeError(...)`。
+- `state_dict()`：返回 `{"mean": ..., "std": ...}`（两个 tensor），用来和模型权重存进同一个文件。
+- `load_state_dict(d)`：从这样一个 dict 恢复 `self.mean` 和 `self.std`。
+--- starter
+class Preprocessor:
+    def __init__(self):
+        self.mean = None
+        self.std = None
+
+    def fit(self, x):
+        raise todo()
+
+    def transform(self, x):
+        raise todo()
+
+    def state_dict(self):
+        raise todo()
+
+    def load_state_dict(self, d):
+        raise todo()
+--- solution
+class Preprocessor:
+    def __init__(self):
+        self.mean = None
+        self.std = None
+
+    def fit(self, x):
+        self.mean = x.mean(dim=0)
+        self.std = x.std(dim=0).clamp_min(1e-6)     # 常数列：std = 0，别除以 0
+        return self
+
+    def transform(self, x):
+        if self.mean is None:
+            raise RuntimeError("先 fit() 或 load_state_dict()")
+        return (x - self.mean) / self.std           # 永远用存下的统计量
+
+    def state_dict(self):
+        return {"mean": self.mean.clone(), "std": self.std.clone()}
+
+    def load_state_dict(self, d):
+        self.mean = d["mean"].clone()
+        self.std = d["std"].clone()
+        return self
+--- tests
+import os
+import tempfile
+
+
+def _train_data():
+    torch.manual_seed(1)
+    return torch.randn(200, 3) * torch.tensor([10.0, 0.1, 3.0]) + torch.tensor([50.0, -2.0, 0.0])
+
+
+@check("fit 之后，训练数据变成均值 0、标准差 1")
+def _():
+    train = _train_data()
+    pre = Preprocessor()
+    true(pre.fit(train) is pre, "fit 最后要 return self，这样才能写 Preprocessor().fit(x)")
+    z = pre.transform(train)
+    shape_is(z, (200, 3))
+    eq(z.mean(dim=0), torch.zeros(3), tol=1e-4, msg="每一列的均值应该是 0：mean 要按 dim=0（每个特征）算")
+    eq(z.std(dim=0), torch.ones(3), tol=1e-3, msg="每一列的标准差应该是 1：std 按 dim=0 算，用默认的 x.std(dim=0)")
+
+
+@check("常数列不会变成 nan / inf")
+def _():
+    train = _train_data()
+    train[:, 1] = 5.0
+    z = Preprocessor().fit(train).transform(train)
+    true(torch.isfinite(z).all().item(), "有一列是常数，std = 0，除出来是 nan：fit 里给 std 加上 .clamp_min(1e-6)")
+
+
+@check("单条请求用的是训练时的统计量")
+def _():
+    train = _train_data()
+    pre = Preprocessor().fit(train)
+    one = torch.tensor([[60.0, -2.05, 1.0]])
+    want = (one - train.mean(dim=0)) / train.std(dim=0)
+    eq(pre.transform(one), want, tol=1e-4,
+       msg="transform 必须用 fit 时存下的 mean / std，不能拿请求自己现算（1 条数据的标准差是 0）")
+    batch = torch.cat([one, torch.randn(4, 3) * 100])
+    eq(pre.transform(batch)[:1], want, tol=1e-4,
+       msg="同一条请求和别的请求放在一起，结果就变了：transform 里不能用当前 batch 的统计量")
+
+
+@check("统计量随模型一起保存，服务端原样加载")
+def _():
+    pre = Preprocessor().fit(_train_data())
+    sd = pre.state_dict()
+    true(isinstance(sd, dict) and set(sd) == {"mean", "std"},
+         f"state_dict() 要返回只有 mean 和 std 两个键的 dict，你返回的是 {sd!r}")
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "bundle.pt")
+        torch.save({"model": nn.Linear(3, 1).state_dict(), "pre": sd}, path)
+        bundle = torch.load(path)
+    served = Preprocessor()          # 服务进程：一个全新的对象，不再 fit
+    served.load_state_dict(bundle["pre"])
+    req = torch.tensor([[48.0, -1.9, 2.5]])
+    eq(served.transform(req), pre.transform(req), tol=1e-6,
+       msg="加载后的 Preprocessor 和训练时的结果不一样：load_state_dict 要把 mean 和 std 都恢复")
+
+
+@check("既没 fit 也没加载就 transform，要报错")
+def _():
+    try:
+        Preprocessor().transform(torch.ones(1, 3))
+    except RuntimeError:
+        return
+    true(False, "没有统计量就 transform，应该 raise RuntimeError，而不是悄悄算出一个结果（那正是训练和推理不一致的来源）")
+--- hints
+- fit 里算完 `self.mean`、`self.std`，最后一行 `return self`。transform 开头先检查 `if self.mean is None:`。
+- `self.std = x.std(dim=0).clamp_min(1e-6)`；`state_dict` 返回 `{"mean": self.mean, "std": self.std}`；`load_state_dict` 反过来赋值：`self.mean = d["mean"]`、`self.std = d["std"]`。
+
+@@ item d18-02
+type: code
+title: 给词表算指纹
+level: 1
+cards: tokenizer 也有版本：用指纹对上号
+targets: vocab_fingerprint, check_vocab
+--- context
+换了 tokenizer 或者词表顺序变了，同一个词会变成另一个 id。模型不报错，只是读到了另一句话。把词表指纹和 checkpoint 存在一起，服务启动时比一下，对不上就拒绝启动。
+--- prompt
+写两个函数：
+
+- `vocab_fingerprint(vocab)`：vocab 是 dict（token 字符串 → id 整数）。先用 `json.dumps(vocab, sort_keys=True)` 变成文本，再用 `hashlib.sha256(文本.encode("utf-8")).hexdigest()` 算摘要，返回**前 16 个字符**。
+- `check_vocab(saved_fp, vocab)`：saved_fp 是训练时存下的指纹。当前词表的指纹和它一样，就什么都不做（返回 None）；不一样，就 `raise ValueError(...)`，报错信息里写上两个指纹，方便排查。
+
+不要用 Python 的 `hash()`。
+--- starter
+import hashlib
+import json
+
+
+def vocab_fingerprint(vocab):
+    raise todo()
+
+
+def check_vocab(saved_fp, vocab):
+    raise todo()
+--- solution
+import hashlib
+import json
+
+
+def vocab_fingerprint(vocab):
+    text = json.dumps(vocab, sort_keys=True)       # 按 key 排序：和插入顺序无关
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def check_vocab(saved_fp, vocab):
+    fp = vocab_fingerprint(vocab)
+    if fp != saved_fp:
+        raise ValueError(f"词表对不上：checkpoint 用的是 {saved_fp}，现在加载的是 {fp}")
+--- tests
+import hashlib
+import json
+
+V = {"<pad>": 0, "<eos>": 1, "hello": 2, "world": 3, "你好": 4}
+
+
+@check("同一份词表，插入顺序不同，指纹一样")
+def _():
+    fp = vocab_fingerprint(V)
+    true(isinstance(fp, str) and len(fp) == 16, f"要返回 16 个字符的字符串，你返回的是 {fp!r}")
+    shuffled = dict(reversed(list(V.items())))
+    true(vocab_fingerprint(shuffled) == fp, "只是插入顺序不同，指纹就变了：json.dumps 要加 sort_keys=True")
+
+
+@check("按规定的方法算（训练进程和服务进程算出来一样）")
+def _():
+    want = hashlib.sha256(json.dumps(V, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    true(vocab_fingerprint(V) == want,
+         "指纹和 sha256(json.dumps(vocab, sort_keys=True)) 的前 16 个字符不一样。"
+         "如果你用了 hash()：它每次启动 Python 都会变，训练和服务永远对不上")
+
+
+@check("任何一个 token 或 id 变了，指纹都变")
+def _():
+    fp = vocab_fingerprint(V)
+    swapped = dict(V, hello=3, world=2)
+    added = dict(V, new_word=5)
+    renamed = {("Hello" if k == "hello" else k): v for k, v in V.items()}
+    for name, v in (("交换两个 id", swapped), ("加一个词", added), ("改一个词的大小写", renamed)):
+        true(vocab_fingerprint(v) != fp, f"{name}之后指纹没变：指纹要覆盖整个词表（token 和 id 都算进去）")
+
+
+@check("check_vocab：对得上就放行，对不上就拒绝")
+def _():
+    fp = vocab_fingerprint(V)
+    true(check_vocab(fp, V) is None, "指纹一致时，check_vocab 应该什么都不做（返回 None）")
+    try:
+        check_vocab(fp, dict(V, hello=3, world=2))
+    except ValueError as e:
+        true(fp in str(e), "报错信息里要写上存下的指纹，排查时才知道 checkpoint 是用哪一版词表训练的")
+        return
+    true(False, "词表变了，check_vocab 应该 raise ValueError")
+--- hints
+- 指纹：`text = json.dumps(vocab, sort_keys=True)`，然后 `hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]`。
+- check_vocab：先 `fp = vocab_fingerprint(vocab)`，再 `if fp != saved_fp: raise ValueError(f"... {saved_fp} ... {fp}")`。
+
+@@ item d18-03
+type: fix
+title: 服务里的模型还在 train 模式
+level: 2
+cards: 推理两件套：eval() 和 inference_mode(); 结果不该随 batch 变
+targets: serve_predict
+ref: day18
+--- context
+刚训练完的模型默认处于 train 模式。直接拿去服务，dropout 还在随机丢，BatchNorm 还在用当前 batch 的统计量：同一个请求两次结果不同，还会随同一批的其他请求变。
+--- prompt
+`serve_predict(model, x)` 是服务里的预测函数：`x` 是 `(B, 4)` 的特征，返回 `(B, 3)` 的类别概率。模型由 `make_net()` 构建（Linear → BatchNorm → ReLU → Dropout → Linear），交到这个函数手里时还在 train 模式。
+
+现在的代码有两个问题：模型没切到推理时的行为，而且每次调用都在建计算图。改好它，做到：
+
+- 同一个输入调用两次，结果完全一样
+- 一条请求的结果不随同一批的其他请求变化
+- 模型的前向在 `torch.inference_mode()` 里运行，返回的张量不记录梯度
+--- starter
+def serve_predict(model, x):
+    logits = model(x)
+    return logits.softmax(dim=-1)
+--- solution
+def serve_predict(model, x):
+    model.eval()                        # dropout 关掉，BatchNorm 用存下的统计量
+    with torch.inference_mode():        # 不建计算图
+        logits = model(x)
+        return logits.softmax(dim=-1)
+--- tests
+@check("同一个输入调用两次，结果完全一样")
+def _():
+    net = make_net()
+    x = torch.randn(8, 4)
+    a = serve_predict(net, x)
+    b = serve_predict(net, x)
+    shape_is(a, (8, 3))
+    true(torch.equal(a, b), "两次结果不一样：dropout 还开着。先 model.eval()")
+
+
+@check("一条请求的结果不随同一批的其他请求变化")
+def _():
+    net = make_net()
+    x = torch.randn(8, 4)
+    together = serve_predict(net, x)
+    alone = torch.cat([serve_predict(net, x[i:i + 1]) for i in range(8)])
+    eq(together, alone, tol=1e-5,
+       msg="整批算和一条一条算，结果不同：BatchNorm 还在用当前 batch 的均值和方差，要 model.eval()")
+
+
+@check("前向在 inference_mode 里，结果不记录梯度")
+def _():
+    net = make_net()
+    seen = []
+    hook = net.register_forward_hook(lambda m, i, o: seen.append(torch.is_inference_mode_enabled()))
+    out = serve_predict(net, torch.randn(4, 4))
+    hook.remove()
+    true(not out.requires_grad, "结果带着 requires_grad=True：每次调用都在建计算图，白白占内存")
+    true(len(seen) > 0 and all(seen), "模型的前向不是在 torch.inference_mode() 里跑的：用 with torch.inference_mode(): 包住它")
+
+
+@check("和参考结果一致，每行概率之和为 1")
+def _():
+    net = make_net()
+    x = torch.randn(5, 4)
+    ref = make_net().eval()
+    with torch.no_grad():
+        want = ref(x).softmax(dim=-1)
+    got = serve_predict(net, x)
+    eq(got.sum(dim=-1), torch.ones(5), tol=1e-5, msg="每行概率之和应为 1：softmax 要在最后一维（类别）上做")
+    eq(got, want, tol=1e-5)
+--- hints
+- 两个问题对应两个开关：一个改变层的行为，一个关掉梯度记录。
+- 先 `model.eval()`，再用 `with torch.inference_mode():` 把前向和 softmax 都包进去。
+
+@@ item d18-04
+type: predict
+title: 同一条数据，换一批伙伴
+level: 1
+cards: 结果不该随 batch 变
+--- context
+服务把几条请求拼成一个 batch 时，每条请求的结果不该取决于它和谁拼在一起。train 模式下的 BatchNorm 恰恰会这样。
+--- prompt
+写出这段代码打印的两行。
+--- code
+torch.manual_seed(0)
+bn = nn.BatchNorm1d(3)
+x = torch.randn(4, 3)
+
+a = bn(x)[0]          # 第 0 条，和另外 3 条一起算
+b = bn(x[:2])[0]      # 还是第 0 条，只和 1 条一起算
+print("train:", torch.allclose(a, b))
+
+bn.eval()
+a = bn(x)[0]
+b = bn(x[:2])[0]
+print("eval:", torch.allclose(a, b))
+--- explain
+train 模式下，BatchNorm 用当前 batch 的均值和方差做标准化。4 条的 batch 和 2 条的 batch 统计量不同，第 0 条的输出也跟着变：`False`。
+
+eval 模式下，它用训练时存下的 running mean / var，和 batch 里还有谁无关：`True`。
+
+另外，train 模式下 batch 里只放 1 条，会直接报错（`Expected more than 1 value per channel when training`）。服务里看到这个错误，多半是忘了 `model.eval()`。
+--- hints
+- train 模式下，BatchNorm 用的是谁的均值和方差？4 条数据和其中 2 条数据，均值一样吗？
+- eval 模式下它用 running_mean / running_var，这两个数和 batch 里有谁无关。
+
+@@ item d18-05
+type: choice
+title: 只有 inference_mode 够不够？
+level: 1
+cards: 推理两件套：eval() 和 inference_mode()
+--- context
+这是面试常问的问题，也是线上常见的坑：以为 inference_mode（或 no_grad）会顺便把模型切到推理状态。
+--- prompt
+服务代码里写了 `with torch.inference_mode(): y = model(x)`，但整个服务从来没调用过 `model.eval()`。模型里有 Dropout 和 BatchNorm。会怎样？
+--- options
+- 没问题：inference_mode 会自动把模型切到 eval 模式
+- dropout 还在随机丢，BatchNorm 还在用当前 batch 的统计量：同一个请求结果会变，还会随同一批的其他请求变
+- 直接报错：train 模式下不允许用 inference_mode
+- 只是慢一点、多占点内存，结果和调用了 eval() 完全一样
+answer: 2
+--- explain
+`inference_mode` 只管 autograd：不建计算图，不存反向传播用的中间结果。它不碰任何层的行为。
+
+层的行为由 `model.train()` / `model.eval()` 决定，这是另一个开关。所以推理时两个都要：`model.eval()`（加载模型后调一次）加 `with torch.inference_mode():`（包住每次前向）。
+
+第 3 项不对：没有这种限制，代码照样能跑，只是结果不对。这正是它危险的地方。
+--- hints
+- inference_mode 关掉的是什么？dropout 开不开，又是由什么决定的？
+- 层的行为只看 `model.training` 这个标志，而它只会被 `train()` / `eval()` 改变。
+
+@@ item d18-06
+type: code
+title: batch 无关性测试
+level: 1
+cards: 结果不该随 batch 变
+targets: batch_gap
+--- context
+上线前给模型加一条「整批结果 = 逐条结果」的测试。忘了 eval、pad 没 mask 这类 bug 会在测试里暴露，而不是等用户发现「同一个问题问两次，答案不一样」。
+--- prompt
+写 `batch_gap(model, x)`：
+
+- `x` 是一批数据，第 0 维是 batch（比如 shape `(B, C, L)`）
+- 整批算一次：`model(x)`
+- 再一条一条算：`model(x[i:i+1])`（保留 batch 维，shape 是 `(1, ...)`），把 B 个结果沿第 0 维拼起来
+- 返回两者之差的绝对值的最大值，是一个 Python float（用 `.item()`）
+
+前向都放在 `with torch.inference_mode():` 里。不要改模型的模式（不要调 `eval()` 或 `train()`）：你是在**测**它，不是在修它。
+--- starter
+def batch_gap(model, x):
+    raise todo()
+--- solution
+def batch_gap(model, x):
+    with torch.inference_mode():
+        together = model(x)
+        alone = torch.cat([model(x[i:i + 1]) for i in range(x.shape[0])], dim=0)
+    return (together - alone).abs().max().item()
+--- tests
+def _conv_bn():
+    torch.manual_seed(0)
+    return nn.Sequential(nn.Conv1d(2, 4, kernel_size=3, padding=1), nn.BatchNorm1d(4), nn.ReLU())
+
+
+@check("eval 模式的模型：差值几乎为 0")
+def _():
+    m = _conv_bn().eval()
+    x = torch.randn(6, 2, 5)
+    g = batch_gap(m, x)
+    true(isinstance(g, float), f"要返回 Python float（用 .item()），你返回的是 {type(g).__name__}")
+    true(g < 1e-5, f"eval 模式下差值应该 < 1e-5，你算出 {g:.3e}：检查逐条算时是不是用了 x[i:i+1]，拼接是不是沿 dim=0")
+
+
+@check("train 模式的 BatchNorm：差值明显大于 0")
+def _():
+    m = _conv_bn().train()
+    x = torch.randn(6, 2, 5)
+    g = batch_gap(m, x)
+    true(g > 0.1, f"train 模式的 BatchNorm 用当前 batch 的统计量，整批和逐条应该差很多，你算出 {g:.3e}：是不是在函数里调了 eval()？")
+
+
+@check("不改模型的模式")
+def _():
+    m = _conv_bn().train()
+    batch_gap(m, torch.randn(4, 2, 5))
+    true(m.training, "调用之后，模型从 train 变成了 eval：测试函数不能偷偷改被测的东西")
+    m.eval()
+    batch_gap(m, torch.randn(4, 2, 5))
+    true(not m.training, "调用之后，模型从 eval 变成了 train")
+
+
+@check("普通的线性模型：差值几乎为 0")
+def _():
+    m = nn.Linear(8, 3)
+    g = batch_gap(m, torch.randn(10, 8))
+    true(g < 1e-5, f"Linear 和 batch 无关，差值应该 < 1e-5，你算出 {g:.3e}")
+--- hints
+- 一条一条算时要保留 batch 维：`x[i:i+1]` 的 shape 是 `(1, ...)`，`x[i]` 就少了一维。
+- `alone = torch.cat([model(x[i:i + 1]) for i in range(x.shape[0])], dim=0)`，然后返回 `(together - alone).abs().max().item()`。
+
+@@ item d18-07
+type: code
+title: 左填充：input_ids、attention_mask、position_ids
+level: 2
+cards: 批量生成（二）：左填充 + attention mask + position ids
+targets: left_pad
+ref: day18
+--- context
+用 decoder-only 模型批量生成时，Hugging Face 会提醒你用左填充。ids、mask、位置这三样是每个 LLM 推理服务每一步都要准备的输入，错一处，批量结果就和单条不一样。
+--- prompt
+写 `left_pad(seqs, pad_id=0)`。seqs 是 B 条长度不同的 token id 列表。返回三个 shape 为 `(B, T)` 的张量，T 是最长那条的长度：
+
+- `input_ids`：pad 补在**左边**，dtype 为 `torch.long`
+- `attention_mask`：真实 token 为 1，pad 为 0（按位置判断，不要用 `ids != pad_id`）
+- `position_ids`：每个真实 token 在它自己那条序列里的位置（0, 1, 2, …）；pad 位置填 0。dtype 为 `torch.long`
+
+例子：`left_pad([[5, 6, 7], [8]], pad_id=0)` 返回
+
+```
+input_ids      = [[5, 6, 7], [0, 0, 8]]
+attention_mask = [[1, 1, 1], [0, 0, 1]]
+position_ids   = [[0, 1, 2], [0, 0, 0]]
+```
+--- starter
+def left_pad(seqs, pad_id=0):
+    raise todo()
+--- solution
+def left_pad(seqs, pad_id=0):
+    T = max(len(s) for s in seqs)
+    ids = torch.full((len(seqs), T), pad_id, dtype=torch.long)
+    mask = torch.zeros((len(seqs), T), dtype=torch.long)
+    for i, s in enumerate(seqs):
+        ids[i, T - len(s):] = torch.tensor(s, dtype=torch.long)   # 真实 token 靠右放
+        mask[i, T - len(s):] = 1
+    pos = (mask.cumsum(dim=-1) - 1).clamp(min=0)                 # 真实位置 0, 1, 2, …；pad 是 0
+    return ids, mask, pos
+--- tests
+@check("小例子：[[5, 6, 7], [8]]")
+def _():
+    ids, mask, pos = left_pad([[5, 6, 7], [8]], pad_id=0)
+    shape_is(ids, (2, 3))
+    true(ids.dtype == torch.long, f"input_ids 的 dtype 要是 torch.long（embedding 查表要整数），你的是 {ids.dtype}")
+    eq(ids, torch.tensor([[5, 6, 7], [0, 0, 8]]), tol=0, msg="pad 要补在左边：短的那条是 [0, 0, 8]，不是 [8, 0, 0]")
+    eq(mask.long(), torch.tensor([[1, 1, 1], [0, 0, 1]]), tol=0, msg="attention_mask：真实 token 是 1，pad 是 0")
+    true(pos.dtype == torch.long, f"position_ids 的 dtype 要是 torch.long，你的是 {pos.dtype}")
+    eq(pos, torch.tensor([[0, 1, 2], [0, 0, 0]]), tol=0,
+       msg="position_ids：第二条的 8 是它那条序列的第 0 个词，位置是 0；pad 位置填 0")
+
+
+@check("三条长短不一，pad_id 是 9")
+def _():
+    ids, mask, pos = left_pad([[4, 4, 4, 4], [1, 2], [7, 8, 9]], pad_id=9)
+    eq(ids, torch.tensor([[4, 4, 4, 4], [9, 9, 1, 2], [9, 7, 8, 9]]), tol=0, msg="pad 要用传进来的 pad_id")
+    eq(mask.long(), torch.tensor([[1, 1, 1, 1], [0, 0, 1, 1], [0, 1, 1, 1]]), tol=0,
+       msg="mask 要看这个位置是不是补出来的，不能看 id 等不等于 pad_id（第三条最后一个真实 token 恰好也是 9）")
+    eq(pos, torch.tensor([[0, 1, 2, 3], [0, 0, 0, 1], [0, 0, 1, 2]]), tol=0,
+       msg="position_ids 要从每条序列自己的第一个真实 token 开始数")
+
+
+@check("接上模型：批量算出的下一个词分数 = 一条一条算")
+def _():
+    model = tiny_lm()
+    prompts = [[3, 7, 2, 9], [5, 1], [4, 4, 8], [11]]
+    ids, mask, pos = left_pad(prompts, pad_id=0)
+    with torch.inference_mode():
+        logits = model(ids, attention_mask=mask, position_ids=pos)[:, -1]
+        for i, p in enumerate(prompts):
+            want = model(torch.tensor([p]))[0, -1]
+            eq(logits[i], want, tol=1e-4, msg=f"第 {i} 条 prompt {p}：批量算的分数和单独算的不一样")
+--- hints
+- 先 `T = max(len(s) for s in seqs)`；用 `torch.full((B, T), pad_id, dtype=torch.long)` 建 ids，用 `torch.zeros((B, T), dtype=torch.long)` 建 mask。
+- 逐行把真实 token 写到最右边：`ids[i, T - len(s):] = torch.tensor(s)`，同时 `mask[i, T - len(s):] = 1`。
+- position ids：`(mask.cumsum(dim=-1) - 1).clamp(min=0)`。
+
+@@ item d18-08
+type: fix
+title: 右填充让批量结果全错了
+level: 2
+cards: 批量生成（一）：右填充为什么出错; 批量生成（二）：左填充 + attention mask + position ids
+targets: next_token_batch
+ref: day18
+--- context
+一条一条生成时一切正常，一上批量，短 prompt 的回答就变成胡话。这是 LLM 推理服务里最常见的 bug 之一，原因几乎总是 padding 的方向、attention mask 或 position ids。
+--- prompt
+`next_token_batch(model, prompts, pad_id=0)` 把几条长度不同的 prompt 放进一个 batch，用贪心（取分数最高的词）算出每条的下一个词，返回长度为 B 的 int 列表。
+
+它应该和 `generate_one(model, p, 1)[0]`（一条一条算，不补 pad）给出一样的结果，现在却不一样。
+
+改好它：用左填充，并把 attention mask 和 position ids 传给模型。可以直接用已经写好的 `left_pad(seqs, pad_id)`（返回 ids、mask、pos）。模型的调用方式是 `model(ids, attention_mask=mask, position_ids=pos)`，返回 `(B, T, V)` 的 logits。
+--- starter
+def next_token_batch(model, prompts, pad_id=0):
+    T = max(len(p) for p in prompts)
+    ids = torch.tensor([p + [pad_id] * (T - len(p)) for p in prompts])   # 右填充
+    with torch.inference_mode():
+        logits = model(ids)
+    return logits[:, -1].argmax(dim=-1).tolist()
+--- solution
+def next_token_batch(model, prompts, pad_id=0):
+    ids, mask, pos = left_pad(prompts, pad_id)                   # 左填充
+    with torch.inference_mode():
+        logits = model(ids, attention_mask=mask, position_ids=pos)
+    return logits[:, -1].argmax(dim=-1).tolist()                 # 每行最后一格都是真实的最后一个词
+--- tests
+class _Spy(nn.Module):
+    """包住模型，记下它收到的输入。"""
+
+    def __init__(self, inner):
+        super().__init__()
+        self.inner = inner
+        self.calls = []
+
+    def forward(self, ids, attention_mask=None, position_ids=None):
+        self.calls.append((ids, attention_mask, position_ids))
+        return self.inner(ids, attention_mask=attention_mask, position_ids=position_ids)
+
+
+P1 = [[3, 7, 2, 9], [5, 1], [4, 4, 8], [11]]
+P2 = [[2, 9, 6, 1, 13], [7], [12, 3], [9, 9, 9]]
+
+
+@check("批量结果 = 一条一条算")
+def _():
+    model = tiny_lm()
+    for P in (P1, P2):
+        got = next_token_batch(model, P)
+        want = [generate_one(model, p, 1)[0] for p in P]
+        true(got == want, f"prompts {P}：批量得到 {got}，一条一条是 {want}")
+
+
+@check("用的是左填充")
+def _():
+    spy = _Spy(tiny_lm())
+    next_token_batch(spy, P1)
+    ids = spy.calls[0][0]
+    true(bool((ids[:, -1] != 0).all()),
+         f"模型收到的最后一列里有 pad：{ids[:, -1].tolist()}。右填充时，短 prompt 的最后一格是 pad；要把 pad 补在左边")
+
+
+@check("attention mask 和 position ids 都传给了模型")
+def _():
+    spy = _Spy(tiny_lm())
+    next_token_batch(spy, P1)
+    ids, mask, pos = spy.calls[0]
+    true(mask is not None, "没传 attention_mask：真实的词会去 attend 左边的 pad")
+    true(pos is not None, "没传 position_ids：左填充后，短 prompt 的第一个词不在第 0 格，位置全错了")
+
+
+@check("prompt 的先后顺序不影响结果")
+def _():
+    model = tiny_lm()
+    a = next_token_batch(model, P1)
+    b = next_token_batch(model, P1[::-1])
+    true(a == b[::-1], "把 prompt 倒过来放，结果就对不上了：某条的结果受到了同一批其他 prompt 的影响")
+--- hints
+- 右填充时，短 prompt 的「最后一格」是什么？模型在那一格预测的，是哪个词后面的词？
+- `ids, mask, pos = left_pad(prompts, pad_id)`，然后 `model(ids, attention_mask=mask, position_ids=pos)`；最后一格仍然用 `[:, -1]` 取。
+
+@@ item d18-09
+type: fill
+title: 批量贪心生成：每一步要接上什么
+level: 2
+cards: 批量生成（二）：左填充 + attention mask + position ids
+ref: day18
+--- context
+生成的每一步都要把新词接到序列末尾。只接了 input_ids、忘了同步 attention mask 和 position ids，从第二个词开始批量结果就和单条不一样；第一个词却看起来一切正常，很难发现。
+--- prompt
+填空，完成批量贪心生成：`generate_batch(model, prompts, n_new)` 的结果，要和对每条 prompt 分别调用 `generate_one(model, p, n_new)` 完全一样。
+
+- 第 1 个空：取每行最后一个位置的 logits，选分数最高的词，得到 shape `(B,)`
+- 第 2 个空：新词变成 shape `(B, 1)`，才能接到 `ids` 末尾
+- 第 3 个空：`mask` 末尾接一列 1（和 mask 同样的 dtype）
+- 第 4 个空：`pos` 末尾接「每行最后一个位置 + 1」
+--- template
+def generate_batch(model, prompts, n_new, pad_id=0):
+    ids, mask, pos = left_pad(prompts, pad_id)
+    new = []
+    with torch.inference_mode():
+        for _ in range(n_new):
+            logits = model(ids, attention_mask=mask, position_ids=pos)   # (B, T, V)
+            nxt = [[logits[:, -1].argmax(dim=-1)]]
+            new.append(nxt)
+            ids = torch.cat([ids, [[nxt.unsqueeze(1)]]], dim=1)
+            mask = torch.cat([mask, [[torch.ones_like(mask[:, :1])]]], dim=1)
+            pos = torch.cat([pos, [[pos[:, -1:] + 1]]], dim=1)
+    return torch.stack(new, dim=1).tolist()                               # B 个列表，每个 n_new 个词
+--- tests
+P1 = [[3, 7, 2, 9], [5, 1], [4, 4, 8], [11]]
+P2 = [[2, 9, 6, 1, 13], [7], [12, 3], [9, 9, 9]]
+
+
+@check("批量生成 = 一条一条生成（6 个新词）")
+def _():
+    model = tiny_lm()
+    for P in (P1, P2):
+        got = generate_batch(model, P, 6)
+        want = [generate_one(model, p, 6) for p in P]
+        for i, (g, w) in enumerate(zip(got, want)):
+            true(g == w, f"第 {i} 条 prompt {P[i]}：批量生成 {g}，一条一条生成 {w}。"
+                         "第 1 个词就错：看 logits 取的位置；后面才错：看 mask 和 pos 有没有跟着接上")
+
+
+@check("形状：B 条，每条 n_new 个词")
+def _():
+    out = generate_batch(tiny_lm(), P1, 3)
+    true(len(out) == 4 and all(len(r) == 3 for r in out), f"应该是 4 个长度为 3 的列表，你得到 {out}")
+--- hints
+- 左填充之后，每行的最后一个位置都是真实的最后一个词，所以第 1 个空取 `logits[:, -1]` 再 `.argmax(dim=-1)`。
+- 新词的 shape 是 `(B,)`，用 `nxt.unsqueeze(1)` 变成 `(B, 1)`；mask 接 `torch.ones_like(mask[:, :1])`；pos 接 `pos[:, -1:] + 1`（写 `-1:` 而不是 `-1`，是为了保留那一维）。
+
+@@ item d18-10
+type: code
+title: set_seed：三个随机数来源都要管
+level: 1
+cards: 可复现：种子和确定性开关
+targets: set_seed
+--- context
+「上周的结果复现不出来」是 ML 团队最常听到的抱怨之一。只写 torch.manual_seed 不够：数据增强、数据划分常用 Python 的 random 和 NumPy，它们有各自的种子。
+--- prompt
+写 `set_seed(seed, deterministic=False)`：
+
+- 给 Python 的 `random`、NumPy、PyTorch 都设上种子
+- `deterministic=True` 时，再打开三个确定性开关：`torch.backends.cudnn.benchmark = False`、`torch.backends.cudnn.deterministic = True`、`torch.use_deterministic_algorithms(True)`
+- `deterministic=False`（默认）时，不碰这些开关
+--- starter
+import random
+
+import numpy as np
+
+
+def set_seed(seed, deterministic=False):
+    torch.manual_seed(seed)
+--- solution
+import random
+
+import numpy as np
+
+
+def set_seed(seed, deterministic=False):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)                       # CPU 和所有 GPU
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True)
+--- tests
+import random
+
+import numpy as np
+
+
+def _draw():
+    return random.random(), float(np.random.rand()), torch.rand(1).item()
+
+
+def _flags():
+    return (torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic,
+            torch.are_deterministic_algorithms_enabled())
+
+
+def _restore(f):
+    torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = f[0], f[1]
+    torch.use_deterministic_algorithms(f[2])
+
+
+@check("random、NumPy、torch 三个都被播种")
+def _():
+    set_seed(123)
+    a = _draw()
+    set_seed(123)
+    b = _draw()
+    true(a[0] == b[0], "Python 的 random 两次不一样：加 random.seed(seed)")
+    true(a[1] == b[1], "NumPy 两次不一样：加 np.random.seed(seed)")
+    true(a[2] == b[2], "torch 两次不一样：加 torch.manual_seed(seed)")
+
+
+@check("不同的 seed 给出不同的数")
+def _():
+    set_seed(1)
+    a = _draw()
+    set_seed(2)
+    b = _draw()
+    true(all(x != y for x, y in zip(a, b)), "seed 换了，随机数却没变：要用传进来的 seed，不要写死一个数")
+
+
+@check("deterministic=True 打开三个确定性开关")
+def _():
+    old = _flags()
+    try:
+        torch.backends.cudnn.benchmark = True        # 假装有人为了速度把它打开了
+        torch.backends.cudnn.deterministic = False
+        torch.use_deterministic_algorithms(False)
+        set_seed(0, deterministic=True)
+        now = _flags()
+    finally:
+        _restore(old)
+    true(now[0] is False, "cudnn.benchmark 还是 True：它会让每次运行挑不同的卷积算法")
+    true(now[1] is True, "cudnn.deterministic 没设成 True")
+    true(now[2] is True, "没调用 torch.use_deterministic_algorithms(True)")
+
+
+@check("默认（deterministic=False）不碰这些开关")
+def _():
+    old = _flags()
+    try:
+        torch.backends.cudnn.benchmark = True
+        torch.use_deterministic_algorithms(False)
+        set_seed(0)
+        now = _flags()
+    finally:
+        _restore(old)
+    true(now[0] is True and now[2] is False,
+         "deterministic=False 时也改了开关：这些开关会变慢，确定性算法还会让某些算子直接报错，只在需要时打开")
+--- hints
+- 三行：`random.seed(seed)`、`np.random.seed(seed)`、`torch.manual_seed(seed)`。
+- 开关只在 `if deterministic:` 里面设：`torch.backends.cudnn.benchmark = False`、`torch.backends.cudnn.deterministic = True`、`torch.use_deterministic_algorithms(True)`。
+
+@@ item d18-11
+type: predict
+title: 1 + 0.001 和 70000，放进三种精度
+level: 2
+cards: 精度和容差：fp32 / TF32 / bf16 / fp16
+--- context
+服务从 fp32 切到 bf16 或 fp16，能省一半显存、快不少。但你得知道每种格式会在哪里丢信息：小的变化被舍掉，大的数溢出成 inf。
+--- prompt
+写出这段代码打印的三行。每行是：dtype 的名字、加上 0.001 后是否还等于 1、70000 是否变成了 inf。
+--- code
+for dt in [torch.float32, torch.float16, torch.bfloat16]:
+    one = torch.tensor(1.0, dtype=dt)
+    lost = (one + 0.001 == one).item()                       # 加上 0.001，还等于 1 吗？
+    overflow = torch.tensor(70000.0).to(dt).isinf().item()   # 70000 装得下吗？
+    print(str(dt).replace("torch.", ""), lost, overflow)
+--- explain
+1 附近相邻两个数的间隔就是 eps：fp32 约 1.2e-7，fp16 约 9.8e-4，bf16 约 7.8e-3。
+
+- 0.001 比 fp16 的间隔大，所以在 fp16 里 1 + 0.001 变成 1.000977，不等于 1（`False`）。
+- 0.001 比 bf16 的间隔小得多，被舍掉了，结果还是 1（`True`）。
+- fp16 最大只到 65504，70000 变成 inf（`True`）。bf16 的指数位和 fp32 一样多，70000 装得下，存成 70144（精度粗，但不溢出）。
+
+所以 bf16 是「范围大、精度粗」，fp16 是「精度细一点、范围小」。用 fp16 训练要配合 loss scaling（把 loss 放大，防止很小的梯度变成 0），bf16 一般不用。
+--- hints
+- 看 eps：fp16 约 9.8e-4，bf16 约 7.8e-3。0.001 比哪个大、比哪个小？
+- fp16 最大只到 65504；bf16 的范围和 fp32 一样。
+
+@@ item d18-12
+type: code
+title: 按 dtype 选容差，比对两份输出
+level: 2
+cards: 精度和容差：fp32 / TF32 / bf16 / fp16
+targets: outputs_match
+--- context
+换精度、换硬件、导出 ONNX 之后，第一件事就是和 fp32 参考输出比一比。容差太紧，正确的 bf16 结果被当成 bug；容差太松，真正的 bug 被放过去。
+--- prompt
+写 `outputs_match(ref, got)`。`ref` 是 fp32 的参考输出，`got` 是要检查的输出，dtype 可能是 fp32、fp16 或 bf16。
+
+- shape 不同，直接返回 `False`（别让广播把 `(4, 1)` 和 `(4,)` 凑成 `(4, 4)`）
+- 按 `got.dtype` 从 `TOL` 里取 `(rtol, atol)`
+- 两边都转成 fp32，逐个元素检查 `|got - ref| <= atol + rtol * |ref|`
+- 全部满足返回 `True`，否则返回 `False`。要返回 Python 的 bool（用 `bool(...)` 或 `.item()`）。nan 和 inf 算不满足。
+--- starter
+TOL = {                          # (rtol, atol)，给模型输出用的经验值
+    torch.float32: (1e-5, 1e-5),
+    torch.float16: (1e-2, 1e-2),
+    torch.bfloat16: (5e-2, 5e-2),
+}
+
+
+def outputs_match(ref, got):
+    raise todo()
+--- solution
+TOL = {                          # (rtol, atol)，给模型输出用的经验值
+    torch.float32: (1e-5, 1e-5),
+    torch.float16: (1e-2, 1e-2),
+    torch.bfloat16: (5e-2, 5e-2),
+}
+
+
+def outputs_match(ref, got):
+    if ref.shape != got.shape:
+        return False
+    rtol, atol = TOL[got.dtype]                   # 按精度低的那一边选容差
+    ref32, got32 = ref.float(), got.float()       # 在 fp32 里比
+    ok = (got32 - ref32).abs() <= atol + rtol * ref32.abs()
+    return bool(ok.all())                         # nan 和任何数比较都是 False
+--- tests
+def _case():
+    torch.manual_seed(0)
+    x, w = torch.randn(8, 32), torch.randn(32, 16)
+    return x, w, x @ w
+
+
+@check("fp32：换一种求和顺序，差 1e-7 左右，算一致")
+def _():
+    x, w, ref = _case()
+    got = (x[:, :, None] * w[None]).sum(dim=1)      # 同样的数学，不同的求和顺序
+    r = outputs_match(ref, got)
+    true(isinstance(r, bool), f"要返回 Python bool，你返回的是 {type(r).__name__}：用 bool(...) 或 .item()")
+    true(r is True, "只是求和顺序不同（误差 1e-7 级），不该判成不一致")
+
+
+@check("fp16 / bf16 算出的正确结果，算一致")
+def _():
+    x, w, ref = _case()
+    for dt in (torch.float16, torch.bfloat16):
+        got = x.to(dt) @ w.to(dt)
+        true(outputs_match(ref, got) is True,
+             f"{dt} 算出的正确结果被判成不一致：容差要按 got.dtype 从 TOL 里取，不能一律用 fp32 的")
+
+
+@check("真正的 bug：在每种精度下都判成不一致")
+def _():
+    x, w, ref = _case()
+    bug = ref.clone()
+    bug[3, 5] += 1.0                                # 一个元素错了 1.0
+    for dt in (torch.float32, torch.float16, torch.bfloat16):
+        true(outputs_match(ref, bug.to(dt)) is False, f"{dt}：有一个元素差了 1.0，应该判成不一致")
+
+
+@check("fp32 的容差不能放宽到 bf16 那么大")
+def _():
+    x, w, ref = _case()
+    true(outputs_match(ref, ref + 1e-3) is False,
+         "fp32 输出整体偏了 1e-3，应该判成不一致：fp32 要用 fp32 的容差，不能一律用最宽的")
+
+
+@check("shape 不同、有 nan，都算不一致")
+def _():
+    ref = torch.ones(4)
+    true(outputs_match(ref, torch.ones(4, 1)) is False,
+         "shape (4,) 和 (4, 1) 不同，要直接返回 False；不检查的话，广播会把它们凑成 (4, 4)，数值还全都对得上")
+    got = ref.clone()
+    got[1] = float("nan")
+    true(outputs_match(ref, got) is False, "输出里有 nan，应该判成不一致")
+--- hints
+- 先 `if ref.shape != got.shape: return False`，再 `rtol, atol = TOL[got.dtype]`。
+- `ok = (got.float() - ref.float()).abs() <= atol + rtol * ref.float().abs()`，返回 `bool(ok.all())`。nan 和任何数比较都是 False，不用单独处理。
+
+@@ item d18-13
+type: choice
+title: 同一个 fp32 模型，CPU 和 GPU 差了 1e-3
+level: 2
+cards: 精度和容差：fp32 / TF32 / bf16 / fp16
+--- context
+部署前你把 GPU 上的输出和 CPU 上的参考输出比对，发现差了 1e-3。先要判断：这是精度设置造成的正常误差，还是真的 bug。
+--- prompt
+训练脚本开头有一行 `torch.set_float32_matmul_precision("high")`（为了训练快）。同一个 fp32 模型、同一个输入，在 CPU 上和在 RTX 4090 上各跑一次，输出的相对误差在 1e-3 左右。最可能的原因是什么？
+--- options
+- GPU 算错了，这块卡有硬件问题
+- 这行设置让 GPU 上的 fp32 矩阵乘改用 TF32（输入只保留 10 位尾数），1e-3 左右的误差是它的正常水平；想确认，就改成 "highest" 再比一次
+- CPU 上的 fp32 其实是按 fp64 算的，所以两边不一样
+- 没有调用 set_seed，两边的随机数不一样
+answer: 2
+--- explain
+TF32 用 10 位尾数做乘法，相对精度约 1e-3，和看到的误差量级正好对得上。
+
+`set_float32_matmul_precision("high")` 允许矩阵乘用 TF32（默认是 "highest"，即完整的 fp32）。卷积在 cuDNN 里默认就允许 TF32（`torch.backends.cudnn.allow_tf32`）。
+
+确认的办法：比对之前设成 "highest"，如果误差回到 1e-6 左右，就说明不是 bug。之后按精度选容差，或者比对时关掉 TF32。
+
+第 3 项不对：CPU 上的 fp32 就是 fp32。第 4 项不对：eval 模式下的推理里没有随机数，和种子无关。
+--- hints
+- 1e-3 这个量级，和哪种格式的尾数位数对得上？
+- TF32 只有 10 位尾数，相对精度约 1e-3。
+
+@@ item d18-14
+type: code
+title: 闭卷：Preprocessor
+level: 2
+exam: yes
+cards: 训练和推理不一致：一份预处理，两边共用
+targets: Preprocessor
+--- context
+训练和服务共用一份预处理、统计量跟着模型走，是防止训练和推理不一致的第一道防线。面试里常让你当场写出来。
+--- prompt
+不看卡片，写出 `Preprocessor` 类（标准化 `(x - mean) / std`，x 的 shape 是 `(N, D)`）：
+
+- `__init__()`：`self.mean`、`self.std` 设为 None
+- `fit(x)`：`mean = x.mean(dim=0)`，`std = x.std(dim=0).clamp_min(1e-6)`，存进 self，`return self`
+- `transform(x)`：只用存下的统计量；还没有统计量就 `raise RuntimeError`
+- `state_dict()`：返回 `{"mean": ..., "std": ...}`
+- `load_state_dict(d)`：从这个 dict 恢复统计量
+--- starter
+class Preprocessor:
+    def __init__(self):
+        raise todo()
+
+    def fit(self, x):
+        raise todo()
+
+    def transform(self, x):
+        raise todo()
+
+    def state_dict(self):
+        raise todo()
+
+    def load_state_dict(self, d):
+        raise todo()
+--- solution
+class Preprocessor:
+    def __init__(self):
+        self.mean = None
+        self.std = None
+
+    def fit(self, x):
+        self.mean = x.mean(dim=0)
+        self.std = x.std(dim=0).clamp_min(1e-6)
+        return self
+
+    def transform(self, x):
+        if self.mean is None:
+            raise RuntimeError("先 fit() 或 load_state_dict()")
+        return (x - self.mean) / self.std
+
+    def state_dict(self):
+        return {"mean": self.mean.clone(), "std": self.std.clone()}
+
+    def load_state_dict(self, d):
+        self.mean = d["mean"].clone()
+        self.std = d["std"].clone()
+        return self
+--- tests
+import os
+import tempfile
+
+
+def _train_data():
+    torch.manual_seed(1)
+    return torch.randn(200, 3) * torch.tensor([10.0, 0.1, 3.0]) + torch.tensor([50.0, -2.0, 0.0])
+
+
+@check("fit 之后，训练数据变成均值 0、标准差 1")
+def _():
+    train = _train_data()
+    pre = Preprocessor()
+    true(pre.fit(train) is pre, "fit 最后要 return self，这样才能写 Preprocessor().fit(x)")
+    z = pre.transform(train)
+    shape_is(z, (200, 3))
+    eq(z.mean(dim=0), torch.zeros(3), tol=1e-4, msg="每一列的均值应该是 0：mean 要按 dim=0（每个特征）算")
+    eq(z.std(dim=0), torch.ones(3), tol=1e-3, msg="每一列的标准差应该是 1：std 按 dim=0 算，用默认的 x.std(dim=0)")
+
+
+@check("常数列不会变成 nan / inf")
+def _():
+    train = _train_data()
+    train[:, 1] = 5.0
+    z = Preprocessor().fit(train).transform(train)
+    true(torch.isfinite(z).all().item(), "有一列是常数，std = 0，除出来是 nan：fit 里给 std 加上 .clamp_min(1e-6)")
+
+
+@check("单条请求用的是训练时的统计量")
+def _():
+    train = _train_data()
+    pre = Preprocessor().fit(train)
+    one = torch.tensor([[60.0, -2.05, 1.0]])
+    want = (one - train.mean(dim=0)) / train.std(dim=0)
+    eq(pre.transform(one), want, tol=1e-4,
+       msg="transform 必须用 fit 时存下的 mean / std，不能拿请求自己现算（1 条数据的标准差是 0）")
+    batch = torch.cat([one, torch.randn(4, 3) * 100])
+    eq(pre.transform(batch)[:1], want, tol=1e-4,
+       msg="同一条请求和别的请求放在一起，结果就变了：transform 里不能用当前 batch 的统计量")
+
+
+@check("统计量随模型一起保存，服务端原样加载")
+def _():
+    pre = Preprocessor().fit(_train_data())
+    sd = pre.state_dict()
+    true(isinstance(sd, dict) and set(sd) == {"mean", "std"},
+         f"state_dict() 要返回只有 mean 和 std 两个键的 dict，你返回的是 {sd!r}")
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "bundle.pt")
+        torch.save({"model": nn.Linear(3, 1).state_dict(), "pre": sd}, path)
+        bundle = torch.load(path)
+    served = Preprocessor()          # 服务进程：一个全新的对象，不再 fit
+    served.load_state_dict(bundle["pre"])
+    req = torch.tensor([[48.0, -1.9, 2.5]])
+    eq(served.transform(req), pre.transform(req), tol=1e-6,
+       msg="加载后的 Preprocessor 和训练时的结果不一样：load_state_dict 要把 mean 和 std 都恢复")
+
+
+@check("既没 fit 也没加载就 transform，要报错")
+def _():
+    try:
+        Preprocessor().transform(torch.ones(1, 3))
+    except RuntimeError:
+        return
+    true(False, "没有统计量就 transform，应该 raise RuntimeError，而不是悄悄算出一个结果（那正是训练和推理不一致的来源）")
+--- hints
+- fit 里算完 `self.mean`、`self.std`，最后一行 `return self`。transform 开头先检查 `if self.mean is None:`。
+- `self.std = x.std(dim=0).clamp_min(1e-6)`；`state_dict` 返回 `{"mean": self.mean, "std": self.std}`；`load_state_dict` 反过来赋值。
+
+@@ item d18-15
+type: code
+title: 闭卷：left_pad
+level: 2
+exam: yes
+cards: 批量生成（二）：左填充 + attention mask + position ids
+targets: left_pad
+ref: day18
+--- context
+左填充、attention mask、position ids 是 decoder-only 模型批量推理的基本功。能不看资料写对，才算真的懂了批量生成为什么会出错。
+--- prompt
+不看卡片，写出 `left_pad(seqs, pad_id=0)`，返回三个 shape 为 `(B, T)` 的张量（T 是最长那条的长度）：
+
+- `input_ids`：pad 补在左边，dtype 为 `torch.long`
+- `attention_mask`：真实 token 为 1，pad 为 0（按位置判断）
+- `position_ids`：每个真实 token 在自己那条序列里的位置，pad 位置填 0，dtype 为 `torch.long`
+
+`left_pad([[5, 6, 7], [8]])` → ids `[[5, 6, 7], [0, 0, 8]]`，mask `[[1, 1, 1], [0, 0, 1]]`，pos `[[0, 1, 2], [0, 0, 0]]`。
+--- starter
+def left_pad(seqs, pad_id=0):
+    raise todo()
+--- solution
+def left_pad(seqs, pad_id=0):
+    T = max(len(s) for s in seqs)
+    ids = torch.full((len(seqs), T), pad_id, dtype=torch.long)
+    mask = torch.zeros((len(seqs), T), dtype=torch.long)
+    for i, s in enumerate(seqs):
+        ids[i, T - len(s):] = torch.tensor(s, dtype=torch.long)
+        mask[i, T - len(s):] = 1
+    pos = (mask.cumsum(dim=-1) - 1).clamp(min=0)
+    return ids, mask, pos
+--- tests
+@check("小例子：[[5, 6, 7], [8]]")
+def _():
+    ids, mask, pos = left_pad([[5, 6, 7], [8]], pad_id=0)
+    shape_is(ids, (2, 3))
+    true(ids.dtype == torch.long, f"input_ids 的 dtype 要是 torch.long（embedding 查表要整数），你的是 {ids.dtype}")
+    eq(ids, torch.tensor([[5, 6, 7], [0, 0, 8]]), tol=0, msg="pad 要补在左边：短的那条是 [0, 0, 8]，不是 [8, 0, 0]")
+    eq(mask.long(), torch.tensor([[1, 1, 1], [0, 0, 1]]), tol=0, msg="attention_mask：真实 token 是 1，pad 是 0")
+    true(pos.dtype == torch.long, f"position_ids 的 dtype 要是 torch.long，你的是 {pos.dtype}")
+    eq(pos, torch.tensor([[0, 1, 2], [0, 0, 0]]), tol=0,
+       msg="position_ids：第二条的 8 是它那条序列的第 0 个词，位置是 0；pad 位置填 0")
+
+
+@check("三条长短不一，pad_id 是 9")
+def _():
+    ids, mask, pos = left_pad([[4, 4, 4, 4], [1, 2], [7, 8, 9]], pad_id=9)
+    eq(ids, torch.tensor([[4, 4, 4, 4], [9, 9, 1, 2], [9, 7, 8, 9]]), tol=0, msg="pad 要用传进来的 pad_id")
+    eq(mask.long(), torch.tensor([[1, 1, 1, 1], [0, 0, 1, 1], [0, 1, 1, 1]]), tol=0,
+       msg="mask 要看这个位置是不是补出来的，不能看 id 等不等于 pad_id（第三条最后一个真实 token 恰好也是 9）")
+    eq(pos, torch.tensor([[0, 1, 2, 3], [0, 0, 0, 1], [0, 0, 1, 2]]), tol=0,
+       msg="position_ids 要从每条序列自己的第一个真实 token 开始数")
+
+
+@check("接上模型：批量算出的下一个词分数 = 一条一条算")
+def _():
+    model = tiny_lm()
+    prompts = [[3, 7, 2, 9], [5, 1], [4, 4, 8], [11]]
+    ids, mask, pos = left_pad(prompts, pad_id=0)
+    with torch.inference_mode():
+        logits = model(ids, attention_mask=mask, position_ids=pos)[:, -1]
+        for i, p in enumerate(prompts):
+            want = model(torch.tensor([p]))[0, -1]
+            eq(logits[i], want, tol=1e-4, msg=f"第 {i} 条 prompt {p}：批量算的分数和单独算的不一样")
+--- hints
+- 先建全是 pad 的 `(B, T)` ids 和全 0 的 mask，再逐行把真实 token 写到最右边。
+- position ids：`(mask.cumsum(dim=-1) - 1).clamp(min=0)`。

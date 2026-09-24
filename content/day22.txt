@@ -1,0 +1,1572 @@
+@@ day 22
+title: 部署二：把模型做成服务
+part: 部署
+hours: 3–4 小时
+--- goal
+学完能用 FastAPI 把一个 PyTorch 模型做成靠得住的 HTTP 服务：启动时加载一次并预热，用 pydantic 挡住坏输入（422），出错时回正确的状态码，用有上限的队列和超时保护自己，用微批处理提高吞吐，再用 p50 / p95 / p99 说清楚它有多快。全部用 TestClient 和假时钟来测：不开端口，不 sleep。
+--- checklist
+- 先清空复习区（昨天看过答案的题从空白重做）
+- 读完 8 张知识卡片，每张的代码都改一个数再运行一次
+- 练习区全部通过：先读失败信息，想清楚问题在哪，再动手改
+- 有时间就做 d22-13：在自己电脑上用 uvicorn 真的把服务跑起来
+- 闭卷区两题不看答案写出来
+
+@@ concept
+title: 服务的骨架：启动时加载一次
+--- body
+把模型做成服务（service），就是让别的程序通过 HTTP 发来输入，拿回预测结果。一个最小的模型服务有三部分：
+
+1. **启动**：加载权重，`model.eval()`，预热（下一张卡片讲），然后才开始接请求。
+2. **`/health`**：健康检查。负载均衡器（load balancer，把流量分给多台服务器的程序）和 Kubernetes 会定时访问它，只把请求发给回答「ok」的服务器。
+3. **`/predict`**：接收输入，检查，跑模型，返回 JSON。
+
+最重要的一条：**模型在启动时加载一次，之后所有请求共用它。** 加载要读权重文件（几百 MB 到几十 GB）、建模型、搬到 GPU，要几秒到几分钟。写进 handler（处理一个请求的函数）里，每个请求都要付一遍这个钱。
+
+今天的写法是一个「工厂函数」`create_app(load_model)`：先调用 `load_model()` 拿到模型，再建 app。handler 是写在 `create_app` 里面的函数，可以直接用外层的变量 `model`（这叫闭包）。好处是测试时能传一个假的 `load_model` 进去，数它被调用了几次。FastAPI 也有官方的启动钩子 `lifespan`，做的是同一件事。
+
+还有一条：**一个进程一个模型。** `uvicorn --workers 4` 会起 4 个进程，每个进程都加载一遍模型。在 GPU 上，这就是 4 份显存，还抢同一块卡。常见做法是一块 GPU 配一个进程、一个模型，请求在进程里排队（后面的卡片讲）。
+
+下面用一个约 4 MB 的小模型，比一比「加载一次」和「预测一次」各花多久。
+--- code
+import io
+import time
+
+def build():
+    return nn.Sequential(*[nn.Linear(512, 512) for _ in range(4)])
+
+weights = io.BytesIO()
+torch.save(build().state_dict(), weights)       # 假装这是硬盘上的权重文件
+
+def load_model():
+    weights.seek(0)
+    m = build()
+    m.load_state_dict(torch.load(weights, weights_only=True))
+    return m.eval()
+
+t0 = time.perf_counter()
+model = load_model()
+t_load = time.perf_counter() - t0
+
+x = torch.randn(1, 512)
+with torch.inference_mode():
+    model(x)                                     # 先跑一次（预热）
+    t0 = time.perf_counter()
+    model(x)
+    t_pred = time.perf_counter() - t0
+print(f"加载一次: {t_load * 1000:.2f} ms")
+print(f"预测一次: {t_pred * 1000:.3f} ms")
+print(f"加载是预测的 {t_load / t_pred:.0f} 倍。真实模型比它大几千倍，加载要几秒到几分钟。")
+
+@@ concept
+title: 预热：准备好了再接请求
+ref: day22
+--- body
+模型的第一次 forward 常常比后面慢得多，因为很多一次性的准备工作拖到了第一次调用才做：
+
+- 第一次用 GPU 时要建立 CUDA context，几百毫秒到几秒；
+- 设置了 `torch.backends.cudnn.benchmark = True` 时，cuDNN 会为每一种新的输入形状试几种算法，挑最快的；
+- `torch.compile` 第一次调用时要编译（几秒到几十秒），形状变了还可能再编译一次；
+- 显存分配器第一次向 GPU 要内存。
+
+不处理的话，第一个用户替你付这笔钱，每出现一种新的 batch 大小，又有一个用户要付。
+
+预热（warm-up）：启动后、接请求之前，用假数据把模型跑几遍，而且要覆盖线上会遇到的形状（比如 batch 大小 1、8、32）。预热也按推理的规矩来：`model.eval()`，`torch.inference_mode()`。
+
+预热做完之前，服务「活着」但「还没准备好」。所以健康检查常分两种：
+
+- liveness（活着吗）：进程没卡死就回 200；
+- readiness（准备好了吗）：加载和预热都做完了才回 200，之前回 **503**。负载均衡器只把请求发给 ready 的服务器。
+
+在 CPU 上这个效应很小，不好演示。下面用今天准备好的 `SlowStartModel` 来模拟：每遇到一种新的 batch 大小，第一次 forward 多花 500 ms，平时花 2 + 0.25·B ms。时间记在假时钟 `FakeClock` 上（单位毫秒，只有调用 `advance` 才会走），所以不用真的等。
+--- code
+def serve(request_sizes, warm_sizes):
+    clock = FakeClock()
+    model = SlowStartModel(clock).eval()
+    with torch.inference_mode():
+        for b in warm_sizes:                     # 预热：上线前先把会遇到的形状跑一遍
+            model(torch.zeros(b, 4))
+        took = []
+        for b in request_sizes:                  # 真实的请求
+            t0 = clock()
+            model(torch.randn(b, 4))
+            took.append(clock() - t0)
+    return took
+
+reqs = [1, 1, 8, 8, 32]
+print("请求的 batch 大小:     ", reqs)
+print("不预热，每个请求的 ms: ", serve(reqs, warm_sizes=[]))
+print("预热 1/8/32 后的 ms:   ", serve(reqs, warm_sizes=[1, 8, 32]))
+
+@@ concept
+title: pydantic：把坏输入挡在门外
+--- body
+线上的请求什么样的都有：少一个数，多一个数，字符串，`null`，NaN，一次塞十万行。不检查就直接变成 tensor，结果是 shape 报错（服务回 500），一个 NaN 让整个 batch 的输出都变成 NaN，或者一个超大请求把显存吃光。
+
+pydantic 让你用类型写出「合格的输入长什么样」，不合格的它替你挡掉。比如一个处理 3D 点的服务，每个点 3 个坐标，一次 1 到 8 个点：
+
+```
+from typing import Annotated
+from pydantic import BaseModel, Field, FiniteFloat
+
+Point = Annotated[list[FiniteFloat], Field(min_length=3, max_length=3)]
+
+class PointsRequest(BaseModel):
+    points: list[Point] = Field(min_length=1, max_length=8)
+```
+
+一个一个看：
+
+- `BaseModel`：继承它，类里写的字段就会被检查。
+- `FiniteFloat`：有限的浮点数，NaN 和 inf 都不行。普通的 `float` 会放过它们。
+- `Annotated[类型, Field(...)]`：给一个类型加限制。`min_length` / `max_length` 限制列表的长度。这里是：每个点正好 3 个数。
+- `points: list[Point] = Field(min_length=1, max_length=8)`：1 到 8 个点。上限挡住超大请求。
+
+`PointsRequest.model_validate(一个 dict)` 做检查：合格就返回对象，不合格就抛 `ValidationError`，里面写着哪个位置（loc）出了什么错。
+
+注意，pydantic 默认是「宽松模式」：字符串 `"1.5"` 会被转成 `1.5`，整数 `3` 会被转成 `3.0`。连这个也想拒绝，就用 strict 模式（比如 `model_validate(..., strict=True)`）。
+
+放进 FastAPI 以后，检查不通过会自动变成 **422** 响应（Unprocessable Entity：JSON 能读，但内容不合格），你的 handler 根本不会被调用。
+--- code
+from typing import Annotated
+from pydantic import BaseModel, Field, FiniteFloat, ValidationError
+
+Point = Annotated[list[FiniteFloat], Field(min_length=3, max_length=3)]
+
+class PointsRequest(BaseModel):
+    points: list[Point] = Field(min_length=1, max_length=8)
+
+for payload in [{"points": [[0.5, 1.0, 2.0]]},
+                {"points": [[0.5, 1.0]]},
+                {"points": [[0.5, 1.0, float("nan")]]},
+                {"points": [["1.5", 3, 2.0]]},
+                {"points": []}]:
+    try:
+        req = PointsRequest.model_validate(payload)
+        print("通过:", req.points)
+    except ValidationError as e:
+        err = e.errors()[0]
+        print("拒绝:", err["loc"], err["msg"])
+
+@@ concept
+title: FastAPI 和 TestClient：不开端口也能测
+ref: day22
+--- body
+FastAPI 用几行代码就能把 Python 函数变成 HTTP 接口：
+
+```
+app = FastAPI()
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/predict")
+def predict(req: PredictRequest):
+    ...
+    return {"labels": [...], "probs": [...]}
+```
+
+- `@app.get(路径)` / `@app.post(路径)`：这个函数处理哪个路径、哪种请求方法。只读取用 GET，发数据过来计算用 POST。
+- 参数写成 `req: PredictRequest`：FastAPI 把请求的 JSON body 交给 pydantic 检查，通过了才调用你的函数，不通过直接回 422。
+- 返回一个 dict，自动变成 JSON。里面只能放 Python 的数字、字符串、列表；tensor 要先 `.tolist()`。
+- 路径不存在回 404；路径存在但方法不对（比如对只收 POST 的路径发 GET）回 405。
+
+测试不用真的开服务器。`TestClient(app)` 在同一个 Python 进程里模拟 HTTP 请求：
+
+```
+client = TestClient(app)
+r = client.post("/predict", json={"rows": [[5.1, 3.5, 1.4, 0.2]]})
+r.status_code     # 200
+r.json()          # 解析好的 dict
+```
+
+有一个细节后面会用到：用 `def`（不是 `async def`）写的 handler，FastAPI 会放到另一个线程（线程池）里去跑。
+--- code
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+class Pair(BaseModel):
+    a: float
+    b: float
+
+app = FastAPI()
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/mul")
+def mul(req: Pair):
+    return {"product": req.a * req.b}
+
+client = TestClient(app)
+for method, path, body in [("GET", "/health", None), ("POST", "/mul", {"a": 3, "b": 4}),
+                           ("POST", "/mul", {"a": 3}), ("GET", "/mul", None), ("GET", "/nope", None)]:
+    r = client.request(method, path, json=body)
+    detail = r.json().get("detail")
+    short = detail[0]["msg"] if isinstance(detail, list) else r.json()
+    print(f"{method:4s} {path:7s} {str(body):16s} -> {r.status_code} {short}")
+
+@@ concept
+title: handler 里的推理：eval() 和 inference_mode
+--- body
+推理的两条规矩，第 18 天讲过：
+
+- `model.eval()`：关掉 Dropout，BatchNorm 改用存下来的统计量。不关的话，同一个请求发两次，结果不一样。
+- `torch.inference_mode()`：不记录计算图，更省内存，也更快。
+
+放进服务里，这两条的写法不一样。
+
+`model.eval()` 改的是模型对象本身。所有线程用的都是同一个模型，所以**加载完调用一次**就够了。
+
+梯度开关却是**按线程**算的。FastAPI 在线程池里跑 `def` handler。你在启动时（主线程）写的 `torch.set_grad_enabled(False)`，管不到 handler 所在的线程。所以要在 handler **里面**写：
+
+```
+with torch.inference_mode():
+    probs = model(x).softmax(-1)
+```
+
+最后用 `.tolist()` 把 tensor 变成 Python 列表，再放进返回的 dict。
+
+下面的代码在主线程里关掉梯度，再开一个线程模拟 handler，看看那边的梯度开关。
+--- code
+import threading
+
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(4, 8), nn.Dropout(0.5), nn.Linear(8, 3))
+x = torch.randn(1, 4)
+print("train 模式，两次一样吗:", torch.equal(model(x), model(x)))
+model.eval()
+print("eval 模式，两次一样吗: ", torch.equal(model(x), model(x)))
+
+torch.set_grad_enabled(False)                    # 在主线程里关掉梯度
+seen = {}
+
+def handler():                                   # 模拟 FastAPI 在另一个线程里跑 handler
+    seen["没写 inference_mode"] = model(x).requires_grad
+    with torch.inference_mode():
+        seen["写了 inference_mode"] = model(x).requires_grad
+
+t = threading.Thread(target=handler)
+t.start()
+t.join()
+torch.set_grad_enabled(True)
+print("主线程关了梯度；另一个线程里，输出的 requires_grad:", seen)
+
+@@ concept
+title: 状态码、队列上限和超时
+ref: day22
+--- body
+HTTP 状态码告诉客户端（还有监控系统）这个请求怎么样了。出错了还回 200，客户端以为成功了，监控里的错误率永远是 0。
+
+今天用到这些：
+
+- **200**：成功。
+- **422**：输入不合格（pydantic 挡下的）。是客户端的错，原样重试没用。
+- **404 / 405**：路径不存在 / 请求方法不对。
+- **500**：服务器内部出错（bug，模型崩了）。只回一句「internal error」；异常的细节（文件路径、显存信息）写进服务器日志，不发给客户端。
+- **503**：暂时没法服务：还在加载 / 预热，或者队列满了。加一个 `Retry-After` 响应头，告诉客户端过几秒再试。
+- **504**：超时：请求等得太久，服务器不管它了。
+- 另外还有 429：某一个客户端请求太频繁，被限流。它是按客户端算的，今天不写。
+
+记法：4xx 是客户端的问题，5xx 是服务器的问题。
+
+在 FastAPI 里，抛一个 `HTTPException` 就回对应的状态码：
+
+```
+raise HTTPException(status_code=503, detail="model is loading", headers={"Retry-After": "5"})
+```
+
+**一块 GPU，一个模型，一个队列。** 请求来得比模型算得快，就得排队。队列要有**上限**：满了立刻回 503，比让队列无限变长好。队列越长，每个请求等得越久，最后大家一起超时。
+
+**超时**：客户端通常只等几秒。一个请求在队列里等了太久，客户端早就放弃了，这时再算它是浪费 GPU。所以轮到它时，先看它等了多久，超过上限就直接回 504，不跑模型。
+
+测这些不用真的等：把「现在几点」做成一个参数 `clock`，测试时传一个假时钟 `FakeClock`，想让时间走多少，就 `advance` 多少。
+--- code
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+
+state = {"ready": False}
+app = FastAPI()
+
+@app.get("/health")
+def health():
+    if not state["ready"]:
+        raise HTTPException(status_code=503, detail="loading", headers={"Retry-After": "5"})
+    return {"status": "ok"}
+
+client = TestClient(app)
+r = client.get("/health")
+print("加载中:", r.status_code, r.json(), "Retry-After =", r.headers["retry-after"])
+state["ready"] = True
+r = client.get("/health")
+print("好了:  ", r.status_code, r.json())
+
+clock = FakeClock()                              # 假时钟，单位毫秒
+arrived = clock()                                # 请求进了队列
+clock.advance(150)                               # 前面的请求一共算了 150 ms（不真的等）
+waited = clock() - arrived
+print(f"这个请求等了 {waited} ms，上限 100 ms ->", "回 504，不跑模型" if waited > 100 else "交给模型")
+
+@@ concept
+title: 延迟百分位数：p50、p95、p99
+--- body
+「平均延迟 20 ms」听着不错，可能其实是 98 个请求 10 ms、2 个请求 500 ms。那 2 个用户等了半秒。平均数把尾巴藏起来了。
+
+所以要看百分位数（percentile）：
+
+- **p50**（中位数）：一半的请求比它快。代表典型体验。
+- **p95**：95% 的请求不比它慢。
+- **p99**：100 个请求里最慢的那一个左右。服务的承诺（SLO，比如「p99 < 200 ms」）通常写的就是它。
+
+算法有好几种，今天用最简单的 **nearest-rank**（最近秩）：
+
+1. 从小到大排好序，一共 n 个。
+2. k = ⌈q × n / 100⌉（⌈⌉ 是向上取整，`math.ceil`）。
+3. 答案是第 k 小的那个（从 1 数，也就是 `s[k - 1]`）。
+
+它返回的永远是真实出现过的一个延迟。`numpy.percentile` 和 `torch.quantile` 默认用**线性插值**：在相邻两个数之间按比例取一个值，结果可能不是任何一个真实的延迟。两种都有人用，报告里写清楚用的哪一种。
+
+写 `q * n / 100`，不要写 `q / 100 * n`。前者先乘后除，碰到能整除的情况结果是精确的；后者可能带一点浮点误差，向上取整就多出 1。
+
+几条经验：
+
+- 样本要够多。只有 20 个数时，p99 就是最大值。p99 至少要几百个样本才有意义。
+- 预热之后再测。失败的请求单独数（错误率），不要混进延迟里。
+--- code
+import math
+
+times = [12, 11, 13, 12, 250, 11, 12, 14, 12, 13, 11, 12, 900, 12, 13, 12, 11, 12, 13, 12]
+s = sorted(times)
+n = len(s)
+print("排好序:", s)
+print(f"平均: {sum(s) / n:.1f} ms  <- 被两个慢请求拉高了，却看不出它们有多慢")
+for q in (50, 95, 99):
+    k = math.ceil(q * n / 100)
+    lin = torch.quantile(torch.tensor(s, dtype=torch.float64), q / 100).item()
+    print(f"p{q}: nearest-rank 取第 {k} 个 = {s[k - 1]} ms；线性插值 = {lin:.1f} ms")
+print("p99.9、n = 1000 时，先除后乘:", 99.9 / 100 * 1000, "-> 向上取整", math.ceil(99.9 / 100 * 1000))
+print("                 先乘后除:", 99.9 * 1000 / 100, "-> 向上取整", math.ceil(99.9 * 1000 / 100))
+
+@@ concept
+title: 吞吐和延迟：微批处理
+ref: day22
+--- body
+有两个指标经常被混在一起：
+
+- **延迟**（latency）：一个请求从发出到拿到结果花了多久。这是用户感受到的。
+- **吞吐**（throughput）：一秒钟能处理多少个请求。它决定要买几台机器。
+
+GPU 算一个 batch 的时间，大约是「固定开销 + 每行的开销」。假设一批 B 行要 10 + 1 × B 毫秒：
+
+- B = 1：一批 11 ms，一秒约 91 个请求；
+- B = 8：一批 18 ms，一秒约 444 个；
+- B = 32：一批 42 ms，一秒约 762 个。
+
+batch 越大，吞吐越高（固定开销被分摊了）。但每一批也更慢，而且吞吐有上限：这里一秒最多 1000 个。
+
+线上的请求是一个一个来的。**微批处理**（micro-batching，也叫 dynamic batching）就是先把请求放进队列，凑成一批再跑：
+
+- 凑满 `max_batch` 个，马上跑；
+- 没凑满，但**最早**进队列的那个已经等了 `max_wait_ms`，也跑，有几个跑几个。
+
+`max_wait_ms` 是给延迟定的上限：流量小的时候，一个请求最多多等这么久。流量大的时候，批很快就满了，基本不用等。
+
+等待时间一定要从**最早**的请求算。如果从最新的请求算，只要请求不断地来，计时就不断被重置，最早的请求可能一直等下去。
+
+下面先打印上面那张表，再用今天准备好的 `MicroBatcher` 模拟 8 个请求：max_batch = 4，max_wait_ms = 5。
+--- code
+print("  B   一批 ms   每秒请求数")
+for B in [1, 2, 8, 32, 128]:
+    ms = 10 + 1 * B
+    print(f"{B:3d}   {ms:6d}   {B * 1000 / ms:8.0f}")
+
+clock = FakeClock()
+rec = BatchRecorder(lambda xb: xb * 2)           # 记下每一批的大小
+batcher = MicroBatcher(rec, max_batch=4, max_wait_ms=5, clock=clock)
+for t in [0, 1, 2, 3, 4, 20, 30, 31]:            # 8 个请求到达的时刻（毫秒）
+    clock.now = t
+    batcher.poll()                               # 服务器的循环：先看看有没有该跑的
+    batcher.submit(torch.tensor([float(t)]))
+clock.now = 40
+batcher.poll()
+print("请求到达的时刻: [0, 1, 2, 3, 4, 20, 30, 31]")
+print("每一批的大小:", rec.sizes)
+
+@@ item d22-01
+type: predict
+title: FastAPI 对这些请求回什么
+level: 2
+cards: pydantic：把坏输入挡在门外; FastAPI 和 TestClient：不开端口也能测
+ref: day22
+--- context
+写服务之前，先弄清楚 FastAPI 和 pydantic 替你挡住了什么、又放过了什么。线上排查「这个请求为什么是 422」时，要能一眼看出来。
+--- prompt
+读下面的代码，写出它打印的 6 行。
+
+`/add` 只接受 POST，body 里的 `x` 必须正好是 2 个数。`TestClient` 在同一个进程里模拟 HTTP 请求；`.json()` 返回的是 Python 的 dict。
+--- code
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+class AddRequest(BaseModel):
+    x: list[float] = Field(min_length=2, max_length=2)
+
+app = FastAPI()
+
+@app.post("/add")
+def add(req: AddRequest):
+    return {"sum": req.x[0] + req.x[1]}
+
+client = TestClient(app)
+print(client.post("/add", json={"x": [1, 2]}).json())
+print(client.post("/add", json={"x": [1, 2, 3]}).status_code)
+print(client.post("/add", json={"x": ["1.5", 2]}).json())
+print(client.post("/add", json={"x": ["one", 2]}).status_code)
+print(client.post("/add", json={"y": [1, 2]}).status_code)
+print(client.get("/add").status_code)
+--- explain
+1. `{'sum': 3.0}`：两个整数被 pydantic 转成了 float，1.0 + 2.0 = 3.0。打印的是 Python dict，所以是单引号。
+2. `422`：3 个数，违反了 `max_length=2`。handler 根本没被调用。
+3. `{'sum': 3.5}`：字符串 `"1.5"` 能读成数字，pydantic 默认的宽松模式就把它转成了 1.5。想拒绝它，要用 strict 模式。
+4. `422`：`"one"` 不是数字，转不了。
+5. `422`：缺了必填的字段 `x`。多出来的 `y` 默认被忽略。
+6. `405`：路径 `/add` 存在，但只接受 POST，这里发的是 GET（Method Not Allowed）。路径不存在才是 404。
+--- hints
+- 422 的意思是「JSON 能读，内容不合格」：pydantic 检查不通过时，FastAPI 自动回 422。
+- pydantic 默认会把「看起来像数字」的字符串转成数字。
+- 「方法不对」和「路径不存在」是两个不同的状态码。
+
+@@ item d22-02
+type: code
+title: 用 pydantic 写请求格式
+level: 1
+cards: pydantic：把坏输入挡在门外
+targets: PredictRequest, Row
+ref: day22
+--- context
+坏输入是线上服务最常见的出错来源：少一个特征、NaN、一次塞几万行。在门口用 pydantic 挡住，比让它在模型里炸成 500 好查得多。
+--- prompt
+今天的模型每行吃 4 个数（`FEATURES = 4`）。写一个 pydantic 类 `PredictRequest`，只有一个字段 `rows`：
+
+- `rows` 是一个列表，1 到 32 行（`MAX_ROWS = 32`），必填；
+- 每一行正好 4 个数；
+- 每个数都必须是有限的浮点数：NaN、inf、字符串 `"abc"`、`None` 都要拒绝。
+
+不合格时，`PredictRequest.model_validate(...)` 要抛 `ValidationError`。测试最后还会把它装进今天准备好的服务里，确认坏请求得到 422。
+--- starter
+from typing import Annotated
+from pydantic import BaseModel, Field, FiniteFloat
+
+FEATURES = 4
+MAX_ROWS = 32
+
+class PredictRequest(BaseModel):
+    rows: list[list[float]]
+--- solution
+from typing import Annotated
+from pydantic import BaseModel, Field, FiniteFloat
+
+FEATURES = 4
+MAX_ROWS = 32
+
+# 一行：正好 4 个有限的数
+Row = Annotated[list[FiniteFloat], Field(min_length=FEATURES, max_length=FEATURES)]
+
+class PredictRequest(BaseModel):
+    rows: list[Row] = Field(min_length=1, max_length=MAX_ROWS)   # 1 到 32 行，没有默认值 = 必填
+--- tests
+def _ok(payload):
+    try:
+        PredictRequest.model_validate(payload)
+        return True
+    except ValidationError:
+        return False
+
+@check("合格的请求能通过")
+def _():
+    req = PredictRequest.model_validate({"rows": [[5.1, 3.5, 1.4, 0.2], [6.7, 3.0, 5.2, 2.3]]})
+    true(len(req.rows) == 2 and list(req.rows[1]) == [6.7, 3.0, 5.2, 2.3], "合格的请求读出来的 rows 不对")
+    true(_ok({"rows": [[1, 2, 3, 4]]}), "整数也是合法的数字（pydantic 会转成 float），应该通过")
+    true(_ok({"rows": [[0.0] * 4] * 32}), "32 行正好是上限，应该通过")
+
+@check("每一行必须正好 4 个数")
+def _():
+    for rows in ([[1.0, 2.0, 3.0]], [[1.0, 2.0, 3.0, 4.0, 5.0]], [[]], [[1.0, 2.0, 3.0, 4.0], [1.0, 2.0]]):
+        true(not _ok({"rows": rows}), f"rows={rows} 被放过了：每一行都必须正好 4 个数。用 Field(min_length=..., max_length=...) 限制每一行的长度。")
+
+@check("行数在 1 到 32 之间，rows 必填")
+def _():
+    true(not _ok({"rows": []}), "空的 rows 被放过了：一个请求至少要有 1 行")
+    true(not _ok({"rows": [[0.0] * 4] * 33}), "33 行被放过了：上限是 32 行。不设上限，一个请求就能塞进几万行，把显存吃光。")
+    true(not _ok({}), "没有 rows 字段也被放过了：rows 是必填的，不要给它默认值")
+
+@check("NaN、inf、字符串、None 都被拒绝")
+def _():
+    for row in ([1.0, 2.0, 3.0, float("nan")], [1.0, float("inf"), 3.0, 4.0], ["abc", 2.0, 3.0, 4.0], [None, 2.0, 3.0, 4.0]):
+        true(not _ok({"rows": [row]}), f"{row} 被放过了。普通的 float 允许 NaN 和 inf，一个 NaN 就能让整个 batch 的输出都变成 NaN。用 FiniteFloat。")
+
+@check("装进服务后：坏请求 422，好请求 200")
+def _():
+    client = TestClient(create_app(CountingLoader()), raise_server_exceptions=False)   # 今天准备好的服务，用的是你写的 PredictRequest
+    r = client.post("/predict", json={"rows": [[5.1, 3.5, 1.4, 0.2]]})
+    true(r.status_code == 200, f"合格的请求得到了 {r.status_code}")
+    r = client.post("/predict", json={"rows": [[5.1, 3.5, 1.4]]})
+    true(r.status_code == 422, f"每行 3 个数的请求得到了 {r.status_code}，应为 422")
+--- hints
+- 先写「一行」的类型：`Row = Annotated[list[FiniteFloat], Field(min_length=..., max_length=...)]`。
+- 再写整个请求：`rows: list[Row] = Field(min_length=1, max_length=MAX_ROWS)`。
+
+@@ item d22-03
+type: fix
+title: 每个请求都重新加载一次模型
+level: 1
+cards: 服务的骨架：启动时加载一次
+targets: create_app
+ref: day22
+--- context
+把 `load_model()` 写进 handler，是新手写的服务里最常见的性能事故：每个请求都重新读一遍几 GB 的权重，延迟从几毫秒变成几秒，显存也可能被占满。
+--- prompt
+`create_app(load_model)` 建一个 FastAPI 服务。`load_model()` 返回一个 train 模式的模型（今天的 `TinyClassifier`：4 个数 → 3 个类别）。
+
+- `GET /health` 回 `{"status": "ok"}`；
+- `POST /predict` 的 body 按 `PredictRequest` 检查（上一题的格式，已经准备好了），回 `{"labels": [...], "probs": [[...], ...]}`。
+
+结果是对的。但测试用一个会计数的 `load_model` 发现：服务启动时模型一次都没加载，之后每来一个请求就加载一次。
+
+改成：**`create_app` 里加载一次，之后所有请求共用这一个模型。**
+--- starter
+def create_app(load_model):
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict(req: PredictRequest):
+        model = load_model()
+        model.eval()
+        x = torch.tensor(req.rows, dtype=torch.float32)
+        with torch.inference_mode():
+            probs = model(x).softmax(-1)
+        return {"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}
+
+    return app
+--- solution
+def create_app(load_model):
+    model = load_model()             # 启动时加载一次；下面的 handler 通过闭包用它
+    model.eval()
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict(req: PredictRequest):
+        x = torch.tensor(req.rows, dtype=torch.float32)
+        with torch.inference_mode():
+            probs = model(x).softmax(-1)
+        return {"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}
+
+    return app
+--- tests
+ROWS = [[5.1, 3.5, 1.4, 0.2], [6.7, 3.0, 5.2, 2.3]]
+
+@check("服务启动时就加载好模型")
+def _():
+    loader = CountingLoader()
+    create_app(loader)
+    true(loader.calls == 1, f"create_app 返回时，模型加载了 {loader.calls} 次，应为 1 次。启动时就加载好，不要让第一个用户等。")
+
+@check("处理 5 个请求后，还是只加载了 1 次")
+def _():
+    loader = CountingLoader()
+    client = TestClient(create_app(loader))
+    for _ in range(5):
+        r = client.post("/predict", json={"rows": ROWS})
+        true(r.status_code == 200, f"/predict 回了 {r.status_code}")
+    true(loader.calls == 1, f"处理 5 个请求后，模型一共加载了 {loader.calls} 次。每次加载都要读权重文件，真实模型要几秒到几分钟。")
+
+@check("预测结果没变")
+def _():
+    client = TestClient(create_app(CountingLoader()))
+    body = client.post("/predict", json={"rows": ROWS}).json()
+    want = reference_probs(ROWS)
+    eq(torch.tensor(body["probs"]), want, tol=1e-5, msg="概率不对：加载后记得调用 model.eval()（模型里有 Dropout）。")
+    true(body["labels"] == [LABELS[i] for i in want.argmax(-1).tolist()], f"labels 不对：{body['labels']}")
+    true(client.get("/health").json() == {"status": "ok"}, "/health 应该回 {'status': 'ok'}")
+--- hints
+- handler 每来一个请求就跑一次，`create_app` 只在启动时跑一次。加载应该放在哪一个里面？
+- 把 `model = load_model()` 和 `model.eval()` 挪到 `create_app` 里、`def predict` 外面。handler 能直接用外层函数的变量 `model`（闭包）。
+
+@@ item d22-04
+type: fix
+title: handler 里没关 Dropout，也没关梯度
+level: 2
+cards: handler 里的推理：eval() 和 inference_mode
+targets: create_app
+ref: day22
+--- context
+同一个输入请求两次得到两个答案，服务的内存越跑越高，常见原因就是推理时忘了 `model.eval()` 和 `torch.inference_mode()`。放在服务里还多一个坑：handler 跑在别的线程里。
+--- prompt
+这个 `create_app(load_model)` 已经只在启动时加载一次模型了，但 handler 里的推理有两个问题：
+
+1. 模型处在 train 模式（`load_model()` 返回的就是 train 模式），Dropout 开着：同一个请求发两次，结果不一样。
+2. forward 没有放在 `torch.inference_mode()` 里，每个请求都在建计算图。
+
+修好它：请求里的 forward 必须在 eval 模式下、并且在 `torch.inference_mode()` 里跑。测试用的 `load_model` 返回一个 `SpyModel`，它会记下每次 forward 时的模式。
+--- starter
+def create_app(load_model):
+    model = load_model()
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict(req: PredictRequest):
+        x = torch.tensor(req.rows, dtype=torch.float32)
+        probs = model(x).softmax(-1)
+        return {"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}
+
+    return app
+--- solution
+def create_app(load_model):
+    model = load_model()
+    model.eval()                                 # 改的是模型本身，所有线程都看得到：加载后调用一次
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict(req: PredictRequest):
+        x = torch.tensor(req.rows, dtype=torch.float32)
+        with torch.inference_mode():             # 梯度开关按线程算，所以写在 handler 里面
+            probs = model(x).softmax(-1)
+        return {"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}
+
+    return app
+--- tests
+ROWS = [[5.1, 3.5, 1.4, 0.2], [6.7, 3.0, 5.2, 2.3]]
+
+@check("同一个请求发两次，结果一样")
+def _():
+    client = TestClient(create_app(CountingLoader()))
+    a = client.post("/predict", json={"rows": ROWS}).json()["probs"]
+    b = client.post("/predict", json={"rows": ROWS}).json()["probs"]
+    eq(torch.tensor(b), torch.tensor(a), tol=0.0, msg="同一个请求，两次结果不一样：Dropout 还开着。加载后调用 model.eval()。")
+
+@check("结果等于 eval 模式下的参考答案")
+def _():
+    client = TestClient(create_app(CountingLoader()))
+    probs = client.post("/predict", json={"rows": ROWS}).json()["probs"]
+    eq(torch.tensor(probs), reference_probs(ROWS), tol=1e-5, msg="概率和 eval 模式下的参考答案不一样。")
+
+@check("请求里的 forward 在 eval 模式和 inference_mode 里")
+def _():
+    loader = CountingLoader()
+    client = TestClient(create_app(loader))
+    client.post("/predict", json={"rows": ROWS})
+    log = loader.models[0].log
+    true(len(log) >= 1, "模型一次都没被调用")
+    last = log[-1]
+    true(not last["training"], "处理请求时，模型还在 train 模式")
+    true(last["inference"], "处理请求时的 forward 不在 torch.inference_mode() 里。FastAPI 在另一个线程里跑 handler，梯度开关按线程算，所以要在 handler 里面写 with torch.inference_mode():")
+--- hints
+- 两件事：一件改模型的模式，一件包住 forward。
+- `model.eval()` 在加载后调用一次就够了。`with torch.inference_mode():` 要写在 `predict` 里面，包住 `model(x)` 那一行。
+
+@@ item d22-05
+type: code
+title: 预热：把会用到的 batch 大小先跑一遍
+level: 2
+cards: 预热：准备好了再接请求
+targets: warm_up
+ref: day22
+--- context
+GPU 服务刚启动时，第一个请求可能要几秒（CUDA 初始化、torch.compile 编译、cuDNN 挑算法），遇到新的形状还可能再慢一次。上线前把这些形状先跑一遍，用户就不用替你等。
+--- prompt
+写 `warm_up(model, batch_sizes, clock)`：
+
+- 先 `model.eval()`；
+- 在 `torch.inference_mode()` 里，对 `batch_sizes` 里的每个 B，跑一次 `model(torch.zeros(B, FEATURES))`（`FEATURES = 4`）；
+- 用 `clock()`（返回毫秒）量出每一次花了多久，返回 dict `{B: 毫秒}`，比如 `{1: 502.25, 8: 504.0, 32: 510.0}`。服务启动时会把它写进日志。
+
+测试用的是 `SlowStartModel(clock)`：每遇到一种新的 batch 大小，第一次 forward 多花 500 ms；平时花 2 + 0.25·B ms。时间加在假时钟 `FakeClock` 上。
+--- starter
+def warm_up(model, batch_sizes, clock):
+    """对每个 batch 大小跑一次全 0 的假数据，返回 {B: 这一次用了多少毫秒}。"""
+    raise todo()
+--- solution
+def warm_up(model, batch_sizes, clock):
+    """对每个 batch 大小跑一次全 0 的假数据，返回 {B: 这一次用了多少毫秒}。"""
+    model.eval()
+    took = {}
+    with torch.inference_mode():
+        for b in batch_sizes:
+            t0 = clock()
+            model(torch.zeros(b, FEATURES))
+            took[b] = clock() - t0              # 这一次 forward 花的毫秒数
+    return took
+--- tests
+SIZES = [1, 8, 32]
+
+@check("返回每个 batch 大小第一次花的时间")
+def _():
+    clock = FakeClock()
+    model = SlowStartModel(clock)
+    took = warm_up(model, SIZES, clock)
+    true(isinstance(took, dict), f"应该返回 dict {{B: 毫秒}}，你返回的是 {type(took).__name__}")
+    for b in SIZES:
+        true(b in took, f"返回的 dict 里没有 batch 大小 {b}")
+        want = model.compile_ms + model.run_ms(b)
+        true(close(took[b], want, 1e-6), f"batch 大小 {b}：你记的是 {took[b]} ms，应为 {want} ms。在这一次 forward 前后各读一次 clock()，相减。")
+    true(sorted(took) == SIZES, f"dict 里应该正好是 {SIZES} 这几个 batch 大小，你的是 {sorted(took)}")
+
+@check("预热之后，真实请求不再慢")
+def _():
+    clock = FakeClock()
+    model = SlowStartModel(clock)
+    warm_up(model, SIZES, clock)
+    for b in SIZES:
+        t0 = clock()
+        with torch.inference_mode():
+            model(torch.randn(b, FEATURES))
+        took = clock() - t0
+        true(took < 100, f"预热之后，batch 大小 {b} 的请求还花了 {took} ms：这个形状没预热到")
+
+@check("预热在 eval 模式和 inference_mode 里，输入是 (B, 4)")
+def _():
+    clock = FakeClock()
+    model = SlowStartModel(clock)
+    model.train()
+    warm_up(model, SIZES, clock)
+    true(len(model.log) >= len(SIZES), f"模型只被调用了 {len(model.log)} 次，每个 batch 大小至少要跑一次")
+    for e in model.log:
+        true(e["shape"][1:] == (FEATURES,), f"输入的形状是 {e['shape']}，应为 (B, {FEATURES})")
+        true(not e["training"], "预热时模型还在 train 模式：先 model.eval()")
+        true(e["inference"], "预热的 forward 不在 torch.inference_mode() 里")
+    true(sorted({e["shape"][0] for e in model.log}) == SIZES, "预热用到的 batch 大小不对")
+--- hints
+- 一个 dict，一个 for 循环；循环外面包一层 `with torch.inference_mode():`。
+- 对每个 B：`t0 = clock()`，`model(torch.zeros(b, FEATURES))`，`took[b] = clock() - t0`。
+
+@@ item d22-06
+type: code
+title: 从头写一个模型服务
+level: 2
+cards: 服务的骨架：启动时加载一次; 预热：准备好了再接请求; FastAPI 和 TestClient：不开端口也能测
+targets: create_app
+ref: day22
+--- context
+「把这个模型包成一个 API」是 ML 工程师面试和工作里最常见的任务之一。加载一次、eval、预热、健康检查、输入检查，一样都不能少。
+--- prompt
+写 `create_app(load_model)`，返回一个 FastAPI app：
+
+1. 启动（也就是 `create_app` 被调用时）：调用 `load_model()` **一次**拿到模型；`model.eval()`；然后预热：在 `torch.inference_mode()` 里跑一次 `model(torch.zeros(1, FEATURES))`。
+2. `GET /health` 回 `{"status": "ok"}`。
+3. `POST /predict`：body 按 `PredictRequest` 检查（已经准备好了：`rows` 是 1 到 32 行，每行 4 个有限的数）。在 `torch.inference_mode()` 里算 softmax 概率，回 `{"labels": [...], "probs": [[...], ...]}`：`probs` 是每行 3 个类别的概率，`labels` 是每行概率最大的那个类别的名字（名字在 `LABELS` 里）。
+
+可以直接用的名字：`FastAPI`、`torch`、`PredictRequest`、`LABELS`、`FEATURES`。
+--- starter
+def create_app(load_model):
+    raise todo()
+--- solution
+def create_app(load_model):
+    model = load_model()                         # 启动时加载一次
+    model.eval()                                 # 关掉 Dropout
+    with torch.inference_mode():                 # 预热：别让第一个用户等
+        model(torch.zeros(1, FEATURES))
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict(req: PredictRequest):            # pydantic 检查不通过，FastAPI 自动回 422
+        x = torch.tensor(req.rows, dtype=torch.float32)
+        with torch.inference_mode():             # handler 在别的线程里跑：在这里关梯度
+            probs = model(x).softmax(-1)
+        return {"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}
+
+    return app
+--- tests
+ROWS = [[5.1, 3.5, 1.4, 0.2], [6.7, 3.0, 5.2, 2.3], [5.9, 3.0, 4.2, 1.5]]
+
+@check('/health 回 200 和 {"status": "ok"}')
+def _():
+    client = TestClient(create_app(CountingLoader()))
+    r = client.get("/health")
+    true(r.status_code == 200, f"/health 回了 {r.status_code}")
+    true(r.json() == {"status": "ok"}, f"/health 回了 {r.json()}")
+
+@check("/predict 回正确的 labels 和 probs")
+def _():
+    client = TestClient(create_app(CountingLoader()))
+    r = client.post("/predict", json={"rows": ROWS})
+    true(r.status_code == 200, f"/predict 回了 {r.status_code}：{r.text[:200]}")
+    body = r.json()
+    true("probs" in body and "labels" in body, f"返回的 JSON 应该有 labels 和 probs 两个字段，你的是 {list(body)}")
+    want = reference_probs(ROWS)
+    eq(torch.tensor(body["probs"]), want, tol=1e-5, msg="probs 不对：要 eval 模式下的 softmax 概率，形状 (行数, 3)")
+    true(body["labels"] == [LABELS[i] for i in want.argmax(-1).tolist()], f"labels 不对：{body['labels']}")
+
+@check("坏请求回 422")
+def _():
+    client = TestClient(create_app(CountingLoader()), raise_server_exceptions=False)
+    bad = [{"rows": [[1.0, 2.0, 3.0]]}, {"rows": []}, {"rows": [["a", 1.0, 2.0, 3.0]]},
+           {"x": [[1.0, 2.0, 3.0, 4.0]]}, {"rows": [[0.0] * 4] * 33}]
+    for body in bad:
+        r = client.post("/predict", json=body)
+        true(r.status_code == 422, f"请求 {str(body)[:60]} 得到了 {r.status_code}，应为 422。handler 的参数要写成 req: PredictRequest。")
+
+@check("模型只加载一次，而且在第一个请求之前")
+def _():
+    loader = CountingLoader()
+    client = TestClient(create_app(loader))
+    true(loader.calls == 1, f"create_app 返回时，模型加载了 {loader.calls} 次，应为 1 次")
+    for _ in range(3):
+        client.post("/predict", json={"rows": ROWS})
+    true(loader.calls == 1, f"3 个请求之后，模型一共加载了 {loader.calls} 次，应该一直是 1 次")
+
+@check("上线前预热过；请求在 eval 模式和 inference_mode 里跑")
+def _():
+    loader = CountingLoader()
+    client = TestClient(create_app(loader))
+    true(loader.calls >= 1, "create_app 里没有调用 load_model()")
+    log = loader.models[0].log
+    true(len(log) >= 1, "create_app 返回时，模型一次都没跑过：没有预热")
+    true(not log[0]["training"] and log[0]["inference"], "预热也要在 eval 模式、torch.inference_mode() 里做：先 model.eval()，再预热")
+    client.post("/predict", json={"rows": ROWS})
+    last = log[-1]
+    true(not last["training"], "处理请求时，模型在 train 模式")
+    true(last["inference"], "处理请求时的 forward 不在 torch.inference_mode() 里（要写在 handler 里面）")
+--- hints
+- 结构：`create_app` 里先加载、eval、预热，再 `app = FastAPI()`，在里面用 `@app.get` / `@app.post` 定义两个函数，最后 `return app`。
+- `/predict` 的参数写成 `req: PredictRequest`；`x = torch.tensor(req.rows, dtype=torch.float32)`。
+- 返回 `{"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}`。
+
+@@ item d22-07
+type: fix
+title: 出了错还回 200
+level: 2
+cards: 状态码、队列上限和超时; 预热：准备好了再接请求
+targets: create_status_app
+ref: day22
+--- context
+出错时回 200 加一个 `{"error": ...}`：客户端当成功处理，负载均衡器继续往没准备好的服务器上发请求，监控里的错误率永远是 0。状态码是服务和外界之间的约定。
+--- prompt
+`create_status_app(state)` 建一个服务。`state.ready` 表示加载和预热做完了没有（服务运行中会从 False 变成 True）；`state.predict(rows)` 返回概率列表，可能抛异常。
+
+现在不管出什么事都回 200。改成：
+
+- `GET /health`：ready 时回 200 和 `{"status": "ok"}`；没 ready 时回 **503**。
+- `POST /predict`：没 ready 时回 **503**，并带上响应头 `Retry-After`（比如 `"5"`，告诉客户端 5 秒后再试）。
+- `state.predict` 抛异常时回 **500**，而且响应里**不能**有异常的原文（里面可能有文件路径、显存信息）；之后的请求照常工作。
+- 其他情况照旧：200 和 `{"probs": ...}`。
+
+用 `raise HTTPException(status_code=..., detail=..., headers=...)`。
+--- starter
+def create_status_app(state):
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        if not state.ready:
+            return {"status": "loading"}
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict(req: PredictRequest):
+        if not state.ready:
+            return {"error": "model is loading"}
+        try:
+            probs = state.predict(req.rows)
+        except Exception as e:
+            return {"error": str(e)}
+        return {"probs": probs}
+
+    return app
+--- solution
+def create_status_app(state):
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        if not state.ready:                      # readiness：没准备好就别让负载均衡器发流量过来
+            raise HTTPException(status_code=503, detail="loading", headers={"Retry-After": "5"})
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict(req: PredictRequest):
+        if not state.ready:
+            raise HTTPException(status_code=503, detail="model is loading", headers={"Retry-After": "5"})
+        try:
+            probs = state.predict(req.rows)
+        except Exception:
+            # 真实的服务在这里写日志：logger.exception("predict failed")，细节留在服务器上
+            raise HTTPException(status_code=500, detail="internal error")
+        return {"probs": probs}
+
+    return app
+--- tests
+ROWS = [[5.1, 3.5, 1.4, 0.2]]
+SECRET = "CUDA out of memory (weights: /srv/models/iris-v3/model.pt)"
+
+def _predict(rows):
+    if rows[0][0] == 999:
+        raise RuntimeError(SECRET)
+    return reference_probs(rows).tolist()
+
+def _client(ready):
+    state = ServiceState(_predict, ready=ready)
+    return state, TestClient(create_status_app(state), raise_server_exceptions=False)
+
+@check("准备好了：/health 和 /predict 都回 200")
+def _():
+    state, client = _client(ready=True)
+    r = client.get("/health")
+    true(r.status_code == 200 and r.json() == {"status": "ok"}, f"/health 回了 {r.status_code} {r.text}")
+    r = client.post("/predict", json={"rows": ROWS})
+    true(r.status_code == 200, f"/predict 回了 {r.status_code}")
+    eq(torch.tensor(r.json()["probs"]), reference_probs(ROWS), tol=1e-5, msg="probs 不对")
+
+@check("没准备好：/health 回 503")
+def _():
+    state, client = _client(ready=False)
+    r = client.get("/health")
+    true(r.status_code == 503, f"模型还在加载，/health 却回了 {r.status_code}。负载均衡器只看状态码：回 200，它就把流量发过来。")
+    state.ready = True
+    r = client.get("/health")
+    true(r.status_code == 200, f"state.ready 变成 True 以后，/health 应该回 200，你的是 {r.status_code}")
+
+@check("没准备好：/predict 回 503，带 Retry-After")
+def _():
+    state, client = _client(ready=False)
+    r = client.post("/predict", json={"rows": ROWS})
+    true(r.status_code == 503, f"模型还没准备好，/predict 回了 {r.status_code}，应为 503")
+    ra = r.headers.get("retry-after")
+    true(ra is not None and ra.strip().isdigit() and int(ra) > 0, f"503 应该带 Retry-After 响应头（正整数，单位秒），你的是 {ra!r}")
+
+@check("模型出错：回 500，不泄露细节，之后照常工作")
+def _():
+    state, client = _client(ready=True)
+    r = client.post("/predict", json={"rows": [[999, 1.0, 1.0, 1.0]]})
+    true(r.status_code == 500, f"模型抛了异常，却回了 {r.status_code}，应为 500")
+    true("/srv/models" not in r.text and "out of memory" not in r.text, f"异常原文发给了客户端：{r.text}。细节写进服务器日志，给客户端只回一句 internal error。")
+    r = client.post("/predict", json={"rows": ROWS})
+    true(r.status_code == 200, f"出过一次错之后，正常的请求回了 {r.status_code}")
+--- hints
+- 把每个 `return {"error": ...}` 换成 `raise HTTPException(...)`；/health 没 ready 时也一样。
+- 503：`raise HTTPException(status_code=503, detail="model is loading", headers={"Retry-After": "5"})`。
+- 500：在 `except Exception:` 里 `raise HTTPException(status_code=500, detail="internal error")`，不要把 `str(e)` 放进去。
+
+@@ item d22-08
+type: code
+title: 一个模型一个队列：满了回 503，等太久回 504
+level: 2
+cards: 状态码、队列上限和超时
+targets: RequestQueue
+ref: day22
+--- context
+一块 GPU 一个模型，请求来得比算得快，就要排队。队列没有上限，高峰时每个请求都等到超时；等太久的请求还照样算，GPU 的时间全花在没人要的结果上。
+--- prompt
+补全 `RequestQueue` 的两个方法。GPU 上只有一个模型 `model_fn`，一次算一个请求；请求先进 `self.waiting` 列表排队。
+
+每个请求用一个 `Ticket` 表示（已经准备好了）：`Ticket(x, arrived)`，有 `.x`、`.arrived`（到达的时刻，毫秒）、`.status`（None 表示还在排队）、`.result`。
+
+- `submit(x)`：用 `self.clock()` 记下到达时刻，建一个 Ticket，返回它。如果已经有 `max_waiting` 个在排队，就**不进队**，直接把 status 设成 **503**。
+- `run_next()`：取出排得最早的那个（先来先服务）；队列是空的就返回 `None`。
+  - 它已经等了超过 `timeout_ms`（`clock() - arrived > timeout_ms`）：status 设成 **504**，**不调用模型**（客户端早就不等了）。
+  - 否则调用 `model_fn(x)`：成功时把结果存进 `result`，status 设成 **200**；抛异常时 status 设成 **500**，队列继续工作。
+  - 最后返回这个 Ticket。
+
+`clock` 是假时钟 `FakeClock`，测试用它控制时间，不用 sleep。
+--- starter
+class RequestQueue:
+    def __init__(self, model_fn, clock, max_waiting=4, timeout_ms=100):
+        self.model_fn = model_fn
+        self.clock = clock              # clock() 返回现在的时刻（毫秒）
+        self.max_waiting = max_waiting
+        self.timeout_ms = timeout_ms
+        self.waiting = []               # 排队中的 Ticket，最早的在最前面
+
+    def submit(self, x):
+        raise todo()
+
+    def run_next(self):
+        raise todo()
+--- solution
+class RequestQueue:
+    def __init__(self, model_fn, clock, max_waiting=4, timeout_ms=100):
+        self.model_fn = model_fn
+        self.clock = clock              # clock() 返回现在的时刻（毫秒）
+        self.max_waiting = max_waiting
+        self.timeout_ms = timeout_ms
+        self.waiting = []               # 排队中的 Ticket，最早的在最前面
+
+    def submit(self, x):
+        t = Ticket(x, self.clock())
+        if len(self.waiting) >= self.max_waiting:
+            t.status = 503              # 队列满了：马上拒绝，不让队列无限变长
+        else:
+            self.waiting.append(t)
+        return t
+
+    def run_next(self):
+        if not self.waiting:
+            return None
+        t = self.waiting.pop(0)         # 先来先服务
+        if self.clock() - t.arrived > self.timeout_ms:
+            t.status = 504              # 客户端早就放弃了：不浪费 GPU
+            return t
+        try:
+            t.result = self.model_fn(t.x)
+            t.status = 200
+        except Exception:
+            t.status = 500              # 这一个失败了，队列照常往下走
+        return t
+--- tests
+def _model():
+    calls = []
+
+    def model_fn(x):
+        calls.append(x)
+        if x[0] < 0:
+            raise RuntimeError("bad input")
+        return x * 2
+
+    return model_fn, calls
+
+def _x(v):
+    return torch.full((4,), float(v))
+
+@check("先来先服务，结果放进 Ticket")
+def _():
+    model_fn, calls = _model()
+    q = RequestQueue(model_fn, FakeClock())
+    tickets = [q.submit(_x(i)) for i in (1, 2, 3)]
+    true(all(t is not None and t.status is None for t in tickets), "刚提交的请求应该在排队：submit 要返回 Ticket，它的 status 还是 None")
+    for i in (1, 2, 3):
+        t = q.run_next()
+        true(t is tickets[i - 1], f"第 {i} 次 run_next 取出的不是第 {i} 个提交的请求：应该先来先服务，并返回那个 Ticket")
+        true(t.status == 200, f"正常算完的请求，status 应为 200，你的是 {t.status}")
+        eq(t.result, _x(i) * 2, msg="result 应该是 model_fn(x) 的返回值")
+    true(q.run_next() is None, "队列空了，run_next 应该返回 None")
+
+@check("队列满了：立刻回 503，不进队")
+def _():
+    model_fn, calls = _model()
+    q = RequestQueue(model_fn, FakeClock(), max_waiting=2)
+    a, b, c = q.submit(_x(1)), q.submit(_x(2)), q.submit(_x(3))
+    true(c is not None and c.status == 503, f"已经有 2 个在排队（max_waiting=2），第 3 个应该立刻得到 503，你的是 {getattr(c, 'status', None)}")
+    true(a.status is None and b.status is None, "前两个请求应该还在排队")
+    true(len(q.waiting) == 2, f"被拒绝的请求不能进队：waiting 里有 {len(q.waiting)} 个")
+    q.run_next()
+    d = q.submit(_x(4))
+    true(d.status is None and len(q.waiting) == 2, "空出一个位置以后，新请求应该能进队")
+    true(len(calls) == 1, f"模型被调用了 {len(calls)} 次：只有被 run_next 取出来的请求才交给模型")
+
+@check("等太久：回 504，不调用模型")
+def _():
+    model_fn, calls = _model()
+    clock = FakeClock()
+    q = RequestQueue(model_fn, clock, timeout_ms=100)
+    a = q.submit(_x(1))
+    b = q.submit(_x(2))
+    clock.advance(50)
+    q.run_next()
+    true(a.status == 200, f"等了 50 ms（上限 100 ms）的请求应该正常处理，它的 status 是 {a.status}")
+    clock.advance(100)
+    t = q.run_next()
+    true(t is b and b.status == 504, f"等了 150 ms 的请求应该得到 504，它的 status 是 {b.status}")
+    true(len(calls) == 1, f"模型被调用了 {len(calls)} 次：超时的请求不应该再交给模型")
+
+@check("模型出错：回 500，队列继续工作")
+def _():
+    model_fn, calls = _model()
+    q = RequestQueue(model_fn, FakeClock())
+    bad, good = q.submit(_x(-1)), q.submit(_x(5))
+    q.run_next()
+    true(bad.status == 500, f"model_fn 抛了异常，status 应为 500，你的是 {bad.status}")
+    q.run_next()
+    true(good.status == 200, f"出过一次错之后，下一个请求应该正常处理，它的 status 是 {good.status}")
+--- hints
+- `submit`：`t = Ticket(x, self.clock())`；满了就 `t.status = 503`，没满就 `self.waiting.append(t)`；最后 `return t`。
+- `run_next`：`t = self.waiting.pop(0)` 取出最早的；先检查有没有超时，再用 `try / except Exception` 调用模型。
+
+@@ item d22-09
+type: code
+title: 算 p50、p95、p99（nearest-rank）
+level: 2
+cards: 延迟百分位数：p50、p95、p99
+targets: latency_report
+ref: day22
+--- context
+「这个服务有多快」的标准回答是 p50 / p95 / p99，不是平均数；服务的承诺（SLO）写的也是 p99。自己会算，才知道监控面板上的数是怎么来的。
+--- prompt
+写 `latency_report(times_ms)`：`times_ms` 是一串延迟（毫秒，至少 1 个，没有排过序）。返回 `{"p50": ..., "p95": ..., "p99": ...}`，用 **nearest-rank** 方法：
+
+1. 从小到大排序，一共 n 个；
+2. 对 q = 50、95、99，算 k = ⌈q × n / 100⌉（向上取整，`math.ceil`）；
+3. 答案是排好序后的第 k 个（从 1 数，也就是 `s[k - 1]`）。
+
+不许用 `numpy.percentile` / `torch.quantile`（它们默认用线性插值，结果不一样）。不要改动传进来的列表。
+--- starter
+import math
+
+def latency_report(times_ms):
+    raise todo()
+--- solution
+import math
+
+def latency_report(times_ms):
+    s = sorted(times_ms)                 # sorted 返回一个新列表，不改动传进来的那个
+    n = len(s)
+
+    def pick(q):
+        k = math.ceil(q * n / 100)       # 先乘后除，避开浮点误差
+        return s[max(k, 1) - 1]          # 第 k 个（从 1 数）
+
+    return {"p50": pick(50), "p95": pick(95), "p99": pick(99)}
+--- tests
+def _shuffled(values):
+    return [values[i] for i in torch.randperm(len(values)).tolist()]
+
+def _expect(times, want, why=""):
+    got = latency_report(times)
+    true(isinstance(got, dict), f"应该返回 dict，你返回的是 {type(got).__name__}")
+    for key in ("p50", "p95", "p99"):
+        true(key in got, f"返回的 dict 里没有 {key!r}")
+        true(close(got[key], want[key]), f"{key}：你的是 {got[key]}，应为 {want[key]}。{why}")
+
+@check("1 到 100：p50 = 50，p95 = 95，p99 = 99")
+def _():
+    _expect(_shuffled(list(range(1, 101))), {"p50": 50, "p95": 95, "p99": 99},
+            "先排序；k = math.ceil(q * n / 100)，取 s[k - 1]。")
+
+@check("20 个请求，尾巴上有两个慢的")
+def _():
+    times = _shuffled([12.0] * 9 + [15.0] * 9 + [200.0, 900.0])
+    _expect(times, {"p50": 15.0, "p95": 200.0, "p99": 900.0},
+            "n = 20：p50 取第 10 个，p95 取第 19 个，p99 取第 20 个。如果你得到 235.0 或 767.0，那是线性插值（numpy / torch.quantile 的默认），这题要 nearest-rank。")
+
+@check("只有 1 个数时，三个值都是它")
+def _():
+    _expect([42.0], {"p50": 42.0, "p95": 42.0, "p99": 42.0})
+
+@check("不改动传进来的列表")
+def _():
+    times = [30.0, 10.0, 20.0]
+    latency_report(times)
+    true(times == [30.0, 10.0, 20.0], f"传进来的列表被改成了 {times}：用 sorted(...)，不要用 .sort()")
+--- hints
+- `s = sorted(times_ms)`，`n = len(s)`。
+- 对每个 q：`k = math.ceil(q * n / 100)`，取 `s[k - 1]`。
+
+@@ item d22-10
+type: choice
+title: batch 越大越好吗
+level: 2
+cards: 吞吐和延迟：微批处理
+--- context
+「怎么把吞吐提上去」「为什么 p99 变高了」，这两个问题的答案常常是同一个旋钮：batch 大小。面试官想听你说清楚它在吞吐和延迟之间怎么取舍。
+--- prompt
+一块 GPU 上，模型算一批 B 行要 10 + 1 × B 毫秒（只算模型计算，不算排队）。下面哪些说法是**对的**？（可多选）
+--- options
+- B = 1 时，这块 GPU 一秒最多处理约 91 个请求。
+- 把 B 从 1 提到 32，每个请求的延迟会变短。
+- B = 32 时，吞吐约每秒 762 个，是 B = 1 时的 8 倍多。
+- 只要 B 足够大，吞吐可以无限增长。
+- 如果要求「一批的计算时间 ≤ 30 ms」，B 最大可以取 20。
+answer: 1,3,5
+--- explain
+第 1 个对：一批 1 行要 11 ms，1000 / 11 ≈ 91。
+
+第 2 个错：一批 32 行要 42 ms，这批里的每个请求都要等整批算完，所以每个请求至少等 42 ms，比 11 ms 长。实际上还要加上凑批时的等待。
+
+第 3 个对：32 × 1000 / 42 ≈ 762，762 / 91 ≈ 8.4。
+
+第 4 个错：每行至少要 1 ms，所以一秒最多约 1000 个；B 再大也只是越来越接近它。
+
+第 5 个对：10 + 20 = 30 ms。B 再大就超了。
+--- hints
+- 吞吐 = 一批的行数 × 1000 / 一批的毫秒数。
+- 一个请求的延迟，至少是它所在那一批的计算时间。
+
+@@ item d22-11
+type: code
+title: 微批处理：凑够 N 个，或者等满 T 毫秒
+level: 3
+cards: 吞吐和延迟：微批处理
+targets: MicroBatcher
+ref: day22
+--- context
+GPU 算 32 行和算 1 行花的时间差不多，所以推理服务几乎都会把零散的请求凑成批（Triton、TorchServe 都有这个功能）。面试常问：凑多少，等多久，从什么时候开始计时。
+--- prompt
+补全 `MicroBatcher`（`__init__` 已经写好）：
+
+- `submit(x)`：`x` 是一个请求的输入，形状 (4,)。建一个 `Ticket(x, self.clock())`，放进 `self.pending`，返回它。如果放进去之后 `pending` 里有 `max_batch` 个了，**马上** `flush()`。
+- `poll()`：服务器的循环会不停地调用它。如果 `pending` 不空，而且**最早**的那个请求已经等了 `max_wait_ms` 或更久（`clock() - arrived >= max_wait_ms`），就 `flush()`。
+- `flush()`：把 `pending` 里的请求全部取出来（`pending` 变空），用 `torch.stack` 拼成 (B, 4)，**只调用一次** `run_batch`，得到 B 行输出；第 i 行交给第 i 个 Ticket：`ticket.result = out[i]`，`ticket.status = 200`。`pending` 是空的就什么都不做。
+
+测试里的 `run_batch` 会记下每一批的大小，`clock` 是 `FakeClock`。
+--- starter
+class MicroBatcher:
+    def __init__(self, run_batch, max_batch, max_wait_ms, clock):
+        self.run_batch = run_batch      # (B, 4) -> B 行输出，一次处理一整批
+        self.max_batch = max_batch
+        self.max_wait_ms = max_wait_ms
+        self.clock = clock              # clock() 返回现在的时刻（毫秒）
+        self.pending = []               # 等着凑批的 Ticket，最早的在最前面
+
+    def submit(self, x):
+        raise todo()
+
+    def poll(self):
+        raise todo()
+
+    def flush(self):
+        raise todo()
+--- solution
+class MicroBatcher:
+    def __init__(self, run_batch, max_batch, max_wait_ms, clock):
+        self.run_batch = run_batch      # (B, 4) -> B 行输出，一次处理一整批
+        self.max_batch = max_batch
+        self.max_wait_ms = max_wait_ms
+        self.clock = clock              # clock() 返回现在的时刻（毫秒）
+        self.pending = []               # 等着凑批的 Ticket，最早的在最前面
+
+    def submit(self, x):
+        t = Ticket(x, self.clock())
+        self.pending.append(t)
+        if len(self.pending) >= self.max_batch:
+            self.flush()                # 凑满了：马上跑
+        return t
+
+    def poll(self):
+        # 从「最早」的请求算等待时间；从最新的算，请求不断时就永远不跑
+        if self.pending and self.clock() - self.pending[0].arrived >= self.max_wait_ms:
+            self.flush()
+
+    def flush(self):
+        if not self.pending:
+            return
+        batch, self.pending = self.pending, []
+        out = self.run_batch(torch.stack([t.x for t in batch]))   # 一整批只跑一次模型
+        for t, y in zip(batch, out):
+            t.result = y                # 第 i 行交还给第 i 个请求
+            t.status = 200
+--- tests
+def _setup(max_batch=4, max_wait_ms=10):
+    clock = FakeClock()
+    rec = BatchRecorder(lambda xb: xb * 2 + 1)
+    return clock, rec, MicroBatcher(rec, max_batch=max_batch, max_wait_ms=max_wait_ms, clock=clock)
+
+@check("凑满 max_batch 个，马上跑一批")
+def _():
+    clock, rec, b = _setup(max_batch=4)
+    for i in range(3):
+        b.submit(torch.full((4,), float(i)))
+    true(rec.sizes == [], f"才 3 个请求（max_batch=4），模型就被调用了：每批的大小 {rec.sizes}")
+    b.submit(torch.full((4,), 3.0))
+    true(rec.sizes == [4], f"第 4 个请求到了，应该马上跑一批 4 个，实际每批的大小是 {rec.sizes}")
+    true(len(b.pending) == 0, "跑完之后 pending 应该清空")
+
+@check("没凑满：最早的请求等满 max_wait_ms 才跑")
+def _():
+    clock, rec, b = _setup(max_batch=4, max_wait_ms=10)
+    for i in range(3):
+        b.submit(torch.full((4,), float(i)))
+    b.poll()
+    true(rec.sizes == [], "才过了 0 ms 就跑了")
+    clock.advance(9)
+    b.poll()
+    true(rec.sizes == [], "过了 9 ms 就跑了，max_wait_ms 是 10")
+    clock.advance(1)
+    b.poll()
+    true(rec.sizes == [3], f"过了 10 ms，应该把这 3 个请求跑成一批，实际每批的大小是 {rec.sizes}")
+    b.poll()
+    true(rec.sizes == [3], "pending 空了，poll 不应该再调用模型")
+
+@check("等待时间从最早的请求算起")
+def _():
+    clock, rec, b = _setup(max_batch=8, max_wait_ms=10)
+    for t in (0, 3, 6, 9):                       # 请求不断地来，间隔都小于 10 ms
+        clock.now = t
+        b.poll()
+        b.submit(torch.full((4,), float(t)))
+    clock.now = 10
+    b.poll()
+    true(rec.sizes == [4], f"10 ms 时，最早的请求已经等了 10 ms，应该跑一批 4 个，实际每批的大小是 {rec.sizes}。从最新的请求算的话，只要请求不断，就永远不跑。")
+
+@check("每个请求拿回自己那一行结果")
+def _():
+    clock, rec, b = _setup(max_batch=3, max_wait_ms=10)
+    xs = [torch.randn(4) for _ in range(5)]
+    tickets = [b.submit(x) for x in xs]
+    clock.advance(10)
+    b.poll()
+    true(rec.sizes == [3, 2], f"5 个请求（max_batch=3）应该跑成两批 [3, 2]，实际是 {rec.sizes}")
+    for i, (x, t) in enumerate(zip(xs, tickets)):
+        true(t is not None and t.status == 200, f"第 {i} 个请求没拿到结果（status 应为 200）")
+        eq(t.result, x * 2 + 1, msg=f"第 {i} 个请求拿到的不是自己那一行")
+--- hints
+- `submit`：建 Ticket，`append`，`if len(self.pending) >= self.max_batch: self.flush()`，`return t`。
+- `poll`：看 `self.pending[0].arrived`（最早的），不是 `self.pending[-1]`。
+- `flush`：`batch, self.pending = self.pending, []`；`out = self.run_batch(torch.stack([t.x for t in batch]))`；再用 `zip(batch, out)` 把每一行交回去。
+
+@@ item d22-12
+type: choice
+title: 微批的两个旋钮怎么调
+level: 2
+cards: 吞吐和延迟：微批处理; 延迟百分位数：p50、p95、p99
+--- context
+`max_batch` 和 `max_wait_ms` 调得不对，要么白白增加延迟，要么 GPU 吃不饱。上线前要能按流量说清楚它们的作用。
+--- prompt
+一个微批处理器设置为 `max_batch = 16`，`max_wait_ms = 20`。下面哪些说法是**对的**？（可多选）
+--- options
+- 流量很小（每 100 ms 来一个请求）时，几乎每批只有 1 个请求，而且每个请求都白等了约 20 ms。
+- 流量很大（每 0.5 ms 来一个请求）时，16 个请求约 7.5 ms 就凑满了，`max_wait_ms` 基本用不上。
+- 把 `max_wait_ms` 调大，吞吐一定会变高。
+- 等待时间从队列里最新的请求算起，对所有请求更公平。
+- 流量小、又很在乎延迟时，可以把 `max_wait_ms` 调小，甚至调成 0。
+answer: 1,2,5
+--- explain
+第 1 个对：100 ms 才来一个，20 ms 内等不到第二个，只能 1 个成一批，还多等了 20 ms。
+
+第 2 个对：第 1 个请求到了之后，再来 15 个要 15 × 0.5 = 7.5 ms，批在等满 20 ms 之前就满了。
+
+第 3 个错：流量小时，吞吐就是请求到达的速度，GPU 本来就闲着，多等只会让延迟变高；流量大时，批本来就是满的，多等也没用。只有 GPU 忙不过来、批又凑不满的时候，多等一点才能提高吞吐。
+
+第 4 个错：从最新的算，请求不断时计时一直被重置，最早的请求可能一直等下去。
+
+第 5 个对：`max_wait_ms = 0` 时，队列里一有请求就跑，延迟最低；代价是批更小，GPU 效率更低。流量小时这个代价不重要。
+--- hints
+- 想一想：在 20 ms 里，能等来几个请求？
+- 吞吐不会超过请求到达的速度。
+
+@@ item d22-13
+type: local
+title: 用 uvicorn 真的把服务跑起来
+level: 1
+cards: 服务的骨架：启动时加载一次; FastAPI 和 TestClient：不开端口也能测
+verify: "labels"\s*:\s*\[\s*"(setosa|versicolor|virginica)"\s*\]\s*,\s*"probs"\s*:\s*\[\s*\[
+placeholder: {"status":"ok"} 和 {"labels":["..."],"probs":[[...]]}
+--- context
+TestClient 测的是 app 本身。真正上线时，前面还有一个 ASGI 服务器（uvicorn）在监听端口。自己跑一次，从另一个终端用 curl 发请求，这条链路就清楚了。
+--- prompt
+在自己电脑上做（需要 Python 环境里有 torch 和 fastapi）：
+
+1. 检查有没有 uvicorn：`python -m uvicorn --version`。没有的话：`python -m pip install uvicorn`。
+2. 新建一个文件夹，在里面建 `serve22.py`，内容如下。把你在 d22-06 写好的 `create_app` 粘贴到标出的位置。
+
+```
+from typing import Annotated
+
+import torch
+import torch.nn as nn
+from fastapi import FastAPI
+from pydantic import BaseModel, Field, FiniteFloat
+
+FEATURES = 4
+LABELS = ["setosa", "versicolor", "virginica"]
+Row = Annotated[list[FiniteFloat], Field(min_length=FEATURES, max_length=FEATURES)]
+
+
+class PredictRequest(BaseModel):
+    rows: list[Row] = Field(min_length=1, max_length=32)
+
+
+def load_model():
+    torch.manual_seed(22)
+    return nn.Sequential(nn.Linear(FEATURES, 16), nn.ReLU(), nn.Dropout(0.3), nn.Linear(16, 3))
+
+
+# ---- 把 d22-06 的 create_app 粘贴到这里 ----
+
+
+app = create_app(load_model)
+```
+
+3. 在这个文件夹里启动服务：`python -m uvicorn serve22:app --port 8022`。等它打印出 `Application startup complete`。
+4. 在同一个文件夹里建 `req.json`，内容是 `{"rows": [[5.1, 3.5, 1.4, 0.2]]}`。
+5. 另开一个终端，进到这个文件夹，发两个请求（Windows PowerShell 里要写 `curl.exe`，因为 `curl` 在那里是另一个命令的别名；Mac / Linux 直接写 `curl`）：
+   - `curl.exe -s http://127.0.0.1:8022/health`
+   - `curl.exe -s -X POST http://127.0.0.1:8022/predict -H "Content-Type: application/json" -d "@req.json"`
+6. 可选：把 `req.json` 里的那一行改成 3 个数，再发一次，看看 422 的 `detail` 怎么说；用浏览器打开 `http://127.0.0.1:8022/docs`，看 FastAPI 自动生成的接口文档。
+7. 在服务的终端按 Ctrl+C 停掉它。把第 5 步两个请求的输出粘贴到下面。
+--- hints
+- 报 `Error loading ASGI app. Could not import module "serve22"`：终端的当前目录不是 `serve22.py` 所在的文件夹。
+- 报端口被占用：把两处 8022 都换成别的数，比如 8123。
+- `/predict` 回 422：检查 `req.json` 是不是合法的 JSON（双引号，每行 4 个数）。
+
+@@ item d22-14
+type: code
+title: 闭卷：模型服务
+level: 2
+exam: yes
+cards: 服务的骨架：启动时加载一次; 预热：准备好了再接请求; FastAPI 和 TestClient：不开端口也能测
+targets: create_app
+ref: day22
+--- context
+加载一次、eval、预热、/health、带输入检查的 /predict：这是每个模型服务的骨架。不看答案写出来，面试时被要求「现场包一个 API」就不慌。
+--- prompt
+写 `create_app(load_model)`，返回一个 FastAPI app：
+
+1. 启动时调用 `load_model()` **一次**；`model.eval()`；在 `torch.inference_mode()` 里用 `torch.zeros(1, FEATURES)` 预热一次。
+2. `GET /health` 回 `{"status": "ok"}`。
+3. `POST /predict`：body 按 `PredictRequest` 检查；在 `torch.inference_mode()` 里算 softmax 概率；回 `{"labels": [每行概率最大的类别名], "probs": [[3 个概率], ...]}`，类别名在 `LABELS` 里。
+
+可以直接用的名字：`FastAPI`、`torch`、`PredictRequest`、`LABELS`、`FEATURES`。
+--- starter
+def create_app(load_model):
+    raise todo()
+--- solution
+def create_app(load_model):
+    model = load_model()                         # 启动时加载一次
+    model.eval()                                 # 关掉 Dropout
+    with torch.inference_mode():                 # 预热：别让第一个用户等
+        model(torch.zeros(1, FEATURES))
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict(req: PredictRequest):            # pydantic 检查不通过，FastAPI 自动回 422
+        x = torch.tensor(req.rows, dtype=torch.float32)
+        with torch.inference_mode():             # handler 在别的线程里跑：在这里关梯度
+            probs = model(x).softmax(-1)
+        return {"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}
+
+    return app
+--- tests
+ROWS = [[5.1, 3.5, 1.4, 0.2], [6.7, 3.0, 5.2, 2.3], [5.9, 3.0, 4.2, 1.5]]
+
+@check('/health 回 200 和 {"status": "ok"}')
+def _():
+    client = TestClient(create_app(CountingLoader()))
+    r = client.get("/health")
+    true(r.status_code == 200, f"/health 回了 {r.status_code}")
+    true(r.json() == {"status": "ok"}, f"/health 回了 {r.json()}")
+
+@check("/predict 回正确的 labels 和 probs")
+def _():
+    client = TestClient(create_app(CountingLoader()))
+    r = client.post("/predict", json={"rows": ROWS})
+    true(r.status_code == 200, f"/predict 回了 {r.status_code}：{r.text[:200]}")
+    body = r.json()
+    true("probs" in body and "labels" in body, f"返回的 JSON 应该有 labels 和 probs 两个字段，你的是 {list(body)}")
+    want = reference_probs(ROWS)
+    eq(torch.tensor(body["probs"]), want, tol=1e-5, msg="probs 不对：要 eval 模式下的 softmax 概率，形状 (行数, 3)")
+    true(body["labels"] == [LABELS[i] for i in want.argmax(-1).tolist()], f"labels 不对：{body['labels']}")
+
+@check("坏请求回 422")
+def _():
+    client = TestClient(create_app(CountingLoader()), raise_server_exceptions=False)
+    bad = [{"rows": [[1.0, 2.0, 3.0]]}, {"rows": []}, {"rows": [["a", 1.0, 2.0, 3.0]]},
+           {"x": [[1.0, 2.0, 3.0, 4.0]]}, {"rows": [[0.0] * 4] * 33}]
+    for body in bad:
+        r = client.post("/predict", json=body)
+        true(r.status_code == 422, f"请求 {str(body)[:60]} 得到了 {r.status_code}，应为 422。handler 的参数要写成 req: PredictRequest。")
+
+@check("模型只加载一次，而且在第一个请求之前")
+def _():
+    loader = CountingLoader()
+    client = TestClient(create_app(loader))
+    true(loader.calls == 1, f"create_app 返回时，模型加载了 {loader.calls} 次，应为 1 次")
+    for _ in range(3):
+        client.post("/predict", json={"rows": ROWS})
+    true(loader.calls == 1, f"3 个请求之后，模型一共加载了 {loader.calls} 次，应该一直是 1 次")
+
+@check("上线前预热过；请求在 eval 模式和 inference_mode 里跑")
+def _():
+    loader = CountingLoader()
+    client = TestClient(create_app(loader))
+    true(loader.calls >= 1, "create_app 里没有调用 load_model()")
+    log = loader.models[0].log
+    true(len(log) >= 1, "create_app 返回时，模型一次都没跑过：没有预热")
+    true(not log[0]["training"] and log[0]["inference"], "预热也要在 eval 模式、torch.inference_mode() 里做：先 model.eval()，再预热")
+    client.post("/predict", json={"rows": ROWS})
+    last = log[-1]
+    true(not last["training"], "处理请求时，模型在 train 模式")
+    true(last["inference"], "处理请求时的 forward 不在 torch.inference_mode() 里（要写在 handler 里面）")
+--- hints
+- 顺序：加载 → eval → 预热 → `app = FastAPI()` → 两个路由 → `return app`。
+- `/predict` 的参数写成 `req: PredictRequest`，forward 包在 `with torch.inference_mode():` 里。
+
+@@ item d22-15
+type: code
+title: 闭卷：延迟报告
+level: 2
+exam: yes
+cards: 延迟百分位数：p50、p95、p99
+targets: latency_report
+ref: day22
+--- context
+被问到「你的服务有多快」时，要能报出 p50 / p95 / p99，并说清楚用的是哪种算法。nearest-rank 只要几行，闭卷写出来。
+--- prompt
+写 `latency_report(times_ms)`：`times_ms` 是一串延迟（毫秒，至少 1 个，没排序）。用 nearest-rank 方法返回 `{"p50": ..., "p95": ..., "p99": ...}`：排好序，k = ⌈q × n / 100⌉，取第 k 个（从 1 数）。
+
+不许用 `numpy.percentile` / `torch.quantile`；不要改动传进来的列表。
+--- starter
+import math
+
+def latency_report(times_ms):
+    raise todo()
+--- solution
+import math
+
+def latency_report(times_ms):
+    s = sorted(times_ms)                 # sorted 返回一个新列表，不改动传进来的那个
+    n = len(s)
+
+    def pick(q):
+        k = math.ceil(q * n / 100)       # 先乘后除，避开浮点误差
+        return s[max(k, 1) - 1]          # 第 k 个（从 1 数）
+
+    return {"p50": pick(50), "p95": pick(95), "p99": pick(99)}
+--- tests
+def _shuffled(values):
+    return [values[i] for i in torch.randperm(len(values)).tolist()]
+
+def _expect(times, want, why=""):
+    got = latency_report(times)
+    true(isinstance(got, dict), f"应该返回 dict，你返回的是 {type(got).__name__}")
+    for key in ("p50", "p95", "p99"):
+        true(key in got, f"返回的 dict 里没有 {key!r}")
+        true(close(got[key], want[key]), f"{key}：你的是 {got[key]}，应为 {want[key]}。{why}")
+
+@check("1 到 100：p50 = 50，p95 = 95，p99 = 99")
+def _():
+    _expect(_shuffled(list(range(1, 101))), {"p50": 50, "p95": 95, "p99": 99},
+            "先排序；k = math.ceil(q * n / 100)，取 s[k - 1]。")
+
+@check("20 个请求，尾巴上有两个慢的")
+def _():
+    times = _shuffled([12.0] * 9 + [15.0] * 9 + [200.0, 900.0])
+    _expect(times, {"p50": 15.0, "p95": 200.0, "p99": 900.0},
+            "n = 20：p50 取第 10 个，p95 取第 19 个，p99 取第 20 个。如果你得到 235.0 或 767.0，那是线性插值（numpy / torch.quantile 的默认），这题要 nearest-rank。")
+
+@check("只有 1 个数时，三个值都是它")
+def _():
+    _expect([42.0], {"p50": 42.0, "p95": 42.0, "p99": 42.0})
+
+@check("不改动传进来的列表")
+def _():
+    times = [30.0, 10.0, 20.0]
+    latency_report(times)
+    true(times == [30.0, 10.0, 20.0], f"传进来的列表被改成了 {times}：用 sorted(...)，不要用 .sort()")
+--- hints
+- 排序用 `sorted`，下标是 `k - 1`。
+- k 用 `math.ceil(q * n / 100)`。

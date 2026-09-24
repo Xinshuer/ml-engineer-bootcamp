@@ -1,0 +1,1572 @@
+@@ day 22
+title: Deployment 2: serving a model
+part: Deployment
+hours: 3–4 hours
+--- goal
+After today you can turn a PyTorch model into a dependable HTTP service with FastAPI: load it once at start-up and warm it up, keep bad input out with pydantic (422), answer with the right status code when something fails, protect the service with a bounded queue and timeouts, raise throughput with micro-batching, and say how fast it is with p50 / p95 / p99. You test all of it with TestClient and a fake clock: no open ports, no sleeping.
+--- checklist
+- Clear the review tab first (redo from scratch the items whose answers you looked at yesterday)
+- Read the 8 cards; change one number in each card's code and run it again
+- Pass every practice item: read the failure message and find the problem before you change code
+- If you have time, do d22-13: run the service for real with uvicorn on your own machine
+- Write the two closed-book items without looking at any answer
+
+@@ concept
+title: Service skeleton: load the model once at start-up
+--- body
+Serving a model means other programs send inputs over HTTP and get predictions back. A minimal model service has three parts:
+
+1. **Start-up**: load the weights, call `model.eval()`, warm up (next card). Only then start taking requests.
+2. **`/health`**: the health check. Load balancers (programs that spread traffic over several servers) and Kubernetes call it regularly and only send requests to servers that answer "ok".
+3. **`/predict`**: take the input, check it, run the model, return JSON.
+
+The most important rule: **load the model once at start-up; every request shares it.** Loading means reading the weight file (hundreds of MB to tens of GB), building the model and moving it to the GPU. That takes seconds to minutes. Put it in the handler (the function that handles one request) and every request pays that price again.
+
+Today we use a "factory function" `create_app(load_model)`. It calls `load_model()` first, then builds the app. The handlers are functions defined inside `create_app`, so they can use the outer variable `model` (this is called a closure). The benefit: a test can pass in a fake `load_model` and count how often it is called. FastAPI also has an official start-up hook, `lifespan`, that does the same job.
+
+One more rule: **one model per process.** `uvicorn --workers 4` starts 4 processes, and each one loads the model. On a GPU that is 4 copies in GPU memory, all fighting over the same card. The usual setup is one process and one model per GPU, with requests waiting in a queue inside that process (later cards).
+
+The code below compares "load once" with "predict once" for a small model of about 4 MB.
+--- code
+import io
+import time
+
+def build():
+    return nn.Sequential(*[nn.Linear(512, 512) for _ in range(4)])
+
+weights = io.BytesIO()
+torch.save(build().state_dict(), weights)       # pretend this is the weight file on disk
+
+def load_model():
+    weights.seek(0)
+    m = build()
+    m.load_state_dict(torch.load(weights, weights_only=True))
+    return m.eval()
+
+t0 = time.perf_counter()
+model = load_model()
+t_load = time.perf_counter() - t0
+
+x = torch.randn(1, 512)
+with torch.inference_mode():
+    model(x)                                     # run once first (warm-up)
+    t0 = time.perf_counter()
+    model(x)
+    t_pred = time.perf_counter() - t0
+print(f"load once:    {t_load * 1000:.2f} ms")
+print(f"predict once: {t_pred * 1000:.3f} ms")
+print(f"Loading takes {t_load / t_pred:.0f}x as long as a prediction. Real models are thousands of times bigger and take seconds to minutes to load.")
+
+@@ concept
+title: Warm-up: be ready before taking requests
+ref: day22
+--- body
+A model's first forward pass is often much slower than the ones after it. A lot of one-time set-up work is delayed until the first call:
+
+- the first use of the GPU creates the CUDA context (hundreds of milliseconds to seconds);
+- with `torch.backends.cudnn.benchmark = True`, cuDNN tries several algorithms for every new input shape and keeps the fastest;
+- `torch.compile` compiles on the first call (seconds to tens of seconds) and may compile again when the shape changes;
+- the memory allocator asks the GPU for memory for the first time.
+
+If you do nothing, your first user pays for all of this. And every new batch size makes another user pay.
+
+Warm-up: after start-up and before taking requests, run the model a few times on fake data, covering the shapes you will see in production (for example batch sizes 1, 8 and 32). Warm-up follows the inference rules too: `model.eval()` and `torch.inference_mode()`.
+
+Until warm-up is done, the service is "alive" but "not ready". So there are usually two kinds of health check:
+
+- liveness (is it alive?): answer 200 as long as the process is not stuck;
+- readiness (is it ready?): answer 200 only when loading and warm-up are done, and **503** before that. Load balancers only send requests to ready servers.
+
+On a CPU the effect is small and hard to show. So the code below simulates it with today's `SlowStartModel`: the first forward for each new batch size costs an extra 500 ms, a normal one costs 2 + 0.25·B ms. The time goes onto a fake clock, `FakeClock` (in milliseconds; it only moves when you call `advance`), so nothing really waits.
+--- code
+def serve(request_sizes, warm_sizes):
+    clock = FakeClock()
+    model = SlowStartModel(clock).eval()
+    with torch.inference_mode():
+        for b in warm_sizes:                     # warm-up: run the shapes you will see before going live
+            model(torch.zeros(b, 4))
+        took = []
+        for b in request_sizes:                  # the real requests
+            t0 = clock()
+            model(torch.randn(b, 4))
+            took.append(clock() - t0)
+    return took
+
+reqs = [1, 1, 8, 8, 32]
+print("batch size of each request:", reqs)
+print("no warm-up, ms per request:", serve(reqs, warm_sizes=[]))
+print("after warming 1/8/32, ms:  ", serve(reqs, warm_sizes=[1, 8, 32]))
+
+@@ concept
+title: pydantic: keep bad input out
+--- body
+Production requests contain everything: a number missing, a number too many, strings, `null`, NaN, a hundred thousand rows at once. Turn that into a tensor without checking and you get a shape error (the service answers 500), one NaN that turns the whole batch's output into NaN, or one huge request that eats all the GPU memory.
+
+With pydantic you write down, as types, what valid input looks like. It rejects everything else for you. For example, a service for 3D points, with 3 coordinates per point and 1 to 8 points per request:
+
+```
+from typing import Annotated
+from pydantic import BaseModel, Field, FiniteFloat
+
+Point = Annotated[list[FiniteFloat], Field(min_length=3, max_length=3)]
+
+class PointsRequest(BaseModel):
+    points: list[Point] = Field(min_length=1, max_length=8)
+```
+
+Piece by piece:
+
+- `BaseModel`: inherit from it and the fields you declare get checked.
+- `FiniteFloat`: a finite float; NaN and inf are rejected. A plain `float` lets them through.
+- `Annotated[type, Field(...)]`: adds limits to a type. `min_length` / `max_length` limit the length of a list. Here: exactly 3 numbers per point.
+- `points: list[Point] = Field(min_length=1, max_length=8)`: 1 to 8 points. The upper limit stops huge requests.
+
+`PointsRequest.model_validate(a dict)` does the check. Valid input returns an object; invalid input raises `ValidationError`, which says at which position (loc) what went wrong.
+
+Note that pydantic is "lax" by default: the string `"1.5"` becomes `1.5` and the integer `3` becomes `3.0`. To reject those too, use strict mode (for example `model_validate(..., strict=True)`).
+
+Inside FastAPI, a failed check automatically becomes a **422** response (Unprocessable Entity: the JSON can be read, but its content is not valid). Your handler is never called.
+--- code
+from typing import Annotated
+from pydantic import BaseModel, Field, FiniteFloat, ValidationError
+
+Point = Annotated[list[FiniteFloat], Field(min_length=3, max_length=3)]
+
+class PointsRequest(BaseModel):
+    points: list[Point] = Field(min_length=1, max_length=8)
+
+for payload in [{"points": [[0.5, 1.0, 2.0]]},
+                {"points": [[0.5, 1.0]]},
+                {"points": [[0.5, 1.0, float("nan")]]},
+                {"points": [["1.5", 3, 2.0]]},
+                {"points": []}]:
+    try:
+        req = PointsRequest.model_validate(payload)
+        print("accepted:", req.points)
+    except ValidationError as e:
+        err = e.errors()[0]
+        print("rejected:", err["loc"], err["msg"])
+
+@@ concept
+title: FastAPI and TestClient: test without opening a port
+ref: day22
+--- body
+FastAPI turns Python functions into HTTP endpoints in a few lines:
+
+```
+app = FastAPI()
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/predict")
+def predict(req: PredictRequest):
+    ...
+    return {"labels": [...], "probs": [...]}
+```
+
+- `@app.get(path)` / `@app.post(path)`: which path and which request method this function handles. Use GET to read, POST to send data to be computed on.
+- A parameter written as `req: PredictRequest`: FastAPI hands the request's JSON body to pydantic, calls your function only if the check passes, and answers 422 otherwise.
+- Return a dict and it becomes JSON. It may only contain Python numbers, strings and lists; call `.tolist()` on tensors first.
+- An unknown path gets 404. A known path with the wrong method (for example GET on a POST-only path) gets 405.
+
+Tests do not need a real server. `TestClient(app)` simulates HTTP requests inside the same Python process:
+
+```
+client = TestClient(app)
+r = client.post("/predict", json={"rows": [[5.1, 3.5, 1.4, 0.2]]})
+r.status_code     # 200
+r.json()          # the parsed dict
+```
+
+One detail you will need later: a handler written with `def` (not `async def`) runs in another thread (a thread pool).
+--- code
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+class Pair(BaseModel):
+    a: float
+    b: float
+
+app = FastAPI()
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/mul")
+def mul(req: Pair):
+    return {"product": req.a * req.b}
+
+client = TestClient(app)
+for method, path, body in [("GET", "/health", None), ("POST", "/mul", {"a": 3, "b": 4}),
+                           ("POST", "/mul", {"a": 3}), ("GET", "/mul", None), ("GET", "/nope", None)]:
+    r = client.request(method, path, json=body)
+    detail = r.json().get("detail")
+    short = detail[0]["msg"] if isinstance(detail, list) else r.json()
+    print(f"{method:4s} {path:7s} {str(body):16s} -> {r.status_code} {short}")
+
+@@ concept
+title: Inference in the handler: eval() and inference_mode
+--- body
+The two inference rules from day 18:
+
+- `model.eval()`: turns Dropout off and makes BatchNorm use its stored statistics. Without it, the same request sent twice gives two different answers.
+- `torch.inference_mode()`: records no computation graph, so it uses less memory and runs faster.
+
+In a service, the two rules are written in different places.
+
+`model.eval()` changes the model object itself. Every thread uses the same model, so **calling it once after loading** is enough.
+
+The autograd switch, however, is **per thread**. FastAPI runs `def` handlers in a thread pool. A `torch.set_grad_enabled(False)` at start-up (in the main thread) does not reach the thread the handler runs in. So write it **inside** the handler:
+
+```
+with torch.inference_mode():
+    probs = model(x).softmax(-1)
+```
+
+Finally, turn tensors into Python lists with `.tolist()` before putting them in the returned dict.
+
+The code below switches autograd off in the main thread, then starts another thread that plays the handler, and looks at the switch over there.
+--- code
+import threading
+
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(4, 8), nn.Dropout(0.5), nn.Linear(8, 3))
+x = torch.randn(1, 4)
+print("train mode, same result twice?", torch.equal(model(x), model(x)))
+model.eval()
+print("eval mode, same result twice? ", torch.equal(model(x), model(x)))
+
+torch.set_grad_enabled(False)                    # autograd off in the main thread
+seen = {}
+
+def handler():                                   # plays FastAPI running a handler in another thread
+    seen["without inference_mode"] = model(x).requires_grad
+    with torch.inference_mode():
+        seen["with inference_mode"] = model(x).requires_grad
+
+t = threading.Thread(target=handler)
+t.start()
+t.join()
+torch.set_grad_enabled(True)
+print("autograd is off in the main thread; requires_grad of the output in the other thread:", seen)
+
+@@ concept
+title: Status codes, queue limits and timeouts
+ref: day22
+--- body
+The HTTP status code tells the client (and the monitoring system) what happened to a request. Answer 200 on errors and the client thinks it worked, and the error rate on your dashboard stays at 0 forever.
+
+The ones we use today:
+
+- **200**: success.
+- **422**: invalid input (stopped by pydantic). The client's fault; retrying the same request will not help.
+- **404 / 405**: unknown path / wrong request method.
+- **500**: something broke inside the server (a bug, the model crashed). Answer only "internal error"; the details of the exception (file paths, GPU memory) go into the server's log, not to the client.
+- **503**: cannot serve right now: still loading / warming up, or the queue is full. Add a `Retry-After` header to tell the client how many seconds to wait before trying again.
+- **504**: timeout: the request waited too long and the server gave up on it.
+- There is also 429: one particular client sends too many requests and gets rate-limited. It is counted per client; we do not write it today.
+
+A way to remember: 4xx means the client has a problem, 5xx means the server has a problem.
+
+In FastAPI you raise an `HTTPException` to answer with a status code:
+
+```
+raise HTTPException(status_code=503, detail="model is loading", headers={"Retry-After": "5"})
+```
+
+**One GPU, one model, one queue.** When requests arrive faster than the model can compute, they have to wait. The queue needs a **limit**: when it is full, answer 503 at once. That is better than a queue that keeps growing: the longer the queue, the longer every request waits, until they all time out.
+
+**Timeouts**: clients usually wait only a few seconds. If a request has waited in the queue too long, its client has already given up, and computing it wastes the GPU. So when its turn comes, check how long it has waited; over the limit, answer 504 and do not run the model.
+
+Testing this needs no real waiting: make "what time is it" a parameter `clock`, pass a fake clock `FakeClock` in the test, and `advance` it by as much time as you like.
+--- code
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+
+state = {"ready": False}
+app = FastAPI()
+
+@app.get("/health")
+def health():
+    if not state["ready"]:
+        raise HTTPException(status_code=503, detail="loading", headers={"Retry-After": "5"})
+    return {"status": "ok"}
+
+client = TestClient(app)
+r = client.get("/health")
+print("loading:", r.status_code, r.json(), "Retry-After =", r.headers["retry-after"])
+state["ready"] = True
+r = client.get("/health")
+print("ready:  ", r.status_code, r.json())
+
+clock = FakeClock()                              # a fake clock, in milliseconds
+arrived = clock()                                # the request enters the queue
+clock.advance(150)                               # the requests ahead of it took 150 ms (no real waiting)
+waited = clock() - arrived
+print(f"this request waited {waited} ms, the limit is 100 ms ->", "answer 504, do not run the model" if waited > 100 else "hand it to the model")
+
+@@ concept
+title: Latency percentiles: p50, p95, p99
+--- body
+"Average latency 20 ms" sounds fine. It could be 98 requests at 10 ms and 2 requests at 500 ms. Those 2 users waited half a second. The average hides the tail.
+
+So we look at percentiles:
+
+- **p50** (the median): half of the requests are faster. The typical experience.
+- **p95**: 95% of the requests are not slower than this.
+- **p99**: roughly the slowest request out of 100. Service promises (SLOs, such as "p99 < 200 ms") are usually written in terms of it.
+
+There are several ways to compute a percentile. Today we use the simplest one, **nearest-rank**:
+
+1. Sort from small to large; there are n values.
+2. k = ⌈q × n / 100⌉ (⌈⌉ means round up, `math.ceil`).
+3. The answer is the k-th smallest value (counting from 1, so `s[k - 1]`).
+
+It always returns a latency that really happened. `numpy.percentile` and `torch.quantile` use **linear interpolation** by default: they take a value in between two neighbouring numbers, which may not be any real latency. Both methods are in use; say in your report which one you used.
+
+Write `q * n / 100`, not `q / 100 * n`. The first multiplies before dividing, so when the division comes out even, the result is exact. The second can carry a tiny floating-point error, and rounding up then adds 1.
+
+Some practical rules:
+
+- Collect enough samples. With only 20 values, p99 is simply the maximum. p99 needs at least a few hundred samples to mean anything.
+- Measure after warm-up. Count failed requests separately (the error rate); do not mix them into the latencies.
+--- code
+import math
+
+times = [12, 11, 13, 12, 250, 11, 12, 14, 12, 13, 11, 12, 900, 12, 13, 12, 11, 12, 13, 12]
+s = sorted(times)
+n = len(s)
+print("sorted:", s)
+print(f"mean: {sum(s) / n:.1f} ms  <- pulled up by two slow requests, yet it does not show how slow they were")
+for q in (50, 95, 99):
+    k = math.ceil(q * n / 100)
+    lin = torch.quantile(torch.tensor(s, dtype=torch.float64), q / 100).item()
+    print(f"p{q}: nearest-rank takes value number {k} = {s[k - 1]} ms; linear interpolation = {lin:.1f} ms")
+print("p99.9 with n = 1000, divide first:  ", 99.9 / 100 * 1000, "-> rounded up", math.ceil(99.9 / 100 * 1000))
+print("                     multiply first:", 99.9 * 1000 / 100, "-> rounded up", math.ceil(99.9 * 1000 / 100))
+
+@@ concept
+title: Throughput vs latency: micro-batching
+ref: day22
+--- body
+Two measures often get mixed up:
+
+- **Latency**: how long one request takes from sending it to getting the result. This is what users feel.
+- **Throughput**: how many requests are handled per second. This decides how many machines you need.
+
+The time a GPU needs for a batch is roughly "fixed cost + cost per row". Suppose a batch of B rows takes 10 + 1 × B milliseconds:
+
+- B = 1: 11 ms per batch, about 91 requests per second;
+- B = 8: 18 ms per batch, about 444 per second;
+- B = 32: 42 ms per batch, about 762 per second.
+
+Bigger batches give higher throughput (the fixed cost is shared). But each batch takes longer, and throughput has a ceiling: here at most 1000 per second.
+
+In production, requests arrive one at a time. **Micro-batching** (also called dynamic batching) puts them in a queue first and runs them as a batch:
+
+- when `max_batch` requests are waiting, run them at once;
+- when fewer are waiting, but the **oldest** one has waited `max_wait_ms`, run what is there.
+
+`max_wait_ms` is a cap on the extra latency: with little traffic, a request waits at most this long. With heavy traffic, batches fill up quickly and hardly anyone waits.
+
+Always measure the wait from the **oldest** request. If you measure from the newest one, the timer restarts with every new arrival, and as long as requests keep coming, the oldest one may wait forever.
+
+The code below prints the table above, then uses today's `MicroBatcher` to simulate 8 requests with max_batch = 4 and max_wait_ms = 5.
+--- code
+print("  B   ms/batch   requests/s")
+for B in [1, 2, 8, 32, 128]:
+    ms = 10 + 1 * B
+    print(f"{B:3d}   {ms:6d}   {B * 1000 / ms:8.0f}")
+
+clock = FakeClock()
+rec = BatchRecorder(lambda xb: xb * 2)           # records the size of every batch
+batcher = MicroBatcher(rec, max_batch=4, max_wait_ms=5, clock=clock)
+for t in [0, 1, 2, 3, 4, 20, 30, 31]:            # arrival times of 8 requests (ms)
+    clock.now = t
+    batcher.poll()                               # the server loop: first see if anything is due
+    batcher.submit(torch.tensor([float(t)]))
+clock.now = 40
+batcher.poll()
+print("arrival times: [0, 1, 2, 3, 4, 20, 30, 31]")
+print("batch sizes:", rec.sizes)
+
+@@ item d22-01
+type: predict
+title: What does FastAPI answer to these requests?
+level: 2
+cards: pydantic: keep bad input out; FastAPI and TestClient: test without opening a port
+ref: day22
+--- context
+Before you write a service, know what FastAPI and pydantic reject for you and what they let through. When you debug "why did this request get a 422?" in production, you should see the answer at a glance.
+--- prompt
+Read the code below and write the 6 lines it prints.
+
+`/add` accepts only POST, and `x` in the body must be exactly 2 numbers. `TestClient` simulates HTTP requests inside the same process; `.json()` returns a Python dict.
+--- code
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+class AddRequest(BaseModel):
+    x: list[float] = Field(min_length=2, max_length=2)
+
+app = FastAPI()
+
+@app.post("/add")
+def add(req: AddRequest):
+    return {"sum": req.x[0] + req.x[1]}
+
+client = TestClient(app)
+print(client.post("/add", json={"x": [1, 2]}).json())
+print(client.post("/add", json={"x": [1, 2, 3]}).status_code)
+print(client.post("/add", json={"x": ["1.5", 2]}).json())
+print(client.post("/add", json={"x": ["one", 2]}).status_code)
+print(client.post("/add", json={"y": [1, 2]}).status_code)
+print(client.get("/add").status_code)
+--- explain
+1. `{'sum': 3.0}`: pydantic turned both integers into floats, 1.0 + 2.0 = 3.0. It prints a Python dict, hence the single quotes.
+2. `422`: 3 numbers break `max_length=2`. The handler is never called.
+3. `{'sum': 3.5}`: the string `"1.5"` can be read as a number, so pydantic's default lax mode turns it into 1.5. To reject it, use strict mode.
+4. `422`: `"one"` is not a number and cannot be converted.
+5. `422`: the required field `x` is missing. The extra `y` is ignored by default.
+6. `405`: the path `/add` exists but only accepts POST, and this is a GET (Method Not Allowed). An unknown path would be 404.
+--- hints
+- 422 means "the JSON can be read, but the content is invalid": when pydantic's check fails, FastAPI answers 422 automatically.
+- By default pydantic converts strings that look like numbers into numbers.
+- "Wrong method" and "unknown path" are two different status codes.
+
+@@ item d22-02
+type: code
+title: Write the request format with pydantic
+level: 1
+cards: pydantic: keep bad input out
+targets: PredictRequest, Row
+ref: day22
+--- context
+Bad input is the most common source of errors in a production service: a missing feature, a NaN, tens of thousands of rows in one request. Stopping it at the door with pydantic is much easier to debug than letting it blow up inside the model as a 500.
+--- prompt
+Today's model takes 4 numbers per row (`FEATURES = 4`). Write a pydantic class `PredictRequest` with one field, `rows`:
+
+- `rows` is a list of 1 to 32 rows (`MAX_ROWS = 32`), and it is required;
+- each row has exactly 4 numbers;
+- each number must be a finite float: reject NaN, inf, the string `"abc"` and `None`.
+
+For invalid input, `PredictRequest.model_validate(...)` must raise `ValidationError`. The last check puts your class into today's prepared service and makes sure bad requests get 422.
+--- starter
+from typing import Annotated
+from pydantic import BaseModel, Field, FiniteFloat
+
+FEATURES = 4
+MAX_ROWS = 32
+
+class PredictRequest(BaseModel):
+    rows: list[list[float]]
+--- solution
+from typing import Annotated
+from pydantic import BaseModel, Field, FiniteFloat
+
+FEATURES = 4
+MAX_ROWS = 32
+
+# one row: exactly 4 finite numbers
+Row = Annotated[list[FiniteFloat], Field(min_length=FEATURES, max_length=FEATURES)]
+
+class PredictRequest(BaseModel):
+    rows: list[Row] = Field(min_length=1, max_length=MAX_ROWS)   # 1 to 32 rows; no default = required
+--- tests
+def _ok(payload):
+    try:
+        PredictRequest.model_validate(payload)
+        return True
+    except ValidationError:
+        return False
+
+@check("a valid request is accepted")
+def _():
+    req = PredictRequest.model_validate({"rows": [[5.1, 3.5, 1.4, 0.2], [6.7, 3.0, 5.2, 2.3]]})
+    true(len(req.rows) == 2 and list(req.rows[1]) == [6.7, 3.0, 5.2, 2.3], "the rows read from a valid request are wrong")
+    true(_ok({"rows": [[1, 2, 3, 4]]}), "integers are valid numbers too (pydantic turns them into floats); this should be accepted")
+    true(_ok({"rows": [[0.0] * 4] * 32}), "32 rows is exactly the limit; this should be accepted")
+
+@check("every row has exactly 4 numbers")
+def _():
+    for rows in ([[1.0, 2.0, 3.0]], [[1.0, 2.0, 3.0, 4.0, 5.0]], [[]], [[1.0, 2.0, 3.0, 4.0], [1.0, 2.0]]):
+        true(not _ok({"rows": rows}), f"rows={rows} got through: every row must have exactly 4 numbers. Limit the length of each row with Field(min_length=..., max_length=...).")
+
+@check("1 to 32 rows, and rows is required")
+def _():
+    true(not _ok({"rows": []}), "empty rows got through: a request needs at least 1 row")
+    true(not _ok({"rows": [[0.0] * 4] * 33}), "33 rows got through: the limit is 32. Without a limit, one request can carry tens of thousands of rows and eat all the GPU memory.")
+    true(not _ok({}), "a request without rows got through: rows is required, so do not give it a default")
+
+@check("NaN, inf, strings and None are rejected")
+def _():
+    for row in ([1.0, 2.0, 3.0, float("nan")], [1.0, float("inf"), 3.0, 4.0], ["abc", 2.0, 3.0, 4.0], [None, 2.0, 3.0, 4.0]):
+        true(not _ok({"rows": [row]}), f"{row} got through. A plain float allows NaN and inf, and one NaN can turn the whole batch's output into NaN. Use FiniteFloat.")
+
+@check("inside the service: a bad request gets 422, a good one 200")
+def _():
+    client = TestClient(create_app(CountingLoader()), raise_server_exceptions=False)   # today's service, using your PredictRequest
+    r = client.post("/predict", json={"rows": [[5.1, 3.5, 1.4, 0.2]]})
+    true(r.status_code == 200, f"a valid request got {r.status_code}")
+    r = client.post("/predict", json={"rows": [[5.1, 3.5, 1.4]]})
+    true(r.status_code == 422, f"a request with 3 numbers per row got {r.status_code}, expected 422")
+--- hints
+- Write the type of one row first: `Row = Annotated[list[FiniteFloat], Field(min_length=..., max_length=...)]`.
+- Then the whole request: `rows: list[Row] = Field(min_length=1, max_length=MAX_ROWS)`.
+
+@@ item d22-03
+type: fix
+title: The model is loaded again for every request
+level: 1
+cards: Service skeleton: load the model once at start-up
+targets: create_app
+ref: day22
+--- context
+Calling `load_model()` inside the handler is the most common performance accident in a first model service: every request reads gigabytes of weights again, latency goes from milliseconds to seconds, and GPU memory can fill up.
+--- prompt
+`create_app(load_model)` builds a FastAPI service. `load_model()` returns a model in train mode (today's `TinyClassifier`: 4 numbers → 3 classes).
+
+- `GET /health` answers `{"status": "ok"}`;
+- `POST /predict` checks the body with `PredictRequest` (the format from the previous item, already prepared) and answers `{"labels": [...], "probs": [[...], ...]}`.
+
+The results are right. But a test with a counting `load_model` found that the model is not loaded at all at start-up, and is then loaded once for every request.
+
+Change it: **load the model once in `create_app`; all requests share that one model.**
+--- starter
+def create_app(load_model):
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict(req: PredictRequest):
+        model = load_model()
+        model.eval()
+        x = torch.tensor(req.rows, dtype=torch.float32)
+        with torch.inference_mode():
+            probs = model(x).softmax(-1)
+        return {"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}
+
+    return app
+--- solution
+def create_app(load_model):
+    model = load_model()             # load once at start-up; the handler below uses it through the closure
+    model.eval()
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict(req: PredictRequest):
+        x = torch.tensor(req.rows, dtype=torch.float32)
+        with torch.inference_mode():
+            probs = model(x).softmax(-1)
+        return {"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}
+
+    return app
+--- tests
+ROWS = [[5.1, 3.5, 1.4, 0.2], [6.7, 3.0, 5.2, 2.3]]
+
+@check("the model is loaded when the service starts")
+def _():
+    loader = CountingLoader()
+    create_app(loader)
+    true(loader.calls == 1, f"when create_app returned, the model had been loaded {loader.calls} times, expected 1. Load it at start-up; do not make the first user wait.")
+
+@check("after 5 requests, still loaded only once")
+def _():
+    loader = CountingLoader()
+    client = TestClient(create_app(loader))
+    for _ in range(5):
+        r = client.post("/predict", json={"rows": ROWS})
+        true(r.status_code == 200, f"/predict answered {r.status_code}")
+    true(loader.calls == 1, f"after 5 requests the model had been loaded {loader.calls} times. Every load reads the weight file; for a real model that takes seconds to minutes.")
+
+@check("the predictions have not changed")
+def _():
+    client = TestClient(create_app(CountingLoader()))
+    body = client.post("/predict", json={"rows": ROWS}).json()
+    want = reference_probs(ROWS)
+    eq(torch.tensor(body["probs"]), want, tol=1e-5, msg="wrong probabilities: call model.eval() after loading (the model has Dropout).")
+    true(body["labels"] == [LABELS[i] for i in want.argmax(-1).tolist()], f"wrong labels: {body['labels']}")
+    true(client.get("/health").json() == {"status": "ok"}, "/health should answer {'status': 'ok'}")
+--- hints
+- The handler runs once per request; `create_app` runs once at start-up. Which one should do the loading?
+- Move `model = load_model()` and `model.eval()` into `create_app`, outside `def predict`. The handler can use the outer function's variable `model` directly (a closure).
+
+@@ item d22-04
+type: fix
+title: The handler leaves Dropout and autograd on
+level: 2
+cards: Inference in the handler: eval() and inference_mode
+targets: create_app
+ref: day22
+--- context
+The same input gives two different answers, and the service's memory keeps growing: the usual cause is forgetting `model.eval()` and `torch.inference_mode()` at inference. A service adds one more trap: the handler runs in another thread.
+--- prompt
+This `create_app(load_model)` already loads the model only once at start-up, but the inference in the handler has two problems:
+
+1. The model is in train mode (`load_model()` returns it that way), so Dropout is on: the same request sent twice gives different results.
+2. The forward pass is not inside `torch.inference_mode()`, so every request builds a computation graph.
+
+Fix it: the forward pass of a request must run in eval mode and inside `torch.inference_mode()`. The test's `load_model` returns a `SpyModel` that records the modes of every forward call.
+--- starter
+def create_app(load_model):
+    model = load_model()
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict(req: PredictRequest):
+        x = torch.tensor(req.rows, dtype=torch.float32)
+        probs = model(x).softmax(-1)
+        return {"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}
+
+    return app
+--- solution
+def create_app(load_model):
+    model = load_model()
+    model.eval()                                 # changes the model itself, so every thread sees it: once after loading
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict(req: PredictRequest):
+        x = torch.tensor(req.rows, dtype=torch.float32)
+        with torch.inference_mode():             # the autograd switch is per thread, so it goes inside the handler
+            probs = model(x).softmax(-1)
+        return {"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}
+
+    return app
+--- tests
+ROWS = [[5.1, 3.5, 1.4, 0.2], [6.7, 3.0, 5.2, 2.3]]
+
+@check("the same request twice gives the same result")
+def _():
+    client = TestClient(create_app(CountingLoader()))
+    a = client.post("/predict", json={"rows": ROWS}).json()["probs"]
+    b = client.post("/predict", json={"rows": ROWS}).json()["probs"]
+    eq(torch.tensor(b), torch.tensor(a), tol=0.0, msg="the same request gave two different results: Dropout is still on. Call model.eval() after loading.")
+
+@check("the result equals the eval-mode reference")
+def _():
+    client = TestClient(create_app(CountingLoader()))
+    probs = client.post("/predict", json={"rows": ROWS}).json()["probs"]
+    eq(torch.tensor(probs), reference_probs(ROWS), tol=1e-5, msg="the probabilities differ from the eval-mode reference.")
+
+@check("the request's forward runs in eval mode and inside inference_mode")
+def _():
+    loader = CountingLoader()
+    client = TestClient(create_app(loader))
+    client.post("/predict", json={"rows": ROWS})
+    log = loader.models[0].log
+    true(len(log) >= 1, "the model was never called")
+    last = log[-1]
+    true(not last["training"], "while handling the request, the model was still in train mode")
+    true(last["inference"], "the request's forward pass is not inside torch.inference_mode(). FastAPI runs the handler in another thread and the autograd switch is per thread, so write with torch.inference_mode(): inside the handler.")
+--- hints
+- Two things: one changes the model's mode, one wraps the forward pass.
+- `model.eval()` once after loading is enough. `with torch.inference_mode():` goes inside `predict`, around the `model(x)` line.
+
+@@ item d22-05
+type: code
+title: Warm-up: run every batch size you will serve
+level: 2
+cards: Warm-up: be ready before taking requests
+targets: warm_up
+ref: day22
+--- context
+Right after a GPU service starts, the first request can take seconds (CUDA start-up, torch.compile, cuDNN picking algorithms), and a new shape can be slow once more. Run those shapes before going live and users do not have to wait for you.
+--- prompt
+Write `warm_up(model, batch_sizes, clock)`:
+
+- call `model.eval()` first;
+- inside `torch.inference_mode()`, for every B in `batch_sizes`, run `model(torch.zeros(B, FEATURES))` once (`FEATURES = 4`);
+- measure each run with `clock()` (it returns milliseconds) and return a dict `{B: milliseconds}`, for example `{1: 502.25, 8: 504.0, 32: 510.0}`. The service writes it to its log at start-up.
+
+The test uses `SlowStartModel(clock)`: the first forward for each new batch size costs an extra 500 ms; a normal one costs 2 + 0.25·B ms. The time is added to the fake clock `FakeClock`.
+--- starter
+def warm_up(model, batch_sizes, clock):
+    """Run all-zero fake data once per batch size; return {B: milliseconds that run took}."""
+    raise todo()
+--- solution
+def warm_up(model, batch_sizes, clock):
+    """Run all-zero fake data once per batch size; return {B: milliseconds that run took}."""
+    model.eval()
+    took = {}
+    with torch.inference_mode():
+        for b in batch_sizes:
+            t0 = clock()
+            model(torch.zeros(b, FEATURES))
+            took[b] = clock() - t0              # milliseconds this forward pass took
+    return took
+--- tests
+SIZES = [1, 8, 32]
+
+@check("returns how long the first run of each batch size took")
+def _():
+    clock = FakeClock()
+    model = SlowStartModel(clock)
+    took = warm_up(model, SIZES, clock)
+    true(isinstance(took, dict), f"should return a dict {{B: milliseconds}}, you returned a {type(took).__name__}")
+    for b in SIZES:
+        true(b in took, f"batch size {b} is missing from the returned dict")
+        want = model.compile_ms + model.run_ms(b)
+        true(close(took[b], want, 1e-6), f"batch size {b}: you recorded {took[b]} ms, expected {want} ms. Read clock() right before and right after this forward pass and subtract.")
+    true(sorted(took) == SIZES, f"the dict should hold exactly the batch sizes {SIZES}, yours has {sorted(took)}")
+
+@check("after warm-up, real requests are no longer slow")
+def _():
+    clock = FakeClock()
+    model = SlowStartModel(clock)
+    warm_up(model, SIZES, clock)
+    for b in SIZES:
+        t0 = clock()
+        with torch.inference_mode():
+            model(torch.randn(b, FEATURES))
+        took = clock() - t0
+        true(took < 100, f"after warm-up, a request with batch size {b} still took {took} ms: that shape was not warmed up")
+
+@check("warm-up runs in eval mode and inside inference_mode, with inputs of shape (B, 4)")
+def _():
+    clock = FakeClock()
+    model = SlowStartModel(clock)
+    model.train()
+    warm_up(model, SIZES, clock)
+    true(len(model.log) >= len(SIZES), f"the model was called only {len(model.log)} times; every batch size needs at least one run")
+    for e in model.log:
+        true(e["shape"][1:] == (FEATURES,), f"the input shape was {e['shape']}, expected (B, {FEATURES})")
+        true(not e["training"], "the model was still in train mode during warm-up: call model.eval() first")
+        true(e["inference"], "the warm-up forward pass is not inside torch.inference_mode()")
+    true(sorted({e["shape"][0] for e in model.log}) == SIZES, "warm-up used the wrong batch sizes")
+--- hints
+- One dict and one for loop; wrap the loop in `with torch.inference_mode():`.
+- For each B: `t0 = clock()`, `model(torch.zeros(b, FEATURES))`, `took[b] = clock() - t0`.
+
+@@ item d22-06
+type: code
+title: Write a model service from scratch
+level: 2
+cards: Service skeleton: load the model once at start-up; Warm-up: be ready before taking requests; FastAPI and TestClient: test without opening a port
+targets: create_app
+ref: day22
+--- context
+"Wrap this model in an API" is one of the most common tasks in ML engineering interviews and jobs. Load once, eval, warm up, a health check, input checks: none of them may be missing.
+--- prompt
+Write `create_app(load_model)`, which returns a FastAPI app:
+
+1. At start-up (that is, when `create_app` is called): call `load_model()` **once** to get the model; call `model.eval()`; then warm up: run `model(torch.zeros(1, FEATURES))` once inside `torch.inference_mode()`.
+2. `GET /health` answers `{"status": "ok"}`.
+3. `POST /predict`: check the body with `PredictRequest` (already prepared: `rows` is 1 to 32 rows of 4 finite numbers). Compute the softmax probabilities inside `torch.inference_mode()` and answer `{"labels": [...], "probs": [[...], ...]}`: `probs` holds the probabilities of the 3 classes for each row, `labels` the name of the most likely class for each row (the names are in `LABELS`).
+
+Names you can use directly: `FastAPI`, `torch`, `PredictRequest`, `LABELS`, `FEATURES`.
+--- starter
+def create_app(load_model):
+    raise todo()
+--- solution
+def create_app(load_model):
+    model = load_model()                         # load once at start-up
+    model.eval()                                 # Dropout off
+    with torch.inference_mode():                 # warm-up: do not make the first user wait
+        model(torch.zeros(1, FEATURES))
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict(req: PredictRequest):            # if pydantic's check fails, FastAPI answers 422 by itself
+        x = torch.tensor(req.rows, dtype=torch.float32)
+        with torch.inference_mode():             # the handler runs in another thread: switch autograd off here
+            probs = model(x).softmax(-1)
+        return {"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}
+
+    return app
+--- tests
+ROWS = [[5.1, 3.5, 1.4, 0.2], [6.7, 3.0, 5.2, 2.3], [5.9, 3.0, 4.2, 1.5]]
+
+@check('/health answers 200 and {"status": "ok"}')
+def _():
+    client = TestClient(create_app(CountingLoader()))
+    r = client.get("/health")
+    true(r.status_code == 200, f"/health answered {r.status_code}")
+    true(r.json() == {"status": "ok"}, f"/health answered {r.json()}")
+
+@check("/predict answers with the right labels and probs")
+def _():
+    client = TestClient(create_app(CountingLoader()))
+    r = client.post("/predict", json={"rows": ROWS})
+    true(r.status_code == 200, f"/predict answered {r.status_code}: {r.text[:200]}")
+    body = r.json()
+    true("probs" in body and "labels" in body, f"the JSON should have two fields, labels and probs; yours has {list(body)}")
+    want = reference_probs(ROWS)
+    eq(torch.tensor(body["probs"]), want, tol=1e-5, msg="wrong probs: expected eval-mode softmax probabilities, shape (rows, 3)")
+    true(body["labels"] == [LABELS[i] for i in want.argmax(-1).tolist()], f"wrong labels: {body['labels']}")
+
+@check("bad requests get 422")
+def _():
+    client = TestClient(create_app(CountingLoader()), raise_server_exceptions=False)
+    bad = [{"rows": [[1.0, 2.0, 3.0]]}, {"rows": []}, {"rows": [["a", 1.0, 2.0, 3.0]]},
+           {"x": [[1.0, 2.0, 3.0, 4.0]]}, {"rows": [[0.0] * 4] * 33}]
+    for body in bad:
+        r = client.post("/predict", json=body)
+        true(r.status_code == 422, f"the request {str(body)[:60]} got {r.status_code}, expected 422. Write the handler's parameter as req: PredictRequest.")
+
+@check("the model is loaded once, before the first request")
+def _():
+    loader = CountingLoader()
+    client = TestClient(create_app(loader))
+    true(loader.calls == 1, f"when create_app returned, the model had been loaded {loader.calls} times, expected 1")
+    for _ in range(3):
+        client.post("/predict", json={"rows": ROWS})
+    true(loader.calls == 1, f"after 3 requests the model had been loaded {loader.calls} times; it should stay at 1")
+
+@check("warmed up before going live; requests run in eval mode and inside inference_mode")
+def _():
+    loader = CountingLoader()
+    client = TestClient(create_app(loader))
+    true(loader.calls >= 1, "create_app never calls load_model()")
+    log = loader.models[0].log
+    true(len(log) >= 1, "when create_app returned, the model had never run: no warm-up")
+    true(not log[0]["training"] and log[0]["inference"], "warm-up also belongs in eval mode and inside torch.inference_mode(): call model.eval() first, then warm up")
+    client.post("/predict", json={"rows": ROWS})
+    last = log[-1]
+    true(not last["training"], "while handling the request, the model was in train mode")
+    true(last["inference"], "the request's forward pass is not inside torch.inference_mode() (it must be inside the handler)")
+--- hints
+- Structure: in `create_app`, load, eval and warm up first; then `app = FastAPI()`; define two functions with `@app.get` / `@app.post`; finally `return app`.
+- Write `/predict`'s parameter as `req: PredictRequest`; `x = torch.tensor(req.rows, dtype=torch.float32)`.
+- Return `{"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}`.
+
+@@ item d22-07
+type: fix
+title: Errors still answer 200
+level: 2
+cards: Status codes, queue limits and timeouts; Warm-up: be ready before taking requests
+targets: create_status_app
+ref: day22
+--- context
+Answer 200 plus `{"error": ...}` on failure and the client treats it as a success, the load balancer keeps sending traffic to a server that is not ready, and the error rate on the dashboard stays at 0. Status codes are the contract between a service and the rest of the world.
+--- prompt
+`create_status_app(state)` builds a service. `state.ready` says whether loading and warm-up are done (it changes from False to True while the service runs); `state.predict(rows)` returns a list of probabilities and may raise.
+
+Right now it answers 200 whatever happens. Change it:
+
+- `GET /health`: 200 and `{"status": "ok"}` when ready; **503** when not ready.
+- `POST /predict`: when not ready, **503** with a `Retry-After` header (for example `"5"`: try again in 5 seconds).
+- When `state.predict` raises, answer **500**, and the response must **not** contain the exception's text (it may hold file paths or GPU memory details); later requests work as usual.
+- Everything else as before: 200 and `{"probs": ...}`.
+
+Use `raise HTTPException(status_code=..., detail=..., headers=...)`.
+--- starter
+def create_status_app(state):
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        if not state.ready:
+            return {"status": "loading"}
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict(req: PredictRequest):
+        if not state.ready:
+            return {"error": "model is loading"}
+        try:
+            probs = state.predict(req.rows)
+        except Exception as e:
+            return {"error": str(e)}
+        return {"probs": probs}
+
+    return app
+--- solution
+def create_status_app(state):
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        if not state.ready:                      # readiness: not ready, so the load balancer must not send traffic
+            raise HTTPException(status_code=503, detail="loading", headers={"Retry-After": "5"})
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict(req: PredictRequest):
+        if not state.ready:
+            raise HTTPException(status_code=503, detail="model is loading", headers={"Retry-After": "5"})
+        try:
+            probs = state.predict(req.rows)
+        except Exception:
+            # a real service logs here: logger.exception("predict failed"); the details stay on the server
+            raise HTTPException(status_code=500, detail="internal error")
+        return {"probs": probs}
+
+    return app
+--- tests
+ROWS = [[5.1, 3.5, 1.4, 0.2]]
+SECRET = "CUDA out of memory (weights: /srv/models/iris-v3/model.pt)"
+
+def _predict(rows):
+    if rows[0][0] == 999:
+        raise RuntimeError(SECRET)
+    return reference_probs(rows).tolist()
+
+def _client(ready):
+    state = ServiceState(_predict, ready=ready)
+    return state, TestClient(create_status_app(state), raise_server_exceptions=False)
+
+@check("ready: /health and /predict both answer 200")
+def _():
+    state, client = _client(ready=True)
+    r = client.get("/health")
+    true(r.status_code == 200 and r.json() == {"status": "ok"}, f"/health answered {r.status_code} {r.text}")
+    r = client.post("/predict", json={"rows": ROWS})
+    true(r.status_code == 200, f"/predict answered {r.status_code}")
+    eq(torch.tensor(r.json()["probs"]), reference_probs(ROWS), tol=1e-5, msg="wrong probs")
+
+@check("not ready: /health answers 503")
+def _():
+    state, client = _client(ready=False)
+    r = client.get("/health")
+    true(r.status_code == 503, f"the model is still loading, yet /health answered {r.status_code}. Load balancers only look at the status code: answer 200 and they send traffic.")
+    state.ready = True
+    r = client.get("/health")
+    true(r.status_code == 200, f"once state.ready is True, /health should answer 200; yours answered {r.status_code}")
+
+@check("not ready: /predict answers 503 with Retry-After")
+def _():
+    state, client = _client(ready=False)
+    r = client.post("/predict", json={"rows": ROWS})
+    true(r.status_code == 503, f"the model is not ready, and /predict answered {r.status_code}, expected 503")
+    ra = r.headers.get("retry-after")
+    true(ra is not None and ra.strip().isdigit() and int(ra) > 0, f"a 503 should carry a Retry-After header (a positive whole number of seconds); yours is {ra!r}")
+
+@check("model error: answers 500, leaks no details, keeps working")
+def _():
+    state, client = _client(ready=True)
+    r = client.post("/predict", json={"rows": [[999, 1.0, 1.0, 1.0]]})
+    true(r.status_code == 500, f"the model raised an exception, yet the answer was {r.status_code}, expected 500")
+    true("/srv/models" not in r.text and "out of memory" not in r.text, f"the exception's text was sent to the client: {r.text}. Details go to the server's log; the client only gets internal error.")
+    r = client.post("/predict", json={"rows": ROWS})
+    true(r.status_code == 200, f"after one error, a normal request got {r.status_code}")
+--- hints
+- Replace every `return {"error": ...}` with `raise HTTPException(...)`; the same goes for /health when not ready.
+- 503: `raise HTTPException(status_code=503, detail="model is loading", headers={"Retry-After": "5"})`.
+- 500: inside `except Exception:`, `raise HTTPException(status_code=500, detail="internal error")`; do not put `str(e)` in it.
+
+@@ item d22-08
+type: code
+title: One model, one queue: 503 when full, 504 when too late
+level: 2
+cards: Status codes, queue limits and timeouts
+targets: RequestQueue
+ref: day22
+--- context
+One GPU, one model: when requests come in faster than it computes, they queue up. Without a limit on the queue, every request waits until it times out at peak hours; and requests that waited too long still get computed, so the GPU spends its time on results nobody wants.
+--- prompt
+Complete the two methods of `RequestQueue`. The GPU holds a single model `model_fn` that computes one request at a time; requests wait in the list `self.waiting`.
+
+Each request is a `Ticket` (already prepared): `Ticket(x, arrived)`, with `.x`, `.arrived` (arrival time in milliseconds), `.status` (None means still waiting) and `.result`.
+
+- `submit(x)`: record the arrival time with `self.clock()`, create a Ticket and return it. If `max_waiting` requests are already waiting, **do not queue it**; set its status to **503** right away.
+- `run_next()`: take the oldest waiting request (first come, first served); return `None` if the queue is empty.
+  - If it has waited more than `timeout_ms` (`clock() - arrived > timeout_ms`): set status **504** and **do not call the model** (the client stopped waiting long ago).
+  - Otherwise call `model_fn(x)`: on success store the output in `result` and set status **200**; if it raises, set status **500** and keep the queue working.
+  - Return the Ticket.
+
+`clock` is the fake clock `FakeClock`; the test uses it to control time without sleeping.
+--- starter
+class RequestQueue:
+    def __init__(self, model_fn, clock, max_waiting=4, timeout_ms=100):
+        self.model_fn = model_fn
+        self.clock = clock              # clock() returns the current time (ms)
+        self.max_waiting = max_waiting
+        self.timeout_ms = timeout_ms
+        self.waiting = []               # waiting Tickets, oldest first
+
+    def submit(self, x):
+        raise todo()
+
+    def run_next(self):
+        raise todo()
+--- solution
+class RequestQueue:
+    def __init__(self, model_fn, clock, max_waiting=4, timeout_ms=100):
+        self.model_fn = model_fn
+        self.clock = clock              # clock() returns the current time (ms)
+        self.max_waiting = max_waiting
+        self.timeout_ms = timeout_ms
+        self.waiting = []               # waiting Tickets, oldest first
+
+    def submit(self, x):
+        t = Ticket(x, self.clock())
+        if len(self.waiting) >= self.max_waiting:
+            t.status = 503              # queue full: reject at once, never let the queue grow without limit
+        else:
+            self.waiting.append(t)
+        return t
+
+    def run_next(self):
+        if not self.waiting:
+            return None
+        t = self.waiting.pop(0)         # first come, first served
+        if self.clock() - t.arrived > self.timeout_ms:
+            t.status = 504              # the client gave up long ago: do not waste the GPU
+            return t
+        try:
+            t.result = self.model_fn(t.x)
+            t.status = 200
+        except Exception:
+            t.status = 500              # this one failed; the queue carries on
+        return t
+--- tests
+def _model():
+    calls = []
+
+    def model_fn(x):
+        calls.append(x)
+        if x[0] < 0:
+            raise RuntimeError("bad input")
+        return x * 2
+
+    return model_fn, calls
+
+def _x(v):
+    return torch.full((4,), float(v))
+
+@check("first come, first served; the result goes into the Ticket")
+def _():
+    model_fn, calls = _model()
+    q = RequestQueue(model_fn, FakeClock())
+    tickets = [q.submit(_x(i)) for i in (1, 2, 3)]
+    true(all(t is not None and t.status is None for t in tickets), "a request that was just submitted should be waiting: submit must return a Ticket whose status is still None")
+    for i in (1, 2, 3):
+        t = q.run_next()
+        true(t is tickets[i - 1], f"run_next call {i} did not take request {i}: serve the oldest first and return that Ticket")
+        true(t.status == 200, f"a request that was computed normally should have status 200; yours has {t.status}")
+        eq(t.result, _x(i) * 2, msg="result should be what model_fn(x) returned")
+    true(q.run_next() is None, "the queue is empty, so run_next should return None")
+
+@check("queue full: answers 503 at once and does not queue")
+def _():
+    model_fn, calls = _model()
+    q = RequestQueue(model_fn, FakeClock(), max_waiting=2)
+    a, b, c = q.submit(_x(1)), q.submit(_x(2)), q.submit(_x(3))
+    true(c is not None and c.status == 503, f"2 requests were already waiting (max_waiting=2), so the 3rd should get 503 at once; it has {getattr(c, 'status', None)}")
+    true(a.status is None and b.status is None, "the first two requests should still be waiting")
+    true(len(q.waiting) == 2, f"a rejected request must not be queued: waiting holds {len(q.waiting)}")
+    q.run_next()
+    d = q.submit(_x(4))
+    true(d.status is None and len(q.waiting) == 2, "once a place is free, a new request should be queued")
+    true(len(calls) == 1, f"the model was called {len(calls)} times: only requests taken by run_next go to the model")
+
+@check("waited too long: answers 504 without calling the model")
+def _():
+    model_fn, calls = _model()
+    clock = FakeClock()
+    q = RequestQueue(model_fn, clock, timeout_ms=100)
+    a = q.submit(_x(1))
+    b = q.submit(_x(2))
+    clock.advance(50)
+    q.run_next()
+    true(a.status == 200, f"a request that waited 50 ms (limit 100 ms) should be served normally; its status is {a.status}")
+    clock.advance(100)
+    t = q.run_next()
+    true(t is b and b.status == 504, f"a request that waited 150 ms should get 504; its status is {b.status}")
+    true(len(calls) == 1, f"the model was called {len(calls)} times: a request that timed out must not go to the model")
+
+@check("model error: answers 500 and the queue keeps working")
+def _():
+    model_fn, calls = _model()
+    q = RequestQueue(model_fn, FakeClock())
+    bad, good = q.submit(_x(-1)), q.submit(_x(5))
+    q.run_next()
+    true(bad.status == 500, f"model_fn raised, so the status should be 500; yours is {bad.status}")
+    q.run_next()
+    true(good.status == 200, f"after one error the next request should be served normally; its status is {good.status}")
+--- hints
+- `submit`: `t = Ticket(x, self.clock())`; if full, `t.status = 503`, otherwise `self.waiting.append(t)`; then `return t`.
+- `run_next`: `t = self.waiting.pop(0)` takes the oldest; check the timeout first, then call the model inside `try / except Exception`.
+
+@@ item d22-09
+type: code
+title: Compute p50, p95, p99 (nearest-rank)
+level: 2
+cards: Latency percentiles: p50, p95, p99
+targets: latency_report
+ref: day22
+--- context
+The standard answer to "how fast is this service?" is p50 / p95 / p99, not the average, and service promises (SLOs) are written in p99. Computing them yourself tells you where the numbers on the dashboard come from.
+--- prompt
+Write `latency_report(times_ms)`: `times_ms` is a list of latencies (milliseconds, at least one, not sorted). Return `{"p50": ..., "p95": ..., "p99": ...}` using the **nearest-rank** method:
+
+1. sort from small to large; there are n values;
+2. for q = 50, 95, 99 compute k = ⌈q × n / 100⌉ (round up, `math.ceil`);
+3. the answer is the k-th value of the sorted list (counting from 1, so `s[k - 1]`).
+
+Do not use `numpy.percentile` / `torch.quantile` (by default they interpolate linearly, which gives different numbers). Do not change the list you are given.
+--- starter
+import math
+
+def latency_report(times_ms):
+    raise todo()
+--- solution
+import math
+
+def latency_report(times_ms):
+    s = sorted(times_ms)                 # sorted returns a new list and leaves the given one alone
+    n = len(s)
+
+    def pick(q):
+        k = math.ceil(q * n / 100)       # multiply first, then divide: avoids floating-point error
+        return s[max(k, 1) - 1]          # value number k (counting from 1)
+
+    return {"p50": pick(50), "p95": pick(95), "p99": pick(99)}
+--- tests
+def _shuffled(values):
+    return [values[i] for i in torch.randperm(len(values)).tolist()]
+
+def _expect(times, want, why=""):
+    got = latency_report(times)
+    true(isinstance(got, dict), f"should return a dict, you returned a {type(got).__name__}")
+    for key in ("p50", "p95", "p99"):
+        true(key in got, f"{key!r} is missing from the returned dict")
+        true(close(got[key], want[key]), f"{key}: yours is {got[key]}, expected {want[key]}. {why}")
+
+@check("1 to 100: p50 = 50, p95 = 95, p99 = 99")
+def _():
+    _expect(_shuffled(list(range(1, 101))), {"p50": 50, "p95": 95, "p99": 99},
+            "Sort first; k = math.ceil(q * n / 100), take s[k - 1].")
+
+@check("20 requests with two slow ones in the tail")
+def _():
+    times = _shuffled([12.0] * 9 + [15.0] * 9 + [200.0, 900.0])
+    _expect(times, {"p50": 15.0, "p95": 200.0, "p99": 900.0},
+            "n = 20: p50 takes value number 10, p95 number 19, p99 number 20. If you got 235.0 or 767.0, that is linear interpolation (the numpy / torch.quantile default); this item wants nearest-rank.")
+
+@check("with a single value, all three are that value")
+def _():
+    _expect([42.0], {"p50": 42.0, "p95": 42.0, "p99": 42.0})
+
+@check("the given list is not changed")
+def _():
+    times = [30.0, 10.0, 20.0]
+    latency_report(times)
+    true(times == [30.0, 10.0, 20.0], f"the given list was changed to {times}: use sorted(...), not .sort()")
+--- hints
+- `s = sorted(times_ms)`, `n = len(s)`.
+- For each q: `k = math.ceil(q * n / 100)`, take `s[k - 1]`.
+
+@@ item d22-10
+type: choice
+title: Is a bigger batch always better?
+level: 2
+cards: Throughput vs latency: micro-batching
+--- context
+"How do we raise throughput?" and "why did p99 go up?" often have the same answer: the batch size. Interviewers want to hear you explain how it trades throughput against latency.
+--- prompt
+On one GPU, the model needs 10 + 1 × B milliseconds for a batch of B rows (compute only, no queueing). Which statements are **true**? (Several may be.)
+--- options
+- With B = 1, this GPU handles at most about 91 requests per second.
+- Raising B from 1 to 32 makes each request's latency shorter.
+- With B = 32, throughput is about 762 requests per second, more than 8 times that of B = 1.
+- With a large enough B, throughput can grow without limit.
+- If one batch may take at most 30 ms of compute, the largest allowed B is 20.
+answer: 1,3,5
+--- explain
+Statement 1 is true: a batch of 1 row takes 11 ms, and 1000 / 11 ≈ 91.
+
+Statement 2 is false: a batch of 32 rows takes 42 ms, and every request in the batch waits for the whole batch, so each request waits at least 42 ms instead of 11 ms. In practice you also wait while the batch fills up.
+
+Statement 3 is true: 32 × 1000 / 42 ≈ 762, and 762 / 91 ≈ 8.4.
+
+Statement 4 is false: every row costs at least 1 ms, so the ceiling is about 1000 per second; a bigger B only gets closer to it.
+
+Statement 5 is true: 10 + 20 = 30 ms. Any bigger B goes over.
+--- hints
+- Throughput = rows per batch × 1000 / milliseconds per batch.
+- A request's latency is at least the compute time of the batch it is in.
+
+@@ item d22-11
+type: code
+title: Micro-batching: wait for N requests or T milliseconds
+level: 3
+cards: Throughput vs latency: micro-batching
+targets: MicroBatcher
+ref: day22
+--- context
+A GPU computes 32 rows in about the same time as 1 row, so almost every inference server groups single requests into batches (Triton and TorchServe have it built in). Interviews often ask: how many to collect, how long to wait, and when the waiting starts.
+--- prompt
+Complete `MicroBatcher` (`__init__` is written):
+
+- `submit(x)`: `x` is one request's input, shape (4,). Create a `Ticket(x, self.clock())`, append it to `self.pending` and return it. If `pending` now holds `max_batch` requests, call `flush()` **at once**.
+- `poll()`: the server loop calls it all the time. If `pending` is not empty and the **oldest** request has waited `max_wait_ms` or longer (`clock() - arrived >= max_wait_ms`), call `flush()`.
+- `flush()`: take all requests out of `pending` (it becomes empty), stack their inputs with `torch.stack` into (B, 4), call `run_batch` **only once** to get B output rows, and give row i to Ticket i: `ticket.result = out[i]`, `ticket.status = 200`. If `pending` is empty, do nothing.
+
+In the tests, `run_batch` records the size of every batch and `clock` is a `FakeClock`.
+--- starter
+class MicroBatcher:
+    def __init__(self, run_batch, max_batch, max_wait_ms, clock):
+        self.run_batch = run_batch      # (B, 4) -> B output rows; handles a whole batch at once
+        self.max_batch = max_batch
+        self.max_wait_ms = max_wait_ms
+        self.clock = clock              # clock() returns the current time (ms)
+        self.pending = []               # Tickets waiting for a batch, oldest first
+
+    def submit(self, x):
+        raise todo()
+
+    def poll(self):
+        raise todo()
+
+    def flush(self):
+        raise todo()
+--- solution
+class MicroBatcher:
+    def __init__(self, run_batch, max_batch, max_wait_ms, clock):
+        self.run_batch = run_batch      # (B, 4) -> B output rows; handles a whole batch at once
+        self.max_batch = max_batch
+        self.max_wait_ms = max_wait_ms
+        self.clock = clock              # clock() returns the current time (ms)
+        self.pending = []               # Tickets waiting for a batch, oldest first
+
+    def submit(self, x):
+        t = Ticket(x, self.clock())
+        self.pending.append(t)
+        if len(self.pending) >= self.max_batch:
+            self.flush()                # the batch is full: run it now
+        return t
+
+    def poll(self):
+        # measure the wait from the OLDEST request; measured from the newest, a steady stream never runs
+        if self.pending and self.clock() - self.pending[0].arrived >= self.max_wait_ms:
+            self.flush()
+
+    def flush(self):
+        if not self.pending:
+            return
+        batch, self.pending = self.pending, []
+        out = self.run_batch(torch.stack([t.x for t in batch]))   # one model call for the whole batch
+        for t, y in zip(batch, out):
+            t.result = y                # row i goes back to request i
+            t.status = 200
+--- tests
+def _setup(max_batch=4, max_wait_ms=10):
+    clock = FakeClock()
+    rec = BatchRecorder(lambda xb: xb * 2 + 1)
+    return clock, rec, MicroBatcher(rec, max_batch=max_batch, max_wait_ms=max_wait_ms, clock=clock)
+
+@check("max_batch requests: run a batch at once")
+def _():
+    clock, rec, b = _setup(max_batch=4)
+    for i in range(3):
+        b.submit(torch.full((4,), float(i)))
+    true(rec.sizes == [], f"with only 3 requests (max_batch=4) the model was already called: batch sizes {rec.sizes}")
+    b.submit(torch.full((4,), 3.0))
+    true(rec.sizes == [4], f"the 4th request arrived, so a batch of 4 should run at once; the batch sizes are {rec.sizes}")
+    true(len(b.pending) == 0, "pending should be empty after the batch ran")
+
+@check("not full: run when the oldest request has waited max_wait_ms")
+def _():
+    clock, rec, b = _setup(max_batch=4, max_wait_ms=10)
+    for i in range(3):
+        b.submit(torch.full((4,), float(i)))
+    b.poll()
+    true(rec.sizes == [], "it ran after 0 ms")
+    clock.advance(9)
+    b.poll()
+    true(rec.sizes == [], "it ran after 9 ms, but max_wait_ms is 10")
+    clock.advance(1)
+    b.poll()
+    true(rec.sizes == [3], f"after 10 ms these 3 requests should run as one batch; the batch sizes are {rec.sizes}")
+    b.poll()
+    true(rec.sizes == [3], "pending is empty, so poll must not call the model again")
+
+@check("the wait is measured from the oldest request")
+def _():
+    clock, rec, b = _setup(max_batch=8, max_wait_ms=10)
+    for t in (0, 3, 6, 9):                       # a steady stream of requests, gaps below 10 ms
+        clock.now = t
+        b.poll()
+        b.submit(torch.full((4,), float(t)))
+    clock.now = 10
+    b.poll()
+    true(rec.sizes == [4], f"at 10 ms the oldest request has waited 10 ms, so a batch of 4 should run; the batch sizes are {rec.sizes}. Measured from the newest request, a steady stream never runs.")
+
+@check("every request gets its own row of the result")
+def _():
+    clock, rec, b = _setup(max_batch=3, max_wait_ms=10)
+    xs = [torch.randn(4) for _ in range(5)]
+    tickets = [b.submit(x) for x in xs]
+    clock.advance(10)
+    b.poll()
+    true(rec.sizes == [3, 2], f"5 requests (max_batch=3) should run as two batches [3, 2]; got {rec.sizes}")
+    for i, (x, t) in enumerate(zip(xs, tickets)):
+        true(t is not None and t.status == 200, f"request {i} got no result (status should be 200)")
+        eq(t.result, x * 2 + 1, msg=f"request {i} did not get its own row")
+--- hints
+- `submit`: create the Ticket, `append` it, `if len(self.pending) >= self.max_batch: self.flush()`, `return t`.
+- `poll`: look at `self.pending[0].arrived` (the oldest), not `self.pending[-1]`.
+- `flush`: `batch, self.pending = self.pending, []`; `out = self.run_batch(torch.stack([t.x for t in batch]))`; then hand each row back with `zip(batch, out)`.
+
+@@ item d22-12
+type: choice
+title: Tuning the two micro-batching knobs
+level: 2
+cards: Throughput vs latency: micro-batching; Latency percentiles: p50, p95, p99
+--- context
+Set `max_batch` and `max_wait_ms` badly and you either add latency for nothing or leave the GPU half idle. Before going live, you should be able to explain what they do at a given traffic level.
+--- prompt
+A micro-batcher is set to `max_batch = 16` and `max_wait_ms = 20`. Which statements are **true**? (Several may be.)
+--- options
+- With little traffic (one request every 100 ms), almost every batch holds 1 request, and each request waits about 20 ms for nothing.
+- With heavy traffic (one request every 0.5 ms), 16 requests arrive within about 7.5 ms, so `max_wait_ms` hardly matters.
+- Raising `max_wait_ms` always raises throughput.
+- Measuring the wait from the newest request in the queue is fairer to all requests.
+- With little traffic and a strict latency target, you can lower `max_wait_ms`, even to 0.
+answer: 1,2,5
+--- explain
+Statement 1 is true: with one request every 100 ms, no second request arrives within 20 ms, so each batch holds 1 request that waited an extra 20 ms.
+
+Statement 2 is true: after the first request, 15 more arrive in 15 × 0.5 = 7.5 ms, so the batch is full long before 20 ms.
+
+Statement 3 is false: with little traffic, throughput is simply the arrival rate and the GPU is idle anyway, so waiting longer only adds latency; with heavy traffic, batches are already full, so waiting longer changes nothing. Waiting a bit longer only helps when the GPU cannot keep up and batches are not full.
+
+Statement 4 is false: measured from the newest request, the timer restarts with every arrival, and the oldest request may wait forever while requests keep coming.
+
+Statement 5 is true: with `max_wait_ms = 0` a request runs as soon as it is in the queue, which gives the lowest latency. The price is smaller batches and a less efficient GPU, which does not matter much when traffic is light.
+--- hints
+- Ask yourself: how many requests arrive within 20 ms?
+- Throughput can never be higher than the rate at which requests arrive.
+
+@@ item d22-13
+type: local
+title: Run the service for real with uvicorn
+level: 1
+cards: Service skeleton: load the model once at start-up; FastAPI and TestClient: test without opening a port
+verify: "labels"\s*:\s*\[\s*"(setosa|versicolor|virginica)"\s*\]\s*,\s*"probs"\s*:\s*\[\s*\[
+placeholder: {"status":"ok"} and {"labels":["..."],"probs":[[...]]}
+--- context
+TestClient tests the app itself. In production, an ASGI server (uvicorn) sits in front of it and listens on a port. Run it once yourself and send requests with curl from another terminal, and the whole path becomes clear.
+--- prompt
+Do this on your own machine (your Python environment needs torch and fastapi):
+
+1. Check for uvicorn: `python -m uvicorn --version`. If it is missing: `python -m pip install uvicorn`.
+2. Make a new folder and create `serve22.py` in it with the content below. Paste the `create_app` you wrote in d22-06 where the comment says.
+
+```
+from typing import Annotated
+
+import torch
+import torch.nn as nn
+from fastapi import FastAPI
+from pydantic import BaseModel, Field, FiniteFloat
+
+FEATURES = 4
+LABELS = ["setosa", "versicolor", "virginica"]
+Row = Annotated[list[FiniteFloat], Field(min_length=FEATURES, max_length=FEATURES)]
+
+
+class PredictRequest(BaseModel):
+    rows: list[Row] = Field(min_length=1, max_length=32)
+
+
+def load_model():
+    torch.manual_seed(22)
+    return nn.Sequential(nn.Linear(FEATURES, 16), nn.ReLU(), nn.Dropout(0.3), nn.Linear(16, 3))
+
+
+# ---- paste your create_app from d22-06 here ----
+
+
+app = create_app(load_model)
+```
+
+3. Start the service from that folder: `python -m uvicorn serve22:app --port 8022`. Wait until it prints `Application startup complete`.
+4. In the same folder, create `req.json` containing `{"rows": [[5.1, 3.5, 1.4, 0.2]]}`.
+5. Open a second terminal, go to the folder and send two requests (in Windows PowerShell write `curl.exe`, because there `curl` is an alias for a different command; on Mac / Linux write `curl`):
+   - `curl.exe -s http://127.0.0.1:8022/health`
+   - `curl.exe -s -X POST http://127.0.0.1:8022/predict -H "Content-Type: application/json" -d "@req.json"`
+6. Optional: change the row in `req.json` to 3 numbers, send it again and read the `detail` of the 422; open `http://127.0.0.1:8022/docs` in a browser to see the API docs FastAPI generates for you.
+7. Stop the service with Ctrl+C in its terminal. Paste the output of the two requests from step 5 below.
+--- hints
+- `Error loading ASGI app. Could not import module "serve22"`: the terminal's current folder is not the one that holds `serve22.py`.
+- The port is already in use: replace both 8022s with another number, such as 8123.
+- `/predict` answers 422: check that `req.json` is valid JSON (double quotes, 4 numbers per row).
+
+@@ item d22-14
+type: code
+title: Closed book: a model service
+level: 2
+exam: yes
+cards: Service skeleton: load the model once at start-up; Warm-up: be ready before taking requests; FastAPI and TestClient: test without opening a port
+targets: create_app
+ref: day22
+--- context
+Load once, eval, warm up, /health, and a /predict with input checks: this is the skeleton of every model service. Write it without looking, and "wrap this model in an API, live" in an interview will not scare you.
+--- prompt
+Write `create_app(load_model)`, which returns a FastAPI app:
+
+1. At start-up, call `load_model()` **once**; call `model.eval()`; warm up once with `torch.zeros(1, FEATURES)` inside `torch.inference_mode()`.
+2. `GET /health` answers `{"status": "ok"}`.
+3. `POST /predict`: check the body with `PredictRequest`; compute softmax probabilities inside `torch.inference_mode()`; answer `{"labels": [most likely class name per row], "probs": [[3 probabilities], ...]}`, with class names from `LABELS`.
+
+Names you can use directly: `FastAPI`, `torch`, `PredictRequest`, `LABELS`, `FEATURES`.
+--- starter
+def create_app(load_model):
+    raise todo()
+--- solution
+def create_app(load_model):
+    model = load_model()                         # load once at start-up
+    model.eval()                                 # Dropout off
+    with torch.inference_mode():                 # warm-up: do not make the first user wait
+        model(torch.zeros(1, FEATURES))
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict(req: PredictRequest):            # if pydantic's check fails, FastAPI answers 422 by itself
+        x = torch.tensor(req.rows, dtype=torch.float32)
+        with torch.inference_mode():             # the handler runs in another thread: switch autograd off here
+            probs = model(x).softmax(-1)
+        return {"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}
+
+    return app
+--- tests
+ROWS = [[5.1, 3.5, 1.4, 0.2], [6.7, 3.0, 5.2, 2.3], [5.9, 3.0, 4.2, 1.5]]
+
+@check('/health answers 200 and {"status": "ok"}')
+def _():
+    client = TestClient(create_app(CountingLoader()))
+    r = client.get("/health")
+    true(r.status_code == 200, f"/health answered {r.status_code}")
+    true(r.json() == {"status": "ok"}, f"/health answered {r.json()}")
+
+@check("/predict answers with the right labels and probs")
+def _():
+    client = TestClient(create_app(CountingLoader()))
+    r = client.post("/predict", json={"rows": ROWS})
+    true(r.status_code == 200, f"/predict answered {r.status_code}: {r.text[:200]}")
+    body = r.json()
+    true("probs" in body and "labels" in body, f"the JSON should have two fields, labels and probs; yours has {list(body)}")
+    want = reference_probs(ROWS)
+    eq(torch.tensor(body["probs"]), want, tol=1e-5, msg="wrong probs: expected eval-mode softmax probabilities, shape (rows, 3)")
+    true(body["labels"] == [LABELS[i] for i in want.argmax(-1).tolist()], f"wrong labels: {body['labels']}")
+
+@check("bad requests get 422")
+def _():
+    client = TestClient(create_app(CountingLoader()), raise_server_exceptions=False)
+    bad = [{"rows": [[1.0, 2.0, 3.0]]}, {"rows": []}, {"rows": [["a", 1.0, 2.0, 3.0]]},
+           {"x": [[1.0, 2.0, 3.0, 4.0]]}, {"rows": [[0.0] * 4] * 33}]
+    for body in bad:
+        r = client.post("/predict", json=body)
+        true(r.status_code == 422, f"the request {str(body)[:60]} got {r.status_code}, expected 422. Write the handler's parameter as req: PredictRequest.")
+
+@check("the model is loaded once, before the first request")
+def _():
+    loader = CountingLoader()
+    client = TestClient(create_app(loader))
+    true(loader.calls == 1, f"when create_app returned, the model had been loaded {loader.calls} times, expected 1")
+    for _ in range(3):
+        client.post("/predict", json={"rows": ROWS})
+    true(loader.calls == 1, f"after 3 requests the model had been loaded {loader.calls} times; it should stay at 1")
+
+@check("warmed up before going live; requests run in eval mode and inside inference_mode")
+def _():
+    loader = CountingLoader()
+    client = TestClient(create_app(loader))
+    true(loader.calls >= 1, "create_app never calls load_model()")
+    log = loader.models[0].log
+    true(len(log) >= 1, "when create_app returned, the model had never run: no warm-up")
+    true(not log[0]["training"] and log[0]["inference"], "warm-up also belongs in eval mode and inside torch.inference_mode(): call model.eval() first, then warm up")
+    client.post("/predict", json={"rows": ROWS})
+    last = log[-1]
+    true(not last["training"], "while handling the request, the model was in train mode")
+    true(last["inference"], "the request's forward pass is not inside torch.inference_mode() (it must be inside the handler)")
+--- hints
+- Order: load → eval → warm up → `app = FastAPI()` → two routes → `return app`.
+- Write `/predict`'s parameter as `req: PredictRequest` and wrap the forward pass in `with torch.inference_mode():`.
+
+@@ item d22-15
+type: code
+title: Closed book: latency report
+level: 2
+exam: yes
+cards: Latency percentiles: p50, p95, p99
+targets: latency_report
+ref: day22
+--- context
+When someone asks "how fast is your service?", you should give p50 / p95 / p99 and say which method you used. Nearest-rank is only a few lines; write it from memory.
+--- prompt
+Write `latency_report(times_ms)`: `times_ms` is a list of latencies (milliseconds, at least one, not sorted). Return `{"p50": ..., "p95": ..., "p99": ...}` with the nearest-rank method: sort, k = ⌈q × n / 100⌉, take value number k (counting from 1).
+
+Do not use `numpy.percentile` / `torch.quantile`; do not change the list you are given.
+--- starter
+import math
+
+def latency_report(times_ms):
+    raise todo()
+--- solution
+import math
+
+def latency_report(times_ms):
+    s = sorted(times_ms)                 # sorted returns a new list and leaves the given one alone
+    n = len(s)
+
+    def pick(q):
+        k = math.ceil(q * n / 100)       # multiply first, then divide: avoids floating-point error
+        return s[max(k, 1) - 1]          # value number k (counting from 1)
+
+    return {"p50": pick(50), "p95": pick(95), "p99": pick(99)}
+--- tests
+def _shuffled(values):
+    return [values[i] for i in torch.randperm(len(values)).tolist()]
+
+def _expect(times, want, why=""):
+    got = latency_report(times)
+    true(isinstance(got, dict), f"should return a dict, you returned a {type(got).__name__}")
+    for key in ("p50", "p95", "p99"):
+        true(key in got, f"{key!r} is missing from the returned dict")
+        true(close(got[key], want[key]), f"{key}: yours is {got[key]}, expected {want[key]}. {why}")
+
+@check("1 to 100: p50 = 50, p95 = 95, p99 = 99")
+def _():
+    _expect(_shuffled(list(range(1, 101))), {"p50": 50, "p95": 95, "p99": 99},
+            "Sort first; k = math.ceil(q * n / 100), take s[k - 1].")
+
+@check("20 requests with two slow ones in the tail")
+def _():
+    times = _shuffled([12.0] * 9 + [15.0] * 9 + [200.0, 900.0])
+    _expect(times, {"p50": 15.0, "p95": 200.0, "p99": 900.0},
+            "n = 20: p50 takes value number 10, p95 number 19, p99 number 20. If you got 235.0 or 767.0, that is linear interpolation (the numpy / torch.quantile default); this item wants nearest-rank.")
+
+@check("with a single value, all three are that value")
+def _():
+    _expect([42.0], {"p50": 42.0, "p95": 42.0, "p99": 42.0})
+
+@check("the given list is not changed")
+def _():
+    times = [30.0, 10.0, 20.0]
+    latency_report(times)
+    true(times == [30.0, 10.0, 20.0], f"the given list was changed to {times}: use sorted(...), not .sort()")
+--- hints
+- Sort with `sorted`; the index is `k - 1`.
+- Compute k with `math.ceil(q * n / 100)`.

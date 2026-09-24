@@ -1,0 +1,1749 @@
+@@ day 26
+title: 毕业项目：从训练到上线
+part: 毕业项目
+hours: 4–5 小时
+--- goal
+把一个小分类模型从数据一路做到上线：开训前检查、固定种子训练、能续训的 checkpoint、导出 ONNX 并对拍、FastAPI 服务、延迟和漂移监控。最后在自己的机器上用一个脚本把六步从头跑到尾。
+--- checklist
+- 先读第一张卡片：看清六步流水线，以及每一步来自前面哪一天
+- 按顺序做练习；卡住了可以先跳到后面一步（每题的隐藏代码里有其他步骤的参考实现）
+- 做第 13 题：在自己的机器上跑 capstone.py，把最后的总结行贴回来
+- 闭卷区从空白重写 checkpoint 和服务
+
+@@ concept
+title: 毕业项目：六步流水线
+ref: day26
+--- body
+今天把前面学过的东西串成一条线：一个很小的分类模型，从造数据一直走到上线和监控。
+
+故事：一台机器有 8 个传感器读数，模型判断它现在是 `ok`（正常）、`overheat`（过热）还是 `vibration`（振动）。数据由 `make_data` 按固定种子造出来，所以每个人拿到的数一模一样。模型 `TinyNet` 已经写好：`Linear(8, 32)` → ReLU → Dropout(0.1) → `Linear(32, 3)`。
+
+六步，每一步都来自前面几天：
+1. 数据 + 开训前检查：可复现的数据、smoke test、过拟合一个 batch（第 14、15、16 天）
+2. 训练：固定种子，CPU 上一两秒，loss 明显下降（第 15、17、18 天）
+3. checkpoint：safetensors 存权重，另存优化器和随机数状态，能续训（第 20 天）
+4. 导出：`torch.onnx.export(..., dynamo=True)`，再用 onnxruntime 对拍（第 21 天）
+5. 服务：FastAPI + pydantic 校验，启动时加载一次、预热一次（第 22 天）
+6. 监控：延迟 p50 / p95 / p99，PSI 漂移检查（第 19、22、25 天）
+
+题目怎么做：每道题只写流水线里的一块。题目的隐藏代码里有**所有步骤的参考实现**；你要写的那个名字会先被删掉，换成你的版本，后面的步骤调用的就是你的版本。所以可以按顺序做，也可以直接跳到你想练的那一步。
+
+第 13 题把六步拼成一个完整的 `capstone.py`，在你自己的机器上跑（有 GPU 就用 GPU），把总结行贴回来。
+--- code
+x, y = make_data(6, seed=0)
+print("x:", tuple(x.shape), x.dtype, "  y:", tuple(y.shape), y.dtype)
+print("labels:", [LABELS[i] for i in y.tolist()])
+torch.manual_seed(0)
+model = TinyNet()
+print(model)
+print("parameters:", sum(p.numel() for p in model.parameters()))
+
+@@ concept
+title: 第 1 步：数据、smoke test、过拟合
+ref: day26
+--- body
+### 可复现的数据
+`make_data(n, seed)` 用自己的 `torch.Generator` 抽随机数：同一个 seed 永远得到同一份数据，而且不碰全局随机数（`torch.manual_seed` 管的那个）。这样「造数据」不会改变后面训练时抽 batch 的顺序（第 18 天：可复现）。
+
+标签必须是 `int64`（long），`F.cross_entropy` 才收（第 16 天）。
+
+### smoke test：开训前一次 forward + backward
+- 输出 shape 对不对：应该是 `(batch, 3)`。
+- 有没有 nan / inf：`torch.isfinite(logits).all()`。
+- 第一个 loss 应该接近 `ln 3 ≈ 1.099`：刚初始化的模型对 3 类差不多一视同仁（第 15 天）。离得很远，通常是初始化或输入的尺度有问题。
+- backward 之后，每个要训练的参数都要有有限的 `.grad`。`grad is None` 说明这个参数根本没接进计算图（第 15 天）。
+
+### 过拟合一个 batch
+只拿 16 条数据反复训练，loss 应该降到接近 0。降不下去，说明代码有 bug，先别去调超参（第 14 天）。
+--- code
+x, y = make_data(16, seed=0)
+torch.manual_seed(0)
+model = TinyNet()
+print("first loss:", round(smoke_test(model, x, y), 3), "  ln 3 =", round(math.log(3), 3))
+losses = overfit_one_batch(model, x, y, steps=200)
+print("overfit 16 rows:", round(losses[0], 3), "->", round(losses[-1], 4))
+
+@@ concept
+title: 第 2 步：固定种子，训练几秒
+ref: day26
+--- body
+训练循环（第 15 天的几个坑都在这里）：
+- 每一步用 `torch.randint(0, len(x), (batch_size,))` 随机抽 64 行 → forward → `F.cross_entropy` → `opt.zero_grad()` → `loss.backward()` → `opt.step()`。
+- 记 `loss.item()`，不要记 `loss` 本身：tensor 会把整张计算图留在内存里（第 19 天）。
+- 一开头先 `model.train()`。`accuracy` 会把模型切到 `eval()`（dropout 关掉）；不切回来，后面的训练就一直没有 dropout（第 17 天）。
+- 优化器由外面建好传进来：续训时要用从 checkpoint 读回来的那个。
+
+固定种子：`torch.manual_seed(0)` 之后再建模型、再训练，同样的代码每次得到一模一样的 loss。这是第 3 步「续训 == 不中断」能对上的前提（第 18 天）。
+
+下面的例子在 CPU 上一两秒就跑完：前 20 步的平均 loss 约 0.75，最后 20 步约 0.18，验证集准确率约 0.95。三类数据本来就有重叠，训再久也到不了 100%。
+--- code
+torch.manual_seed(0)
+x_train, y_train = make_data(2000, seed=1)
+x_val, y_val = make_data(500, seed=2)
+model = TinyNet()
+opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+losses = train_steps(model, opt, x_train, y_train, steps=300)
+print(f"mean loss, first 20 steps: {sum(losses[:20]) / 20:.3f}")
+print(f"mean loss, last 20 steps:  {sum(losses[-20:]) / 20:.3f}")
+print(f"val accuracy: {accuracy(model, x_val, y_val):.3f}")
+
+@@ concept
+title: 第 3 步：能续训的 checkpoint
+ref: day26
+--- body
+训练可能被打断（机器重启、云上的抢占式 GPU 被收回）。能续训的 checkpoint 要做到：「存 → 读 → 接着训」和「一口气训完」得到一模一样的权重（第 20 天）。
+
+存两个文件：
+- `model.safetensors`：只有权重。`save_file(model.state_dict(), 路径)` 存，`load_file(路径)` 读。safetensors 里只有张量，没有可执行的 pickle，读别人给的文件也安全。上线时服务只需要这一个文件。
+- `train_state.pt`：只有续训才用得到的东西：`{"opt": opt.state_dict(), "step": step, "rng": torch.get_rng_state()}`。用 `torch.load(路径, weights_only=True)` 读：只允许张量、数字、列表、字典，不会执行文件里的任意代码。
+
+少存一样会怎样：
+- 没存优化器状态：AdamW 的两个动量（`exp_avg`、`exp_avg_sq`）从 0 重新开始，续训后的每一步都和原来不一样。
+- 没存随机数状态：续训后抽到的 batch、dropout 的 mask 都和不中断时不一样。
+
+两种情况都不报错，loss 也照样下降，只是结果悄悄变了。所以要用测试来证明「续训 == 不中断」。真实项目还会先写临时文件再 `os.replace`，避免写到一半断电留下坏文件（第 20 天）。
+--- code
+import os, tempfile
+from safetensors.torch import load_file
+torch.manual_seed(0)
+x, y = make_data(2000, seed=1)
+model = TinyNet()
+opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+train_steps(model, opt, x, y, steps=10)
+folder = tempfile.mkdtemp()
+save_checkpoint(folder, model, opt, step=10)
+for name in sorted(os.listdir(folder)):
+    print(name, os.path.getsize(os.path.join(folder, name)), "bytes")
+print("weights:", list(load_file(os.path.join(folder, "model.safetensors")).keys()))
+state = torch.load(os.path.join(folder, "train_state.pt"), weights_only=True)
+print("train_state:", list(state.keys()), "  step =", state["step"])
+print("AdamW state of fc1.weight:", list(state["opt"]["state"][0].keys()))
+
+@@ concept
+title: 第 4 步：导出 ONNX 并对拍
+ref: day26
+--- body
+上线时常常不带 PyTorch 训练代码，而是把模型导出成 ONNX 文件，用 onnxruntime 跑（第 21 天）：
+```python
+model.eval()                                # 关掉 dropout：导出的是推理用的图
+torch.onnx.export(model, (torch.randn(2, FEATURES),), "tinynet.onnx", dynamo=True,
+                  input_names=["x"], output_names=["logits"],
+                  dynamic_shapes={"x": {0: "batch"}},   # 第 0 维（batch）可以变
+                  external_data=False,                  # 权重写进同一个文件
+                  verbose=False)                        # 不打印进度
+```
+- 示例输入只用来追踪计算图。它的 batch 是 2；不加 `dynamic_shapes`，导出的文件就只收 batch 2。
+- `dynamic_shapes` 的键是 `forward` 的参数名：`TinyNet.forward(self, x)` 里的 `x`。
+- 不加 `external_data=False`，权重会写进旁边另一个 `.onnx.data` 文件；部署时忘了拷它，模型就加载不了。
+- 导出后一定要对拍：同一批输入，比 onnxruntime 的输出和 eval 模式的 PyTorch 输出的最大绝对差。float32 下一般在 1e-7 到 1e-6 之间，容差取 1e-4。多试几个 batch 大小（1、5、64），证明 batch 维真的可变。
+
+导出要先追踪整个模型，要几秒钟：下面的例子点运行后要等一会儿，导出的两道题时间限制是 120 秒。
+--- code
+import os, tempfile
+import onnxruntime as ort
+torch.manual_seed(0)
+model = TinyNet()
+path = export_onnx(model, os.path.join(tempfile.mkdtemp(), "tinynet.onnx"))
+sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+print("inputs: ", [(i.name, i.shape) for i in sess.get_inputs()])
+print("outputs:", [(o.name, o.shape) for o in sess.get_outputs()])
+for b in (1, 5, 64):
+    x = torch.randn(b, FEATURES)
+    with torch.inference_mode():
+        want = model(x).numpy()
+    got = sess.run(None, {"x": x.numpy()})[0]
+    print(f"batch {b:2d}: max |onnx - torch| = {abs(got - want).max():.1e}")
+
+@@ concept
+title: 第 5 步：做成 FastAPI 服务
+ref: day26
+--- body
+服务的结构（第 22 天）：
+- **启动时加载一次**：`create_app(load_model)` 一开始就调 `load_model()`，拿到一个 `predict` 函数，之后所有请求都用它。每个请求都重新加载模型，是「服务很慢」最常见的原因。
+- **预热一次**：加载完先用一行全 0 的输入调一次 `predict`。第一次调用往往特别慢（分配内存、初始化），别让第一个用户来付这个时间。
+- `GET /health` 返回 `{"status": "ok"}`，给负载均衡和监控用。
+- `POST /predict` 收 `{"rows": [[8 个数], ...]}`，把一个请求里的所有行**一次**送进模型（一个 batch），返回每行的 label 和 3 类的概率。
+
+输入校验交给 pydantic：
+```python
+Row = Annotated[list[FiniteFloat], Field(min_length=FEATURES, max_length=FEATURES)]
+
+class PredictRequest(BaseModel):
+    rows: list[Row] = Field(min_length=1, max_length=MAX_ROWS)
+```
+- `FiniteFloat`：普通的 float，但不收 nan 和 inf。
+- `Annotated[类型, Field(...)]` 给类型加限制；`min_length` / `max_length` 限制列表长度：每行正好 8 个数，一个请求 1 到 64 行。
+- 路由函数的参数写成 `req: PredictRequest`，FastAPI 会先校验；不合格就直接回 **422**，你的函数不会被调用，模型也不会跑。
+
+测试不用真的起服务器：`TestClient(app)` 在同一个进程里发请求。
+--- code
+from fastapi.testclient import TestClient
+torch.manual_seed(0)
+model = TinyNet()
+client = TestClient(create_app(lambda: torch_predictor(model)))
+print(client.get("/health").json())
+x, _ = make_data(2, seed=5)
+r = client.post("/predict", json={"rows": x.tolist()})
+print(r.status_code, r.json()["labels"])
+r = client.post("/predict", json={"rows": [[1.0] * 7]})
+print(r.status_code, r.json()["detail"][0]["msg"])
+
+@@ concept
+title: 第 6 步：延迟分位数和 PSI 漂移
+ref: day26
+--- body
+### 延迟：看分位数，不看平均
+- 先发几次预热请求，不计时（第 19 天）。
+- 每次请求用 `time.perf_counter()` 前后相减，乘 1000 变成毫秒。
+- 只统计成功（200）的请求：422 返回得很快，混进来会让延迟「看起来」很好。
+- 报 p50 / p95 / p99：`np.percentile(times, 95)` 表示 95% 的请求比它快。平均值会被少数慢请求拉高，也把它们藏了起来；用户感到的卡顿在 p95 / p99（第 22 天）。
+
+### 漂移：PSI
+上线后输入的分布可能慢慢变了（传感器换了型号、季节变化）。PSI（population stability index，群体稳定性指数）比较一个特征在训练数据（expected）和线上数据（actual）里的分布（第 25 天）：
+1. 用训练数据的分位数切 10 个桶，每个桶正好装 10% 的训练数据。
+2. 数线上数据落进每个桶的比例 a，训练数据的比例 e。
+3. `PSI = Σ (a − e) · ln(a / e)`。比例为 0 的桶先截到一个很小的数 eps，不然 ln 0 = −∞。
+
+常用的经验线：小于 0.1 基本没变；0.1 到 0.25 值得看一看；大于 0.25 明显漂移，要查原因、考虑重新训练。
+--- code
+times = [3.1, 2.9, 3.0, 3.2, 2.8, 3.0, 3.1, 2.9, 3.0, 25.0]
+report = latency_report(times)
+print("mean:", round(sum(times) / len(times), 2), " p50 / p95 / p99:", [round(report[k], 2) for k in ("p50", "p95", "p99")])
+x_train, _ = make_data(5000, seed=1)
+x_same, _ = make_data(5000, seed=2)
+x_moved, _ = make_data(5000, seed=3, shift=1.0)
+print("PSI, same distribution:", round(psi(x_train[:, 0], x_same[:, 0]), 4))
+print("PSI, shifted by 1.0:   ", round(psi(x_train[:, 0], x_moved[:, 0]), 4))
+
+@@ item d26-01
+type: code
+title: 第 1 步：可复现的数据
+level: 1
+cards: 第 1 步：数据、smoke test、过拟合; 毕业项目：六步流水线
+targets: make_data
+ref: day26
+--- context
+数据一变，loss 曲线、准确率、bug 复现全都对不上。用自己的随机数生成器造数据：同一个 seed 永远是同一份数据，也不会打乱训练时抽 batch 的顺序。
+--- prompt
+写 `make_data(n, seed=0, shift=0.0)`，造 n 台机器的传感器数据，返回 `(x, y)`：
+- 先建一个自己的生成器 `g`，用 `seed` 初始化；下面两次抽随机数都要传 `generator=g`。
+- 先抽标签 `y`：n 个 0 到 `CLASSES - 1` 之间的随机整数（`torch.randint`），dtype 是 int64。
+- 再抽特征 `x`，shape `(n, FEATURES)`，float32：每行 = 这一行类别的中心（`class_centers()[y]`）+ 标准正态噪声 + `shift`。
+
+顺序要和上面一样（先 y 后 x），不然同一个 seed 抽出的数不一样，就和参考答案对不上。不许用 `torch.manual_seed`：它改的是全局随机数。`class_centers()`、`FEATURES = 8`、`CLASSES = 3` 已经有了。
+--- starter
+def make_data(n, seed=0, shift=0.0):
+    """返回 x: (n, FEATURES) float32，y: (n,) int64。
+    同一个 seed 必须得到同一份数据；不许碰全局随机数。"""
+    raise todo()
+--- solution
+def make_data(n, seed=0, shift=0.0):
+    g = torch.Generator().manual_seed(seed)                  # 自己的随机数，不碰全局的
+    y = torch.randint(0, CLASSES, (n,), generator=g)          # 先抽标签
+    x = class_centers()[y] + torch.randn(n, FEATURES, generator=g) + shift
+    return x, y
+--- setup
+_make_data_ref = make_data
+--- tests
+@check("和参考实现一模一样")
+def _():
+    x, y = make_data(50, seed=3)
+    x0, y0 = _make_data_ref(50, seed=3)
+    true(x.dtype == torch.float32, f"x 的 dtype 应该是 float32，你的是 {x.dtype}")
+    true(y.dtype == torch.int64, f"y 的 dtype 应该是 int64（cross_entropy 要 long 类型的标签），你的是 {y.dtype}")
+    shape_is(x, (50, FEATURES))
+    shape_is(y, (50,))
+    eq(y, y0, msg="标签不一样：先抽 y，torch.randint(0, CLASSES, (n,), generator=g)")
+    eq(x, x0, msg="特征不一样：x = class_centers()[y] + torch.randn(n, FEATURES, generator=g) + shift")
+
+@check("shift 把每个数都平移")
+def _():
+    x, y = make_data(50, seed=3)
+    xs, ys = make_data(50, seed=3, shift=0.5)
+    eq(ys, y, msg="shift 不应该改变标签")
+    eq(xs, x + 0.5, msg="shift=0.5 时，x 里的每个数都应该正好多 0.5")
+
+@check("同一个 seed 同一份数据，不同 seed 不同")
+def _():
+    a, _ = make_data(20, seed=1)
+    b, _ = make_data(20, seed=1)
+    c, _ = make_data(20, seed=2)
+    true(torch.equal(a, b), "同一个 seed 两次结果不一样：用 g = torch.Generator().manual_seed(seed)，每次调用都新建")
+    true(not torch.equal(a, c), "不同的 seed 结果一样：seed 没有用上")
+
+@check("不碰全局随机数")
+def _():
+    before = torch.get_rng_state()
+    make_data(20, seed=1)
+    true(torch.equal(before, torch.get_rng_state()),
+         "全局随机数的状态变了：torch.randint 和 torch.randn 都要传 generator=g，也别调 torch.manual_seed")
+--- hints
+- `g = torch.Generator().manual_seed(seed)`：`manual_seed` 返回生成器本身，可以直接赋值。
+- `class_centers()` 的 shape 是 `(3, 8)`；`class_centers()[y]` 用标签当下标，得到 `(n, 8)`：每行取自己类别的中心。
+- `x = class_centers()[y] + torch.randn(n, FEATURES, generator=g) + shift`
+
+@@ item d26-02
+type: code
+title: 第 1 步：smoke test
+level: 2
+cards: 第 1 步：数据、smoke test、过拟合
+targets: smoke_test
+ref: day26
+--- context
+大训练跑了两小时才发现输出 shape 不对，或者某一层根本没接进计算图，太亏了。开训前花一秒做一次 forward + backward，把这类错误挡在门口。
+--- prompt
+写 `smoke_test(model, x, y)`：对一小批数据做一次 forward + backward，按顺序检查下面 4 条。哪条不满足就 `raise AssertionError("...")`，消息说清楚是哪条；全部通过就返回第一个 loss（Python float）。
+1. `logits = model(x)` 的 shape 是 `(len(x), CLASSES)`。
+2. `logits` 里没有 nan / inf（`torch.isfinite`）。
+3. `loss = F.cross_entropy(logits, y)`，`loss.item()` 和 `math.log(CLASSES)` 的差不超过 0.5。
+4. `loss.backward()` 之后，每个 `requires_grad` 为 True 的参数都有 `.grad`，而且里面全是有限值。用 `model.named_parameters()`，消息里带上参数名。
+--- starter
+def smoke_test(model, x, y):
+    """一次 forward + backward。4 条检查，不满足就 raise AssertionError；
+    全部通过返回第一个 loss（float）。"""
+    raise todo()
+--- solution
+def smoke_test(model, x, y):
+    logits = model(x)
+    if tuple(logits.shape) != (len(x), CLASSES):
+        raise AssertionError(f"logits 的 shape 是 {tuple(logits.shape)}，应该是 {(len(x), CLASSES)}")
+    if not torch.isfinite(logits).all():
+        raise AssertionError("logits 里有 nan / inf")
+    loss = F.cross_entropy(logits, y)
+    if abs(loss.item() - math.log(CLASSES)) > 0.5:
+        raise AssertionError(f"第一个 loss {loss.item():.3f} 离 ln 3 = {math.log(CLASSES):.3f} 太远")
+    loss.backward()
+    for name, p in model.named_parameters():
+        if p.requires_grad and (p.grad is None or not torch.isfinite(p.grad).all()):
+            raise AssertionError(f"{name} 没有拿到有限的梯度")
+    return loss.item()
+--- setup
+def _must_raise(fn, msg):
+    try:
+        fn()
+    except AssertionError:
+        return
+    raise AssertionError(msg)
+--- tests
+@check("好模型：返回第一个 loss（float）")
+def _():
+    x, y = make_data(64, seed=0)
+    seed(0)
+    got = smoke_test(TinyNet(), x, y)
+    true(isinstance(got, float), f"要返回 Python float（loss.item()），你返回的是 {type(got).__name__}")
+    true(abs(got - math.log(3)) < 0.5, f"返回了 {got:.3f}：应该返回第一个 loss，它接近 ln 3 = 1.099")
+
+@check("输出 shape 不对要 raise")
+def _():
+    x, y = make_data(64, seed=0)
+    seed(0)
+    m = TinyNet()
+    m.fc2 = nn.Linear(32, 4)
+    _must_raise(lambda: smoke_test(m, x, y),
+                "模型输出 4 类（应该是 3 类），你没有 raise：比较 tuple(logits.shape) 和 (len(x), CLASSES)")
+
+@check("输出里有 nan 要 raise")
+def _():
+    x, y = make_data(64, seed=0)
+    seed(0)
+    m = TinyNet()
+    with torch.no_grad():
+        m.fc1.bias[0] = float("nan")
+    _must_raise(lambda: smoke_test(m, x, y), "logits 里有 nan，你没有 raise：用 torch.isfinite(logits).all() 检查")
+
+@check("第一个 loss 离 ln 3 太远要 raise")
+def _():
+    x, y = make_data(64, seed=0)
+    seed(0)
+    m = TinyNet()
+    with torch.no_grad():
+        m.fc2.weight.mul_(30)
+    _must_raise(lambda: smoke_test(m, x, y),
+                "最后一层的权重放大了 30 倍，第一个 loss 离 ln 3 很远，你没有 raise：检查 abs(loss.item() - math.log(CLASSES)) > 0.5")
+
+@check("有参数没拿到梯度要 raise")
+def _():
+    class WithUnused(TinyNet):
+        def __init__(self):
+            super().__init__()
+            self.unused = nn.Linear(FEATURES, CLASSES)   # 定义了，但 forward 里没用到
+    x, y = make_data(64, seed=0)
+    seed(0)
+    _must_raise(lambda: smoke_test(WithUnused(), x, y),
+                "unused 这一层没接进计算图，backward 之后它的 .grad 是 None，你没有 raise")
+--- hints
+- 每一条都是 `if 不满足: raise AssertionError("...")`。shape 的比较：`tuple(logits.shape) != (len(x), CLASSES)`。
+- 第 4 条：`for name, p in model.named_parameters():`，跳过 `requires_grad` 为 False 的；`p.grad is None or not torch.isfinite(p.grad).all()` 时 raise。
+- 最后 `return loss.item()`。
+
+@@ item d26-03
+type: fix
+title: 第 1 步：修好「过拟合一个 batch」
+level: 2
+cards: 第 1 步：数据、smoke test、过拟合
+targets: overfit_one_batch
+ref: day26
+--- context
+过拟合一个 batch 是最便宜的「代码对不对」测试：16 条数据都记不住，模型或 loss 一定写错了。下面这段代码有 3 个第 15、19 天讲过的典型 bug。
+--- prompt
+`overfit_one_batch(model, x, y, steps=200, lr=1e-2)` 应该在同一批 `(x, y)` 上反复训练 `steps` 步，返回每一步的 loss（Python float 的列表）。现在它有 3 个 bug：
+- loss 永远降不到 0 附近；
+- 梯度在步与步之间越积越多；
+- 返回的列表里存的是还挂着计算图的 tensor。
+
+找出来改掉。测试会检查：返回的是 float；训练 2 步之后的参数和正确实现完全一样；200 步后最后一个 loss < 0.05。
+--- starter
+def overfit_one_batch(model, x, y, steps=200, lr=1e-2):
+    model.train()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    losses = []
+    for _ in range(steps):
+        probs = F.softmax(model(x), dim=-1)
+        loss = F.cross_entropy(probs, y)
+        loss.backward()
+        opt.step()
+        losses.append(loss)
+    return losses
+--- solution
+def overfit_one_batch(model, x, y, steps=200, lr=1e-2):
+    model.train()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    losses = []
+    for _ in range(steps):
+        loss = F.cross_entropy(model(x), y)       # cross_entropy 自己会做 log_softmax
+        opt.zero_grad(set_to_none=True)           # 清掉上一步的梯度
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())                # 存 float，不留计算图
+    return losses
+--- setup
+_overfit_ref = overfit_one_batch
+--- tests
+@check("每一步记的是 float")
+def _():
+    x, y = make_data(16, seed=0)
+    seed(0)
+    losses = overfit_one_batch(TinyNet(), x, y, steps=3)
+    true(len(losses) == 3, f"steps=3 应该返回 3 个 loss，你返回了 {len(losses)} 个")
+    true(all(isinstance(l, float) for l in losses),
+         "要存 loss.item()（Python float）：存 tensor 会把每一步的计算图都留在内存里（第 19 天）")
+
+@check("2 步之后的参数和正确实现一模一样")
+def _():
+    x, y = make_data(16, seed=0)
+    seed(0)
+    m = TinyNet()
+    overfit_one_batch(m, x, y, steps=2)
+    seed(0)
+    m0 = TinyNet()
+    _overfit_ref(m0, x, y, steps=2)
+    for (name, p), p0 in zip(m.named_parameters(), m0.parameters()):
+        eq(p, p0, tol=1e-6,
+           msg=f"{name} 不一样。两个常见原因：cross_entropy 前面又做了一次 softmax（它自己会做）；"
+               "每步 backward 之前没有 opt.zero_grad()，梯度一直在累加")
+
+@check("16 条数据记得住：最后的 loss < 0.05")
+def _():
+    x, y = make_data(16, seed=0)
+    seed(0)
+    losses = overfit_one_batch(TinyNet(), x, y)
+    last = float(losses[-1])
+    true(last < 0.05, f"200 步后 loss 还有 {last:.3f}。先 softmax 再 cross_entropy，loss 最低只能到 0.55 左右")
+--- hints
+- `F.cross_entropy` 要的是 logits（没过 softmax 的原始分数），它内部自己做 log_softmax。
+- PyTorch 的梯度默认是累加的：每步 `backward()` 之前要 `opt.zero_grad()`。
+- `losses.append(loss.item())`
+
+@@ item d26-04
+type: code
+title: 第 2 步：固定种子，训练几秒
+level: 2
+cards: 第 2 步：固定种子，训练几秒
+targets: train_steps
+ref: day26
+--- context
+训练循环是整条流水线的心脏。抽 batch 用全局随机数，固定种子后每次结果都一样：第 3 步「续训 == 不中断」的测试就靠这一点。
+--- prompt
+写 `train_steps(model, opt, x, y, steps, batch_size=64)`，返回每一步的 loss（float 列表，长度 `steps`）：
+- 一开头先 `model.train()`。
+- 每一步：`idx = torch.randint(0, len(x), (batch_size,))` 随机抽一批（用全局随机数，每步正好抽一次，在 forward 之前）→ `F.cross_entropy(model(x[idx]), y[idx])` → `opt.zero_grad(set_to_none=True)` → `loss.backward()` → `opt.step()` → 记 `loss.item()`。
+- 优化器由调用的人建好传进来（续训时传的是读回来的那个），函数里不要新建。
+
+测试会在 `seed(0)` 之后建模型，和参考实现逐步对比；再训练 300 步，看 loss 是否明显下降、验证集准确率是否超过 0.88。
+--- starter
+def train_steps(model, opt, x, y, steps, batch_size=64):
+    """在随机抽的 mini-batch 上训练 steps 步，返回每步的 loss（float）。"""
+    raise todo()
+--- solution
+def train_steps(model, opt, x, y, steps, batch_size=64):
+    model.train()                                            # accuracy() 可能刚把它切到 eval
+    losses = []
+    for _ in range(steps):
+        idx = torch.randint(0, len(x), (batch_size,))        # 全局随机数：固定种子就能复现
+        loss = F.cross_entropy(model(x[idx]), y[idx])
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+--- setup
+_train_steps_ref = train_steps
+--- tests
+@check("和参考实现逐步一致")
+def _():
+    x, y = make_data(2000, seed=1)
+    seed(0)
+    m = TinyNet()
+    got = train_steps(m, torch.optim.AdamW(m.parameters(), lr=3e-3), x, y, 30)
+    seed(0)
+    m0 = TinyNet()
+    want = _train_steps_ref(m0, torch.optim.AdamW(m0.parameters(), lr=3e-3), x, y, 30)
+    true(len(got) == 30, f"steps=30 应该返回 30 个 loss，你返回了 {len(got)} 个")
+    true(all(isinstance(l, float) for l in got), "要记 loss.item()（float），不是 tensor")
+    eq(torch.tensor(got), torch.tensor(want), tol=1e-5,
+       msg="loss 序列和参考不一样：每步先 idx = torch.randint(0, len(x), (batch_size,))（只抽一次），"
+           "再 forward、zero_grad、backward、step")
+    for (name, p), p0 in zip(m.named_parameters(), m0.parameters()):
+        eq(p, p0, tol=1e-5, msg=f"训练后的 {name} 和参考不一样")
+
+@check("先切回 train 模式")
+def _():
+    x, y = make_data(200, seed=1)
+    seed(0)
+    m = TinyNet()
+    m.eval()
+    train_steps(m, torch.optim.AdamW(m.parameters(), lr=3e-3), x, y, 1)
+    true(m.training, "传进来的模型处在 eval 模式（比如刚算过准确率），你没有调 model.train()，训练时 dropout 一直是关的")
+
+@check("300 步：loss 明显下降，验证准确率 > 0.88")
+def _():
+    x, y = make_data(2000, seed=1)
+    xv, yv = make_data(500, seed=2)
+    seed(0)
+    m = TinyNet()
+    losses = train_steps(m, torch.optim.AdamW(m.parameters(), lr=3e-3), x, y, 300)
+    first, last = sum(losses[:20]) / 20, sum(losses[-20:]) / 20
+    true(last < 0.5 * first, f"前 20 步平均 loss {first:.3f}，最后 20 步 {last:.3f}，没有降到一半以下")
+    acc = accuracy(m, xv, yv)
+    true(acc > 0.88, f"验证准确率 {acc:.3f}，应该 > 0.88")
+--- hints
+- 函数骨架：`model.train()`，`losses = []`，`for _ in range(steps): ...`，最后 `return losses`。
+- 抽 batch：`idx = torch.randint(0, len(x), (batch_size,))`，然后用 `x[idx]`、`y[idx]`。
+- 循环体里依次是 `loss = F.cross_entropy(...)`、`opt.zero_grad(set_to_none=True)`、`loss.backward()`、`opt.step()`、`losses.append(loss.item())`。
+
+@@ item d26-05
+type: code
+title: 第 3 步：能续训的 checkpoint
+level: 3
+cards: 第 3 步：能续训的 checkpoint
+targets: save_checkpoint, load_checkpoint
+ref: day26
+--- context
+训练被打断后要能接着训，而且结果要和没打断时一样。少存优化器或随机数状态都不会报错，只会让结果悄悄变掉，所以要用测试证明「续训 == 不中断」。
+--- prompt
+写两个函数。
+
+`save_checkpoint(folder, model, opt, step)`：
+- `folder` 不存在就建：`Path(folder).mkdir(parents=True, exist_ok=True)`。
+- `folder/model.safetensors`：用 `save_file` 存 `model.state_dict()`。
+- `folder/train_state.pt`：用 `torch.save` 存字典 `{"opt": opt.state_dict(), "step": step, "rng": torch.get_rng_state()}`。
+
+`load_checkpoint(folder, model, opt)`：
+- 用 `load_file` 读权重，`model.load_state_dict(...)`。
+- 用 `torch.load(路径, weights_only=True)` 读 train_state.pt，恢复优化器（`opt.load_state_dict`）和全局随机数（`torch.set_rng_state`）。
+- 返回 step。
+
+`save_file`、`load_file`（来自 `safetensors.torch`）和 `Path` 已经导入了。测试会先不中断地训练 20 步；再训练 10 步、存、换一个随机初始化的新模型读回来、再训练 10 步，两边的权重必须完全一样。
+--- starter
+def save_checkpoint(folder, model, opt, step):
+    """folder/model.safetensors：权重
+    folder/train_state.pt：{"opt": ..., "step": ..., "rng": ...}"""
+    raise todo()
+
+
+def load_checkpoint(folder, model, opt):
+    """恢复权重、优化器状态和全局随机数状态；返回 step。"""
+    raise todo()
+--- solution
+def save_checkpoint(folder, model, opt, step):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    save_file(model.state_dict(), folder / "model.safetensors")          # 只有张量，读起来安全
+    torch.save({"opt": opt.state_dict(), "step": step, "rng": torch.get_rng_state()},
+               folder / "train_state.pt")
+
+
+def load_checkpoint(folder, model, opt):
+    folder = Path(folder)
+    model.load_state_dict(load_file(folder / "model.safetensors"))
+    state = torch.load(folder / "train_state.pt", weights_only=True)
+    opt.load_state_dict(state["opt"])                                      # AdamW 的动量
+    torch.set_rng_state(state["rng"])                                      # 之后抽的 batch、dropout 的 mask
+    return state["step"]
+--- tests
+import os, tempfile
+
+@check("两个文件都在，权重是 safetensors")
+def _():
+    seed(0)
+    m = TinyNet()
+    opt = torch.optim.AdamW(m.parameters(), lr=3e-3)
+    folder = os.path.join(tempfile.mkdtemp(), "run1", "step10")
+    save_checkpoint(folder, m, opt, 10)
+    true(os.path.exists(os.path.join(folder, "model.safetensors")),
+         "没有 folder/model.safetensors（文件夹不存在时要先建：mkdir(parents=True, exist_ok=True)）")
+    true(os.path.exists(os.path.join(folder, "train_state.pt")), "没有 folder/train_state.pt")
+    w = load_file(os.path.join(folder, "model.safetensors"))
+    true(set(w) == set(m.state_dict()), f"model.safetensors 里的名字应该是 {sorted(m.state_dict())}，你的是 {sorted(w)}")
+    for k, v in m.state_dict().items():
+        eq(w[k], v, tol=0, msg=f"{k} 存得不对")
+
+@check("train_state.pt 能用 weights_only=True 读")
+def _():
+    seed(0)
+    m = TinyNet()
+    opt = torch.optim.AdamW(m.parameters(), lr=3e-3)
+    folder = tempfile.mkdtemp()
+    save_checkpoint(folder, m, opt, 10)
+    try:
+        st = torch.load(os.path.join(folder, "train_state.pt"), weights_only=True)
+    except Exception as e:
+        raise AssertionError(f"weights_only=True 读不了（{type(e).__name__}）：只存 state_dict、数字和张量，"
+                             "别把整个优化器或模型对象存进去")
+    true(isinstance(st, dict) and {"opt", "step", "rng"} <= set(st),
+         "train_state.pt 应该是一个有 opt / step / rng 三个键的字典")
+    true(st["step"] == 10, f"step 应该是 10，存进去的是 {st['step']}")
+
+@check("续训 == 不中断")
+def _():
+    x, y = make_data(2000, seed=1)
+    seed(0)
+    m1 = TinyNet()
+    o1 = torch.optim.AdamW(m1.parameters(), lr=3e-3)
+    train_steps(m1, o1, x, y, 20)                      # 一口气 20 步
+    seed(0)
+    m2 = TinyNet()
+    o2 = torch.optim.AdamW(m2.parameters(), lr=3e-3)
+    train_steps(m2, o2, x, y, 10)                      # 10 步，然后存
+    folder = tempfile.mkdtemp()
+    save_checkpoint(folder, m2, o2, 10)
+    seed(123)                                          # 模拟重启：新的随机初始化，随机数状态也不一样
+    m3 = TinyNet()
+    o3 = torch.optim.AdamW(m3.parameters(), lr=3e-3)
+    step = load_checkpoint(folder, m3, o3)
+    true(step == 10, f"load_checkpoint 应该返回 10，你返回了 {step}")
+    train_steps(m3, o3, x, y, 10)                      # 再 10 步
+    for (name, p), p1 in zip(m3.named_parameters(), m1.parameters()):
+        eq(p, p1, tol=1e-6, msg=f"续训后的 {name} 和不中断训练的不一样。"
+                               "漏了优化器状态（opt.load_state_dict）还是随机数状态（torch.set_rng_state）？")
+--- hints
+- 先 `folder = Path(folder)`，之后用 `folder / "model.safetensors"` 拼路径。
+- 读的时候：`model.load_state_dict(load_file(...))`，`state = torch.load(..., weights_only=True)`，然后 `opt.load_state_dict(state["opt"])`、`torch.set_rng_state(state["rng"])`。
+- 「续训」对不上时，挨个问：权重读了吗？优化器状态读了吗？随机数状态恢复了吗？
+
+@@ item d26-06
+type: choice
+title: 第 3 步：漏存了随机数状态会怎样
+level: 1
+cards: 第 3 步：能续训的 checkpoint; 第 2 步：固定种子，训练几秒
+--- context
+这是面试里常见的追问：「你的 checkpoint 里存了什么？少了会怎样？」能说清每一样东西管什么，才算真的懂续训。
+--- prompt
+你的 `save_checkpoint` 存了模型权重和优化器状态，但**没有**存 `torch.get_rng_state()`。在一个新进程里读回来，接着训 10 步，再和一口气不中断训练的结果比。哪个说法对？
+--- options
+- 读取时会报错，因为 train_state.pt 里少了 "rng" 这个键
+- 不报错，loss 也在正常下降；但续训时抽到的 batch 和 dropout 的 mask 都和不中断时不同，最后的权重对不上
+- 结果完全一样：`make_data` 每次都用固定的 seed 造数据，随机数已经固定了
+- 结果完全一样：优化器状态里已经包含了随机数状态
+answer: 2
+--- explain
+全局随机数状态决定两件事：`train_steps` 每一步用 `torch.randint` 抽哪些行，以及 dropout 关掉哪些神经元。新进程里的随机数状态和中断时不一样，所以之后的每一步都走了另一条路：训练照样正常，loss 照样下降，只是权重和不中断时对不上。
+- 选项 1：`load_checkpoint` 只读自己存过的键，不会报错。这正是这类 bug 危险的地方。
+- 选项 3：`make_data` 用的是自己的 `torch.Generator`，根本不碰全局随机数（第 1 题特意这样设计）。数据一样，不代表抽 batch 的顺序一样。
+- 选项 4：`opt.state_dict()` 里只有 AdamW 的动量（`exp_avg`、`exp_avg_sq`）、步数和超参数，没有随机数。
+
+在 GPU 上训练时还要多存 `torch.cuda.get_rng_state_all()`：GPU 上的 dropout 用的是 CUDA 自己的随机数（第 13 题的脚本就是这样做的）。
+
+@@ item d26-07
+type: code
+title: 第 4 步：导出 ONNX
+level: 2
+cards: 第 4 步：导出 ONNX 并对拍
+targets: export_onnx
+ref: day26
+timeout: 120
+--- context
+很多线上环境只跑 ONNX 文件，不装训练代码。导出时忘了 eval()、batch 维被写死、权重被拆到另一个文件，都是文件能导出、上线后才出问题的坑。
+--- prompt
+写 `export_onnx(model, path)`，把模型导出成**一个** ONNX 文件，返回 `str(path)`：
+- 先 `model.eval()`。
+- 示例输入：`torch.randn(2, FEATURES)`。
+- 调 `torch.onnx.export(model, (示例输入,), str(path), dynamo=True, ...)`，再加上：输入名 `"x"`、输出名 `"logits"`（`input_names`、`output_names`）；第 0 维可变：`dynamic_shapes={"x": {0: "batch"}}`；`external_data=False`；`verbose=False`。
+
+测试会传一个还在 train 模式的模型，用 onnxruntime 打开导出的文件，用 batch 1 和 7 跑，和 eval 模式的 PyTorch 比，还会检查图里没有 Dropout 节点。导出要几秒钟。
+--- starter
+def export_onnx(model, path):
+    """导出成一个 ONNX 文件：输入 "x"、输出 "logits"，batch 维可变。返回 str(path)。"""
+    raise todo()
+--- solution
+def export_onnx(model, path):
+    model.eval()                                             # 导出推理用的图：没有 dropout
+    example = torch.randn(2, FEATURES)                       # 只用来追踪计算图
+    torch.onnx.export(model, (example,), str(path), dynamo=True,
+                      input_names=["x"], output_names=["logits"],
+                      dynamic_shapes={"x": {0: "batch"}},    # 不写的话 batch 固定成 2
+                      external_data=False, verbose=False)
+    return str(path)
+--- tests
+import os, tempfile
+import numpy as np
+import onnx
+import onnxruntime as ort
+
+_EXPORTED = {}
+
+def _exported():
+    if not _EXPORTED:
+        seed(0)
+        m = TinyNet()                                   # 故意留在 train 模式
+        folder = tempfile.mkdtemp()
+        path = os.path.join(folder, "tinynet.onnx")
+        ret = export_onnx(m, path)
+        _EXPORTED.update(model=m, folder=folder, path=path, ret=ret)
+    return _EXPORTED
+
+@check("一个文件，输入叫 x，输出叫 logits")
+def _():
+    e = _exported()
+    true(e["ret"] == e["path"], f"要返回 str(path)，你返回了 {e['ret']!r}")
+    files = sorted(os.listdir(e["folder"]))
+    true(files == ["tinynet.onnx"], f"文件夹里是 {files}：权重被拆到了 .data 文件里，加 external_data=False")
+    sess = ort.InferenceSession(e["path"], providers=["CPUExecutionProvider"])
+    ins = [i.name for i in sess.get_inputs()]
+    outs = [o.name for o in sess.get_outputs()]
+    true(ins == ["x"], f"输入名应该是 ['x']，你的是 {ins}：加 input_names=['x']")
+    true(outs == ["logits"], f"输出名应该是 ['logits']，你的是 {outs}：加 output_names=['logits']")
+
+@check("batch 维可变：batch 1 和 7 都能跑")
+def _():
+    e = _exported()
+    sess = ort.InferenceSession(e["path"], providers=["CPUExecutionProvider"])
+    name = sess.get_inputs()[0].name
+    for b in (1, 7):
+        try:
+            out = sess.run(None, {name: np.zeros((b, FEATURES), dtype=np.float32)})[0]
+        except Exception:
+            raise AssertionError(f"batch {b} 跑不了：batch 维被写死成示例输入的 2 了。"
+                                 "加 dynamic_shapes={'x': {0: 'batch'}}")
+        shape_is(out, (b, CLASSES))
+
+@check("和 eval 模式的 PyTorch 对得上")
+def _():
+    e = _exported()
+    m = e["model"]
+    m.eval()
+    x = torch.randn(2, FEATURES)
+    with torch.inference_mode():
+        want = m(x)
+    sess = ort.InferenceSession(e["path"], providers=["CPUExecutionProvider"])
+    got = sess.run(None, {sess.get_inputs()[0].name: x.numpy()})[0]
+    eq(torch.from_numpy(got), want, tol=1e-4, msg="ONNX 的输出和 PyTorch 差太多")
+
+@check("图里没有 Dropout（导出前要 eval）")
+def _():
+    e = _exported()
+    ops = [n.op_type for n in onnx.load(e["path"]).graph.node]
+    true("Dropout" not in ops,
+         f"图里有 {ops}：导出前先 model.eval()。onnxruntime 推理时恰好会跳过 Dropout，别的推理引擎不一定；"
+         "像 BatchNorm 这样的层，在 train 模式下导出会直接算错")
+--- hints
+- 第一行 `model.eval()`，第二行 `example = torch.randn(2, FEATURES)`。
+- `torch.onnx.export` 的第二个参数是**元组**：`(example,)`，逗号不能少。
+- 完整调用：`torch.onnx.export(model, (example,), str(path), dynamo=True, input_names=["x"], output_names=["logits"], dynamic_shapes={"x": {0: "batch"}}, external_data=False, verbose=False)`，最后 `return str(path)`。
+
+@@ item d26-08
+type: fill
+title: 第 4 步：用 onnxruntime 对拍
+level: 1
+cards: 第 4 步：导出 ONNX 并对拍
+targets: verify_onnx
+ref: day26
+timeout: 120
+--- context
+导出「成功」不等于导出「正确」。每次导出后都拿同一批输入比一比 ONNX 和 PyTorch 的输出；这一步应该放进自动测试，而不是靠人眼看。
+--- prompt
+把空填上，完成 `verify_onnx(model, path, batch_sizes=(1, 5, 64), tol=1e-4)`：对每个 batch 大小造一批随机输入，分别用 PyTorch（eval 模式、`inference_mode`）和 onnxruntime 跑，记下最大绝对差。超过 `tol` 就 `raise AssertionError`，否则返回这个差（float）。
+
+测试准备好了一个导出的文件。它会传一个还在 train 模式的模型（你要先切到 eval），还会传一个导出后又被改过的模型（必须 raise）。
+--- template
+import numpy as np
+import onnxruntime as ort
+
+
+def verify_onnx(model, path, batch_sizes=(1, 5, 64), tol=1e-4):
+    [[model.eval()]]
+    sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    name = sess.[[get_inputs()]][0].name
+    worst = 0.0
+    for b in batch_sizes:
+        x = torch.randn(b, FEATURES)
+        with [[torch.inference_mode()]]:
+            want = model(x).numpy()
+        got = sess.run(None, {name: [[x.numpy()]]})[0]
+        worst = max(worst, float(np.abs(got - want).[[max()]]))
+    if worst > tol:
+        raise AssertionError(f"ONNX 和 PyTorch 差了 {worst:.2e}，超过容差 {tol}")
+    return worst
+--- setup
+import copy as _copy
+import tempfile as _tempfile
+torch.manual_seed(0)
+_MODEL = TinyNet()
+_ONNX = export_onnx(_MODEL, os.path.join(_tempfile.mkdtemp(), "tinynet.onnx"))
+--- tests
+@check("正确的文件：返回很小的差（float）")
+def _():
+    _MODEL.eval()
+    d = verify_onnx(_MODEL, _ONNX)
+    true(isinstance(d, float), f"要返回 float，你返回的是 {type(d).__name__}")
+    true(0 <= d < 1e-4, f"返回的差是 {d}，应该在 0 到 1e-4 之间")
+
+@check("模型还在 train 模式也能对上（先 eval）")
+def _():
+    _MODEL.train()
+    try:
+        verify_onnx(_MODEL, _ONNX)
+    except AssertionError:
+        raise AssertionError("模型在 train 模式时，dropout 会随机关掉神经元，PyTorch 这边的输出就变了：先 model.eval()")
+
+@check("模型和文件对不上时要 raise")
+def _():
+    m = _copy.deepcopy(_MODEL)
+    with torch.no_grad():
+        m.fc2.bias[0] += 0.5                           # 只改第 0 类的输出
+    try:
+        verify_onnx(m, _ONNX)
+    except AssertionError:
+        return
+    raise AssertionError("模型导出后被改过（第 0 类的 bias 加了 0.5），你的函数没有 raise：要取所有差里最大的那个")
+--- hints
+- 第一个空：把模型切到推理模式，关掉 dropout。
+- onnxruntime 的会话用 `sess.get_inputs()` 列出输入，`sess.run` 收 numpy 数组，不收 torch 张量。
+- 第三个空是 `torch.inference_mode()`；最后一个空取最大值：`max()`。
+
+@@ item d26-09
+type: code
+title: 第 5 步：用 pydantic 挡住坏输入
+level: 2
+cards: 第 5 步：做成 FastAPI 服务
+targets: Row, PredictRequest
+ref: day26
+--- context
+线上一定会收到坏请求：少一个数、空列表、一次塞一万行、nan。在门口挡住、返回 422，比让模型算出一堆 nan 再返回 200 好得多。
+--- prompt
+补全请求的格式 `{"rows": [[8 个数], [8 个数], ...]}`：
+- `Row`：一行，正好 `FEATURES` 个**有限**的 float。写法：`Annotated[list[每个数的类型], Field(min_length=..., max_length=...)]`。
+- `PredictRequest`：只有一个字段 `rows`，是 `Row` 的列表，至少 1 行、最多 `MAX_ROWS` 行：`rows: list[Row] = Field(min_length=..., max_length=...)`。
+
+`Annotated`、`BaseModel`、`Field`、`FiniteFloat` 已经导入；`FEATURES = 8`，`MAX_ROWS = 64`。最后一个检查会把你的 `PredictRequest` 接进参考的 FastAPI 服务，看坏请求是不是返回 422。
+--- starter
+Row = Annotated[list[float], Field()]           # TODO: 有限的数，正好 FEATURES 个
+
+
+class PredictRequest(BaseModel):
+    rows: list[Row]                             # TODO: 1 到 MAX_ROWS 行
+--- solution
+Row = Annotated[list[FiniteFloat], Field(min_length=FEATURES, max_length=FEATURES)]
+
+
+class PredictRequest(BaseModel):
+    rows: list[Row] = Field(min_length=1, max_length=MAX_ROWS)
+--- tests
+from pydantic import ValidationError
+from fastapi.testclient import TestClient
+
+def _rejects(rows):
+    try:
+        PredictRequest.model_validate({"rows": rows})
+    except ValidationError:
+        return True
+    return False
+
+@check("合法的请求能通过")
+def _():
+    r = PredictRequest.model_validate({"rows": [[0.5] * 8]})
+    true(len(r.rows) == 1, "1 行 8 个数应该能通过")
+    r = PredictRequest.model_validate({"rows": [[0.0] * 8] * 64})
+    true(len(r.rows) == 64, "64 行（MAX_ROWS）应该能通过")
+
+@check("每行必须正好 8 个数")
+def _():
+    true(_rejects([[0.0] * 7]), "只有 7 个数的行被放过去了：Row 要 Field(min_length=FEATURES, ...)")
+    true(_rejects([[0.0] * 9]), "9 个数的行被放过去了：Row 还要 max_length=FEATURES")
+
+@check("一个请求 1 到 64 行")
+def _():
+    true(_rejects([]), "空的 rows 被放过去了：rows 要 Field(min_length=1, ...)")
+    true(_rejects([[0.0] * 8] * 65), "65 行被放过去了：rows 要 Field(..., max_length=MAX_ROWS)")
+
+@check("nan 和 inf 要挡住")
+def _():
+    true(_rejects([[float("nan")] + [0.0] * 7]), "nan 被放过去了：每个数的类型用 FiniteFloat，不是 float")
+    true(_rejects([[float("inf")] + [0.0] * 7]), "inf 被放过去了：每个数的类型用 FiniteFloat")
+
+@check("接进服务：坏请求返回 422")
+def _():
+    seed(0)
+    client = TestClient(create_app(lambda: torch_predictor(TinyNet())), raise_server_exceptions=False)
+    ok = client.post("/predict", json={"rows": [[0.0] * 8]})
+    true(ok.status_code == 200, f"合法请求应该返回 200，服务返回了 {ok.status_code}")
+    bad = client.post("/predict", json={"rows": [[0.0] * 7]})
+    true(bad.status_code == 422, f"7 个数的请求应该返回 422，服务返回了 {bad.status_code}")
+--- hints
+- `FiniteFloat` 就是「不收 nan 和 inf 的 float」：把 `list[float]` 换成 `list[FiniteFloat]`。
+- 每行的长度写在 `Row` 的 `Field(...)` 里：`Field(min_length=FEATURES, max_length=FEATURES)`。
+- 行数写在字段的默认值位置：`rows: list[Row] = Field(min_length=1, max_length=MAX_ROWS)`。
+
+@@ item d26-10
+type: code
+title: 第 5 步：FastAPI 服务
+level: 3
+cards: 第 5 步：做成 FastAPI 服务
+targets: create_app
+ref: day26
+--- context
+服务慢，最常见的原因是每个请求都重新加载模型；第一个用户特别慢，是因为没预热；吞吐上不去，是因为一行一行地跑模型。这一题把这三件事一次做对。
+--- prompt
+写 `create_app(load_model)`，返回一个 FastAPI 应用。`load_model()` 返回一个 `predict` 函数：输入 `np.ndarray`，shape `(B, 8)`，float32；输出每行 3 类的概率，shape `(B, 3)`。
+- 启动时：调一次 `load_model()` 拿到 `predict`；再用 `np.zeros((1, FEATURES), dtype=np.float32)` 调一次 `predict` 预热。之后不再加载。
+- `GET /health` → `{"status": "ok"}`。
+- `POST /predict`，参数写成 `req: PredictRequest`（已经有了，不合格时 FastAPI 自动回 422）：`np.asarray(req.rows, dtype=np.float32)` 得到 `(B, 8)`，**一次**调用 `predict` 算完整个请求；返回 `{"labels": [每行概率最大的类名], "probs": probs.tolist()}`。类名在 `LABELS` 里。
+
+`FastAPI`、`np`、`LABELS`、`FEATURES`、`PredictRequest` 已经有了。
+--- starter
+def create_app(load_model):
+    """启动时加载一次、预热一次；GET /health；POST /predict（整个请求一次调用 predict）。"""
+    raise todo()
+--- solution
+def create_app(load_model):
+    predict = load_model()                                     # 启动时加载一次
+    predict(np.zeros((1, FEATURES), dtype=np.float32))         # 预热：第一次调用最慢
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict_route(req: PredictRequest):                    # 不合格的请求在这之前就被回 422
+        x = np.asarray(req.rows, dtype=np.float32)             # (B, 8)
+        probs = predict(x)                                     # 整个请求一个 batch
+        return {"labels": [LABELS[i] for i in probs.argmax(axis=1)], "probs": probs.tolist()}
+
+    return app
+--- setup
+from fastapi.testclient import TestClient
+
+def _counting_loader():
+    torch.manual_seed(0)
+    base = torch_predictor(TinyNet())
+    calls = {"load": 0, "predict": 0, "rows": []}
+
+    def load_model():
+        calls["load"] += 1
+
+        def predict(x):
+            calls["predict"] += 1
+            calls["rows"].append(len(x))
+            return base(x)
+
+        return predict
+
+    return load_model, calls, base
+--- tests
+@check("GET /health")
+def _():
+    load, calls, _ = _counting_loader()
+    r = TestClient(create_app(load)).get("/health")
+    true(r.status_code == 200 and r.json() == {"status": "ok"},
+         f"/health 应该返回 200 和 {{'status': 'ok'}}，你的是 {r.status_code} {r.text[:200]}")
+
+@check("POST /predict：每行一个 label 和 3 个概率")
+def _():
+    load, calls, base = _counting_loader()
+    client = TestClient(create_app(load))
+    x, _ = make_data(3, seed=5)
+    r = client.post("/predict", json={"rows": x.tolist()})
+    true(r.status_code == 200, f"状态码 {r.status_code}：{r.text[:300]}")
+    body = r.json()
+    true(isinstance(body, dict) and "labels" in body and "probs" in body, f"要返回有 labels 和 probs 的字典，你的是 {body}")
+    p = base(x.numpy())
+    want = [LABELS[i] for i in p.argmax(axis=1)]
+    true(body["labels"] == want, f"labels 应该是 {want}，你的是 {body['labels']}（每行取概率最大的类，再查 LABELS）")
+    eq(torch.tensor(body["probs"]), torch.from_numpy(p), tol=1e-5, msg="probs 应该是 predict 返回的概率")
+
+@check("启动时只加载一次、预热一次")
+def _():
+    load, calls, _ = _counting_loader()
+    app = create_app(load)
+    true(calls["load"] == 1, f"create_app 里应该调 1 次 load_model()，你调了 {calls['load']} 次")
+    true(calls["predict"] == 1, f"还没有任何请求时，predict 应该已经被调过 1 次（预热），实际是 {calls['predict']} 次")
+    client = TestClient(app)
+    for _ in range(3):
+        client.post("/predict", json={"rows": [[0.0] * 8]})
+    true(calls["load"] == 1, f"3 个请求之后 load_model 一共被调了 {calls['load']} 次：模型只能在 create_app 里加载一次")
+
+@check("一个请求只调一次模型")
+def _():
+    load, calls, _ = _counting_loader()
+    client = TestClient(create_app(load))
+    before = calls["predict"]
+    client.post("/predict", json={"rows": [[0.0] * 8] * 5})
+    n = calls["predict"] - before
+    true(n == 1 and calls["rows"][-1] == 5,
+         f"5 行的请求调了 {n} 次 predict：应该把 5 行拼成一个 (5, 8) 的数组，调 1 次")
+
+@check("坏请求返回 422，模型不会跑")
+def _():
+    load, calls, _ = _counting_loader()
+    client = TestClient(create_app(load), raise_server_exceptions=False)
+    before = calls["predict"]
+    for rows in ([[0.0] * 7], [], [[0.0] * 8] * 65):
+        r = client.post("/predict", json={"rows": rows})
+        true(r.status_code == 422, f"{len(rows)} 行、每行 {len(rows[0]) if rows else 0} 个数的请求应该返回 422，"
+                                   f"你的服务返回 {r.status_code}：路由函数的参数要写成 req: PredictRequest")
+    true(calls["predict"] == before, "坏请求也跑了模型：校验要在调用 predict 之前")
+--- hints
+- 结构：先 `predict = load_model()` 和预热，再 `app = FastAPI()`，在里面用 `@app.get("/health")`、`@app.post("/predict")` 定义两个函数，最后 `return app`。
+- 路由函数：`def predict_route(req: PredictRequest):`，FastAPI 看到这个类型标注就会先校验请求体。
+- `probs.argmax(axis=1)` 得到每行的类号，`[LABELS[i] for i in ...]` 换成类名。
+
+@@ item d26-11
+type: code
+title: 第 6 步：测延迟，报分位数
+level: 2
+cards: 第 6 步：延迟分位数和 PSI 漂移
+targets: measure_latency, latency_report
+ref: day26
+--- context
+「平均 5 毫秒」可能是大多数请求 3 毫秒、每 20 个里有 1 个卡 40 毫秒。上线后看的是 p95 / p99；测的时候还要排除预热和失败的请求，否则数字好看却不真实。
+--- prompt
+写两个函数。
+
+`measure_latency(client, payload, n=50, warmup=5)`：
+- 先发 `warmup` 次 `client.post("/predict", json=payload)`，不计时。
+- 再发 `n` 次，每次用 `time.perf_counter()` 前后相减，换成**毫秒**记下来。
+- 回复的 `status_code` 不是 200 就 `raise AssertionError`：失败的请求不算延迟。
+- 返回 n 个毫秒数的列表。
+
+`latency_report(times_ms)`：返回 `{"p50": ..., "p95": ..., "p99": ...}`，用 `np.percentile` 算，值转成 Python float。
+
+测试用一个假的 client：第一次请求要 300 毫秒（冷启动），之后每次约 3 毫秒。`time` 和 `np` 已经导入。
+--- starter
+def measure_latency(client, payload, n=50, warmup=5):
+    """预热 warmup 次（不计时），再计时 n 次；返回 n 个毫秒数。非 200 就 raise AssertionError。"""
+    raise todo()
+
+
+def latency_report(times_ms):
+    """返回 {"p50": float, "p95": float, "p99": float}。"""
+    raise todo()
+--- solution
+def measure_latency(client, payload, n=50, warmup=5):
+    for _ in range(warmup):                                    # 预热：不计时
+        client.post("/predict", json=payload)
+    times = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        r = client.post("/predict", json=payload)
+        times.append((time.perf_counter() - t0) * 1000)        # 秒 -> 毫秒
+        if r.status_code != 200:
+            raise AssertionError(f"状态码 {r.status_code}：失败的请求不算延迟")
+    return times
+
+
+def latency_report(times_ms):
+    t = np.asarray(times_ms, dtype=float)
+    return {"p50": float(np.percentile(t, 50)), "p95": float(np.percentile(t, 95)),
+            "p99": float(np.percentile(t, 99))}
+--- setup
+class _Resp:
+    def __init__(self, code):
+        self.status_code = code
+
+
+class _FakeClient:
+    """第一次请求 300 ms（冷启动），之后每次约 3 ms。"""
+
+    def __init__(self, code=200, cold=0.3):
+        self.code, self.cold, self.calls = code, cold, 0
+
+    def post(self, url, json=None):
+        self.calls += 1
+        time.sleep(self.cold if self.calls == 1 else 0.003)
+        return _Resp(self.code)
+--- tests
+@check("latency_report：p50 / p95 / p99")
+def _():
+    rep = latency_report(list(range(1, 101)))
+    true(isinstance(rep, dict) and {"p50", "p95", "p99"} <= set(rep), f"要返回有 p50 / p95 / p99 的字典，你的是 {rep}")
+    true(all(type(rep[k]) is float for k in ("p50", "p95", "p99")), "值要转成 Python float：float(np.percentile(...))")
+    true(close(rep["p50"], 50.5) and close(rep["p95"], 95.05) and close(rep["p99"], 99.01),
+         f"1 到 100 的 p50 / p95 / p99 应该是 50.5 / 95.05 / 99.01（np.percentile 的默认算法），你的是 {rep}")
+
+@check("measure_latency：预热 + 计时，单位是毫秒")
+def _():
+    c = _FakeClient()
+    t = measure_latency(c, {"rows": [[0.0] * 8]}, n=20, warmup=3)
+    true(c.calls == 23, f"应该一共发 23 次（3 次预热 + 20 次计时），你发了 {c.calls} 次")
+    true(len(t) == 20, f"应该返回 20 个数，你返回了 {len(t)} 个")
+    true(min(t) >= 2.0, f"最小值是 {min(t):.4f}：每次请求至少 3 毫秒，看起来你返回的是秒，要乘 1000")
+    true(max(t) < 150, f"最大值是 {max(t):.1f} ms：300 ms 的冷启动请求被算进去了，预热的请求不要计时")
+
+@check("失败的请求不算：不是 200 要 raise")
+def _():
+    c = _FakeClient(code=422, cold=0.0)
+    try:
+        measure_latency(c, {"rows": [[0.0] * 7]}, n=5, warmup=1)
+    except AssertionError:
+        return
+    raise AssertionError("每个回复都是 422，你却返回了延迟：检查 r.status_code，不是 200 就 raise AssertionError")
+--- hints
+- 计时：`t0 = time.perf_counter()`，请求完 `(time.perf_counter() - t0) * 1000` 就是毫秒。
+- 预热的循环里只发请求，不记时间；计时循环里记下 `r = client.post(...)`，检查 `r.status_code`。
+- `float(np.percentile(times_ms, 95))` 就是 p95。
+
+@@ item d26-12
+type: code
+title: 第 6 步：PSI 漂移检查
+level: 2
+cards: 第 6 步：延迟分位数和 PSI 漂移
+targets: psi
+ref: day26
+--- context
+模型上线后不报错，准确率却慢慢变差，常见原因是输入的分布变了。每天对每个特征算一次 PSI，超过 0.25 就报警，比等用户投诉早得多。
+--- prompt
+写 `psi(expected, actual, bins=10, eps=1e-4)`：`expected` 是一个特征在训练数据里的值，`actual` 是它在线上数据里的值（都是一维 tensor）。返回 Python float。
+1. 两个都转成一维 float64：`torch.as_tensor(v, dtype=torch.float64).flatten()`。
+2. 切点：用 `torch.quantile` 取 expected 在 0, 1/bins, 2/bins, …, 1 处的分位数（`torch.linspace(0, 1, bins + 1, dtype=torch.float64)`），去掉头尾，剩下 bins − 1 个切点 `edges`。
+3. 分桶：`torch.bucketize(v, edges)` 给每个值一个 0 到 bins − 1 的桶号；`torch.bincount(桶号, minlength=bins)` 数每个桶有几个，除以总个数得到比例。expected 的比例叫 e，actual 的叫 a。
+4. e 和 a 都截到至少 eps（`clamp_min`），返回 `Σ (a − e) · ln(a / e)`。
+--- starter
+def psi(expected, actual, bins=10, eps=1e-4):
+    """用 expected 的分位数切 bins 个桶，比较两边落进每个桶的比例。返回 float。"""
+    raise todo()
+--- solution
+def psi(expected, actual, bins=10, eps=1e-4):
+    expected = torch.as_tensor(expected, dtype=torch.float64).flatten()
+    actual = torch.as_tensor(actual, dtype=torch.float64).flatten()
+    qs = torch.linspace(0, 1, bins + 1, dtype=torch.float64)
+    edges = torch.quantile(expected, qs)[1:-1]                 # bins - 1 个内部切点
+    e = torch.bincount(torch.bucketize(expected, edges), minlength=bins) / len(expected)
+    a = torch.bincount(torch.bucketize(actual, edges), minlength=bins) / len(actual)
+    e, a = e.clamp_min(eps), a.clamp_min(eps)                  # 空桶：避免 ln 0
+    return float(((a - e) * torch.log(a / e)).sum())
+--- setup
+_psi_ref = psi
+--- tests
+@check("手算的小例子")
+def _():
+    # expected = 0..9，bins=2：切点是中位数 4.5，每个桶 50%
+    # actual = [0, 0, 0, 9]：75% 在左桶，25% 在右桶
+    # PSI = 0.25 * ln(0.75 / 0.5) + (-0.25) * ln(0.25 / 0.5) = 0.2747
+    got = psi(torch.arange(10.0), torch.tensor([0.0, 0.0, 0.0, 9.0]), bins=2)
+    true(isinstance(got, float), f"要返回 Python float，你返回的是 {type(got).__name__}")
+    true(close(got, 0.2746531, 1e-5), f"应该是 0.2747，你的是 {got:.4f}")
+
+@check("空桶不能变成 inf")
+def _():
+    got = psi(torch.arange(10.0), torch.zeros(4), bins=2)
+    true(math.isfinite(got), "actual 的右桶是空的，ln(0) = -inf：比例要先 clamp_min(eps)")
+    true(close(got, 4.6043, 1e-3), f"应该约 4.604，你的是 {got:.4f}")
+
+@check("同分布很小，整体平移 1.0 之后 > 0.25")
+def _():
+    a, _ = make_data(5000, seed=1)
+    b, _ = make_data(5000, seed=2)
+    s, _ = make_data(5000, seed=3, shift=1.0)
+    same, moved = psi(a[:, 0], b[:, 0]), psi(a[:, 0], s[:, 0])
+    true(same < 0.02, f"同一个分布的两份样本，PSI 应该接近 0，你的是 {same:.4f}")
+    true(moved > 0.25, f"平移 1.0 是明显的漂移，PSI 应该 > 0.25，你的是 {moved:.4f}")
+
+@check("和参考实现一致（10 个桶，8 个特征）")
+def _():
+    a, _ = make_data(3000, seed=1)
+    s, _ = make_data(1000, seed=4, shift=0.3)
+    for j in range(FEATURES):
+        got, want = psi(a[:, j], s[:, j]), _psi_ref(a[:, j], s[:, j])
+        true(close(got, want, 1e-3), f"第 {j} 个特征：你的 {got:.5f}，参考 {want:.5f}")
+--- hints
+- 切点：`edges = torch.quantile(expected, torch.linspace(0, 1, bins + 1, dtype=torch.float64))[1:-1]`。
+- 比例：`torch.bincount(torch.bucketize(v, edges), minlength=bins) / len(v)`，expected 和 actual 各算一次。
+- 最后：`e, a = e.clamp_min(eps), a.clamp_min(eps)`，`return float(((a - e) * torch.log(a / e)).sum())`。
+
+@@ item d26-13
+type: local
+title: 本机：一个脚本跑完六步
+level: 2
+cards: 毕业项目：六步流水线
+verify: CAPSTONE OK \| device=\w+ \| val_acc=0\.\d+ \| resume_diff=\S+ \| onnx_diff=\S+ \| p50_ms=[\d.]+ \| p95_ms=[\d.]+ \| psi_ok=[\d.]+ \| psi_shifted=[\d.]+
+placeholder: 把 python capstone.py 的完整输出粘贴到这里
+--- context
+真正的交付物不是一堆单独通过的函数，而是一条能从头跑到尾的流水线。在自己的机器上跑一遍（有 GPU 就用 GPU），你才会看到课程环境里看不到的东西：GPU 启动开销、文件落盘、真实的延迟。
+--- prompt
+下面的 `capstone.py` 就是你前 12 题写的那些函数，加上一个把六步串起来的 `main()`。
+
+1. 新建一个文件夹，把脚本存成 `capstone.py`。想用自己写的版本，就把对应的函数换成你的。
+2. 用装了课程依赖的 Python（跑 `serve.py` 的那个）运行：`python capstone.py`。
+3. 脚本会在旁边建一个 `capstone_out` 文件夹，放两个 checkpoint 和 `tinynet.onnx`，一共几十 KB。
+4. 最后一行是 `CAPSTONE OK | ...`。把完整输出粘贴到下面。
+
+和前面几题不一样的地方：
+- 有 NVIDIA GPU 时，训练在 GPU 上跑：数据和模型都 `.to(DEVICE)`。第一次在 GPU 上 forward / backward 要加载 CUDA kernel，可能要好几秒，所以先预热几步、不计时（第 19 天）。这个模型太小，GPU 上训练可能反而比 CPU 慢：每一步都要付启动 kernel 的固定开销。
+- `save_checkpoint` 多存了 `torch.cuda.get_rng_state_all()`：GPU 上的 dropout 用 CUDA 自己的随机数，不存它，GPU 上的续训就对不上。
+- 导出前，从 `model.safetensors` 在 CPU 上读回一个新模型：服务端拿到的就只有这个文件。
+- 服务里的 `predict` 用 onnxruntime 跑（`onnx_predictor`），不是 PyTorch。
+- 开头可能有几行 warning（比如 `triton not found`），不用管。第 [5] 行预测的 4 个 label 里可能有 1 个和真实的不一样：三类数据有重叠，准确率约 93%，这是正常的。
+
+```python
+"""capstone.py：第 26 天的毕业项目。一个小分类模型，从数据一路走到服务和监控。
+
+运行：python capstone.py
+需要：torch numpy safetensors onnx onnxscript onnxruntime fastapi httpx
+有 NVIDIA GPU 就在 GPU 上训练；导出、服务、监控都在 CPU 上。
+"""
+import math
+import time
+import warnings
+from pathlib import Path
+from typing import Annotated
+
+warnings.filterwarnings("ignore", message=".*(httpx|LeafSpec).*")   # 已安装的库版本带来的无害提示
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field, FiniteFloat
+from safetensors.torch import load_file, save_file
+
+FEATURES, CLASSES, MAX_ROWS = 8, 3, 64
+LABELS = ["ok", "overheat", "vibration"]
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+OUT = Path(__file__).resolve().parent / "capstone_out"
+
+
+# ---------------- 第 1 步：数据和开训前检查（第 1–3 题）
+def class_centers():
+    g = torch.Generator().manual_seed(1234)
+    return torch.randn(CLASSES, FEATURES, generator=g)
+
+
+def make_data(n, seed=0, shift=0.0):
+    g = torch.Generator().manual_seed(seed)
+    y = torch.randint(0, CLASSES, (n,), generator=g)
+    x = class_centers()[y] + torch.randn(n, FEATURES, generator=g) + shift
+    return x, y
+
+
+class TinyNet(nn.Module):
+    def __init__(self, hidden=32, p_drop=0.1):
+        super().__init__()
+        self.fc1 = nn.Linear(FEATURES, hidden)
+        self.drop = nn.Dropout(p_drop)
+        self.fc2 = nn.Linear(hidden, CLASSES)
+
+    def forward(self, x):
+        return self.fc2(self.drop(F.relu(self.fc1(x))))
+
+
+def smoke_test(model, x, y):
+    logits = model(x)
+    if tuple(logits.shape) != (len(x), CLASSES):
+        raise AssertionError(f"logits 的 shape 是 {tuple(logits.shape)}")
+    if not torch.isfinite(logits).all():
+        raise AssertionError("logits 里有 nan / inf")
+    loss = F.cross_entropy(logits, y)
+    if abs(loss.item() - math.log(CLASSES)) > 0.5:
+        raise AssertionError(f"第一个 loss {loss.item():.3f} 离 ln 3 太远")
+    loss.backward()
+    for name, p in model.named_parameters():
+        if p.requires_grad and (p.grad is None or not torch.isfinite(p.grad).all()):
+            raise AssertionError(f"{name} 没有拿到有限的梯度")
+    return loss.item()
+
+
+def overfit_one_batch(model, x, y, steps=200, lr=1e-2):
+    model.train()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    losses = []
+    for _ in range(steps):
+        loss = F.cross_entropy(model(x), y)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+
+
+# ---------------- 第 2 步：训练（第 4 题）
+def train_steps(model, opt, x, y, steps, batch_size=64):
+    model.train()
+    losses = []
+    for _ in range(steps):
+        idx = torch.randint(0, len(x), (batch_size,))
+        loss = F.cross_entropy(model(x[idx]), y[idx])
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+
+
+def accuracy(model, x, y):
+    model.eval()
+    with torch.inference_mode():
+        return (model(x).argmax(dim=1) == y).float().mean().item()
+
+
+# ---------------- 第 3 步：checkpoint（第 5 题），多存了 GPU 的随机数状态
+def save_checkpoint(folder, model, opt, step):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    save_file(model.state_dict(), folder / "model.safetensors")
+    state = {"opt": opt.state_dict(), "step": step, "rng": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda_rng"] = torch.cuda.get_rng_state_all()   # GPU 上的 dropout 用 CUDA 自己的随机数
+    torch.save(state, folder / "train_state.pt")
+
+
+def load_checkpoint(folder, model, opt):
+    folder = Path(folder)
+    model.load_state_dict(load_file(folder / "model.safetensors"))
+    state = torch.load(folder / "train_state.pt", weights_only=True)
+    opt.load_state_dict(state["opt"])
+    torch.set_rng_state(state["rng"])
+    if "cuda_rng" in state:
+        torch.cuda.set_rng_state_all(state["cuda_rng"])
+    return state["step"]
+
+
+# ---------------- 第 4 步：导出 ONNX 并对拍（第 7、8 题）
+def export_onnx(model, path):
+    model.eval()
+    example = torch.randn(2, FEATURES)
+    torch.onnx.export(model, (example,), str(path), dynamo=True,
+                      input_names=["x"], output_names=["logits"],
+                      dynamic_shapes={"x": {0: "batch"}},
+                      external_data=False, verbose=False)
+    return str(path)
+
+
+def verify_onnx(model, path, batch_sizes=(1, 5, 64), tol=1e-4):
+    import onnxruntime as ort
+
+    model.eval()
+    sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    name = sess.get_inputs()[0].name
+    worst = 0.0
+    for b in batch_sizes:
+        x = torch.randn(b, FEATURES)
+        with torch.inference_mode():
+            want = model(x).numpy()
+        got = sess.run(None, {name: x.numpy()})[0]
+        worst = max(worst, float(np.abs(got - want).max()))
+    if worst > tol:
+        raise AssertionError(f"ONNX 和 PyTorch 差了 {worst:.2e}，超过容差 {tol}")
+    return worst
+
+
+# ---------------- 第 5 步：服务（第 9、10 题）
+Row = Annotated[list[FiniteFloat], Field(min_length=FEATURES, max_length=FEATURES)]
+
+
+class PredictRequest(BaseModel):
+    rows: list[Row] = Field(min_length=1, max_length=MAX_ROWS)
+
+
+def onnx_predictor(path):
+    import onnxruntime as ort
+
+    sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    name = sess.get_inputs()[0].name
+
+    def predict(x):
+        logits = sess.run(None, {name: np.asarray(x, dtype=np.float32)})[0]
+        e = np.exp(logits - logits.max(axis=1, keepdims=True))
+        return e / e.sum(axis=1, keepdims=True)
+
+    return predict
+
+
+def create_app(load_model):
+    predict = load_model()
+    predict(np.zeros((1, FEATURES), dtype=np.float32))
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict_route(req: PredictRequest):
+        x = np.asarray(req.rows, dtype=np.float32)
+        probs = predict(x)
+        return {"labels": [LABELS[i] for i in probs.argmax(axis=1)], "probs": probs.tolist()}
+
+    return app
+
+
+# ---------------- 第 6 步：延迟和漂移（第 11、12 题）
+def measure_latency(client, payload, n=50, warmup=5):
+    for _ in range(warmup):
+        client.post("/predict", json=payload)
+    times = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        r = client.post("/predict", json=payload)
+        times.append((time.perf_counter() - t0) * 1000)
+        if r.status_code != 200:
+            raise AssertionError(f"状态码 {r.status_code}：失败的请求不算延迟")
+    return times
+
+
+def latency_report(times_ms):
+    t = np.asarray(times_ms, dtype=float)
+    return {"p50": float(np.percentile(t, 50)), "p95": float(np.percentile(t, 95)),
+            "p99": float(np.percentile(t, 99))}
+
+
+def psi(expected, actual, bins=10, eps=1e-4):
+    expected = torch.as_tensor(expected, dtype=torch.float64).flatten()
+    actual = torch.as_tensor(actual, dtype=torch.float64).flatten()
+    edges = torch.quantile(expected, torch.linspace(0, 1, bins + 1, dtype=torch.float64))[1:-1]
+    e = torch.bincount(torch.bucketize(expected, edges), minlength=bins) / len(expected)
+    a = torch.bincount(torch.bucketize(actual, edges), minlength=bins) / len(actual)
+    e, a = e.clamp_min(eps), a.clamp_min(eps)
+    return float(((a - e) * torch.log(a / e)).sum())
+
+
+# ---------------- 把六步串起来
+def main():
+    t_start = time.perf_counter()
+    gpu = f" ({torch.cuda.get_device_name(0)})" if DEVICE == "cuda" else ""
+    print(f"torch {torch.__version__} | device: {DEVICE}{gpu}")
+
+    # 第 1 步
+    x_train, y_train = make_data(4000, seed=1)
+    x_val, y_val = make_data(1000, seed=2)
+    torch.manual_seed(0)
+    first = smoke_test(TinyNet(), x_train[:64], y_train[:64])
+    over = overfit_one_batch(TinyNet(), x_train[:16], y_train[:16])
+    print(f"[1] smoke test 通过，第一个 loss {first:.3f}（ln 3 = {math.log(3):.3f}）；"
+          f"过拟合 16 行：{over[0]:.3f} -> {over[-1]:.4f}")
+    if over[-1] > 0.05:
+        raise SystemExit("16 行数据都记不住：先修代码，别往下跑")
+
+    # 第 2 步：在 DEVICE 上训练 600 步，第 300 步存一次 checkpoint
+    xd, yd = x_train.to(DEVICE), y_train.to(DEVICE)
+    # 预热：第一次在 GPU 上 forward/backward 要加载 CUDA kernel，可能要好几秒，不算进训练时间（第 19 天）
+    t0 = time.perf_counter()
+    warm = TinyNet().to(DEVICE)
+    train_steps(warm, torch.optim.AdamW(warm.parameters()), xd, yd, 5)
+    warm_s = time.perf_counter() - t0
+    torch.manual_seed(0)
+    model = TinyNet().to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+    t0 = time.perf_counter()
+    losses = train_steps(model, opt, xd, yd, 300)
+    save_checkpoint(OUT / "ckpt_300", model, opt, 300)
+    losses += train_steps(model, opt, xd, yd, 300)
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+    train_s = time.perf_counter() - t0
+    acc = accuracy(model, x_val.to(DEVICE), y_val.to(DEVICE))
+    save_checkpoint(OUT / "ckpt_600", model, opt, 600)
+    print(f"[2] 预热 {warm_s:.1f} s；在 {DEVICE} 上训练 600 步用了 {train_s:.2f} s；loss（20 步平均）"
+          f"{sum(losses[:20]) / 20:.3f} -> {sum(losses[-20:]) / 20:.3f}；验证准确率 {acc:.3f}")
+
+    # 第 3 步：换一个随机初始化的新模型，从第 300 步的 checkpoint 续训到 600 步，应该和不中断的一样
+    torch.manual_seed(123)
+    resumed = TinyNet().to(DEVICE)
+    opt2 = torch.optim.AdamW(resumed.parameters(), lr=3e-3)
+    step = load_checkpoint(OUT / "ckpt_300", resumed, opt2)
+    train_steps(resumed, opt2, xd, yd, 600 - step)
+    resume_diff = max((a - b).abs().max().item()
+                      for a, b in zip(model.state_dict().values(), resumed.state_dict().values()))
+    print(f"[3] 从第 {step} 步续训到 600 步，和不中断训练的权重最大差 {resume_diff:.1e}")
+
+    # 第 4 步：服务端只拿到 model.safetensors：在 CPU 上读回一个新模型，导出，对拍
+    serve_model = TinyNet()
+    serve_model.load_state_dict(load_file(OUT / "ckpt_600" / "model.safetensors"))
+    t0 = time.perf_counter()
+    onnx_path = export_onnx(serve_model, OUT / "tinynet.onnx")
+    export_s = time.perf_counter() - t0
+    onnx_diff = verify_onnx(serve_model, onnx_path)
+    size_kb = Path(onnx_path).stat().st_size / 1024
+    print(f"[4] 导出 tinynet.onnx（{size_kb:.1f} KB，{export_s:.1f} s）；onnxruntime 和 PyTorch 最大差 {onnx_diff:.1e}")
+
+    # 第 5 步：服务，用 onnxruntime 跑
+    client = TestClient(create_app(lambda: onnx_predictor(onnx_path)))
+    if client.get("/health").json() != {"status": "ok"}:
+        raise SystemExit("/health 不对")
+    got = client.post("/predict", json={"rows": x_val[:4].tolist()}).json()["labels"]
+    want = [LABELS[i] for i in y_val[:4].tolist()]
+    bad = client.post("/predict", json={"rows": [[0.0] * 7]}).status_code
+    print(f"[5] /health ok；/predict 预测 {got}，真实 {want}；只有 7 个数的请求 -> {bad}")
+
+    # 第 6 步：延迟分位数 + PSI 漂移
+    lat1 = latency_report(measure_latency(client, {"rows": x_val[:1].tolist()}, n=200))
+    lat64 = latency_report(measure_latency(client, {"rows": x_val[:64].tolist()}, n=200))
+    print(f"[6] 延迟（ms，含 TestClient 开销）1 行：p50 {lat1['p50']:.2f} p95 {lat1['p95']:.2f} "
+          f"p99 {lat1['p99']:.2f}；64 行：p50 {lat64['p50']:.2f} p95 {lat64['p95']:.2f} p99 {lat64['p99']:.2f}")
+    live_ok, _ = make_data(1000, seed=3)
+    live_moved, _ = make_data(1000, seed=4, shift=0.8)
+    psi_ok = max(psi(x_train[:, j], live_ok[:, j]) for j in range(FEATURES))
+    psi_moved = max(psi(x_train[:, j], live_moved[:, j]) for j in range(FEATURES))
+    alert = "报警" if psi_moved > 0.25 else "没报警"
+    print(f"    PSI（8 个特征里最大的）：正常流量 {psi_ok:.3f}，整体平移 0.8 的流量 {psi_moved:.3f} -> {alert}")
+
+    problems = []
+    if acc < 0.88:
+        problems.append(f"验证准确率 {acc:.3f} < 0.88")
+    if resume_diff > 1e-5:
+        problems.append(f"续训和不中断差了 {resume_diff:.1e}")
+    if bad != 422:
+        problems.append(f"坏请求返回了 {bad}，应该是 422")
+    if psi_ok > 0.1 or psi_moved < 0.25:
+        problems.append(f"PSI 不对：正常 {psi_ok:.3f}（应 < 0.1），平移 {psi_moved:.3f}（应 > 0.25）")
+    if problems:
+        raise SystemExit("CAPSTONE FAILED: " + "; ".join(problems))
+    total_s = time.perf_counter() - t_start
+    print(f"CAPSTONE OK | device={DEVICE} | val_acc={acc:.3f} | resume_diff={resume_diff:.1e} | "
+          f"onnx_diff={onnx_diff:.1e} | p50_ms={lat1['p50']:.2f} | p95_ms={lat1['p95']:.2f} | "
+          f"psi_ok={psi_ok:.3f} | psi_shifted={psi_moved:.3f} | total_s={total_s:.1f}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+输出里值得看的几处：第 [2] 行 GPU 和 CPU 各花了多少时间；第 [3] 行续训的差是不是 0；第 [6] 行 1 行和 64 行的延迟差多少（整批跑，每行摊到的时间少得多），以及平移后的 PSI 为什么会报警。
+--- hints
+- 报 `ModuleNotFoundError`：你用的 Python 不是装了课程依赖的那个。用跑 `serve.py` 的同一个 Python。
+- 最后一行是 `CAPSTONE FAILED: ...`：它会说是哪一步没过；把那一步的函数换回脚本里的原版再跑一次，就能判断是不是你改出来的问题。
+
+@@ item d26-14
+type: code
+title: 闭卷：能续训的 checkpoint
+level: 3
+exam: yes
+cards: 第 3 步：能续训的 checkpoint
+targets: save_checkpoint, load_checkpoint
+ref: day26
+--- context
+面试和实际工作里都会遇到：训练任务被打断，要从 checkpoint 接着训，而且结果要和没打断时一模一样。
+--- prompt
+不看资料，写 `save_checkpoint(folder, model, opt, step)` 和 `load_checkpoint(folder, model, opt)`：
+- `folder/model.safetensors`：模型权重（safetensors）。
+- `folder/train_state.pt`：`{"opt": ..., "step": ..., "rng": ...}`，要能用 `torch.load(..., weights_only=True)` 读。
+- `folder` 不存在就建；`load_checkpoint` 恢复权重、优化器状态、全局随机数状态，返回 step。
+
+`save_file`、`load_file`、`Path` 已经导入。测试和第 5 题一样，包括「续训 == 不中断」。
+--- starter
+def save_checkpoint(folder, model, opt, step):
+    raise todo()
+
+
+def load_checkpoint(folder, model, opt):
+    raise todo()
+--- solution
+def save_checkpoint(folder, model, opt, step):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    save_file(model.state_dict(), folder / "model.safetensors")
+    torch.save({"opt": opt.state_dict(), "step": step, "rng": torch.get_rng_state()},
+               folder / "train_state.pt")
+
+
+def load_checkpoint(folder, model, opt):
+    folder = Path(folder)
+    model.load_state_dict(load_file(folder / "model.safetensors"))
+    state = torch.load(folder / "train_state.pt", weights_only=True)
+    opt.load_state_dict(state["opt"])
+    torch.set_rng_state(state["rng"])
+    return state["step"]
+--- tests
+import os, tempfile
+
+@check("两个文件都在，权重是 safetensors")
+def _():
+    seed(0)
+    m = TinyNet()
+    opt = torch.optim.AdamW(m.parameters(), lr=3e-3)
+    folder = os.path.join(tempfile.mkdtemp(), "run1", "step10")
+    save_checkpoint(folder, m, opt, 10)
+    true(os.path.exists(os.path.join(folder, "model.safetensors")),
+         "没有 folder/model.safetensors（文件夹不存在时要先建：mkdir(parents=True, exist_ok=True)）")
+    true(os.path.exists(os.path.join(folder, "train_state.pt")), "没有 folder/train_state.pt")
+    w = load_file(os.path.join(folder, "model.safetensors"))
+    true(set(w) == set(m.state_dict()), f"model.safetensors 里的名字应该是 {sorted(m.state_dict())}，你的是 {sorted(w)}")
+    for k, v in m.state_dict().items():
+        eq(w[k], v, tol=0, msg=f"{k} 存得不对")
+
+@check("train_state.pt 能用 weights_only=True 读")
+def _():
+    seed(0)
+    m = TinyNet()
+    opt = torch.optim.AdamW(m.parameters(), lr=3e-3)
+    folder = tempfile.mkdtemp()
+    save_checkpoint(folder, m, opt, 10)
+    try:
+        st = torch.load(os.path.join(folder, "train_state.pt"), weights_only=True)
+    except Exception as e:
+        raise AssertionError(f"weights_only=True 读不了（{type(e).__name__}）：只存 state_dict、数字和张量，"
+                             "别把整个优化器或模型对象存进去")
+    true(isinstance(st, dict) and {"opt", "step", "rng"} <= set(st),
+         "train_state.pt 应该是一个有 opt / step / rng 三个键的字典")
+    true(st["step"] == 10, f"step 应该是 10，存进去的是 {st['step']}")
+
+@check("续训 == 不中断")
+def _():
+    x, y = make_data(2000, seed=1)
+    seed(0)
+    m1 = TinyNet()
+    o1 = torch.optim.AdamW(m1.parameters(), lr=3e-3)
+    train_steps(m1, o1, x, y, 20)                      # 一口气 20 步
+    seed(0)
+    m2 = TinyNet()
+    o2 = torch.optim.AdamW(m2.parameters(), lr=3e-3)
+    train_steps(m2, o2, x, y, 10)                      # 10 步，然后存
+    folder = tempfile.mkdtemp()
+    save_checkpoint(folder, m2, o2, 10)
+    seed(123)                                          # 模拟重启：新的随机初始化，随机数状态也不一样
+    m3 = TinyNet()
+    o3 = torch.optim.AdamW(m3.parameters(), lr=3e-3)
+    step = load_checkpoint(folder, m3, o3)
+    true(step == 10, f"load_checkpoint 应该返回 10，你返回了 {step}")
+    train_steps(m3, o3, x, y, 10)                      # 再 10 步
+    for (name, p), p1 in zip(m3.named_parameters(), m1.parameters()):
+        eq(p, p1, tol=1e-6, msg=f"续训后的 {name} 和不中断训练的不一样。"
+                               "漏了优化器状态（opt.load_state_dict）还是随机数状态（torch.set_rng_state）？")
+--- hints
+- 两个文件、三样续训要的东西：权重、优化器状态、随机数状态，再加 step。
+- 读 train_state.pt 用 `torch.load(..., weights_only=True)`。
+
+@@ item d26-15
+type: code
+title: 闭卷：FastAPI 服务
+level: 3
+exam: yes
+cards: 第 5 步：做成 FastAPI 服务
+targets: create_app
+ref: day26
+--- context
+「把这个模型做成一个服务」是 ML 工程面试的高频题：加载一次、预热、健康检查、输入校验、整批推理，都要在白板上写得出来。
+--- prompt
+不看资料，写 `create_app(load_model)`：
+- 启动时调一次 `load_model()` 得到 `predict`（`(B, 8)` float32 → `(B, 3)` 概率），再用一行全 0 预热一次。
+- `GET /health` → `{"status": "ok"}`。
+- `POST /predict`，请求体是 `PredictRequest`（不合格自动 422）：整个请求一次调用 `predict`，返回 `{"labels": [...], "probs": [...]}`，类名在 `LABELS` 里。
+
+`FastAPI`、`np`、`LABELS`、`FEATURES`、`PredictRequest` 已经有了。测试和第 10 题一样。
+--- starter
+def create_app(load_model):
+    raise todo()
+--- solution
+def create_app(load_model):
+    predict = load_model()
+    predict(np.zeros((1, FEATURES), dtype=np.float32))
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict_route(req: PredictRequest):
+        x = np.asarray(req.rows, dtype=np.float32)
+        probs = predict(x)
+        return {"labels": [LABELS[i] for i in probs.argmax(axis=1)], "probs": probs.tolist()}
+
+    return app
+--- setup
+from fastapi.testclient import TestClient
+
+def _counting_loader():
+    torch.manual_seed(0)
+    base = torch_predictor(TinyNet())
+    calls = {"load": 0, "predict": 0, "rows": []}
+
+    def load_model():
+        calls["load"] += 1
+
+        def predict(x):
+            calls["predict"] += 1
+            calls["rows"].append(len(x))
+            return base(x)
+
+        return predict
+
+    return load_model, calls, base
+--- tests
+@check("GET /health")
+def _():
+    load, calls, _ = _counting_loader()
+    r = TestClient(create_app(load)).get("/health")
+    true(r.status_code == 200 and r.json() == {"status": "ok"},
+         f"/health 应该返回 200 和 {{'status': 'ok'}}，你的是 {r.status_code} {r.text[:200]}")
+
+@check("POST /predict：每行一个 label 和 3 个概率")
+def _():
+    load, calls, base = _counting_loader()
+    client = TestClient(create_app(load))
+    x, _ = make_data(3, seed=5)
+    r = client.post("/predict", json={"rows": x.tolist()})
+    true(r.status_code == 200, f"状态码 {r.status_code}：{r.text[:300]}")
+    body = r.json()
+    true(isinstance(body, dict) and "labels" in body and "probs" in body, f"要返回有 labels 和 probs 的字典，你的是 {body}")
+    p = base(x.numpy())
+    want = [LABELS[i] for i in p.argmax(axis=1)]
+    true(body["labels"] == want, f"labels 应该是 {want}，你的是 {body['labels']}（每行取概率最大的类，再查 LABELS）")
+    eq(torch.tensor(body["probs"]), torch.from_numpy(p), tol=1e-5, msg="probs 应该是 predict 返回的概率")
+
+@check("启动时只加载一次、预热一次")
+def _():
+    load, calls, _ = _counting_loader()
+    app = create_app(load)
+    true(calls["load"] == 1, f"create_app 里应该调 1 次 load_model()，你调了 {calls['load']} 次")
+    true(calls["predict"] == 1, f"还没有任何请求时，predict 应该已经被调过 1 次（预热），实际是 {calls['predict']} 次")
+    client = TestClient(app)
+    for _ in range(3):
+        client.post("/predict", json={"rows": [[0.0] * 8]})
+    true(calls["load"] == 1, f"3 个请求之后 load_model 一共被调了 {calls['load']} 次：模型只能在 create_app 里加载一次")
+
+@check("一个请求只调一次模型")
+def _():
+    load, calls, _ = _counting_loader()
+    client = TestClient(create_app(load))
+    before = calls["predict"]
+    client.post("/predict", json={"rows": [[0.0] * 8] * 5})
+    n = calls["predict"] - before
+    true(n == 1 and calls["rows"][-1] == 5,
+         f"5 行的请求调了 {n} 次 predict：应该把 5 行拼成一个 (5, 8) 的数组，调 1 次")
+
+@check("坏请求返回 422，模型不会跑")
+def _():
+    load, calls, _ = _counting_loader()
+    client = TestClient(create_app(load), raise_server_exceptions=False)
+    before = calls["predict"]
+    for rows in ([[0.0] * 7], [], [[0.0] * 8] * 65):
+        r = client.post("/predict", json={"rows": rows})
+        true(r.status_code == 422, f"{len(rows)} 行、每行 {len(rows[0]) if rows else 0} 个数的请求应该返回 422，"
+                                   f"你的服务返回 {r.status_code}：路由函数的参数要写成 req: PredictRequest")
+    true(calls["predict"] == before, "坏请求也跑了模型：校验要在调用 predict 之前")
+--- hints
+- 顺序：加载、预热、建 app、两个路由、`return app`。
+- 路由参数写成 `req: PredictRequest`，FastAPI 就会先校验。

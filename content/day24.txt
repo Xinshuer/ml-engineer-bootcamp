@@ -1,0 +1,1415 @@
+@@ day 24
+title: 运维一：实验可复现、模型可追溯
+part: 上线后的运维
+hours: 3–4 小时
+--- goal
+学完能给每次训练留一份完整的实验记录（config、git commit、数据指纹、种子、库版本、指标），能从一堆实验里挑出最好的，并说清它和别的实验差在哪。还能用一个 JSON 文件做一个小小的模型注册表：注册版本、上线、拒绝更差的模型、一步回滚。最后给模型写一张模型卡。
+--- checklist
+- 先清空复习区（昨天看过答案的题从空白重做）
+- 读完 8 张知识卡片，每张的代码都改一个数再运行一次
+- 练习区全部通过：先读失败信息，想清楚问题在哪一行，再动手改
+- 闭卷区两题不看答案写出来
+
+@@ concept
+title: 一次实验要记下的六样东西
+--- body
+三个月后，有人问你：「线上那个模型是怎么训出来的？能再训一个一样的吗？」答不上来，这个模型就没法修，也没法改，更说不清它为什么好。
+
+所以每次训练结束，都要留一份**实验记录**（run record）。它要回答一个问题：用同样的东西，能不能再得到同样的结果？至少要记六样：
+
+1. **config**：所有超参数（学习率、batch size、epoch 数、模型大小……）。
+2. **git commit**：代码的版本，一串 40 个字符的十六进制数（`git rev-parse HEAD` 打印的就是它）。如果还有没提交的改动（working tree 是 dirty 的），这个 commit 就不等于你跑的代码。要么先提交，要么把 diff 一起存下来。
+3. **数据指纹**：数据文件内容的 sha256（下一张卡讲）。文件名没变，内容可能早就被人改过。
+4. **seed**：随机种子。
+5. **库版本**：Python、torch、numpy 的版本。升级 torch 之后结果变了，是常有的事。
+6. **metrics**：这次训练的结果（val_loss、val_acc……）。
+
+再加一个 `run_id`，给这次实验起个名字。整份记录存成一个 JSON 文件，和 checkpoint 放在一起。
+
+今天的练习里，git commit 是当作字符串传进来的，不用真的去跑 git。
+--- code
+import platform
+import numpy as np
+
+record = {
+    "run_id": "run-01",
+    "config": {"lr": 0.001, "batch_size": 32, "epochs": 10},
+    "git_commit": "3f9a2c1d0b7e4f6a8c5d2e1f0a9b8c7d6e5f4a3b",
+    "data_fingerprint": "（下一张卡讲怎么算）",
+    "seed": 42,
+    "versions": {"python": platform.python_version(), "torch": torch.__version__, "numpy": np.__version__},
+    "metrics": {"val_loss": 0.47, "val_acc": 0.842},
+}
+for key, value in record.items():
+    print(f"{key:17s}", value)
+print("git commit 有", len(record["git_commit"]), "个字符")
+
+@@ concept
+title: 数据指纹：用 sha256 认出同一份数据
+--- body
+sha256 是一种**哈希函数**：把任意多的字节变成一个 64 个字符的十六进制字符串（叫哈希值）。它有两个性质，正好拿来当数据的「指纹」：
+
+- 同样的字节，永远得到同样的哈希值。换台机器、换个文件名都一样。
+- 字节哪怕只改了一个，哈希值就完全变了。
+
+Python 自带 `hashlib`：
+
+```
+h = hashlib.sha256()
+h.update(b"some bytes")    # 可以分好几次 update，结果和一次喂进去一样
+h.hexdigest()              # 64 个字符
+```
+
+读文件要用二进制模式 `"rb"`（哈希算的是字节），而且分块读，比如每次 1 MB。这样 10 GB 的文件也不用一次装进内存。
+
+一份数据常常是好几个文件，怎么合成一个指纹？直接按顺序把内容拼起来算，有个问题：`os.listdir` 返回文件的顺序，在不同机器上可能不一样。同一份数据，就会得到不同的指纹。
+
+办法：**先给每个文件单独算哈希，把这些哈希排好序，用换行连起来，再算一次 sha256。** 这样文件的顺序、文件名、放在哪个文件夹，都不影响结果，只有内容算数。
+--- code
+import hashlib
+
+a, b = b"cat,1\n", b"dog,0\n"                     # 两个「文件」的内容
+print("a 的 sha256:  ", hashlib.sha256(a).hexdigest()[:16], "...（一共 64 个字符）")
+print("a 多一个空格: ", hashlib.sha256(b"cat,1 \n").hexdigest()[:16], "...")
+print("直接拼起来算，a+b 和 b+a 一样吗:", hashlib.sha256(a + b).hexdigest() == hashlib.sha256(b + a).hexdigest())
+
+def fingerprint(contents):
+    hashes = sorted(hashlib.sha256(c).hexdigest() for c in contents)
+    return hashlib.sha256("\n".join(hashes).encode("utf-8")).hexdigest()
+
+print("先各算各的、排序、再合起来，顺序还有影响吗:", fingerprint([a, b]) != fingerprint([b, a]))
+
+@@ concept
+title: 种子：torch、numpy、random 要分别设
+--- body
+一次训练里，常常有三个互不相干的随机数来源：
+
+- **torch**：初始化权重、Dropout、`torch.randn`。用 `torch.manual_seed(seed)` 设。
+- **numpy**：很多数据代码用 `np.random.permutation` 打乱顺序、切分数据集。用 `np.random.seed(seed)` 设。
+- **Python 自带的 random**：数据增强里常见的 `random.random() < 0.5`。用 `random.seed(seed)` 设。
+
+它们各有各的状态。**只设 torch 的种子，numpy 和 random 完全不受影响。** 这时 numpy 打乱出来的顺序，取决于这个进程之前有谁用过 numpy 的随机数。同一个 seed，两次运行的数据顺序不一样，结果自然也不一样。
+
+两条规则：
+
+1. 训练开始时，三个种子都设上，而且只设一次。要是在每个 epoch 里重新设，每个 epoch 的数据顺序就一模一样，打乱等于没打乱。
+2. 把 seed 写进实验记录。
+
+numpy 还有一种更干净的写法：`rng = np.random.default_rng(seed)`，再用 `rng.permutation(n)`。这是一个只属于你的生成器，别的代码动不了它。
+
+GPU 上有些算子本身就不确定（`cudnn.benchmark`、确定性算法），第 18 天讲过。今天只管种子。
+--- code
+import numpy as np
+
+def shuffled(seed, also_numpy):
+    torch.manual_seed(seed)
+    if also_numpy:
+        np.random.seed(seed)
+    return np.random.permutation(6).tolist()
+
+np.random.seed(1); a = shuffled(0, also_numpy=False)    # 模拟：之前有别的代码用过 numpy 的随机数
+np.random.seed(2); b = shuffled(0, also_numpy=False)
+print("只设了 torch 的种子:", a, b, "一样吗:", a == b)
+np.random.seed(1); a = shuffled(0, also_numpy=True)
+np.random.seed(2); b = shuffled(0, also_numpy=True)
+print("numpy 也设了种子:  ", a, b, "一样吗:", a == b)
+rng = np.random.default_rng(0)
+print("自己的生成器 default_rng(0):", rng.permutation(6).tolist())
+
+@@ concept
+title: 存成 JSON：只认几种简单类型
+--- body
+实验记录、注册表，都存成 JSON：纯文本，人能直接读，任何语言都能解析，还能用 git diff 比较两个版本。
+
+- `json.dump(obj, f)` 写进文件，`json.load(f)` 从文件读回来。
+- 带 s 的 `json.dumps(obj)` / `json.loads(text)` 操作的是字符串，不是文件。
+
+JSON 只认这几种类型：dict、list、str、int、float、True / False、None。三个常见的坑：
+
+- **张量和 numpy 的 float32 存不进去**，会报 `TypeError: Object of type Tensor is not JSON serializable`。指标常常是 `loss.mean()` 这种 0 维张量，存之前用 `float(v)` 转成 Python 数字。
+- **dict 的 key 只能是字符串。** 存进去 `{1: ...}`，读回来是 `{"1": ...}`，`1 in d` 就成了 False。所以今天的注册表把版本号放在 list 里，不拿它当 key。
+- 元组读回来变成 list。
+
+两个好习惯：`indent=2` 让文件分行缩进，好读；`sort_keys=True` 让 key 的顺序固定，两个文件才好逐行比较。打开文件时写明 `encoding="utf-8"`，不然 Windows 可能用别的编码。
+--- code
+import json
+import numpy as np
+
+metrics = {"val_loss": torch.tensor(0.25), "val_acc": np.float32(0.875)}
+try:
+    json.dumps(metrics)
+except TypeError as e:
+    print("存不进去:", e)
+clean = {k: float(v) for k, v in metrics.items()}
+print("转成 float 以后:", json.dumps(clean, sort_keys=True))
+back = json.loads(json.dumps({"versions": {1: "a", 2: "b"}}))
+print("int 当 key，读回来变成了:", list(back["versions"]), "  1 in 它:", 1 in back["versions"])
+print(json.dumps({"lr": 0.001, "betas": (0.9, 0.95)}, indent=2))
+
+@@ concept
+title: 比较实验：谁最好，配置差在哪
+ref: day24
+--- body
+调参时你会跑很多次实验，每次的记录都是一个 JSON 文件。比较它们，只要两个动作。
+
+**1. 按一个指标挑最好的。** 先想清楚方向：accuracy 越大越好，用 `max`；loss 越小越好，用 `min`。不同的指标，可能挑出不同的「最好」。
+
+`max(runs, key=lambda r: r["metrics"]["val_acc"])` 返回的是**整条记录**，不只是那个数。`key=` 告诉 `max` 拿什么来比；`lambda r: ...` 是一个只有一行的小函数。
+
+崩掉的实验（比如 loss 变成 nan，还没评估就停了）没有这个指标。要跳过它：不能让它报错，也不能把它当成 0 分。
+
+**2. 看两次实验的 config 差在哪。** 把两个 config 的所有 key 合在一起（`set(a) | set(b)`），一个一个比较值。只在一边有的 key（比如后来新加的 warmup），另一边记成 None。`d.get(key)` 在 key 不存在时正好返回 None。
+
+还要注意：只有数据指纹一样的实验，分数才能直接比。换了一份测试集，分数高了，可能只是题目变容易了。
+--- code
+runs = sample_runs()
+for r in runs:
+    print(r["run_id"], " lr =", r["config"]["lr"], " batch =", r["config"]["batch_size"], " metrics =", r["metrics"])
+done = [r for r in runs if "val_acc" in r["metrics"]]          # 跳过崩掉的 run-03
+print("val_acc 最高: ", max(done, key=lambda r: r["metrics"]["val_acc"])["run_id"])
+print("val_loss 最低:", min(done, key=lambda r: r["metrics"]["val_loss"])["run_id"])
+a, b = runs[1]["config"], runs[3]["config"]
+print("两个 config 的全部 key:", sorted(set(a) | set(b)))
+print("warmup:", a.get("warmup"), "->", b.get("warmup"))
+
+@@ concept
+title: 模型注册表：注册、上线、历史
+ref: day24
+--- body
+模型越训越多：哪个在线上？上一个是谁？它是哪次实验训出来的？**模型注册表**（model registry）就是回答这些问题的地方。MLflow、Weights & Biases 这些工具都有这个功能。今天我们用一个 JSON 文件自己做一个最小的：
+
+```
+{"versions": [{"version": 1, "run_id": "run-01", "metrics": {"val_acc": 0.842}},
+              {"version": 2, "run_id": "run-04", "metrics": {"val_acc": 0.875}}],
+ "production": 2,
+ "history": [2]}
+```
+
+- **register（注册）**：加一个新版本。版本号 1、2、3 往上加，记下它来自哪次实验（run_id）和它的指标。注册不等于上线。
+- **promote（上线）**：把一个版本设成 `production`，同时追加到 `history`（上线过的版本，按时间顺序）。
+- **production**：线上现在是哪个版本，还没有就是 None。
+
+一个重要的写法：**每个方法都是「读文件 → 改 → 写回文件」，不在内存里留状态。** 训练脚本、上线脚本、推理服务是不同的进程，它们只能通过这个文件看到同一个状态。
+
+写文件要「先写临时文件，再 `os.replace`」，写到一半崩了也不会留下坏文件（第 20 天讲过）。今天的 `JsonStore` 已经写好了 `self._load()` 和 `self._save(data)`：文件还不存在时，`_load()` 返回一个空的注册表。
+--- code
+import json
+import tempfile
+
+with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+    reg = BasicRegistry(folder)
+    print("注册，得到版本号:", reg.register("run-01", {"val_acc": 0.842}), reg.register("run-04", {"val_acc": 0.875}))
+    print("线上:", reg.production())
+    reg.promote(2)
+    print("promote(2) 之后，新建一个对象来看，线上:", BasicRegistry(folder).production())
+    print(json.dumps(reg._load()))
+
+@@ concept
+title: 上线门槛和回滚
+ref: day24
+--- body
+**门槛（gate）**：新版本要上线，它的评估指标不能比线上的差。不然一次手滑，更差的模型就上线了。规则是：
+
+- 线上还没有模型：直接上。
+- 看清方向：`higher_is_better=True`（比如 accuracy）时，新的比旧的**小**才算更差；`False`（比如 loss）时，新的比旧的**大**才算更差。
+- 一样好，可以上。
+- 更差：`raise ValueError(...)`，文件一个字都不改。报错信息里写上两个数，方便排查。
+
+**回滚（rollback）**：新版本上线后出了问题（投诉变多、延迟变高），第一件事是回到上一个版本，让线上先恢复正常，再慢慢查原因。有了 `history`，回滚就是：去掉 history 的最后一个，把 production 设成新的最后一个。history 里不到 2 个版本，就没有可回的，`raise ValueError`。
+
+注意：**回滚不过门槛。** 上一个版本的分数本来就比现在的低（不然当初也不会换掉它），拿门槛去拦它，回滚就永远做不成。出事的时候，要的是一步回到「已知能用」的状态。
+
+真实的系统在上线前还会做更多检查，比如先只放一小部分流量（canary），第 25 天讲。
+--- code
+import tempfile
+
+with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+    reg = Registry(folder)                       # 比 val_acc，越大越好
+    for run_id, acc in [("run-01", 0.842), ("run-04", 0.875), ("run-05", 0.861)]:
+        reg.register(run_id, {"val_acc": acc})
+    reg.promote(1)
+    reg.promote(2)
+    try:
+        reg.promote(3)
+    except ValueError as e:
+        print("v3 被拒绝:", e)
+    print("线上:", reg.production(), " history:", reg._load()["history"])
+    print("回滚到:", reg.rollback(), " history:", reg._load()["history"])
+
+@@ concept
+title: 模型卡：给用模型的人看的说明书
+ref: day24
+--- body
+实验记录是写给**自己**看的：怎么复现。**模型卡**（model card）是写给**用这个模型的人**看的：它能干什么，不能干什么，什么情况下会出错。别的团队要接入你的模型，产品经理要决定能不能上线，都先看它。
+
+一张最小的模型卡有这几节：
+
+1. **名字和版本**：和注册表里的版本号一致。
+2. **用途**：设计来做什么，比如「给英文商品评论分正面 / 负面」。
+3. **不适合的用途**：明确说不该用在哪，比如「其他语言」「医疗、法律决定」。
+4. **评估结果**：哪些指标，多少分。除了总分，最好还有分组的分数（比如长评论单独算一个），平均分会把弱点藏起来。
+5. **训练数据**：数据是什么，加上数据指纹。
+6. **怎样复现**：git commit、seed、库版本，都从实验记录里来。
+7. **局限和风险**：已知的问题，比如「讽刺的句子经常判错」。
+
+模型卡里的数字要**用代码从实验记录里填**，不要手抄。手抄的数字，迟早和真实的对不上。
+--- code
+rec = sample_runs()[3]
+lines = ["# 模型卡：review-sentiment v2", "## 评估结果"]
+lines += [f"- {k}: {v:.4f}" for k, v in sorted(rec["metrics"].items())]
+lines += ["## 怎样复现", "- git commit: " + rec["git_commit"], "- seed: " + str(rec["seed"])]
+print("\n".join(lines))
+
+@@ item d24-01
+type: predict
+title: 分两次喂、换个顺序，哈希还一样吗
+level: 1
+cards: 数据指纹：用 sha256 认出同一份数据
+--- context
+数据指纹整个建立在 sha256 的两个性质上：分块喂进去和一次喂进去结果一样（所以能分块读大文件），字节顺序一变结果就变（所以多个文件要先排序）。先亲眼确认这两点。
+--- prompt
+读下面的代码，写出它打印的三行。
+--- code
+import hashlib
+h = hashlib.sha256()
+h.update(b"cat,1\n")
+h.update(b"dog,0\n")                          # 分两次喂进去
+one_go = hashlib.sha256(b"cat,1\ndog,0\n").hexdigest()
+print(h.hexdigest() == one_go)
+print(len(one_go))
+swapped = hashlib.sha256(b"dog,0\ncat,1\n").hexdigest()
+print(one_go == swapped)
+--- explain
+第一行 `True`：sha256 可以分好几次 `update`，结果和把所有字节一次喂进去完全一样。所以大文件可以一块一块地读、一块一块地 update，不用一次装进内存。
+
+第二行 `64`：`hexdigest()` 是 64 个十六进制字符（256 位，每个字符表示 4 位）。
+
+第三行 `False`：两行内容一样，只是顺序反了，拼出来的字节就不一样，哈希也就不一样。所以多个文件合成一个指纹时，要先各自算哈希、排好序，再合起来。
+--- hints
+- `update` 两次，喂进去的字节连起来是什么？和 `one_go` 用的字节比一比。
+- 哈希只认字节。`b"cat,1\ndog,0\n"` 和 `b"dog,0\ncat,1\n"` 是同样的字节吗？
+
+@@ item d24-02
+type: code
+title: 一个文件的 sha256
+level: 1
+cards: 数据指纹：用 sha256 认出同一份数据
+targets: file_sha256
+ref: day24
+--- context
+「这份数据和上次训练用的是同一份吗？」看文件名和修改时间都不可靠，只有内容的哈希说了算。分块读，是为了几十 GB 的数据文件也能算。
+--- prompt
+写 `file_sha256(path)`：返回文件内容的 sha256，也就是 64 个字符的十六进制字符串（`hexdigest()`）。
+
+- 用二进制模式 `"rb"` 打开：哈希算的是字节。文本模式会把 Windows 的换行 `\r\n` 改成 `\n`，读出来的也是字符串，不是字节。
+- 分块读：每次 `f.read(1 << 20)`（1 MB），每块都 `h.update(chunk)`，读到空的 `b""` 就停。
+--- starter
+import hashlib
+
+def file_sha256(path):
+    """path -> 64 个字符的十六进制字符串"""
+    raise todo()
+--- solution
+import hashlib
+
+def file_sha256(path):
+    """path -> 64 个字符的十六进制字符串"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:                  # 二进制模式：原样读字节
+        while True:
+            chunk = f.read(1 << 20)              # 每次 1 MB
+            if not chunk:                        # 读到空的 b""：文件结束
+                break
+            h.update(chunk)
+    return h.hexdigest()
+--- tests
+import os, tempfile, hashlib
+
+def _hash_of(data):
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        return file_sha256(write_files(folder, {"f.bin": data})[0])
+
+@check("和一次读完再算的 sha256 一样")
+def _():
+    data = b"x,y\n1,0\n2,1\n"
+    got = _hash_of(data)
+    true(isinstance(got, str) and len(got) == 64, f"要返回 hexdigest()：64 个字符的字符串。你返回的是 {got!r}")
+    true(got == hashlib.sha256(data).hexdigest(), "哈希值不对：要算的是文件的全部字节")
+
+@check("Windows 换行和不是文字的字节，也要算对")
+def _():
+    data = b"a,b\r\n1,2\r\n" + bytes([0, 255, 254, 10])
+    true(_hash_of(data) == hashlib.sha256(data).hexdigest(),
+         "文件里有 \\r\\n 和 0xFF 这种字节时，哈希不对。要用 \"rb\" 二进制模式打开：文本模式会改掉换行，也读不了不是文字的字节。")
+
+@check("3 MB 的大文件也对")
+def _():
+    data = torch.randint(0, 256, (3_000_000,), dtype=torch.uint8).numpy().tobytes()
+    true(_hash_of(data) == hashlib.sha256(data).hexdigest(),
+         "3 MB 的文件哈希不对。先确认用的是 \"rb\" 二进制模式；再看分块读：每一块都要 update，一块都不能漏，最后一块可能不满 1 MB。")
+
+@check("改一个字节，哈希就变")
+def _():
+    true(_hash_of(b"x,y\n1,0\n") != _hash_of(b"x,y\n1,1\n"), "两个文件只差一个字节，哈希却一样：你是不是没读文件内容？")
+--- hints
+- 先 `h = hashlib.sha256()`，最后 `return h.hexdigest()`。
+- `with open(path, "rb") as f:`，然后在 `while True:` 里 `chunk = f.read(1 << 20)`。
+- `if not chunk: break`，否则 `h.update(chunk)`。
+
+@@ item d24-03
+type: code
+title: 和文件顺序无关的数据指纹
+level: 2
+cards: 数据指纹：用 sha256 认出同一份数据
+targets: data_fingerprint
+ref: day24
+--- context
+同一份数据在你的电脑上是一个指纹，在训练集群上是另一个，这个指纹就没用了。`os.listdir` 和 `glob` 返回文件的顺序不固定，所以指纹不能依赖文件顺序，也不该依赖文件名。
+--- prompt
+写 `data_fingerprint(paths)`：`paths` 是一组文件路径（list），返回一个 64 个字符的指纹。步骤要完全照做（测试会对数值）：
+
+1. 每个文件用 `file_sha256(p)` 算哈希（已经写好了）。
+2. 把这些哈希字符串排序（`sorted`）。
+3. 用换行 `"\n"` 连起来，`.encode("utf-8")` 变成字节，再算一次 sha256，返回 `hexdigest()`。
+
+这样：文件顺序变了，指纹不变；文件改名、换文件夹，指纹也不变；任何一个文件改了一个字节，指纹就变。
+--- starter
+import hashlib
+
+def data_fingerprint(paths):
+    """一组文件 -> 一个 64 个字符的指纹，和文件顺序、文件名都无关"""
+    raise todo()
+--- solution
+import hashlib
+
+def data_fingerprint(paths):
+    """一组文件 -> 一个 64 个字符的指纹，和文件顺序、文件名都无关"""
+    hashes = sorted(file_sha256(p) for p in paths)          # 排序：顺序就不算数了
+    joined = "\n".join(hashes).encode("utf-8")
+    return hashlib.sha256(joined).hexdigest()
+--- tests
+import os, tempfile, hashlib
+
+FILES = {"train.csv": "x,y\n1,0\n3,1\n", "val.csv": "x,y\n2,1\n", "test.csv": "x,y\n5,0\n"}
+
+def _want(contents):
+    hashes = sorted(hashlib.sha256(c.encode("utf-8")).hexdigest() for c in contents)
+    return hashlib.sha256("\n".join(hashes).encode("utf-8")).hexdigest()
+
+@check("数值对：各自哈希、排序、换行连起来、再 sha256")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        got = data_fingerprint(write_files(folder, FILES))
+    true(isinstance(got, str) and len(got) == 64, f"要返回 64 个字符的 hexdigest()，你返回的是 {got!r}")
+    true(got == _want(FILES.values()),
+         "指纹的数值不对。按步骤来：每个文件 file_sha256 -> sorted -> \"\\n\".join -> encode(\"utf-8\") -> sha256 -> hexdigest()")
+
+@check("文件顺序变了，指纹不变")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        paths = write_files(folder, FILES)
+        a = data_fingerprint(paths)
+        b = data_fingerprint(paths[::-1])
+    true(a == b, "同样三个文件，换了个顺序，指纹就变了。先把各个文件的哈希排好序，再合起来算。")
+
+@check("只看内容：换个文件夹、改了文件名，指纹不变")
+def _():
+    renamed = {f"part-{i}.csv": c for i, c in enumerate(FILES.values())}
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as f1, tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as f2:
+        a = data_fingerprint(write_files(f1, FILES))
+        b = data_fingerprint(write_files(f2, renamed))
+    true(a == b, "内容一模一样，只是换了文件夹和文件名，指纹却变了：你把路径或文件名也算进去了。指纹只看字节。")
+
+@check("任何一个文件改了一个字节，指纹就变")
+def _():
+    changed = dict(FILES, **{"val.csv": "x,y\n2,0\n"})
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as f1, tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as f2:
+        a = data_fingerprint(write_files(f1, FILES))
+        b = data_fingerprint(write_files(f2, changed))
+    true(a != b, "val.csv 里一个标签从 1 改成了 0，指纹却没变：每个文件的内容都要算进去。")
+--- hints
+- 第一步是一个列表推导：`[file_sha256(p) for p in paths]`，外面套一个 `sorted(...)`。
+- 连起来：`"\n".join(hashes)`，它是字符串，要 `.encode("utf-8")` 变成字节才能喂给 sha256。
+- `return hashlib.sha256(joined).hexdigest()`
+
+@@ item d24-04
+type: code
+title: 一份完整的实验记录
+level: 2
+cards: 一次实验要记下的六样东西; 存成 JSON：只认几种简单类型
+targets: make_run_record
+ref: day24
+--- context
+实验记录是复现一个模型的唯一依据。少记一样，三个月后就说不清结果为什么变了；记错了类型（比如存了张量），它根本存不成 JSON。
+--- prompt
+写 `make_run_record(run_id, config, git_commit, data_paths, seed, metrics)`，返回一个 dict，正好有这 7 个 key：
+
+- `"run_id"`、`"git_commit"`、`"seed"`：原样存。
+- `"config"`：config 的**深拷贝**（`copy.deepcopy(config)`）。训练脚本之后可能还会改这个 dict（包括里面嵌套的 dict），记录不能跟着变。
+- `"data_fingerprint"`：`data_fingerprint(data_paths)`（已经写好了）。
+- `"versions"`：`{"python": platform.python_version(), "torch": torch.__version__, "numpy": np.__version__}`。
+- `"metrics"`：每个值都用 `float(v)` 转成 Python 数字。传进来的可能是 0 维张量，或者 numpy 的 float32，它们存不进 JSON。
+--- starter
+import copy
+import platform
+import numpy as np
+
+def make_run_record(run_id, config, git_commit, data_paths, seed, metrics):
+    """返回一次实验的记录（dict），能直接存成 JSON。"""
+    raise todo()
+--- solution
+import copy
+import platform
+import numpy as np
+
+def make_run_record(run_id, config, git_commit, data_paths, seed, metrics):
+    """返回一次实验的记录（dict），能直接存成 JSON。"""
+    return {
+        "run_id": run_id,
+        "config": copy.deepcopy(config),                  # 拷贝一份：之后改 config，记录不变
+        "git_commit": git_commit,
+        "data_fingerprint": data_fingerprint(data_paths),
+        "seed": seed,
+        "versions": {"python": platform.python_version(), "torch": torch.__version__, "numpy": np.__version__},
+        "metrics": {k: float(v) for k, v in metrics.items()},   # 张量、float32 -> Python float
+    }
+--- tests
+import os, json, tempfile, platform
+
+COMMIT = "3f9a2c1d0b7e4f6a8c5d2e1f0a9b8c7d6e5f4a3b"
+KEYS = ["run_id", "config", "git_commit", "data_fingerprint", "seed", "versions", "metrics"]
+
+def _record():
+    config = {"lr": 0.001, "optim": {"name": "adamw", "betas": [0.9, 0.95]}}
+    metrics = {"val_loss": torch.tensor(0.25), "val_acc": np.float32(0.875)}
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        paths = write_files(folder, {"train.csv": "x,y\n1,0\n3,1\n", "val.csv": "x,y\n2,1\n"})
+        fp = data_fingerprint(paths)
+        rec = make_run_record("run-07", config, COMMIT, paths, 42, metrics)
+    return rec, fp, config
+
+@check("7 个 key 都在")
+def _():
+    rec, _, _ = _record()
+    true(isinstance(rec, dict), f"要返回一个 dict，你返回的是 {type(rec).__name__}")
+    missing = [k for k in KEYS if k not in rec]
+    true(not missing, f"记录里少了：{missing}")
+    extra = sorted(set(rec) - set(KEYS))
+    true(not extra, f"记录里多了不认识的 key：{extra}（名字要和题目里的一模一样）")
+
+@check("run_id、config、commit、seed、数据指纹都记对了")
+def _():
+    rec, fp, _ = _record()
+    true(rec.get("run_id") == "run-07", f"run_id 应该是 'run-07'，你的是 {rec.get('run_id')!r}")
+    true(rec.get("git_commit") == COMMIT, "git_commit 要原样存传进来的字符串")
+    true(rec.get("seed") == 42, f"seed 应该是 42，你的是 {rec.get('seed')!r}")
+    true(rec.get("config") == {"lr": 0.001, "optim": {"name": "adamw", "betas": [0.9, 0.95]}}, f"config 和传进来的不一样：{rec.get('config')}")
+    true(rec.get("data_fingerprint") == fp, "data_fingerprint 应该是 data_fingerprint(data_paths) 的结果")
+
+@check("库版本：python、torch、numpy")
+def _():
+    rec, _, _ = _record()
+    v = rec.get("versions")
+    true(isinstance(v, dict), "versions 应该是一个 dict")
+    for k, want in [("python", platform.python_version()), ("torch", torch.__version__), ("numpy", np.__version__)]:
+        true(v.get(k) == want, f"versions[{k!r}] 应该是 {want!r}，你的是 {v.get(k)!r}")
+
+@check("指标是 Python float，整份记录能存成 JSON")
+def _():
+    rec, _, _ = _record()
+    m = rec.get("metrics")
+    true(isinstance(m, dict), "metrics 应该是一个 dict")
+    for k, want in [("val_loss", 0.25), ("val_acc", 0.875)]:
+        true(k in m, f"metrics 里少了 {k!r}")
+        true(type(m[k]) is float, f"metrics[{k!r}] 的类型是 {type(m[k]).__name__}，要用 float(v) 转成 Python float，不然存不进 JSON")
+        true(close(m[k], want, 1e-6), f"metrics[{k!r}] 应该是 {want}，你的是 {m[k]}")
+    true(json.loads(json.dumps(rec)) == rec, "存成 JSON 再读回来，和原来的不一样")
+
+@check("config 存的是拷贝：之后改 config，记录不变")
+def _():
+    rec, _, config = _record()
+    config["lr"] = 999
+    config["optim"]["name"] = "sgd"                 # 改里面嵌套的 dict
+    got = rec.get("config", {})
+    true(got.get("lr") == 0.001, "外面把 config['lr'] 改成了 999，记录里的也跟着变了：你存的是同一个 dict，不是拷贝")
+    true(got.get("optim", {}).get("name") == "adamw",
+         "外面改了嵌套的 config['optim']['name']，记录里的也跟着变了。dict(config) 和 config.copy() 只拷贝了最外层，要用 copy.deepcopy。")
+--- hints
+- 直接 `return {...}`，一个 key 一行，照着题目的 7 条写。
+- 指标：`{k: float(v) for k, v in metrics.items()}`。
+- config 里还有 dict，`dict(config)` 只拷贝最外面一层。用 `copy.deepcopy(config)`。
+
+@@ item d24-05
+type: fill
+title: 把实验记录存成 JSON，再全部读回来
+level: 1
+cards: 存成 JSON：只认几种简单类型
+targets: save_run, load_runs
+ref: day24
+--- context
+实验记录要落在磁盘上，才能被别人、被别的脚本看到。一个实验一个 JSON 文件，文件名就是 run_id，比较实验时再一次全部读回来。
+--- prompt
+把空填上：
+
+- `save_run(record, folder)`：把记录存成 `folder/<run_id>.json`（缩进 2 格、key 排序），返回文件路径。
+- `load_runs(folder)`：读回文件夹里所有 `.json` 记录，按文件名排好序，返回一个 list。文件夹里别的文件（比如 `notes.txt`）不管。
+--- template
+def save_run(record, folder):
+    path = os.path.join(folder, record["run_id"] + "[[.json]]")
+    with open(path, "[[w]]", encoding="utf-8") as f:
+        json.[[dump]](record, f, indent=2, sort_keys=True)
+    return path
+
+
+def load_runs(folder):
+    runs = []
+    for name in [[sorted]](os.listdir(folder)):
+        if name.endswith(".json"):
+            with open(os.path.join(folder, name), encoding="utf-8") as f:
+                runs.append(json.[[load]](f))
+    return runs
+--- tests
+import os, json, tempfile
+
+@check("存成 folder/run_id.json，内容是缩进过的 JSON")
+def _():
+    rec = sample_runs()[1]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path = save_run(rec, folder)
+        want = os.path.join(folder, "run-02.json")
+        true(isinstance(path, str) and os.path.normcase(path) == os.path.normcase(want), f"应该返回 {want}，你返回的是 {path!r}")
+        true(os.path.exists(want), "文件没写出来")
+        with open(want, encoding="utf-8") as f:
+            text = f.read()
+    true(json.loads(text) == rec, "文件里的 JSON 读出来，和原来的记录不一样")
+    true("\n  " in text, "文件应该分行缩进（indent=2），人才好读")
+
+@check("读回来：和存进去的一样，按文件名排好序")
+def _():
+    runs = sample_runs()
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        for rec in (runs[3], runs[0], runs[2]):          # 故意乱序存
+            save_run(rec, folder)
+        with open(os.path.join(folder, "notes.txt"), "w", encoding="utf-8") as f:
+            f.write("这不是实验记录")
+        back = load_runs(folder)
+    true(isinstance(back, list), f"load_runs 要返回一个 list，你返回的是 {type(back).__name__}")
+    ids = [r.get("run_id") for r in back]
+    true(ids == ["run-01", "run-03", "run-04"], f"应该读回 run-01、run-03、run-04 三份（按文件名排序，notes.txt 不算），你读回的是 {ids}")
+    true(back == [runs[0], runs[2], runs[3]], "读回来的记录和存进去的不一样")
+--- hints
+- 文件名是 run_id 加上扩展名；写文件的模式是一个字母。
+- `json.dump` 写进文件，`json.load` 从文件读；带 s 的两个是给字符串用的。
+- `os.listdir` 返回的顺序不固定，用 Python 自带的哪个函数排序？
+
+@@ item d24-06
+type: fix
+title: 只给 torch 设了种子
+level: 2
+cards: 种子：torch、numpy、random 要分别设
+targets: train_run
+ref: day24
+--- context
+「我明明设了 seed，为什么两次跑出来不一样？」最常见的原因：只设了 `torch.manual_seed`，可数据是用 numpy 打乱的，增强是用 random 做的。结果随「之前谁用过随机数」而变，实验就没法复现。
+--- prompt
+`train_run(seed, x, y)` 训练一个小线性模型，返回 `(weight, orders)`：训练后的权重，和每个 epoch 打乱后的样本顺序。它用了三种随机数：torch（初始化权重、噪声）、numpy（`np.random.permutation` 打乱数据）、random（一半的 batch 加噪声，做数据增强）。
+
+测试模拟了真实情况：两次调用之间，别的代码用过 numpy 和 random 的随机数。
+
+修好它，做到：
+
+1. 同一个 seed，得到完全一样的权重和顺序。
+2. 不同的 seed，打乱出不同的顺序。
+3. 同一次训练里，每个 epoch 的顺序也不一样（打乱不能失效）。
+--- starter
+import random
+import numpy as np
+
+def train_run(seed, x, y, epochs=2, batch_size=8):
+    """返回 (训练后的 weight, 每个 epoch 的样本顺序)"""
+    torch.manual_seed(seed)
+    model = nn.Linear(x.shape[1], 1)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    orders = []
+    for epoch in range(epochs):
+        order = np.random.permutation(len(x))          # 用 numpy 打乱数据
+        orders.append(order.tolist())
+        for i in range(0, len(x), batch_size):
+            idx = torch.from_numpy(order[i:i + batch_size])
+            xb, yb = x[idx], y[idx]
+            if random.random() < 0.5:                  # 数据增强：一半的 batch 加一点噪声
+                xb = xb + 0.1 * torch.randn_like(xb)
+            loss = F.mse_loss(model(xb), yb)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+    return model.weight.detach().clone(), orders
+--- solution
+import random
+import numpy as np
+
+def train_run(seed, x, y, epochs=2, batch_size=8):
+    """返回 (训练后的 weight, 每个 epoch 的样本顺序)"""
+    torch.manual_seed(seed)
+    np.random.seed(seed)                               # numpy：打乱数据
+    random.seed(seed)                                  # random：数据增强
+    model = nn.Linear(x.shape[1], 1)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    orders = []
+    for epoch in range(epochs):
+        order = np.random.permutation(len(x))          # 用 numpy 打乱数据
+        orders.append(order.tolist())
+        for i in range(0, len(x), batch_size):
+            idx = torch.from_numpy(order[i:i + batch_size])
+            xb, yb = x[idx], y[idx]
+            if random.random() < 0.5:                  # 数据增强：一半的 batch 加一点噪声
+                xb = xb + 0.1 * torch.randn_like(xb)
+            loss = F.mse_loss(model(xb), yb)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+    return model.weight.detach().clone(), orders
+--- tests
+import random
+import numpy as np
+
+def _data():
+    x = torch.randn(32, 4)
+    y = x @ torch.tensor([[1.0], [-2.0], [0.5], [3.0]]) + 0.1 * torch.randn(32, 1)
+    return x, y
+
+@check("别的代码用过 numpy 的随机数，同一个 seed 结果还是一样")
+def _():
+    x, y = _data()
+    random.seed(7); np.random.seed(1)            # 模拟：之前别的代码用过随机数
+    w1, o1 = train_run(0, x, y)
+    random.seed(7); np.random.seed(2)            # 这次 numpy 的状态不一样
+    w2, o2 = train_run(0, x, y)
+    true(o1 == o2, "同一个 seed，两次打乱的顺序不一样：numpy 的随机数没设种子，torch.manual_seed 管不到它。")
+    eq(w2, w1, tol=0.0, msg="同一个 seed，训练出的权重不一样")
+
+@check("别的代码用过 random 的随机数，同一个 seed 结果还是一样")
+def _():
+    x, y = _data()
+    np.random.seed(1); random.seed(7)
+    w1, o1 = train_run(0, x, y)
+    np.random.seed(1); random.seed(8)            # 这次 random 的状态不一样
+    w2, o2 = train_run(0, x, y)
+    eq(w2, w1, tol=0.0, msg="数据顺序一样，权重却不一样：哪些 batch 加噪声，是 random.random() 决定的。Python 自带的 random 也要设种子。")
+
+@check("不同的 seed 顺序不同，每个 epoch 的顺序也不同")
+def _():
+    x, y = _data()
+    _, o0 = train_run(0, x, y)
+    _, o1 = train_run(1, x, y)
+    true(len(o0) == 2 and all(sorted(o) == list(range(32)) for o in o0), "orders 应该有 2 个 epoch，每个都是 0..31 的一个排列")
+    true(o0 != o1, "seed 0 和 seed 1 的样本顺序一样：种子是不是写死了，或者根本没打乱？要用传进来的 seed，打乱也要留着。")
+    true(o0[0] != o0[1], "两个 epoch 的顺序一模一样：种子要在开头设一次。放进 epoch 循环里，每个 epoch 都会回到同一个顺序。")
+--- hints
+- 这段代码用了三个随机数来源：torch、numpy、random。现在设了几个种子？
+- 在 `torch.manual_seed(seed)` 下面，再给 numpy 和 random 各设一次种子，用同一个 seed。
+- 加两行：`np.random.seed(seed)` 和 `random.seed(seed)`。不要放进 for 循环里。
+
+@@ item d24-07
+type: choice
+title: 哪些记录没法用来复现
+level: 2
+cards: 一次实验要记下的六样东西; 数据指纹：用 sha256 认出同一份数据; 存成 JSON：只认几种简单类型
+--- context
+实验记录最怕的不是没有，而是「有，但不可信」：每个字段都在，可要复现的时候才发现，它记下的不是当时真正用的代码、配置或数据。
+--- prompt
+下面哪些情况，会让一份实验记录**没法用来复现**这次实验？（可多选）
+--- options
+- git commit 记的是 `3f9a2c1…`，但训练时还有没提交的改动，diff 也没存
+- 记录里的 config 是原来那个 dict 本身（不是拷贝），后来扫参的代码又改了它
+- 数据指纹是对「文件名列表」算的 sha256，没读文件内容
+- 指标存成了 Python float，而不是张量
+- JSON 用 `sort_keys=True` 存，key 的顺序和训练代码里写的不一样
+answer: 1,2,3
+--- explain
+前三个都会让记录「说谎」：
+
+1. 有没提交的改动时，commit 对应的代码不是你真正跑的代码。要么先提交，要么把 `git diff` 一起存下来。
+2. 记录里存的是同一个 dict，外面一改，记录就跟着变，记下的就不是当时的配置了。要存 `copy.deepcopy(config)`。
+3. 文件名没变，内容可能早就变了（有人重新导出、清洗过数据）。指纹必须算文件的字节。
+
+第 4 个是对的做法：float 能存进 JSON，张量反而存不进去。第 5 个也没问题：key 的顺序不影响内容，`sort_keys=True` 反而让两个文件更好比较。
+--- hints
+- 对每一项问自己：照着这份记录去复现，拿到的代码、配置、数据，和当时的一样吗？
+- 后两项只是「怎么存」的格式问题，存下来的内容没有变。
+
+@@ item d24-08
+type: code
+title: 比较实验：挑出最好的，找出配置差在哪
+level: 2
+cards: 比较实验：谁最好，配置差在哪
+targets: best_run, config_diff
+ref: day24
+--- context
+调参调了二十次，哪次最好？它和第二名差在哪个超参数上？每个团队都有这样两个小函数。方向写反（loss 用了 max），或者被一次崩掉的实验弄得报错，都是常见的坑。
+--- prompt
+写两个函数：
+
+1. `best_run(runs, metric, higher_is_better=True)`：`runs` 是实验记录的 list，每条都有一个 `"metrics"` dict。返回 `metric` 最好的那条**整条记录**。越大越好用 `max`，越小越好（`higher_is_better=False`）用 `min`。没有这个指标的记录（比如崩掉的实验）要跳过；一条都没有，就 `raise ValueError`。
+2. `config_diff(a, b)`：比较两个 config dict，返回 `{key: (a 的值, b 的值)}`，只放值不一样的 key。只在一边出现的 key，另一边记成 None。值一样的 key 不要放进去。
+
+测试用 `sample_runs()` 的四条记录（卡片里打印过）。
+--- starter
+def best_run(runs, metric, higher_is_better=True):
+    """返回 metric 最好的那条记录；没有这个指标的记录跳过"""
+    raise todo()
+
+
+def config_diff(a, b):
+    """{key: (a 的值, b 的值)}，只放值不一样的 key；缺的一边是 None"""
+    raise todo()
+--- solution
+def best_run(runs, metric, higher_is_better=True):
+    """返回 metric 最好的那条记录；没有这个指标的记录跳过"""
+    have = [r for r in runs if metric in r["metrics"]]      # 跳过崩掉的实验
+    if not have:
+        raise ValueError(f"没有一条记录有指标 {metric!r}")
+    pick = max if higher_is_better else min
+    return pick(have, key=lambda r: r["metrics"][metric])
+
+
+def config_diff(a, b):
+    """{key: (a 的值, b 的值)}，只放值不一样的 key；缺的一边是 None"""
+    diff = {}
+    for k in sorted(set(a) | set(b)):                       # 两边所有的 key
+        if a.get(k) != b.get(k):                            # 缺的一边，get 返回 None
+            diff[k] = (a.get(k), b.get(k))
+    return diff
+--- tests
+def _finished():
+    return [r for r in sample_runs() if r["run_id"] != "run-03"]
+
+def _id(r):
+    return r.get("run_id") if isinstance(r, dict) else r
+
+@check("val_acc 越大越好：挑出 run-04")
+def _():
+    r = best_run(_finished(), "val_acc")
+    true(_id(r) == "run-04", f"val_acc 最高的是 run-04（0.875），你返回的是 {_id(r)!r}。要返回整条记录。")
+
+@check("val_loss 越小越好：挑出 run-02")
+def _():
+    r = best_run(_finished(), "val_loss", higher_is_better=False)
+    true(_id(r) == "run-02", f"val_loss 最低的是 run-02（0.44），你返回的是 {_id(r)!r}。higher_is_better=False 时要用 min。")
+
+@check("跳过没有这个指标的记录；一条都没有就 raise ValueError")
+def _():
+    r = best_run(sample_runs(), "val_acc")          # run-03 崩了，它的 metrics 是空的
+    true(_id(r) == "run-04", f"带上崩掉的 run-03，val_acc 最高的还是 run-04，你返回的是 {_id(r)!r}")
+    try:
+        best_run(sample_runs(), "f1")
+    except ValueError:
+        pass
+    else:
+        true(False, "没有一条记录有 f1，应该 raise ValueError，而不是返回 None 或者随便一条")
+
+@check("config_diff：只列出值不一样的 key")
+def _():
+    runs = sample_runs()
+    got = config_diff(runs[1]["config"], runs[3]["config"])
+    true(isinstance(got, dict), f"要返回 dict，你返回的是 {type(got).__name__}")
+    want = {"batch_size": (32, 64), "warmup": (None, 100)}
+    for k, v in want.items():
+        true(k in got, f"少了 {k!r}：run-02 和 run-04 的 {k} 不一样" + ("（run-02 根本没有这个 key，要记成 None）" if v[0] is None else ""))
+        true(tuple(got[k]) == v, f"{k!r} 应该是 {v}（a 的值在前），你的是 {got[k]}")
+    extra = sorted(set(got) - set(want))
+    true(not extra, f"这些 key 两边的值一样，不该出现：{extra}")
+
+@check("config_diff：顺序是 (a, b)；两个一样的 config 返回空 dict")
+def _():
+    runs = sample_runs()
+    got = config_diff(runs[3]["config"], runs[0]["config"])
+    true(isinstance(got, dict), f"要返回 dict，你返回的是 {type(got).__name__}")
+    want = {"batch_size": (64, 32), "lr": (0.003, 0.001), "warmup": (100, None)}
+    for k, v in want.items():
+        true(k in got and tuple(got[k]) == v, f"{k!r} 应该是 {v}，你的是 {got.get(k, '（没有）')}")
+    true(set(got) == set(want), f"key 应该正好是 {sorted(want)}，你的是 {sorted(got)}")
+    same = config_diff(runs[0]["config"], dict(runs[0]["config"]))
+    true(same == {}, f"两个一样的 config，应该返回空 dict，你返回的是 {same}")
+--- hints
+- best_run：先用列表推导留下 `metric in r["metrics"]` 的记录；列表是空的就 raise。
+- `max(have, key=lambda r: r["metrics"][metric])`；越小越好时换成 `min`。
+- config_diff：`for k in set(a) | set(b):`，用 `a.get(k)` 和 `b.get(k)` 比较，不一样就放进结果。
+
+@@ item d24-09
+type: code
+title: 模型注册表一：注册和上线
+level: 2
+cards: 模型注册表：注册、上线、历史; 存成 JSON：只认几种简单类型
+targets: Registry
+ref: day24
+--- context
+「线上跑的是哪个模型？它是哪次实验训出来的？」有了注册表，这个问题一行代码就能回答。关键是所有状态都在一个文件里：训练脚本、上线脚本、推理服务看到的是同一份。
+--- prompt
+写 `class Registry(JsonStore)` 的三个方法。`JsonStore` 已经写好了：
+
+- 用法：`Registry(folder)`，文件是 `folder/registry.json`（路径在 `self.path`）。
+- `self._load()` 返回整个注册表 dict；文件还不存在时返回 `{"versions": [], "production": None, "history": []}`。
+- `self._save(data)` 把 dict 写回文件（原子写）。
+
+要写的：
+
+1. `register(run_id, metrics)`：在 `versions` 末尾加上 `{"version": 版本号, "run_id": run_id, "metrics": metrics}`。版本号从 1 开始，一个个往上加。保存，返回版本号。注册不改 `production`。
+2. `production()`：返回线上的版本号，没有就返回 None。
+3. `promote(version)`：这个版本号不存在，就 `raise ValueError`；否则把 `production` 设成它，追加到 `history` 末尾，保存。
+
+每个会改东西的方法，都从 `self._load()` 开始，以 `self._save(data)` 结束。不要把状态存在 `self` 上：测试会新建一个 `Registry(folder)` 来检查。
+--- starter
+class Registry(JsonStore):
+    def register(self, run_id, metrics):
+        """加一个新版本，返回版本号（1, 2, 3, ...）"""
+        raise todo()
+
+    def production(self):
+        """线上的版本号，没有就是 None"""
+        raise todo()
+
+    def promote(self, version):
+        """把 version 设成线上版本，并记进 history"""
+        raise todo()
+--- solution
+class Registry(JsonStore):
+    def register(self, run_id, metrics):
+        """加一个新版本，返回版本号（1, 2, 3, ...）"""
+        data = self._load()
+        version = len(data["versions"]) + 1
+        data["versions"].append({"version": version, "run_id": run_id, "metrics": metrics})
+        self._save(data)
+        return version
+
+    def production(self):
+        """线上的版本号，没有就是 None"""
+        return self._load()["production"]
+
+    def promote(self, version):
+        """把 version 设成线上版本，并记进 history"""
+        data = self._load()
+        if not any(v["version"] == version for v in data["versions"]):
+            raise ValueError(f"没有版本 {version}")
+        data["production"] = version
+        data["history"].append(version)
+        self._save(data)
+--- tests
+import os, json, tempfile
+
+def _file(folder):
+    with open(os.path.join(folder, "registry.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+@check("register 返回 1、2、3，内容写进 registry.json")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = Registry(folder)
+        vs = [reg.register("run-01", {"val_acc": 0.842}),
+              reg.register("run-02", {"val_acc": 0.861}),
+              reg.register("run-04", {"val_acc": 0.875})]
+        true(vs == [1, 2, 3], f"版本号应该是 [1, 2, 3]，你的是 {vs}")
+        true(os.path.exists(reg.path), "registry.json 没写出来：register 最后要 self._save(data)")
+        data = _file(folder)
+    want = [{"version": 1, "run_id": "run-01", "metrics": {"val_acc": 0.842}},
+            {"version": 2, "run_id": "run-02", "metrics": {"val_acc": 0.861}},
+            {"version": 3, "run_id": "run-04", "metrics": {"val_acc": 0.875}}]
+    got = data.get("versions", [])
+    true(len(got) == 3, f"versions 里应该有 3 个版本，文件里有 {len(got)} 个")
+    for w, g in zip(want, got):
+        true(g == w, f"第 {w['version']} 个版本应该是 {w}，文件里是 {g}")
+
+@check("注册不等于上线：production 还是 None")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = Registry(folder)
+        true(reg.production() is None, "什么都还没注册时，production() 应该返回 None")
+        reg.register("run-01", {"val_acc": 0.842})
+        true(reg.production() is None, "注册之后 production() 还应该是 None：注册不等于上线")
+        data = _file(folder)
+    true(data.get("production") is None and data.get("history") == [],
+         f"文件里 production 应该是 None、history 是 []，现在是 {data.get('production')!r} 和 {data.get('history')!r}")
+
+@check("promote：新建的 Registry 也看得到，history 按顺序记下")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = Registry(folder)
+        for run_id in ("run-01", "run-02", "run-04"):
+            reg.register(run_id, {"val_acc": 0.8})
+        reg.promote(2)
+        true(Registry(folder).production() == 2, "promote(2) 之后，新建的 Registry(folder) 看到的线上版本不是 2：状态要写进文件，不能只放在 self 上")
+        reg.promote(3)
+        true(Registry(folder).production() == 3, "再 promote(3)，线上版本应该是 3")
+        data = _file(folder)
+    true(data.get("history") == [2, 3], f"history 应该是 [2, 3]（上线过的版本，按顺序），文件里是 {data.get('history')!r}")
+
+@check("promote 不存在的版本：raise ValueError，线上不变")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = Registry(folder)
+        reg.register("run-01", {"val_acc": 0.842})
+        reg.promote(1)
+        try:
+            reg.promote(7)
+        except ValueError:
+            pass
+        else:
+            true(False, "只有 1 个版本，promote(7) 应该 raise ValueError")
+        true(Registry(folder).production() == 1, "promote 失败以后，线上应该还是版本 1")
+--- hints
+- register：`data = self._load()`，版本号是 `len(data["versions"]) + 1`，`append` 一个 dict，`self._save(data)`，返回版本号。
+- production：`return self._load()["production"]`。
+- promote：先检查 `any(v["version"] == version for v in data["versions"])`，不存在就 raise；再改 `production`、`history.append(version)`，最后保存。
+
+@@ item d24-10
+type: code
+title: 模型注册表二：上线门槛和回滚
+level: 3
+cards: 上线门槛和回滚; 模型注册表：注册、上线、历史
+targets: Registry
+ref: day24
+--- context
+没有门槛，一个更差的模型只要一条命令就能上线；没有回滚，出了事只能连夜重新训练。这两个功能加起来不到二十行，却是线上事故里最先用到的。
+--- prompt
+`BasicRegistry` 已经写好了 `register`、`production()`，还有 `get(version)`：返回这个版本的 dict（`{"version", "run_id", "metrics"}`），不存在就 `raise ValueError`。写 `class Registry(BasicRegistry)` 的两个方法：
+
+1. `promote(version)`：带门槛的上线。
+   - 新版本的分数：`self.get(version)["metrics"][self.metric]`。
+   - 线上已经有版本时，拿同一个指标比。`self.higher_is_better` 为 True 时，新的更**小**就是更差；为 False 时（比如 loss），新的更**大**就是更差。更差就 `raise ValueError`（信息里写上两个数），文件不改。
+   - 不更差（一样好，或者线上还没有模型）：`production` 设成它，追加到 `history`，保存。
+2. `rollback()`：`history` 里少于 2 个版本时 `raise ValueError`。否则去掉 `history` 的最后一个，`production` 设成新的最后一个，保存，返回这个版本号。回滚**不过门槛**。
+
+用 `self._load()` / `self._save(data)` 读写。
+--- starter
+class Registry(BasicRegistry):
+    def promote(self, version):
+        """不比线上差才能上线；更差就 raise ValueError"""
+        raise todo()
+
+    def rollback(self):
+        """回到上一个上线过的版本，返回它的版本号"""
+        raise todo()
+--- solution
+class Registry(BasicRegistry):
+    def promote(self, version):
+        """不比线上差才能上线；更差就 raise ValueError"""
+        new = self.get(version)["metrics"][self.metric]
+        data = self._load()
+        current = data["production"]
+        if current is not None:
+            old = self.get(current)["metrics"][self.metric]
+            worse = new < old if self.higher_is_better else new > old
+            if worse:
+                raise ValueError(f"v{version} 的 {self.metric}={new}，比线上 v{current} 的 {old} 差")
+        data["production"] = version
+        data["history"].append(version)
+        self._save(data)
+
+    def rollback(self):
+        """回到上一个上线过的版本，返回它的版本号"""
+        data = self._load()
+        if len(data["history"]) < 2:
+            raise ValueError("没有可以回滚的版本")
+        data["history"].pop()                          # 去掉出问题的那个
+        data["production"] = data["history"][-1]       # 回到上一个，不过门槛
+        self._save(data)
+        return data["production"]
+--- tests
+import os, json, tempfile
+
+def _setup(folder, scores, metric="val_acc", higher=True):
+    reg = Registry(folder, metric=metric, higher_is_better=higher)
+    for i, s in enumerate(scores, 1):
+        reg.register(f"run-{i:02d}", {metric: s})
+    return reg
+
+def _refused(fn):
+    try:
+        fn()
+    except ValueError:
+        return True
+    return False
+
+@check("第一个版本直接上线；不比线上差的可以上")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.80, 0.85, 0.85])
+        reg.promote(1)
+        true(reg.production() == 1, "线上还没有模型时，第一个版本应该直接上线")
+        reg.promote(2)
+        true(reg.production() == 2, "v2（0.85）比线上的 v1（0.80）好，应该能上线")
+        reg.promote(3)
+        true(reg.production() == 3, "v3 和线上的 v2 一样（都是 0.85），不算更差，应该能上线")
+        history = reg._load()["history"]
+    true(history == [1, 2, 3], f"history 应该是 [1, 2, 3]，现在是 {history}")
+
+@check("比线上差的版本被拒绝，线上和 history 都不变")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.80, 0.85, 0.78])
+        reg.promote(1)
+        reg.promote(2)
+        true(_refused(lambda: reg.promote(3)), "v3（0.78）比线上的 v2（0.85）差，promote(3) 应该 raise ValueError")
+        other = Registry(folder)
+        true(other.production() == 2, f"拒绝之后线上应该还是 v2，现在是 v{other.production()}")
+        history = other._load()["history"]
+    true(history == [1, 2], f"拒绝之后 history 应该还是 [1, 2]，现在是 {history}：先检查，通过了才改文件")
+
+@check("val_loss 越小越好：方向反过来")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.50, 0.40, 0.45], metric="val_loss", higher=False)
+        reg.promote(1)
+        true(not _refused(lambda: reg.promote(2)), "v2 的 val_loss 是 0.40，比 v1 的 0.50 小，是更好的，却被拒绝了。higher_is_better=False 时，越小越好。")
+        true(reg.production() == 2, "v2 应该上线了")
+        true(_refused(lambda: reg.promote(3)), "v3 的 val_loss 是 0.45，比线上 v2 的 0.40 大，是更差的，应该被拒绝")
+
+@check("rollback：回到上一个线上版本，不看分数")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.80, 0.85])
+        reg.promote(1)
+        reg.promote(2)
+        try:
+            back = reg.rollback()
+        except ValueError as e:
+            true(False, f"rollback 报错了：{e}。回滚不过门槛：上一个版本的分数本来就比现在的低。直接改 production 和 history，不要调用 promote。")
+        true(back == 1, f"rollback() 应该返回回到的版本 1，你返回的是 {back!r}")
+        other = Registry(folder)
+        true(other.production() == 1, "rollback 之后线上应该是 v1（新建的 Registry 也要看得到）")
+        history = other._load()["history"]
+    true(history == [1], f"rollback 之后 history 应该是 [1]，现在是 {history}")
+
+@check("没有可以回滚的版本：raise ValueError")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.80, 0.85])
+        reg.promote(1)
+        true(_refused(reg.rollback), "只上线过 v1，没有更早的版本，rollback() 应该 raise ValueError")
+        true(Registry(folder).production() == 1, "回滚失败时，线上应该还是 v1")
+--- hints
+- promote：先取新分数；`data = self._load()`；`current = data["production"]`。current 不是 None 时，再取旧分数来比。
+- 「更差」：`new < old if self.higher_is_better else new > old`。更差就 raise，不要先改 data。
+- rollback：`len(data["history"]) < 2` 就 raise；否则 `data["history"].pop()`，`data["production"] = data["history"][-1]`，保存，返回它。别调用 `self.promote`：门槛会拦住回滚。
+
+@@ item d24-11
+type: choice
+title: 新版本上线后出事了，第一步做什么
+level: 1
+cards: 上线门槛和回滚
+--- context
+线上出事的时候，时间就是用户的耐心。先恢复，再查原因：这是运维的第一原则，也是面试里常被问到的场景题。
+--- prompt
+v3 在离线评估里比 v2 高 1 个点，过了门槛，上线了。一小时后，客服说错误投诉翻了一倍。你第一件事做什么？
+--- options
+- 马上 rollback 到 v2，让线上先恢复，再去查 v3 的问题
+- 从注册表里删掉 v3，免得有人再把它上线
+- 马上用最新的数据训练一个 v4，训好了再上线
+- 把门槛改成「比线上高 2 个点才能上」，再重新 promote 一次 v3
+answer: 1
+--- explain
+回滚一步就能回到「已知能用」的状态，用户马上不再受影响，你也有时间慢慢查。
+
+删掉 v3 会丢掉证据：它来自哪次实验、用了什么数据、哪个 commit，查问题正需要这些。重新训练要好几个小时，这段时间用户一直在受影响，而且你还不知道问题出在哪，v4 很可能有同样的问题。改门槛没用：v3 已经在线上了，而且门槛看的是离线分数，问题恰恰是离线分数没能反映线上的情况（可能是训练和线上的数据处理不一致，第 18 天；也可能是线上数据变了，第 25 天）。
+--- hints
+- 哪个选项能在一分钟之内让用户不再受影响？
+- 查原因需要 v3 的记录，别把证据删了。
+
+@@ item d24-12
+type: fill
+title: 用实验记录生成模型卡
+level: 1
+cards: 模型卡：给用模型的人看的说明书
+targets: model_card
+ref: day24
+--- context
+模型卡里的数字要是手抄的，迟早会和真实的对不上。用代码从实验记录生成模型卡，每次注册新版本都自动生成一张，数字就永远和记录一致。
+--- prompt
+把空填上，让 `model_card(name, version, record, intended_use, out_of_scope, limitations)` 返回一张 Markdown 格式的模型卡（一个字符串）：
+
+- `record` 是实验记录（和前面的格式一样）。
+- `out_of_scope` 和 `limitations` 是字符串的 list，每条一行，各放在自己那一节。
+- 指标按名字排序，保留 4 位小数。
+- 复现信息（数据指纹、git commit、seed）从 `record` 里取。
+--- template
+def model_card(name, version, record, intended_use, out_of_scope, limitations):
+    m = record["metrics"]
+    v = record["versions"]
+    lines = ["# 模型卡：" + name + " v" + str(version), ""]
+    lines += ["## 用途", intended_use, ""]
+    lines += ["## 不适合的用途"] + ["- " + x for x in [[out_of_scope]]] + [""]
+    lines += ["## 评估结果"] + [f"- {k}: {m[k]:.4f}" for k in [[sorted(m)]]] + [""]
+    lines += ["## 训练数据", "- 数据指纹: " + record["[[data_fingerprint]]"], ""]
+    lines += ["## 怎样复现",
+              "- git commit: " + record["[[git_commit]]"],
+              "- seed: " + str(record["[[seed]]"]),
+              "- torch " + v["torch"] + ", numpy " + v["numpy"], ""]
+    lines += ["## 局限和风险"] + ["- " + x for x in [[limitations]]]
+    return "\n".join(lines)
+--- tests
+HEADINGS = ["# 模型卡：review-sentiment v2", "## 用途", "## 不适合的用途", "## 评估结果", "## 训练数据", "## 怎样复现", "## 局限和风险"]
+
+def _card():
+    rec = sample_runs()[3]
+    rec["metrics"] = {"val_loss": 0.4412, "val_acc": 0.8611, "val_acc_long_text": 0.7702}
+    oos = ["其他语言的评论", "医疗、法律相关的决定"]
+    limits = ["讽刺的句子经常判错", "超过 512 个 token 的评论会被截断"]
+    card = model_card("review-sentiment", 2, rec, "给英文商品评论分正面 / 负面", oos, limits)
+    return card.split("\n"), rec, oos, limits
+
+@check("七节都在，顺序对")
+def _():
+    lines, _, _, _ = _card()
+    missing = [h for h in HEADINGS if h not in lines]
+    true(not missing, f"缺了这几节：{missing}")
+    pos = [lines.index(h) for h in HEADINGS]
+    true(pos == sorted(pos), "各节的顺序不对")
+
+@check("复现信息从实验记录里来")
+def _():
+    lines, rec, _, _ = _card()
+    for want in ["- 数据指纹: " + rec["data_fingerprint"], "- git commit: " + rec["git_commit"], "- seed: 0"]:
+        true(want in lines, f"模型卡里应该有这一行：{want}")
+
+@check("每个指标一行，按名字排序，保留 4 位小数")
+def _():
+    lines, _, _, _ = _card()
+    want = ["- val_acc: 0.8611", "- val_acc_long_text: 0.7702", "- val_loss: 0.4412"]
+    for w in want:
+        true(w in lines, f"模型卡里应该有这一行：{w}")
+    pos = [lines.index(w) for w in want]
+    true(pos == sorted(pos), "指标要按名字排序（sorted），两张模型卡才好逐行比较")
+
+@check("不适合的用途、局限，各在自己那一节")
+def _():
+    lines, _, oos, limits = _card()
+    a, b, c = lines.index("## 不适合的用途"), lines.index("## 评估结果"), lines.index("## 局限和风险")
+    for x in oos:
+        true("- " + x in lines[a:b], f"「{x}」应该列在「不适合的用途」这一节")
+    for x in limits:
+        true("- " + x in lines[c:], f"「{x}」应该列在「局限和风险」这一节")
+--- hints
+- 两个 `for x in ...` 分别遍历函数的哪个参数？看它们在哪一节下面。
+- 指标要按名字排序：对 dict 用 `sorted(...)`，得到排好序的 key。
+- `record[...]` 里填的是实验记录的 key 名：数据指纹、git commit、seed 各叫什么？
+
+@@ item d24-13
+type: code
+title: 闭卷：一份完整的实验记录
+level: 2
+exam: yes
+cards: 一次实验要记下的六样东西
+targets: make_run_record
+ref: day24
+--- context
+面试里常问：「你怎么保证实验能复现？」能不看答案写出这个函数，你就能一口气说出要记的每一样东西，以及为什么。
+--- prompt
+写 `make_run_record(run_id, config, git_commit, data_paths, seed, metrics)`，返回一个 dict，正好有 7 个 key：`run_id`、`config`、`git_commit`、`data_fingerprint`、`seed`、`versions`、`metrics`。
+
+- config 要深拷贝；数据指纹用已经写好的 `data_fingerprint(data_paths)`。
+- versions 里有 `"python"`、`"torch"`、`"numpy"` 三个版本号。
+- metrics 的每个值转成 Python float。
+--- starter
+def make_run_record(run_id, config, git_commit, data_paths, seed, metrics):
+    raise todo()
+--- solution
+import copy
+import platform
+import numpy as np
+
+def make_run_record(run_id, config, git_commit, data_paths, seed, metrics):
+    return {
+        "run_id": run_id,
+        "config": copy.deepcopy(config),                  # 拷贝一份：之后改 config，记录不变
+        "git_commit": git_commit,
+        "data_fingerprint": data_fingerprint(data_paths),
+        "seed": seed,
+        "versions": {"python": platform.python_version(), "torch": torch.__version__, "numpy": np.__version__},
+        "metrics": {k: float(v) for k, v in metrics.items()},   # 张量、float32 -> Python float
+    }
+--- tests
+import os, json, tempfile, platform
+
+COMMIT = "3f9a2c1d0b7e4f6a8c5d2e1f0a9b8c7d6e5f4a3b"
+KEYS = ["run_id", "config", "git_commit", "data_fingerprint", "seed", "versions", "metrics"]
+
+def _record():
+    config = {"lr": 0.001, "optim": {"name": "adamw", "betas": [0.9, 0.95]}}
+    metrics = {"val_loss": torch.tensor(0.25), "val_acc": np.float32(0.875)}
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        paths = write_files(folder, {"train.csv": "x,y\n1,0\n3,1\n", "val.csv": "x,y\n2,1\n"})
+        fp = data_fingerprint(paths)
+        rec = make_run_record("run-07", config, COMMIT, paths, 42, metrics)
+    return rec, fp, config
+
+@check("7 个 key 都在")
+def _():
+    rec, _, _ = _record()
+    true(isinstance(rec, dict), f"要返回一个 dict，你返回的是 {type(rec).__name__}")
+    missing = [k for k in KEYS if k not in rec]
+    true(not missing, f"记录里少了：{missing}")
+    extra = sorted(set(rec) - set(KEYS))
+    true(not extra, f"记录里多了不认识的 key：{extra}（名字要和题目里的一模一样）")
+
+@check("run_id、config、commit、seed、数据指纹都记对了")
+def _():
+    rec, fp, _ = _record()
+    true(rec.get("run_id") == "run-07", f"run_id 应该是 'run-07'，你的是 {rec.get('run_id')!r}")
+    true(rec.get("git_commit") == COMMIT, "git_commit 要原样存传进来的字符串")
+    true(rec.get("seed") == 42, f"seed 应该是 42，你的是 {rec.get('seed')!r}")
+    true(rec.get("config") == {"lr": 0.001, "optim": {"name": "adamw", "betas": [0.9, 0.95]}}, f"config 和传进来的不一样：{rec.get('config')}")
+    true(rec.get("data_fingerprint") == fp, "data_fingerprint 应该是 data_fingerprint(data_paths) 的结果")
+
+@check("库版本：python、torch、numpy")
+def _():
+    rec, _, _ = _record()
+    v = rec.get("versions")
+    true(isinstance(v, dict), "versions 应该是一个 dict")
+    for k, want in [("python", platform.python_version()), ("torch", torch.__version__), ("numpy", np.__version__)]:
+        true(v.get(k) == want, f"versions[{k!r}] 应该是 {want!r}，你的是 {v.get(k)!r}")
+
+@check("指标是 Python float，整份记录能存成 JSON")
+def _():
+    rec, _, _ = _record()
+    m = rec.get("metrics")
+    true(isinstance(m, dict), "metrics 应该是一个 dict")
+    for k, want in [("val_loss", 0.25), ("val_acc", 0.875)]:
+        true(k in m, f"metrics 里少了 {k!r}")
+        true(type(m[k]) is float, f"metrics[{k!r}] 的类型是 {type(m[k]).__name__}，要用 float(v) 转成 Python float，不然存不进 JSON")
+        true(close(m[k], want, 1e-6), f"metrics[{k!r}] 应该是 {want}，你的是 {m[k]}")
+    true(json.loads(json.dumps(rec)) == rec, "存成 JSON 再读回来，和原来的不一样")
+
+@check("config 存的是拷贝：之后改 config，记录不变")
+def _():
+    rec, _, config = _record()
+    config["lr"] = 999
+    config["optim"]["name"] = "sgd"                 # 改里面嵌套的 dict
+    got = rec.get("config", {})
+    true(got.get("lr") == 0.001, "外面把 config['lr'] 改成了 999，记录里的也跟着变了：你存的是同一个 dict，不是拷贝")
+    true(got.get("optim", {}).get("name") == "adamw",
+         "外面改了嵌套的 config['optim']['name']，记录里的也跟着变了。dict(config) 和 config.copy() 只拷贝了最外层，要用 copy.deepcopy。")
+--- hints
+- 六样东西加一个 run_id。
+- 拷贝、版本号、float 各一行。
+
+@@ item d24-14
+type: code
+title: 闭卷：上线门槛和回滚
+level: 3
+exam: yes
+cards: 上线门槛和回滚
+targets: Registry
+ref: day24
+--- context
+「新模型上线后出事了怎么办？怎么防止更差的模型上线？」这是 ML 工程面试里的常见问题。能不看答案写出门槛和回滚，你就能讲清楚背后的每一个决定。
+--- prompt
+写 `class Registry(BasicRegistry)` 的 `promote(version)` 和 `rollback()`。可以用 `self.get(version)`、`self._load()`、`self._save(data)`、`self.metric`、`self.higher_is_better`。
+
+- `promote`：线上已有版本时，新版本的 `self.metric` 不能更差（方向看 `higher_is_better`），更差就 `raise ValueError`、文件不改；否则设成 `production`、追加到 `history`、保存。
+- `rollback`：`history` 少于 2 个就 `raise ValueError`；否则回到上一个上线过的版本，返回它的版本号。回滚不过门槛。
+--- starter
+class Registry(BasicRegistry):
+    def promote(self, version):
+        raise todo()
+
+    def rollback(self):
+        raise todo()
+--- solution
+class Registry(BasicRegistry):
+    def promote(self, version):
+        new = self.get(version)["metrics"][self.metric]
+        data = self._load()
+        current = data["production"]
+        if current is not None:
+            old = self.get(current)["metrics"][self.metric]
+            worse = new < old if self.higher_is_better else new > old
+            if worse:
+                raise ValueError(f"v{version} 的 {self.metric}={new}，比线上 v{current} 的 {old} 差")
+        data["production"] = version
+        data["history"].append(version)
+        self._save(data)
+
+    def rollback(self):
+        data = self._load()
+        if len(data["history"]) < 2:
+            raise ValueError("没有可以回滚的版本")
+        data["history"].pop()                          # 去掉出问题的那个
+        data["production"] = data["history"][-1]       # 回到上一个，不过门槛
+        self._save(data)
+        return data["production"]
+--- tests
+import os, json, tempfile
+
+def _setup(folder, scores, metric="val_acc", higher=True):
+    reg = Registry(folder, metric=metric, higher_is_better=higher)
+    for i, s in enumerate(scores, 1):
+        reg.register(f"run-{i:02d}", {metric: s})
+    return reg
+
+def _refused(fn):
+    try:
+        fn()
+    except ValueError:
+        return True
+    return False
+
+@check("第一个版本直接上线；不比线上差的可以上")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.80, 0.85, 0.85])
+        reg.promote(1)
+        true(reg.production() == 1, "线上还没有模型时，第一个版本应该直接上线")
+        reg.promote(2)
+        true(reg.production() == 2, "v2（0.85）比线上的 v1（0.80）好，应该能上线")
+        reg.promote(3)
+        true(reg.production() == 3, "v3 和线上的 v2 一样（都是 0.85），不算更差，应该能上线")
+        history = reg._load()["history"]
+    true(history == [1, 2, 3], f"history 应该是 [1, 2, 3]，现在是 {history}")
+
+@check("比线上差的版本被拒绝，线上和 history 都不变")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.80, 0.85, 0.78])
+        reg.promote(1)
+        reg.promote(2)
+        true(_refused(lambda: reg.promote(3)), "v3（0.78）比线上的 v2（0.85）差，promote(3) 应该 raise ValueError")
+        other = Registry(folder)
+        true(other.production() == 2, f"拒绝之后线上应该还是 v2，现在是 v{other.production()}")
+        history = other._load()["history"]
+    true(history == [1, 2], f"拒绝之后 history 应该还是 [1, 2]，现在是 {history}：先检查，通过了才改文件")
+
+@check("val_loss 越小越好：方向反过来")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.50, 0.40, 0.45], metric="val_loss", higher=False)
+        reg.promote(1)
+        true(not _refused(lambda: reg.promote(2)), "v2 的 val_loss 是 0.40，比 v1 的 0.50 小，是更好的，却被拒绝了。higher_is_better=False 时，越小越好。")
+        true(reg.production() == 2, "v2 应该上线了")
+        true(_refused(lambda: reg.promote(3)), "v3 的 val_loss 是 0.45，比线上 v2 的 0.40 大，是更差的，应该被拒绝")
+
+@check("rollback：回到上一个线上版本，不看分数")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.80, 0.85])
+        reg.promote(1)
+        reg.promote(2)
+        try:
+            back = reg.rollback()
+        except ValueError as e:
+            true(False, f"rollback 报错了：{e}。回滚不过门槛：上一个版本的分数本来就比现在的低。直接改 production 和 history，不要调用 promote。")
+        true(back == 1, f"rollback() 应该返回回到的版本 1，你返回的是 {back!r}")
+        other = Registry(folder)
+        true(other.production() == 1, "rollback 之后线上应该是 v1（新建的 Registry 也要看得到）")
+        history = other._load()["history"]
+    true(history == [1], f"rollback 之后 history 应该是 [1]，现在是 {history}")
+
+@check("没有可以回滚的版本：raise ValueError")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.80, 0.85])
+        reg.promote(1)
+        true(_refused(reg.rollback), "只上线过 v1，没有更早的版本，rollback() 应该 raise ValueError")
+        true(Registry(folder).production() == 1, "回滚失败时，线上应该还是 v1")
+--- hints
+- promote：先比较，通过了才改 data。
+- rollback：pop 最后一个，production 取新的最后一个。

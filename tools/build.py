@@ -113,6 +113,9 @@ def normalize(o, day):
         out["solution"] = re.sub(r"\[\[(.*?)\]\]", r"\1", o["template"])
         out["starter"] = re.sub(r"\[\[(.*?)\]\]", "", o["template"])
         out["fills"] = re.findall(r"\[\[(.*?)\]\]", o["template"])
+        for f in out["fills"]:
+            if f.count("[") != f.count("]"):  # `[[x[0]]]` reads as the blank `x[0` followed by `]`
+                bad(o.get("id", "?"), f"fill blank [[{f}]] has unbalanced brackets: a blank cannot end in ], so write it another way")
     if o.get("type") == "order" and "lines" in o:
         out["lines"] = o["lines"].split("\n")
         out["distractors"] = o["distractors"].split("\n") if o.get("distractors") else []
@@ -163,6 +166,8 @@ def prepare(days, lang):
             if blk["id"] in ids:
                 bad(blk["id"], "duplicate id")
             ids.add(blk["id"])
+            if re.match(r'^\s*(["\'“「]).*(["\'”」])\s*$', blk.get("title", "")):
+                bad(f"{lang} {blk['id']}", "title: is wrapped in quotes; values are taken literally, so drop the quotes")
         for it in d["items"]:
             where = f"{lang} {it['id']}"
             if not re.match(rf"^d{d['id']}-\d\d$", it["id"] or ""):

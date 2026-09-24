@@ -1,0 +1,1183 @@
+@@ day 25
+title: Operations 2: monitoring in production
+part: Operations
+hours: 3–4 hours
+--- goal
+After today you know which numbers to watch once a model is live. You can write PSI and KS by hand to catch input drift, and use the prediction distribution to spot trouble before the labels arrive. You can write alert rules that do not cry wolf, swap models safely with shadow traffic and canaries, and work out what 1,000 requests cost.
+--- checklist
+- Clear your Review list first (redo from blank anything you looked up yesterday)
+- Read the 8 knowledge cards; change something in each example and run it again
+- Pass every practice exercise
+- Closed book: write psi and the rolling-window alert without looking at the cards
+
+@@ concept
+title: The numbers to watch after launch
+--- body
+Once a model is live, someone asks every day: "Is it OK?" To answer, you look at two kinds of numbers.
+
+**Is the service healthy?** (the same as for any web backend)
+
+- **Latency**: how long one request takes from arrival to response. Look at percentiles p50 / p95 / p99 (day 22), not only the mean. A few very slow requests pull the mean up, and at the same time the mean hides them.
+- **Error rate**: the share of requests that fail. 5xx (server errors) and timeouts count. 4xx (the user sent bad data) is usually tracked separately.
+- **Throughput**: how many requests per second are handled (req/s). If more come in than get finished, the queue keeps growing.
+- **Saturation**: GPU use, GPU memory, number of queued requests. GPU at 100% and a growing queue mean you are out of capacity.
+- **Cost**: what 1,000 requests cost (the last card today).
+
+**Is the model right?** All of the above can be green while the model quietly gets worse. Say a new group of users arrives and the inputs no longer look like the training data. The service still answers on time; the answers are just wrong. True labels (did this loan default, was this payment fraud) often take days or weeks to arrive. So first watch the **input distribution** and the **prediction distribution** (the next cards).
+
+Below, a 10-second request log turns into the numbers on a dashboard.
+--- code
+latency_ms = torch.tensor([21., 19, 25, 22, 480, 20, 23, 18, 2000, 24, 22, 19])
+status = torch.tensor([200, 200, 200, 200, 200, 200, 200, 200, 504, 200, 500, 200])
+seconds = 10                                         # these 12 requests arrived within 10 seconds
+gpu_util = torch.tensor([0.62, 0.71, 0.68, 0.66])    # sampled every 2.5 seconds
+
+print("throughput:", len(latency_ms) / seconds, "req/s")
+print("error rate:", round((status >= 500).float().mean().item(), 3))
+print("mean latency:", round(latency_ms.mean().item(), 1), "ms   <- pulled up by two slow requests")
+q = torch.quantile(latency_ms, torch.tensor([0.5, 0.95]))
+print("p50, p95:", [round(v, 1) for v in q.tolist()], "ms")
+print("GPU use:", round(gpu_util.mean().item(), 3))
+
+@@ concept
+title: PSI: how much the input has changed
+--- body
+**Drift**: the distribution of live data slowly moves away from the training data. Say the average user age was 35 in training, and after a marketing campaign a big group of 20-year-olds signs up. The model has never seen data like this, so its predictions may get worse, while the service itself reports no error at all.
+
+PSI (Population Stability Index) is the most common drift metric. Credit-risk teams have used it for decades. You compute it for one feature (one input column) at a time:
+
+1. **Take the bin edges from the training data**: the 10%, 20%, ..., 90% quantiles of the training values, 9 edges in total, which cut the line into 10 bins. Each bin then holds exactly 10% of the training data.
+2. Count: the share of training data in each bin (e, "expected") and the share of live data in each bin (a, "actual").
+3. PSI = Σ (a − e) × ln(a / e), summed over the 10 bins. When both sides match, every term is 0; the bigger the difference, the bigger the PSI.
+
+Details that matter:
+
+- The edges must **come from the training data only**, and are saved together with the model. Live data is counted with the same edges. If you bin live data with its own quantiles, every bin always holds 10% and PSI is always close to 0 (one of today's fix exercises is exactly this bug).
+- Live values outside the training range still count, in the outermost bins. `torch.bucketize(x, edges)` does exactly that: anything below the first edge goes to bin 0, anything above the last edge goes to bin 9.
+- `torch.bincount(idx, minlength=10)` counts how many values fall in each bin. Always pass minlength: otherwise the result gets shorter when the last bins are empty.
+- If a bin gets no live data at all, a = 0 and ln(0) is minus infinity. So clip the shares to a tiny number first: `clamp_min(1e-4)`.
+- Common rules of thumb: PSI < 0.1 means almost no change; 0.1 to 0.25 means some change, keep an eye on it; > 0.25 means a big change, find out why.
+--- code
+torch.manual_seed(0)
+train = torch.randn(5000)                                          # one feature at training time
+edges = torch.quantile(train, torch.linspace(0, 1, 11))[1:-1]      # 9 edges -> 10 bins
+print("edges:", [round(v, 2) for v in edges.tolist()])
+
+def shares(x):
+    return torch.bincount(torch.bucketize(x, edges), minlength=10) / len(x)
+
+e = shares(train).clamp_min(1e-4)
+print("training share per bin:", [round(v, 3) for v in e.tolist()])
+
+for name, live in [("no change", torch.randn(2000)),
+                   ("mean +0.3", torch.randn(2000) + 0.3),
+                   ("mean +1.0", torch.randn(2000) + 1.0)]:
+    a = shares(live).clamp_min(1e-4)
+    psi = ((a - e) * torch.log(a / e)).sum().item()
+    print(f"{name:9s} PSI = {psi:.3f}")
+
+@@ concept
+title: The KS statistic: the biggest gap between two curves
+--- body
+PSI needs bins first, and the choice of bins changes the result. The KS statistic (Kolmogorov–Smirnov) needs no bins.
+
+First meet the **empirical cumulative distribution** (ECDF): F(x) = the share of values that are ≤ x. For the data [1, 2, 3, 4]: F(0) = 0, F(2) = 2/4 = 0.5, F(10) = 1. As x moves from small to large, F climbs step by step from 0 to 1. Drawn out, it looks like a staircase.
+
+Each of two datasets has its own staircase. **The KS statistic is the largest vertical distance between the two staircases**:
+
+- 0 means the two distributions are identical; 1 means they are completely apart (every value of one is smaller than every value of the other).
+- The largest distance always sits at one of the data points. So it is enough to evaluate both curves at "all values of both datasets put together".
+
+To compute F in PyTorch: sort with `torch.sort`, then call `torch.searchsorted(sorted_a, points, right=True)`. It returns how many values of a are ≤ each point (right=True counts equal values too). Divide by len(a) and you have F(points).
+
+PSI or KS? Both are common. PSI comes with thresholds the industry already uses. KS needs no bins and always lies between 0 and 1, which makes it easy to read. scipy's `ks_2samp` also gives a p-value, but with the huge sample sizes of live traffic even a tiny difference is "significant", so monitoring usually puts a threshold on the KS value itself. Today you write it yourself, without scipy.
+--- code
+a = torch.tensor([1., 2., 3., 4.])
+b = torch.tensor([3., 4., 5., 6.])
+points = torch.cat([a, b]).sort().values          # sorted only to make the printout readable
+Fa = torch.searchsorted(a, points, right=True) / len(a)     # a and b are already sorted
+Fb = torch.searchsorted(b, points, right=True) / len(b)
+print("x   :", points.tolist())
+print("F_a :", Fa.tolist())
+print("F_b :", Fb.tolist())
+print("KS  :", (Fa - Fb).abs().max().item())
+
+torch.manual_seed(0)
+train = torch.randn(3000).sort().values
+live = (torch.randn(1000) + 0.5).sort().values
+pts = torch.cat([train, live])
+d = (torch.searchsorted(train, pts, right=True) / len(train)
+     - torch.searchsorted(live, pts, right=True) / len(live)).abs().max()
+print("KS when the mean moves by 0.5:", round(d.item(), 3))
+
+@@ concept
+title: Prediction drift: watch the outputs before labels arrive
+--- body
+The most direct way to monitor a model is to compute its accuracy on live traffic. But true labels often take a long time: you learn whether a loan defaults months later, and about fraud only when the customer complains. By the time the labels are in, the damage is done.
+
+**Prediction drift**: ignore the labels and ask whether the distribution of the model's **outputs** has changed. You know every prediction the moment it is made, so this works in real time.
+
+- Classifiers: the share of predictions for each class. In the first week after launch 2% of payments were predicted "fraud"; today it is 9%. Either there really is more fraud, or the inputs changed and the model has started guessing. Both are worth a person's attention.
+- You can also check whether the mean confidence (the average of the largest softmax value) has dropped.
+
+The classes are already "bins", so no binning is needed:
+
+- Shares: `torch.bincount(pred, minlength=num_classes) / len(pred)`. Always pass minlength: if a class never appears today, bincount returns a shorter result that no longer lines up with the training shares.
+- Then use the PSI formula: Σ (a − e) × ln(a / e), again after `clamp_min(eps)`.
+
+Input drift and prediction drift complement each other. The inputs can change without the predictions changing (the model may not care about that feature). When the predictions change, it is always worth a look.
+--- code
+ref_pred = torch.repeat_interleave(torch.arange(3), torch.tensor([700, 250, 50]))    # predictions in the first week
+live_pred = torch.repeat_interleave(torch.arange(3), torch.tensor([450, 250, 300]))  # predictions today
+print("start of ref_pred:", ref_pred[:5].tolist(), " length", len(ref_pred))
+
+e = torch.bincount(ref_pred, minlength=3) / len(ref_pred)
+a = torch.bincount(live_pred, minlength=3) / len(live_pred)
+print("first week:", [round(v, 3) for v in e.tolist()])
+print("today:     ", [round(v, 3) for v in a.tolist()])
+a, e = a.clamp_min(1e-4), e.clamp_min(1e-4)
+print("PSI of the predictions:", round(((a - e) * torch.log(a / e)).sum().item(), 3))
+
+only_0_and_1 = torch.tensor([0, 1, 1, 0])
+print("without minlength:", torch.bincount(only_0_and_1).tolist())
+print("with minlength:   ", torch.bincount(only_0_and_1, minlength=3).tolist())
+
+@@ concept
+title: Alert rules: a rolling window plus a minimum count
+--- body
+An alert has two jobs: fire **fast** when something is wrong, and stay **quiet** when nothing is. After being woken up a few times at night for nothing, people start to ignore alerts.
+
+**Rolling window**: look only at the requests of the last stretch of time (say, the last 5 minutes).
+
+- The error rate "since launch" does not work. The service has run for a week at 0.5% errors; for the last 5 minutes it has been at 30%, and the all-time rate only moves from 0.5% to 0.6%. Nobody notices.
+- A window that is too short makes the number jump around; one that is too long fires long after the trouble started. A few minutes is a common choice.
+
+**Minimum count**: with too few requests in the window, the error rate means nothing. At 3 a.m. there may be only 2 requests in a minute; 1 fails, the error rate is 50%, and it is probably just one user sending bad data. So the rule is: fire only when **count ≥ min_count and error rate > threshold**.
+
+Implementation: keep (time, is_error) pairs in time order in a `collections.deque` (a queue that is fast to add to and remove from at both ends). New requests `append` on the right. On every check, first `popleft` the old ones on the left (time ≤ now − window_s); what remains is the window. Dropping old requests has a second benefit: after months of running, memory has not grown.
+
+Real systems (for example Prometheus alert rules) often add "above the threshold for N minutes in a row" and "after firing, stay quiet for a while". Same idea.
+--- code
+from collections import deque
+
+window_s, threshold, min_count = 60, 0.05, 20
+events = deque()                                        # (t in seconds, is it an error), oldest on the left
+
+def check(now):
+    while events and events[0][0] <= now - window_s:   # too old: drop from the left
+        events.popleft()
+    n = len(events)
+    errors = sum(1 for _, is_error in events if is_error)
+    rate = errors / n if n else 0.0
+    return n, round(rate, 3), n >= min_count and rate > threshold
+
+events.extend([(3, True), (41, False)])                 # night: only 2 requests in one minute
+print("3 a.m. (count, error rate, alert):", check(now=50))
+
+for t in range(100, 160):                               # daytime: 1 request per second, every 5th one fails
+    events.append((t, t % 5 == 0))
+print("daytime incident (count, error rate, alert):", check(now=160))
+print("left in the deque:", len(events), "requests (the 2 from the night are gone)")
+
+@@ concept
+title: Shadow traffic: the new model rides along
+--- body
+A new model that wins on the offline test set does not always win in production. Live data, live traffic and all the odd inputs are not necessarily in your test set.
+
+**Shadow traffic** (also "shadow mode"): every live request is also sent to the new model (the shadow), but **the user always gets the old model's (prod's) answer**. The shadow's answers are only recorded and compared with prod's.
+
+- Zero risk for users: if the shadow is wrong, slow or crashes, nobody notices.
+- You get numbers from real traffic: the **disagreement rate** (the share of rows where the two models predict differently), plus the shadow's latency and error count.
+- A high disagreement rate is not automatically bad (maybe the new model fixes mistakes). But it tells you how many users' results will change when you switch, and you can pull out the rows where they disagree for a person to review.
+
+Two iron rules:
+
+1. If the shadow fails, catch it with `try/except`, record it, and return prod's answer as usual. A user must **never** see an error because of the shadow.
+2. If prod itself fails, the error must go out as usual (that is normal error handling). The shadow's try/except must not swallow it by accident. So the try wraps only the shadow's line.
+
+In real systems the shadow usually runs asynchronously, in a background thread or a separate service, so it does not slow down the response either. To keep today's exercise simple, it is called synchronously.
+--- code
+torch.manual_seed(0)
+prod = nn.Linear(4, 3)
+shadow = nn.Linear(4, 3)
+shadow.load_state_dict(prod.state_dict())
+with torch.no_grad():
+    shadow.weight.add_(0.05 * torch.randn(3, 4))     # the "new model": slightly different from prod
+
+x = torch.randn(1000, 4)                             # 1000 live requests
+with torch.inference_mode():
+    p = prod(x).argmax(dim=-1)                       # what the user gets
+    s = shadow(x).argmax(dim=-1)                     # only recorded
+print("rows where they disagree:", int((p != s).sum()))
+print("disagreement rate:", round((p != s).float().mean().item(), 3))
+
+def broken(x):
+    raise RuntimeError("CUDA out of memory (simulated)")
+
+try:
+    broken(x)
+except Exception as e:
+    print("shadow failed, recorded:", type(e).__name__, "-> the user still gets prod's answer, shape", tuple(p.shape))
+
+@@ concept
+title: Canary and A/B: no decision without enough samples
+--- body
+**Canary release**: the new version first gets only a small slice of real traffic (say 5%); the rest still goes to the old version (the baseline). You compare the error rate and latency of both. If all is well, you raise the slice step by step to 100%; if not, you roll back. The name comes from the canary that miners took into the mine: it got into trouble first, so the people had time to get out.
+
+**A/B testing** looks similar but has a different goal: each version gets part of the users for a period fixed in advance, and you compare a business metric (click rate, conversion rate) to decide which version is better.
+
+Both run into the same problem: **with too few samples, a difference may be pure luck.** For a service whose true error rate is p, the error rate you measure on n requests wobbles up and down. The size of that wobble is the **standard error** (SE):
+
+SE = sqrt(p × (1 − p) / n)
+
+With p = 2% and n = 50, SE ≈ 2 percentage points: a model whose true error rate is 2% can easily look like 4%. With 100 times more requests, SE only shrinks to 1/10 (because of the square root).
+
+So the decision rule has three outcomes:
+
+1. Either side has fewer than min_n requests (fixed in advance): **wait**. Keep collecting; do not decide.
+2. The canary's error rate is higher than the baseline's by more than z standard errors (z = 2 is common): **rollback**. The combined standard error of both sides is se = sqrt(p_b(1 − p_b)/n_b + p_c(1 − p_c)/n_c), where b is the baseline and c the canary.
+3. Otherwise: **promote** (give it more traffic).
+
+The code below simulates 2000 canaries where the new and the old model are **exactly the same**, both with a true error rate of 2%. Each time we look at only n requests. How often does the canary "look" like it has 4% errors or more?
+--- code
+torch.manual_seed(0)
+p = 0.02
+for n in [50, 500, 5000]:
+    errors = torch.binomial(torch.full((2000,), float(n)), torch.full((2000,), p))  # failures in each of 2000 canaries
+    looks_bad = (errors / n >= 0.04).float().mean().item()
+    se = math.sqrt(p * (1 - p) / n)
+    print(f"n={n:5d}  SE={se:.4f}  share that looks >= 4%: {looks_bad:.3f}")
+
+@@ concept
+title: What 1,000 requests cost
+--- body
+Your manager will ask: "What does this model cost per month? Is it worth it?" An engineer should be able to work out the **cost per 1,000 requests**.
+
+You pay for a GPU by the hour, busy or not. So:
+
+- requests actually handled per hour = throughput at full load (per second) × 3600 × average utilization
+- cost per request = GPU price per hour ÷ requests handled per hour
+- cost per 1,000 requests = cost per request × 1000
+
+Two levers:
+
+- **Throughput**: batching (day 22) and int8 / fp16 (day 21) let the same GPU handle more requests per second, and the cost drops in proportion.
+- **Utilization**: traffic is high in the day and low at night. A GPU sized for the peak sits mostly idle at night, and you still pay for it. At 25% average utilization, the cost is 4 times the full-load cost. Autoscaling (adding and removing machines as traffic changes) exists to raise utilization.
+
+Generative models often talk about "cost per 1,000 tokens". The arithmetic is the same, with tokens instead of requests.
+
+The price below is made up, just to show the calculation.
+--- code
+price = 2.00                                         # assumed: one GPU costs 2 dollars per hour
+for name, rps, util in [("batch=1,  100% utilization", 40, 1.0),
+                        ("batch=1,  25% utilization", 40, 0.25),
+                        ("batch=16, 25% utilization", 400, 0.25)]:
+    per_hour = rps * 3600 * util                     # requests actually handled per hour
+    cost = price / per_hour * 1000
+    print(f"{name}   per 1,000 requests ${cost:.4f}")
+
+@@ item d25-01
+type: predict
+title: Dashboard numbers from a request log
+level: 1
+cards: The numbers to watch after launch
+--- context
+Every number on a monitoring dashboard is computed from request logs, one line per request. Compute a few yourself and you will see why a number like "mean latency 125 ms" can mislead.
+--- prompt
+10 requests arrived within 5 seconds. Write the 4 lines this code prints.
+--- code
+latency_ms = [12, 15, 11, 240, 14, 13, 16, 12, 15, 900]
+status = [200, 200, 200, 500, 200, 200, 200, 200, 200, 504]
+seconds = 5
+
+print(len(latency_ms) / seconds)                        # throughput, req/s
+print(sum(s >= 500 for s in status) / len(status))      # error rate
+print(sum(latency_ms) / len(latency_ms))                # mean latency
+print(sorted(latency_ms)[len(latency_ms) // 2])         # the middle one after sorting
+--- explain
+Throughput: 10 / 5 = 2.0. Two status codes are ≥ 500: 500 (server error) and 504 (timeout), so the error rate is 2 / 10 = 0.2. The latencies add up to 1248, so the mean is 124.8 ms. Sorted, they are [11, 12, 12, 13, 14, 15, 15, 16, 240, 900]; counting from 0, position 10 // 2 = 5 holds 15.
+
+The mean of 124.8 ms describes no request at all: 8 requests took 16 ms or less, and the other 2 took far longer. That is why dashboards show percentiles (day 22's p50 / p95 / p99) and not just the mean.
+--- hints
+- How many status codes are ≥ 500? 504 counts too.
+- `sorted(...)[5]`: sort first, then count from 0 up to position 5.
+
+@@ item d25-02
+type: choice
+title: Reading a latency dashboard
+level: 2
+cards: The numbers to watch after launch
+--- context
+During an incident, the person on call often has a few minutes to read the dashboard and decide. If you can read the cause from the combination of curves, you do not waste time on the wrong fix, such as rolling back a model that is fine.
+--- prompt
+The dashboard from 8 p.m. onwards:
+
+- Incoming requests: 200 per second → 320 per second
+- Finished requests: stuck at about 250 per second
+- p50 latency: 25 ms → 160 ms; p99 latency: 80 ms → 2000 ms
+- Error rate: 0.1% → 4%; almost all new errors are 504 (timeout; the service's timeout is 2 seconds)
+- GPU use: 100%; queued requests: still growing
+
+What is the most likely cause, and the first thing to do?
+--- options
+- The new model's outputs got worse: roll back to the previous version right away
+- Not enough capacity: more requests come in than can be handled, so they wait longer and longer in the queue, and the ones that wait longest time out. Add capacity (more replicas) or rate-limit first
+- The input data drifted: the model sees data it has never seen, so it computes more slowly
+- Network jitter: p50 is slower too, so it is the network; wait for it to recover
+answer: 2
+--- explain
+The key is two numbers that do not match: 320 requests come in per second but only 250 get handled, so 70 more join the queue every second and the queue can only grow. The GPU is at 100%, so it cannot compute any faster. The waiting time is added to every request, so both p50 and p99 get slower, and the requests that wait the longest hit the 2-second limit and become 504s.
+
+Almost all new errors are timeouts, not 500s, so the model itself has not crashed. Rolling back would not help: the old model cannot keep up either. The first step is to add replicas, or to rate-limit (answer the extra requests right away with 429 "too busy" instead of letting everyone wait until they time out). Drift can make predictions worse, but it does not usually make the same model compute more slowly.
+--- hints
+- Compare "incoming" with "finished": how many per second is the difference? Where do those requests go?
+- The new errors are 504, not 500: did the model fail, or did requests wait too long?
+
+@@ item d25-03
+type: choice
+title: Everything is green, yet users complain
+level: 1
+cards: The numbers to watch after launch; Prediction drift: watch the outputs before labels arrive; PSI: how much the input has changed
+--- context
+Monitoring the service and monitoring the model are two different things. A healthy service only means "there is an answer", not "the answer is right". Many incidents after launch happen while every service metric stays green.
+--- prompt
+A credit-card fraud model has been live for three months. The dashboard shows: p95 latency 40 ms (same as at launch), error rate 0.1%, normal throughput, GPU use 60%. But the risk team says noticeably more fraud has slipped through lately. The true labels (which payments were fraud) arrive only when customers dispute a charge, usually 3 to 6 weeks later.
+
+What monitoring should be added first?
+--- options
+- Lower the GPU-use alert threshold from 90% to 70%
+- Monitor the distribution of the input features and of the predictions: how much today's data differs from the training data (for example, the PSI of each feature and the share of payments predicted "fraud")
+- Replace p95 latency with p99 latency
+- Shorten the error-rate alert window from 5 minutes to 1 minute
+answer: 2
+--- explain
+The other three options all tune "service health" monitoring, and the service really is healthy: it answered every request on time. The problem is that the answers are wrong.
+
+Accuracy needs labels, and those take weeks. The input and prediction distributions are available right now. For example, a new fraud pattern may shift the distribution of a few features (their PSI goes up), or the share of payments predicted "fraud" may drop. None of this proves the model is wrong, but it can tell you to go and look weeks before the labels come back.
+--- hints
+- Latency, error rate and GPU are all normal, so the service answers on time. Then where is the problem?
+- The labels come weeks later. What data do you have right now that says something about whether the model is right?
+
+@@ item d25-04
+type: code
+title: Write PSI by hand
+level: 2
+cards: PSI: how much the input has changed
+targets: psi
+ref: day25
+--- context
+PSI is the most widely used metric for input drift. In credit risk and recommender systems, almost every model has a "PSI per feature per day" table, and interviewers often ask you to write it by hand.
+--- prompt
+Write `psi(ref, live, bins=10, eps=1e-4)` that returns a Python float. `ref` is one feature at training time (a 1-D float tensor); `live` is the same feature in production (a 1-D float tensor, its length may differ from ref's).
+
+1. The bin edges come from `ref` only: `torch.quantile(ref, torch.linspace(0, 1, bins + 1))[1:-1]` (drop the first and last, leaving bins − 1 edges).
+2. `torch.bucketize(x, edges)` gives each value's bin (0 to bins − 1); `torch.bincount(..., minlength=bins)` counts them; divide by the length to get the shares e (for ref) and a (for live).
+3. `clamp_min(eps)` both shares, then PSI = Σ (a − e) × ln(a / e).
+--- starter
+def psi(ref, live, bins=10, eps=1e-4):
+    """ref: one feature at training time (N,); live: the same feature in production (M,). Returns PSI (a Python float)."""
+    edges = ...      # 1. bins - 1 edges, from ref only
+    e = ...          # 2. share of ref in each bin, length bins
+    a = ...          #    share of live in each bin, length bins
+    raise todo()     # 3. clamp_min(eps), apply the formula, return a float
+--- solution
+def psi(ref, live, bins=10, eps=1e-4):
+    edges = torch.quantile(ref, torch.linspace(0, 1, bins + 1))[1:-1]     # edges from the training data only
+    e = torch.bincount(torch.bucketize(ref, edges), minlength=bins) / len(ref)
+    a = torch.bincount(torch.bucketize(live, edges), minlength=bins) / len(live)
+    e, a = e.clamp_min(eps), a.clamp_min(eps)                            # an empty bin does not become log(0)
+    return float(((a - e) * torch.log(a / e)).sum())
+--- tests
+@check("no drift: PSI is small, and computed correctly")
+def _():
+    seed(1)
+    ref, live = torch.randn(2000), torch.randn(1000)
+    p = psi(ref, live)
+    true(isinstance(p, float), f"return a Python float (use float(...) or .item()); you returned {type(p).__name__}")
+    eq(p, _psi_ref(ref, live), tol=1e-4, msg="differs from the reference: check the bin edges, bincount's minlength and the formula")
+    true(p < 0.05, f"same distribution, so PSI should be small; yours is {p:.4f}")
+
+@check("mean shifted by 1 standard deviation: PSI far above 0.25")
+def _():
+    seed(2)
+    ref, live = torch.randn(2000), torch.randn(1000) + 1.0
+    p = psi(ref, live)
+    eq(p, _psi_ref(ref, live), tol=1e-4, msg="differs from the reference")
+    true(p > 0.25, f"PSI is only {p:.4f}: the whole distribution moved by 1 standard deviation, it should be far above 0.25")
+
+@check("a wider distribution (standard deviation doubled) is caught too")
+def _():
+    seed(3)
+    ref, live = torch.randn(2000), 2 * torch.randn(1000)
+    p = psi(ref, live)
+    eq(p, _psi_ref(ref, live), tol=1e-4,
+       msg="differs from the reference. The edges must be ref's quantiles, not live's: with live's own quantiles, every live bin is always 10%")
+    true(p > 0.25, f"PSI is only {p:.4f}: the standard deviation doubled, it should be above 0.25")
+
+@check("all live values below the training minimum: they go to bin 0, and the result is not inf")
+def _():
+    seed(4)
+    ref = torch.randn(2000)
+    live = ref.min() - 1 - torch.rand(500)
+    p = psi(ref, live)
+    true(math.isfinite(p), f"PSI is {p}: some bins have no live data, and log(0) became infinite. clamp_min(eps) before the log")
+    eq(p, _psi_ref(ref, live), tol=1e-3,
+       msg="differs from the reference. bincount needs minlength=bins: with all live values in bin 0, the result has only 1 element without it")
+
+@check("the bins argument is used")
+def _():
+    seed(5)
+    ref, live = torch.randn(2000), torch.randn(1000) + 0.3
+    eq(psi(ref, live, bins=5), _psi_ref(ref, live, bins=5), tol=1e-4, msg="wrong for bins=5: both the number of edges and minlength must use bins")
+--- hints
+- Edges: `torch.quantile(ref, torch.linspace(0, 1, bins + 1))` gives bins + 1 quantiles (including the min and the max); `[1:-1]` drops the first and last.
+- Shares: `torch.bincount(torch.bucketize(x, edges), minlength=bins) / len(x)`, with the **same** edges for ref and live.
+- Last: `e, a = e.clamp_min(eps), a.clamp_min(eps)`, then `return float(((a - e) * torch.log(a / e)).sum())`.
+
+@@ item d25-05
+type: fix
+title: PSI is always 0: binned with today's data
+level: 2
+cards: PSI: how much the input has changed
+targets: fit_reference, daily_psi
+ref: day25
+--- context
+A real incident: a drift monitor ran for six months, PSI stayed below 0.01 every day, and it never fired. Only when the model had clearly got worse did someone notice the binning was wrong. A bug like this raises no error; it just makes the monitor say "all fine" forever.
+--- prompt
+`fit_reference` runs once at training time: it fixes the bin edges and records the share of training data in each bin, and the result is saved together with the model. Once live, `daily_psi` runs every day to compare today's data with the training data.
+
+This monitor has been live for six months, and PSI is close to 0 every day, even when today's data has clearly changed. Find the bug and fix it: `daily_psi(fit_reference(train), today)` must give the same result as `psi(train, today)` from exercise 4.
+--- starter
+def fit_reference(train_values, bins=10):
+    """Runs once at training time: fix the bin edges and record the share of training data in each bin."""
+    edges = torch.quantile(train_values, torch.linspace(0, 1, bins + 1))[1:-1]
+    shares = torch.bincount(torch.bucketize(train_values, edges), minlength=bins) / len(train_values)
+    return {"edges": edges, "shares": shares}
+
+
+def daily_psi(reference, today_values, eps=1e-4):
+    """Runs every day: how much today's data differs from the training data."""
+    bins = len(reference["shares"])
+    edges = torch.quantile(today_values, torch.linspace(0, 1, bins + 1))[1:-1]
+    a = torch.bincount(torch.bucketize(today_values, edges), minlength=bins) / len(today_values)
+    e = reference["shares"]
+    a, e = a.clamp_min(eps), e.clamp_min(eps)
+    return float(((a - e) * torch.log(a / e)).sum())
+--- solution
+def fit_reference(train_values, bins=10):
+    edges = torch.quantile(train_values, torch.linspace(0, 1, bins + 1))[1:-1]
+    shares = torch.bincount(torch.bucketize(train_values, edges), minlength=bins) / len(train_values)
+    return {"edges": edges, "shares": shares}
+
+
+def daily_psi(reference, today_values, eps=1e-4):
+    edges, e = reference["edges"], reference["shares"]       # the edges saved at training time
+    a = torch.bincount(torch.bucketize(today_values, edges), minlength=len(e)) / len(today_values)
+    a, e = a.clamp_min(eps), e.clamp_min(eps)
+    return float(((a - e) * torch.log(a / e)).sum())
+--- tests
+@check("today's data moved as a whole: PSI must show it")
+def _():
+    seed(1)
+    train, today = torch.randn(3000), torch.randn(1000) + 1.0
+    p = daily_psi(fit_reference(train), today)
+    true(p > 0.25, f"PSI is only {p:.4f}. Today's data is binned with today's own quantiles, so every bin always holds exactly 10%, "
+         "exactly like the training data. Use reference['edges']")
+    eq(p, _psi_ref(train, today), tol=1e-4, msg="PSI went up, but the value differs from the reference")
+
+@check("today's data got wider (standard deviation doubled): PSI must show it too")
+def _():
+    seed(2)
+    train, today = torch.randn(3000), 2 * torch.randn(1000)
+    p = daily_psi(fit_reference(train), today)
+    true(p > 0.25, f"PSI is only {p:.4f}: the distribution clearly got wider, yet the monitor says nothing changed")
+    eq(p, _psi_ref(train, today), tol=1e-4, msg="PSI went up, but the value differs from the reference")
+
+@check("same result as psi(train, today)")
+def _():
+    seed(3)
+    train = torch.randn(3000)
+    reference = fit_reference(train)
+    for shift, scale in [(0.0, 1.0), (0.3, 1.0), (0.0, 1.5), (-0.5, 0.7)]:
+        today = torch.randn(1000) * scale + shift
+        eq(daily_psi(reference, today), _psi_ref(train, today), tol=1e-4,
+           msg=f"differs for today = randn * {scale} + {shift}. Even with no change, PSI is not exactly 0 but a small number")
+--- hints
+- Look at what data the edges in `daily_psi` are computed from. If you cut today's data at today's own 10% quantiles, how much ends up in each bin?
+- `fit_reference` already saved the training edges in `reference["edges"]`; bin today's data with those.
+- One line is enough: `edges = reference["edges"]`.
+
+@@ item d25-06
+type: predict
+title: A few small KS examples
+level: 1
+cards: The KS statistic: the biggest gap between two curves
+ref: day25
+--- context
+Before you write monitoring code, be able to work out a few small examples on paper. Then you notice at once when the code gives a wrong number.
+--- prompt
+`ks_statistic(a, b)` is the algorithm from the card: the largest vertical distance between the two empirical cumulative curves. Write the 4 lines this code prints.
+--- code
+t = torch.tensor
+a = t([1., 2., 3., 4.])
+print(ks_statistic(a, t([3., 4., 5., 6.])))
+print(ks_statistic(a, t([11., 12., 13., 14.])))
+print(ks_statistic(a, t([4., 3., 2., 1.])))
+print(round(ks_statistic(a, t([1., 2., 3., 4., 100., 200.])), 3))
+--- explain
+Line 1: at x = 2, a's F = 2/4 = 0.5 and b's F = 0 (b's smallest value is 3), a gap of 0.5; at x = 4 the gap is 1 − 2/4 = 0.5. No gap is larger, so the answer is 0.5.
+
+Line 2: every value of a is smaller than every value of b. At x = 4, a's F is already 1 and b's is still 0: a gap of 1.0 (completely apart).
+
+Line 3: the same 4 numbers in a different order. The cumulative curve only asks "how many are ≤ x", so the order does not matter: 0.0.
+
+Line 4: b has two extra very large values. At x = 4, a's F = 1 and b's F = 4/6, a gap of 1/3 ≈ 0.333.
+--- hints
+- For each x, count how many values of a are ≤ x and divide by len(a); the same for b. Find the x where they differ most.
+- In line 4, b has 6 values, and 4 of them are ≤ 4.
+
+@@ item d25-07
+type: code
+title: Write the KS statistic by hand (no scipy)
+level: 2
+cards: The KS statistic: the biggest gap between two curves
+targets: ks_statistic
+ref: day25
+--- context
+The KS statistic needs no bins and always lies between 0 and 1, which makes it handy for monitoring continuous features. Production images often do not ship scipy, and interviewers like to ask how KS is computed. Write it once yourself and neither will worry you.
+--- prompt
+Write `ks_statistic(a, b)` that returns a Python float. a and b are 1-D float tensors, of possibly different lengths, in no particular order. No scipy.
+
+1. Sort each one: `torch.sort(a).values`.
+2. The places to look at: both datasets put together, `torch.cat([a, b])`.
+3. Evaluate both cumulative curves at those places: `torch.searchsorted(sorted a, places, right=True) / len(a)`, and the same for b.
+4. Return the largest absolute difference between the two curves.
+--- starter
+def ks_statistic(a, b):
+    """KS statistic of two 1-D datasets: the largest vertical distance between their empirical cumulative curves, between 0 and 1."""
+    raise todo()
+--- solution
+def ks_statistic(a, b):
+    a = torch.sort(a).values                   # searchsorted needs sorted input
+    b = torch.sort(b).values
+    points = torch.cat([a, b])                 # the largest gap always sits at a data point
+    cdf_a = torch.searchsorted(a, points, right=True) / len(a)    # share of a that is <= each point
+    cdf_b = torch.searchsorted(b, points, right=True) / len(b)
+    return float((cdf_a - cdf_b).abs().max())
+--- tests
+@check("same result as a brute-force point-by-point computation")
+def _():
+    seed(1)
+    a, b = torch.randn(300), torch.randn(200) * 1.3 - 0.3
+    got = ks_statistic(a, b)
+    true(isinstance(got, float), f"return a Python float; you returned {type(got).__name__}")
+    eq(got, _ks_slow(a, b), tol=1e-6,
+       msg="differs from the brute-force result. Evaluate both cumulative curves at all values of a and b together; sort before searchsorted")
+
+@check("identical data gives 0, completely separate data gives 1")
+def _():
+    seed(2)
+    a = torch.randn(100)
+    got = ks_statistic(a, a.clone())
+    true(close(got, 0.0, 1e-9), f"two identical datasets should give KS 0; yours is {got}")
+    got = ks_statistic(a, a + 100)
+    true(close(got, 1.0, 1e-9), f"every value of b is larger than every value of a, so KS should be 1; yours is {got}")
+
+@check("repeated values are handled correctly")
+def _():
+    seed(3)
+    a = torch.randint(0, 5, (200,)).float()
+    b = torch.randint(1, 6, (150,)).float()
+    eq(ks_statistic(a, b), _ks_slow(a, b), tol=1e-6,
+       msg="wrong when many values are equal. F(x) counts how many values are <= x, so equal values count together: use searchsorted, not the sorted position i / n")
+
+@check("shuffled order and different lengths change nothing")
+def _():
+    seed(4)
+    a, b = torch.randn(250) + 0.4, torch.randn(80)
+    want = _ks_slow(a, b)
+    got = ks_statistic(a[torch.randperm(250)], b[torch.randperm(80)])
+    eq(got, want, tol=1e-6, msg="the result changed after shuffling: did you sort? Each curve is divided by its own length")
+--- hints
+- The cumulative curve F(x) = (how many are ≤ x) ÷ total. `torch.searchsorted(sorted_a, points, right=True)` computes the "how many" for all points at once.
+- The points are `torch.cat([a, b])`; pass the sorted a and b to searchsorted.
+- Last: `float((cdf_a - cdf_b).abs().max())`.
+
+@@ item d25-08
+type: code
+title: Prediction drift: class shares and PSI
+level: 2
+cards: Prediction drift: watch the outputs before labels arrive; PSI: how much the input has changed
+targets: class_shares, prediction_psi
+ref: day25
+--- context
+Labels come back weeks later, but you know every prediction the moment the model makes it. A sudden change in the share of predictions for one class is often the earliest warning you get.
+--- prompt
+Write two functions:
+
+- `class_shares(pred, num_classes)`: pred is a 1-D long tensor where each element is a predicted class (0 to num_classes − 1). Return a float tensor of length num_classes: the share of each class. A class that never appears has share 0, and the length must not shrink.
+- `prediction_psi(ref_pred, live_pred, num_classes, eps=1e-4)`: e is the shares of ref_pred and a the shares of live_pred; `clamp_min(eps)` both, compute Σ (a − e) × ln(a / e), and return a Python float.
+--- starter
+def class_shares(pred, num_classes):
+    """The share of predictions for each class, length num_classes."""
+    raise todo()
+
+
+def prediction_psi(ref_pred, live_pred, num_classes, eps=1e-4):
+    """Predictions right after launch vs predictions today: PSI (a float)."""
+    raise todo()
+--- solution
+def class_shares(pred, num_classes):
+    return torch.bincount(pred, minlength=num_classes) / len(pred)     # minlength: classes that never appear still get a slot
+
+
+def prediction_psi(ref_pred, live_pred, num_classes, eps=1e-4):
+    e = class_shares(ref_pred, num_classes).clamp_min(eps)
+    a = class_shares(live_pred, num_classes).clamp_min(eps)
+    return float(((a - e) * torch.log(a / e)).sum())
+--- tests
+def _preds(counts):
+    return torch.repeat_interleave(torch.arange(len(counts)), torch.tensor(counts))
+
+@check("the share of each class")
+def _():
+    got = class_shares(torch.tensor([0, 0, 1, 2, 2, 2]), 3)
+    true(torch.is_tensor(got), f"return a tensor; you returned {type(got).__name__}")
+    eq(got, torch.tensor([2 / 6, 1 / 6, 3 / 6]), tol=1e-6, msg="share = how often each class appears / total")
+
+@check("a class that never appears has share 0, and the length stays the same")
+def _():
+    got = class_shares(torch.tensor([0, 0, 1]), 4)
+    eq(got, torch.tensor([2 / 3, 1 / 3, 0.0, 0.0]), tol=1e-6,
+       msg="classes 2 and 3 never appear, but they still need their slots: pass minlength=num_classes to torch.bincount")
+
+@check("the prediction distribution changed: PSI is computed correctly")
+def _():
+    ref_pred, live_pred = _preds([700, 250, 50]), _preds([450, 250, 300])
+    got = prediction_psi(ref_pred, live_pred, 3)
+    true(isinstance(got, float), f"return a Python float; you returned {type(got).__name__}")
+    eq(got, _prediction_psi_ref(ref_pred, live_pred, 3), tol=1e-5, msg="the formula is Σ (a - e) * ln(a / e), with e from ref_pred")
+    true(close(prediction_psi(ref_pred, ref_pred.flip(0), 3), 0.0, 1e-9), "the same predictions (just in another order) should give PSI 0")
+
+@check("a class that never appears today: the result is still a finite number")
+def _():
+    ref_pred, live_pred = _preds([700, 250, 50]), _preds([600, 400])
+    got = prediction_psi(ref_pred, live_pred, 3)
+    true(math.isfinite(got), f"PSI is {got}: class 2 has share 0 today, and log(0) is minus infinity. clamp_min(eps) first")
+    eq(got, _prediction_psi_ref(ref_pred, live_pred, 3), tol=1e-5,
+       msg="wrong. live_pred has no class 2, but class_shares must still have length 3")
+--- hints
+- Shares: `torch.bincount(pred, minlength=num_classes) / len(pred)`.
+- In `prediction_psi`, call your `class_shares`, then do what you did in exercise 4: clamp_min, the formula, `float(...)`.
+
+@@ item d25-09
+type: code
+title: A rolling-window alert with a minimum count
+level: 2
+cards: Alert rules: a rolling window plus a minimum count
+targets: ErrorRateAlert
+ref: day25
+--- context
+With badly written alert rules, either nobody notices when something breaks, or people get woken up at night for nothing. "A rolling window plus a minimum count" is the basic pattern of almost every alerting system (Prometheus, for example).
+--- prompt
+Complete `ErrorRateAlert`:
+
+- `record(t, is_error)`: record one request. t is the time in seconds (always increasing); is_error is True / False. Store it in `self.events`.
+- `firing(now)`: look only at the requests of the last window_s seconds, that is those with now − window_s < t ≤ now. First `popleft` the older ones off the left of `self.events`, so memory does not keep growing. Return True only when the window has ≥ min_count requests **and** an error rate > threshold; otherwise return False (also when the window is empty).
+--- starter
+from collections import deque
+
+class ErrorRateAlert:
+    def __init__(self, window_s=300, threshold=0.05, min_count=50):
+        self.window_s = window_s
+        self.threshold = threshold
+        self.min_count = min_count
+        self.events = deque()          # (t, is_error), oldest on the left
+
+    def record(self, t, is_error):
+        raise todo()
+
+    def firing(self, now):
+        raise todo()
+--- solution
+from collections import deque
+
+class ErrorRateAlert:
+    def __init__(self, window_s=300, threshold=0.05, min_count=50):
+        self.window_s = window_s
+        self.threshold = threshold
+        self.min_count = min_count
+        self.events = deque()
+
+    def record(self, t, is_error):
+        self.events.append((t, bool(is_error)))
+
+    def firing(self, now):
+        while self.events and self.events[0][0] <= now - self.window_s:   # outside the window: drop from the left
+            self.events.popleft()
+        n = len(self.events)
+        if n == 0 or n < self.min_count:                                 # too few samples: no verdict
+            return False
+        errors = sum(1 for _, is_error in self.events if is_error)
+        return errors / n > self.threshold
+--- tests
+@check("too few requests: no alert; enough requests with a high error rate: alert")
+def _():
+    alert = ErrorRateAlert(window_s=60, threshold=0.05, min_count=20)
+    true(not alert.firing(0), "no requests in the window, so return False (watch out for dividing by 0)")
+    alert.record(1, True)
+    true(not alert.firing(2), "only 1 request in the window (100% errors), but fewer than min_count=20: no alert")
+    for t in range(2, 21):
+        alert.record(t, t in (5, 9))
+    true(alert.firing(21), "20 requests in the window with 3 errors (15% > 5%): should return True")
+
+@check("no alert at or below the threshold, alert above it")
+def _():
+    alert = ErrorRateAlert(window_s=300, threshold=0.05, min_count=50)
+    for t in range(100):
+        alert.record(t, t % 50 == 0)
+    true(not alert.firing(100), "100 requests with 2 errors (2%) is not above 5%: no alert")
+    for t in range(100, 110):
+        alert.record(t, True)
+    true(alert.firing(110), "110 requests with 12 errors (about 10.9%) is above 5%: should alert")
+
+@check("only the window counts: old errors do not")
+def _():
+    alert = ErrorRateAlert(window_s=60, threshold=0.05, min_count=20)
+    for t in range(50):
+        alert.record(t, True)
+    true(alert.firing(50), "every request in the first 50 seconds failed: should alert at this point")
+    for t in range(100, 200):
+        alert.record(t, False)
+    true(not alert.firing(200), "the window is now (140, 200] and holds only successful requests: no alert. Are you counting the whole history?")
+
+@check("requests outside the window are dropped from events (memory does not keep growing)")
+def _():
+    alert = ErrorRateAlert(window_s=60, threshold=0.05, min_count=20)
+    for t in range(5000):
+        alert.record(t, t % 10 == 0)
+        alert.firing(t)
+    true(len(alert.events) <= 61,
+         f"after 5000 seconds, events still holds {len(alert.events)} requests: popleft the ones outside the window")
+    true(alert.firing(4999), "the last 60 seconds have 60 requests with 6 errors (10%): should alert")
+--- hints
+- `record` is one line: `self.events.append((t, bool(is_error)))`.
+- Start `firing` with: `while self.events and self.events[0][0] <= now - self.window_s: self.events.popleft()`.
+- Then `n = len(self.events)`; if `n == 0` or `n < self.min_count`, return False; otherwise count the errors and return `errors / n > self.threshold`.
+
+@@ item d25-10
+type: code
+title: Shadow traffic: users only get prod's answer
+level: 2
+cards: Shadow traffic: the new model rides along
+targets: serve_with_shadow, disagreement_rate
+ref: day25
+--- context
+Before a new model goes live, it runs as a "shadow": you see how often it disagrees with the old model on real traffic and whether it crashes, while users are not affected at all. Many teams take this step when they replace a recommendation, search or fraud model.
+--- prompt
+Write two functions. The caller creates `stats`: `{"rows": 0, "disagree": 0, "shadow_errors": 0}`.
+
+`serve_with_shadow(x, prod, shadow, stats)`, all inside `torch.inference_mode()`:
+
+1. Use prod to get each row's predicted class, `prod(x).argmax(dim=-1)`, and return it at the end: this is the answer the user gets.
+2. Run shadow on x too. If shadow raises any error (`Exception`), do `stats["shadow_errors"] += 1` and return prod's answer as usual.
+3. If shadow did not fail: add this call's number of rows to `stats["rows"]`, and the number of rows where the two models predict differently to `stats["disagree"]`.
+4. If prod itself fails: do not catch it; let the error go out as usual.
+
+`disagreement_rate(stats)`: return disagree / rows; return None when rows is 0 (nothing compared yet).
+--- starter
+def serve_with_shadow(x, prod, shadow, stats):
+    """Return prod's predictions (for the user); shadow is only compared, and its errors must never reach the user."""
+    raise todo()
+
+
+def disagreement_rate(stats):
+    raise todo()
+--- solution
+def serve_with_shadow(x, prod, shadow, stats):
+    with torch.inference_mode():
+        pred = prod(x).argmax(dim=-1)          # the user's answer comes from prod only; prod errors go out as usual
+        try:
+            other = shadow(x).argmax(dim=-1)   # the try wraps only the shadow
+        except Exception:
+            stats["shadow_errors"] += 1        # record it, without affecting the user
+        else:
+            stats["rows"] += len(x)
+            stats["disagree"] += int((pred != other).sum())
+    return pred
+
+
+def disagreement_rate(stats):
+    if stats["rows"] == 0:
+        return None
+    return stats["disagree"] / stats["rows"]
+--- tests
+class _Broken(nn.Module):
+    def forward(self, x):
+        raise RuntimeError("CUDA out of memory (simulated)")
+
+def _models():
+    torch.manual_seed(1)
+    prod, shadow = nn.Linear(4, 3), nn.Linear(4, 3)
+    shadow.load_state_dict(prod.state_dict())
+    with torch.no_grad():
+        shadow.weight.add_(0.5 * torch.randn(3, 4))
+    return prod, shadow
+
+def _stats():
+    return {"rows": 0, "disagree": 0, "shadow_errors": 0}
+
+@check("the user gets prod's answer")
+def _():
+    prod, shadow = _models()
+    x = torch.randn(64, 4)
+    got = serve_with_shadow(x, prod, shadow, _stats())
+    want = prod(x).argmax(dim=-1)
+    true(not torch.equal(want, shadow(x).argmax(dim=-1)), "(self-check of the exercise) the two models should disagree")
+    true(torch.is_tensor(got) and torch.equal(got, want), "return prod(x).argmax(dim=-1): the user may only get prod's answer")
+
+@check("disagreements are counted correctly and add up over calls")
+def _():
+    prod, shadow = _models()
+    stats = _stats()
+    rows, disagree = 0, 0
+    for n in (64, 36):
+        x = torch.randn(n, 4)
+        serve_with_shadow(x, prod, shadow, stats)
+        rows += n
+        disagree += int((prod(x).argmax(-1) != shadow(x).argmax(-1)).sum())
+    true(stats["rows"] == rows, f"stats['rows'] is {stats['rows']}, should be {rows} (the rows of both calls added up)")
+    true(stats["disagree"] == disagree, f"stats['disagree'] is {stats['disagree']}, should be {disagree}")
+    true(stats["shadow_errors"] == 0, "the shadow did not fail, so shadow_errors should still be 0")
+
+@check("the shadow crashes: the user still gets an answer, and shadow_errors goes up by one")
+def _():
+    prod, _ = _models()
+    stats = _stats()
+    x = torch.randn(8, 4)
+    try:
+        got = serve_with_shadow(x, prod, _Broken(), stats)
+    except NotImplementedError:
+        raise
+    except RuntimeError:
+        true(False, "the shadow failed and the error reached the user: wrap the shadow's line in try/except")
+    true(torch.equal(got, prod(x).argmax(dim=-1)), "when the shadow fails, still return prod's answer")
+    true(stats["shadow_errors"] == 1, f"stats['shadow_errors'] is {stats['shadow_errors']}, should be 1")
+    true(stats["rows"] == 0 and stats["disagree"] == 0, "the shadow produced no result, so this call must not count in rows / disagree")
+
+@check("an error in prod goes out as usual; it is not swallowed")
+def _():
+    _, shadow = _models()
+    try:
+        serve_with_shadow(torch.randn(8, 4), _Broken(), shadow, _stats())
+    except NotImplementedError:
+        raise
+    except RuntimeError:
+        return
+    true(False, "prod failed, but your function did not raise that error: the try/except should wrap only the shadow's line")
+
+@check("disagreement_rate: a share when there is data, None when there is none")
+def _():
+    true(disagreement_rate({"rows": 0, "disagree": 0, "shadow_errors": 3}) is None,
+         "no rows compared yet (rows is 0): return None instead of dividing by 0")
+    r = disagreement_rate({"rows": 200, "disagree": 30, "shadow_errors": 0})
+    true(r is not None and close(r, 0.15, 1e-9), f"30 of 200 rows differ, so the disagreement rate is 0.15; you returned {r!r}")
+--- hints
+- Compute `pred = prod(x).argmax(dim=-1)` **outside** the try: errors from prod must go out as usual.
+- The shadow: `try: other = shadow(x).argmax(dim=-1)`, `except Exception: stats["shadow_errors"] += 1`, and update rows and disagree in the `else:` block.
+- Rows that differ: `int((pred != other).sum())`. At the end, `return pred`.
+
+@@ item d25-11
+type: choice
+title: The canary has seen only 50 requests
+level: 1
+cards: Canary and A/B: no decision without enough samples
+--- context
+An automatic release system answers "can the new version get more traffic?" every day. Deciding on too few samples either kills a good version or lets a bad one through.
+--- prompt
+A new model runs as a canary on 5% of traffic for 10 minutes.
+
+- Baseline (old model): 20000 requests, error rate 2.0%
+- Canary (new model): 50 requests, 2 failures, error rate 4.0%
+
+What should the release system do now?
+--- options
+- Roll back right away: the error rate has doubled
+- Release to everyone right away: it is just one extra failure, a tiny difference
+- Hold off and keep collecting: with 50 requests, luck alone moves the error rate by about 2 percentage points, so 2% and 4% cannot be told apart
+- Switch both sides to the new model and compare again
+answer: 3
+--- explain
+For a service with a 2% error rate, the standard error over 50 requests is sqrt(0.02 × 0.98 / 50) ≈ 0.02, that is 2 percentage points. The simulation in the card shows that even when the new and old model are **exactly the same**, about 26% of canaries that see only 50 requests "look" like they have 4% errors or more. So you can neither say the new model is worse (roll back) nor that it is fine (release to everyone). The sample has not reached min_n yet, so the answer is wait. With a few thousand requests the standard error drops to a few tenths of a point, and then you can tell.
+--- hints
+- Use the formula from the card: with p = 2% and n = 50, how many percentage points is SE?
+- 2% and 4% differ by 2 percentage points. Is that much bigger than SE?
+
+@@ item d25-12
+type: fix
+title: Rolled back after the 7th canary request failed
+level: 2
+cards: Canary and A/B: no decision without enough samples
+targets: canary_decision
+ref: day25
+--- context
+A real incident: the release system saw 1 failure in the canary's first 7 requests (14%) and rolled back at once, although the new version had nothing wrong with it. A rule that only compares two error rates gets fooled by luck again and again.
+--- prompt
+The `canary_decision` below only checks which error rate is bigger. Fix it to follow the three-outcome rule from the card, returning one of `"wait"`, `"rollback"`, `"promote"`:
+
+1. If `base_n < min_n` or `canary_n < min_n`: return "wait". (Check this first; then no division happens at all.)
+2. Otherwise compute p_base, p_canary and se = sqrt(p_base(1 − p_base)/base_n + p_canary(1 − p_canary)/canary_n). If p_canary − p_base > z × se, return "rollback".
+3. In every other case: return "promote".
+--- starter
+def canary_decision(base_errors, base_n, canary_errors, canary_n, min_n=1000, z=2.0):
+    p_base = base_errors / base_n
+    p_canary = canary_errors / canary_n
+    if p_canary > p_base:              # the canary's error rate is above the baseline's: roll back
+        return "rollback"
+    return "promote"
+--- solution
+def canary_decision(base_errors, base_n, canary_errors, canary_n, min_n=1000, z=2.0):
+    if base_n < min_n or canary_n < min_n:
+        return "wait"                                       # not enough samples: no verdict yet
+    p_base = base_errors / base_n
+    p_canary = canary_errors / canary_n
+    se = math.sqrt(p_base * (1 - p_base) / base_n + p_canary * (1 - p_canary) / canary_n)
+    if p_canary - p_base > z * se:                          # worse by much more than the noise: really worse
+        return "rollback"
+    return "promote"
+--- tests
+@check("not enough samples: wait, even if it looks bad")
+def _():
+    got = canary_decision(40, 20000, 1, 7)
+    true(got == "wait", f"the canary has only 7 requests, so return 'wait'; you returned {got!r}: 1 failure is 14%, and that is just luck")
+    got = canary_decision(3, 500, 30, 5000)
+    true(got == "wait", f"the baseline has only 500 requests (fewer than min_n=1000), so also 'wait'; you returned {got!r}")
+    got = canary_decision(20, 2000, 20, 2000)
+    true(got == "promote", f"2000 requests on each side with the same error rate should give 'promote'; you returned {got!r}")
+
+@check("a little worse, within the noise: promote; much worse: rollback")
+def _():
+    got = canary_decision(20, 2000, 26, 2000)
+    true(got == "promote", f"1.0% vs 1.3% is a 0.3-point gap, while 2 × se is about 0.67 points: should be 'promote'; you returned {got!r}")
+    got = canary_decision(20, 2000, 36, 2000)
+    true(got == "rollback", f"1.0% vs 1.8% is a 0.8-point gap, more than 2 × se (about 0.74): should be 'rollback'; you returned {got!r}")
+
+@check("clearly worse: rollback; better: promote")
+def _():
+    got = canary_decision(100, 10000, 150, 10000)
+    true(got == "rollback", f"1.0% vs 1.5% with 10000 requests on each side: should be 'rollback'; you returned {got!r}")
+    got = canary_decision(40, 2000, 10, 2000)
+    true(got == "promote", f"the canary has the lower error rate (0.5% vs 2.0%): should be 'promote'; you returned {got!r}")
+
+@check("the min_n and z arguments are used")
+def _():
+    got = canary_decision(20, 2000, 60, 2000, min_n=5000)
+    true(got == "wait", f"with min_n=5000 neither side has enough requests: should be 'wait'; you returned {got!r}")
+    a, b = canary_decision(20, 2000, 32, 2000), canary_decision(20, 2000, 32, 2000, z=1.0)
+    true((a, b) == ("promote", "rollback"),
+         f"1.0% vs 1.6%: with z=2 it should be 'promote', with z=1 the bar is lower so 'rollback'. You returned {a!r} and {b!r}")
+--- hints
+- The first thing in the function: `if base_n < min_n or canary_n < min_n: return "wait"`.
+- Standard error: `se = math.sqrt(p_base * (1 - p_base) / base_n + p_canary * (1 - p_canary) / canary_n)`.
+- Change `if p_canary > p_base:` into `if p_canary - p_base > z * se:`.
+
+@@ item d25-13
+type: fill
+title: Cost per 1,000 requests
+level: 1
+cards: What 1,000 requests cost
+targets: cost_per_1k
+ref: day25
+--- context
+"What does this model cost per month?" gets asked about every model in production. Turning the GPU price and throughput into a cost per 1,000 requests is how you judge whether batching, quantization or autoscaling are worth the effort.
+--- prompt
+Fill in the blanks. The GPU costs `gpu_dollars_per_hour` dollars per hour; at full load it handles `requests_per_second` requests per second; its average utilization is `utilization` (0 to 1). Return the cost of 1,000 requests in dollars.
+--- template
+def cost_per_1k(gpu_dollars_per_hour, requests_per_second, utilization=1.0):
+    requests_per_hour = requests_per_second * [[3600]] * [[utilization]]     # requests actually handled in one hour
+    dollars_per_request = [[gpu_dollars_per_hour]] / requests_per_hour
+    return dollars_per_request * [[1000]]
+--- tests
+@check("full load: 2 dollars per hour, 50 requests per second")
+def _():
+    got = cost_per_1k(2.0, 50)
+    true(close(got, 2.0 / (50 * 3600) * 1000, 1e-12), f"should be about 0.01111 dollars; you got {got}")
+
+@check("25% utilization: 4 times the full-load cost")
+def _():
+    got = cost_per_1k(2.0, 50, utilization=0.25)
+    true(close(got, 0.0444444444, 1e-9), f"should be about 0.04444 dollars; you got {got}: the GPU works only 25% of each hour but still bills the full hour")
+
+@check("10 times the throughput: one tenth of the cost")
+def _():
+    slow, fast = cost_per_1k(1.2, 40, 0.5), cost_per_1k(1.2, 400, 0.5)
+    true(close(slow, 1.2 / (40 * 3600 * 0.5) * 1000, 1e-12), f"1.2 dollars per hour, 40 per second, 50% utilization: should be about 0.01667; you got {slow}")
+    true(close(fast * 10, slow, 1e-12), f"at 400 per second it should be {slow / 10}; you got {fast}")
+--- hints
+- How many seconds are in an hour? Multiply by the utilization and you have the requests actually handled per hour.
+- Cost per request = price per hour ÷ requests per hour; for 1,000 requests, multiply by 1000.
+
+@@ item d25-14
+type: code
+title: Closed book: write PSI
+level: 2
+exam: yes
+cards: PSI: how much the input has changed
+targets: psi
+ref: day25
+--- context
+PSI is today's most important function: when an interviewer asks "how do you detect data drift?", the answer almost always ends up here. Write it from a blank page without looking at the cards.
+--- prompt
+Without looking at the cards, write `psi(ref, live, bins=10, eps=1e-4)` that returns a Python float: the bin edges come from ref's quantiles only (bins − 1 of them); count the share of ref and of live in each bin with those same edges (length bins for both); clamp_min(eps) both; PSI = Σ (a − e) × ln(a / e).
+
+The checks are the same as in exercise 4.
+--- starter
+def psi(ref, live, bins=10, eps=1e-4):
+    raise todo()
+--- solution
+def psi(ref, live, bins=10, eps=1e-4):
+    edges = torch.quantile(ref, torch.linspace(0, 1, bins + 1))[1:-1]
+    e = torch.bincount(torch.bucketize(ref, edges), minlength=bins) / len(ref)
+    a = torch.bincount(torch.bucketize(live, edges), minlength=bins) / len(live)
+    e, a = e.clamp_min(eps), a.clamp_min(eps)
+    return float(((a - e) * torch.log(a / e)).sum())
+--- tests
+@check("no drift: PSI is small, and computed correctly")
+def _():
+    seed(1)
+    ref, live = torch.randn(2000), torch.randn(1000)
+    p = psi(ref, live)
+    true(isinstance(p, float), f"return a Python float (use float(...) or .item()); you returned {type(p).__name__}")
+    eq(p, _psi_ref(ref, live), tol=1e-4, msg="differs from the reference: check the bin edges, bincount's minlength and the formula")
+    true(p < 0.05, f"same distribution, so PSI should be small; yours is {p:.4f}")
+
+@check("mean shifted by 1 standard deviation: PSI far above 0.25")
+def _():
+    seed(2)
+    ref, live = torch.randn(2000), torch.randn(1000) + 1.0
+    p = psi(ref, live)
+    eq(p, _psi_ref(ref, live), tol=1e-4, msg="differs from the reference")
+    true(p > 0.25, f"PSI is only {p:.4f}: the whole distribution moved by 1 standard deviation, it should be far above 0.25")
+
+@check("a wider distribution (standard deviation doubled) is caught too")
+def _():
+    seed(3)
+    ref, live = torch.randn(2000), 2 * torch.randn(1000)
+    p = psi(ref, live)
+    eq(p, _psi_ref(ref, live), tol=1e-4,
+       msg="differs from the reference. The edges must be ref's quantiles, not live's: with live's own quantiles, every live bin is always 10%")
+    true(p > 0.25, f"PSI is only {p:.4f}: the standard deviation doubled, it should be above 0.25")
+
+@check("all live values below the training minimum: they go to bin 0, and the result is not inf")
+def _():
+    seed(4)
+    ref = torch.randn(2000)
+    live = ref.min() - 1 - torch.rand(500)
+    p = psi(ref, live)
+    true(math.isfinite(p), f"PSI is {p}: some bins have no live data, and log(0) became infinite. clamp_min(eps) before the log")
+    eq(p, _psi_ref(ref, live), tol=1e-3,
+       msg="differs from the reference. bincount needs minlength=bins: with all live values in bin 0, the result has only 1 element without it")
+
+@check("the bins argument is used")
+def _():
+    seed(5)
+    ref, live = torch.randn(2000), torch.randn(1000) + 0.3
+    eq(psi(ref, live, bins=5), _psi_ref(ref, live, bins=5), tol=1e-4, msg="wrong for bins=5: both the number of edges and minlength must use bins")
+--- hints
+- Three steps: edges (from ref only) → shares on both sides (same edges) → clamp_min, then the formula.
+- Quantiles, bucketize, bincount(minlength=bins).
+
+@@ item d25-15
+type: code
+title: Closed book: the rolling-window alert
+level: 2
+exam: yes
+cards: Alert rules: a rolling window plus a minimum count
+targets: ErrorRateAlert
+ref: day25
+--- context
+Alert rules are something you use every day once a model is live. "Look only at the recent window", "decide only with enough samples" and "drop old data": you should be able to write all three without the cards.
+--- prompt
+Without looking at the cards, write `ErrorRateAlert(window_s=300, threshold=0.05, min_count=50)`:
+
+- `self.events` is a deque of (t, is_error);
+- `record(t, is_error)` records one request;
+- `firing(now)` first drops requests with t ≤ now − window_s from the left, then returns True when the window has ≥ min_count requests and an error rate > threshold, otherwise False (also when there are no requests).
+
+The checks are the same as in exercise 9.
+--- starter
+from collections import deque
+
+class ErrorRateAlert:
+    def __init__(self, window_s=300, threshold=0.05, min_count=50):
+        raise todo()
+
+    def record(self, t, is_error):
+        raise todo()
+
+    def firing(self, now):
+        raise todo()
+--- solution
+from collections import deque
+
+class ErrorRateAlert:
+    def __init__(self, window_s=300, threshold=0.05, min_count=50):
+        self.window_s = window_s
+        self.threshold = threshold
+        self.min_count = min_count
+        self.events = deque()
+
+    def record(self, t, is_error):
+        self.events.append((t, bool(is_error)))
+
+    def firing(self, now):
+        while self.events and self.events[0][0] <= now - self.window_s:
+            self.events.popleft()
+        n = len(self.events)
+        if n == 0 or n < self.min_count:
+            return False
+        errors = sum(1 for _, is_error in self.events if is_error)
+        return errors / n > self.threshold
+--- tests
+@check("too few requests: no alert; enough requests with a high error rate: alert")
+def _():
+    alert = ErrorRateAlert(window_s=60, threshold=0.05, min_count=20)
+    true(not alert.firing(0), "no requests in the window, so return False (watch out for dividing by 0)")
+    alert.record(1, True)
+    true(not alert.firing(2), "only 1 request in the window (100% errors), but fewer than min_count=20: no alert")
+    for t in range(2, 21):
+        alert.record(t, t in (5, 9))
+    true(alert.firing(21), "20 requests in the window with 3 errors (15% > 5%): should return True")
+
+@check("no alert at or below the threshold, alert above it")
+def _():
+    alert = ErrorRateAlert(window_s=300, threshold=0.05, min_count=50)
+    for t in range(100):
+        alert.record(t, t % 50 == 0)
+    true(not alert.firing(100), "100 requests with 2 errors (2%) is not above 5%: no alert")
+    for t in range(100, 110):
+        alert.record(t, True)
+    true(alert.firing(110), "110 requests with 12 errors (about 10.9%) is above 5%: should alert")
+
+@check("only the window counts: old errors do not")
+def _():
+    alert = ErrorRateAlert(window_s=60, threshold=0.05, min_count=20)
+    for t in range(50):
+        alert.record(t, True)
+    true(alert.firing(50), "every request in the first 50 seconds failed: should alert at this point")
+    for t in range(100, 200):
+        alert.record(t, False)
+    true(not alert.firing(200), "the window is now (140, 200] and holds only successful requests: no alert. Are you counting the whole history?")
+
+@check("requests outside the window are dropped from events (memory does not keep growing)")
+def _():
+    alert = ErrorRateAlert(window_s=60, threshold=0.05, min_count=20)
+    for t in range(5000):
+        alert.record(t, t % 10 == 0)
+        alert.firing(t)
+    true(len(alert.events) <= 61,
+         f"after 5000 seconds, events still holds {len(alert.events)} requests: popleft the ones outside the window")
+    true(alert.firing(4999), "the last 60 seconds have 60 requests with 6 errors (10%): should alert")
+--- hints
+- The window: a `while` loop with `popleft`, as long as the leftmost t ≤ now − window_s.
+- Check "enough requests?" first, then compute the error rate.

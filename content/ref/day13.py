@@ -1,21 +1,20 @@
-# imports of the drill file (the checks use them)
-import sys, os
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+"""Day 13 reference implementations: audio codec codes + an audio language model.
 
-"""Day 13 参考答案 —— 注意 AudioLM 和 Day 4 的 GPT 差别有多小。"""
+Loaded as hidden setup for the day-13 exercises; the names an exercise asks for are removed again before the
+learner's code runs. Notice how little AudioLM differs from the day-4 GPT: only the input (n_q embedding
+tables, summed) and the output (n_q heads) change; the Block is the same.
+"""
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-CONVERGED = True
 
 
 class Block(nn.Module):
+    """The day-4 pre-LN Transformer block, written compactly:
+    x = x + attn(ln1(x)) with causal self-attention, then x = x + mlp(ln2(x))."""
+
     def __init__(self, dim, n_head):
         super().__init__()
         self.ln1, self.ln2 = nn.LayerNorm(dim), nn.LayerNorm(dim)

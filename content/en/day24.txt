@@ -1,0 +1,1415 @@
+@@ day 24
+title: Operations 1: reproducible runs, traceable models
+part: Operations
+hours: 3–4 hours
+--- goal
+After today you can leave a complete record for every training run (config, git commit, data fingerprint, seeds, library versions, metrics), pick the best run from many and say exactly how it differs from the others. You can also build a tiny model registry in one JSON file: register versions, promote one to production, refuse a worse model, and roll back in one step. Finally, you write a model card for a model.
+--- checklist
+- First clear the review area (redo from blank the items whose answers you looked at yesterday)
+- Read all 8 cards; change one number in each card's code and run it again
+- Pass every practice item: read the failure message first, work out which line is wrong, then change the code
+- Write the two closed-book items without looking at any answer
+
+@@ concept
+title: Six things to record for every run
+--- body
+Three months from now, someone asks you: "How was the production model trained? Can you train the same one again?" If you cannot answer, nobody can fix or improve that model, or even explain why it is good.
+
+So every training run must leave a **run record**. It answers one question: with the same inputs, do we get the same result again? Record at least six things:
+
+1. **config**: every hyperparameter (learning rate, batch size, number of epochs, model size, ...).
+2. **git commit**: the version of the code, a 40-character hexadecimal string (what `git rev-parse HEAD` prints). If there are uncommitted changes (a "dirty" working tree), the commit is not the code you ran. Commit first, or save the diff with the record.
+3. **data fingerprint**: the sha256 of the data files' contents (next card). A file can keep its name while someone changes what is inside.
+4. **seed**: the random seed.
+5. **library versions**: Python, torch and numpy. Results that change after a torch upgrade are common.
+6. **metrics**: the results of this run (val_loss, val_acc, ...).
+
+Add a `run_id` to name the run. Save the whole record as one JSON file, next to the checkpoint.
+
+In today's exercises the git commit is passed in as a string; you never run git.
+--- code
+import platform
+import numpy as np
+
+record = {
+    "run_id": "run-01",
+    "config": {"lr": 0.001, "batch_size": 32, "epochs": 10},
+    "git_commit": "3f9a2c1d0b7e4f6a8c5d2e1f0a9b8c7d6e5f4a3b",
+    "data_fingerprint": "(the next card shows how to compute it)",
+    "seed": 42,
+    "versions": {"python": platform.python_version(), "torch": torch.__version__, "numpy": np.__version__},
+    "metrics": {"val_loss": 0.47, "val_acc": 0.842},
+}
+for key, value in record.items():
+    print(f"{key:17s}", value)
+print("the git commit has", len(record["git_commit"]), "characters")
+
+@@ concept
+title: Data fingerprints: sha256 recognises the same data
+--- body
+sha256 is a **hash function**: it turns any number of bytes into a 64-character hexadecimal string (the hash). Two properties make it a good "fingerprint" for data:
+
+- The same bytes always give the same hash, on any machine, under any file name.
+- Change even one byte and the hash is completely different.
+
+Python has `hashlib` built in:
+
+```
+h = hashlib.sha256()
+h.update(b"some bytes")    # you can call update several times; the result is the same as one big call
+h.hexdigest()              # 64 characters
+```
+
+Open files in binary mode `"rb"` (the hash is over bytes) and read them in chunks, for example 1 MB at a time. Then even a 10 GB file never has to fit in memory.
+
+A dataset is often several files. How do you turn them into one fingerprint? Gluing the contents together in order has a problem: the order in which `os.listdir` returns files can differ between machines, so the same data would get different fingerprints.
+
+The fix: **hash each file on its own, sort those hashes, join them with newlines, and hash the result once more.** Now the order of the files, their names and their folder do not matter. Only the contents count.
+--- code
+import hashlib
+
+a, b = b"cat,1\n", b"dog,0\n"                     # the contents of two "files"
+print("sha256 of a:        ", hashlib.sha256(a).hexdigest()[:16], "... (64 characters in total)")
+print("a with one space:   ", hashlib.sha256(b"cat,1 \n").hexdigest()[:16], "...")
+print("glued together, is a+b the same as b+a:", hashlib.sha256(a + b).hexdigest() == hashlib.sha256(b + a).hexdigest())
+
+def fingerprint(contents):
+    hashes = sorted(hashlib.sha256(c).hexdigest() for c in contents)
+    return hashlib.sha256("\n".join(hashes).encode("utf-8")).hexdigest()
+
+print("hash each, sort, combine: does the order still matter:", fingerprint([a, b]) != fingerprint([b, a]))
+
+@@ concept
+title: Seeds: torch, numpy and random each need one
+--- body
+One training run often has three separate sources of random numbers:
+
+- **torch**: weight initialisation, Dropout, `torch.randn`. Seed it with `torch.manual_seed(seed)`.
+- **numpy**: a lot of data code shuffles or splits with `np.random.permutation`. Seed it with `np.random.seed(seed)`.
+- **Python's own random**: common in data augmentation, like `random.random() < 0.5`. Seed it with `random.seed(seed)`.
+
+Each has its own state. **Seeding torch does nothing to numpy or random.** The order numpy shuffles into then depends on whatever used numpy's random numbers earlier in the process. Same seed, two runs, different data order, different results.
+
+Two rules:
+
+1. Seed all three at the start of training, once. If you re-seed inside every epoch, every epoch sees exactly the same order, and the shuffle does nothing.
+2. Write the seed into the run record.
+
+numpy also has a cleaner option: `rng = np.random.default_rng(seed)`, then `rng.permutation(n)`. That generator belongs to you alone; no other code can move it.
+
+Some GPU operations are not deterministic by themselves (`cudnn.benchmark`, deterministic algorithms); day 18 covers that. Today is only about seeds.
+--- code
+import numpy as np
+
+def shuffled(seed, also_numpy):
+    torch.manual_seed(seed)
+    if also_numpy:
+        np.random.seed(seed)
+    return np.random.permutation(6).tolist()
+
+np.random.seed(1); a = shuffled(0, also_numpy=False)    # pretend other code used numpy's random numbers before
+np.random.seed(2); b = shuffled(0, also_numpy=False)
+print("only torch seeded: ", a, b, "same:", a == b)
+np.random.seed(1); a = shuffled(0, also_numpy=True)
+np.random.seed(2); b = shuffled(0, also_numpy=True)
+print("numpy seeded too:  ", a, b, "same:", a == b)
+rng = np.random.default_rng(0)
+print("your own generator default_rng(0):", rng.permutation(6).tolist())
+
+@@ concept
+title: Saving as JSON: only a few simple types
+--- body
+Run records and the registry are saved as JSON: plain text that people can read, every language can parse, and git diff can compare.
+
+- `json.dump(obj, f)` writes to a file; `json.load(f)` reads it back.
+- The versions with an s, `json.dumps(obj)` / `json.loads(text)`, work on strings, not files.
+
+JSON only knows these types: dict, list, str, int, float, True / False, None. Three common traps:
+
+- **Tensors and numpy float32 values cannot be saved.** You get `TypeError: Object of type Tensor is not JSON serializable`. Metrics are often 0-dim tensors like `loss.mean()`; turn them into Python numbers with `float(v)` before saving.
+- **Dict keys must be strings.** Save `{1: ...}` and you read back `{"1": ...}`, so `1 in d` becomes False. That is why today's registry keeps version numbers inside a list instead of using them as keys.
+- Tuples come back as lists.
+
+Two good habits: `indent=2` puts the file on several indented lines, easy to read; `sort_keys=True` fixes the key order, so two files can be compared line by line. Pass `encoding="utf-8"` when you open the file; otherwise Windows may use a different encoding.
+--- code
+import json
+import numpy as np
+
+metrics = {"val_loss": torch.tensor(0.25), "val_acc": np.float32(0.875)}
+try:
+    json.dumps(metrics)
+except TypeError as e:
+    print("cannot save:", e)
+clean = {k: float(v) for k, v in metrics.items()}
+print("after float():", json.dumps(clean, sort_keys=True))
+back = json.loads(json.dumps({"versions": {1: "a", 2: "b"}}))
+print("int keys come back as:", list(back["versions"]), "  1 in it:", 1 in back["versions"])
+print(json.dumps({"lr": 0.001, "betas": (0.9, 0.95)}, indent=2))
+
+@@ concept
+title: Comparing runs: which is best, and what changed
+ref: day24
+--- body
+While tuning you run many experiments, and each one leaves a JSON record. Comparing them takes two moves.
+
+**1. Pick the best run by one metric.** First decide the direction: for accuracy higher is better, so use `max`; for loss lower is better, so use `min`. Different metrics can pick different "best" runs.
+
+`max(runs, key=lambda r: r["metrics"]["val_acc"])` returns the **whole record**, not just the number. `key=` tells `max` what to compare; `lambda r: ...` is a one-line function.
+
+A run that crashed (say the loss became nan before evaluation) does not have the metric. Skip it: it must not raise an error, and it must not count as a score of 0.
+
+**2. See where two configs differ.** Take all keys from both configs (`set(a) | set(b)`) and compare the values one by one. A key that only one side has (say warmup, added later) counts as None on the other side. `d.get(key)` returns exactly None when the key is missing.
+
+One more rule: only runs with the same data fingerprint can be compared directly. On a different test set, a higher score may just mean easier questions.
+--- code
+runs = sample_runs()
+for r in runs:
+    print(r["run_id"], " lr =", r["config"]["lr"], " batch =", r["config"]["batch_size"], " metrics =", r["metrics"])
+done = [r for r in runs if "val_acc" in r["metrics"]]          # skip run-03, which crashed
+print("highest val_acc:", max(done, key=lambda r: r["metrics"]["val_acc"])["run_id"])
+print("lowest val_loss:", min(done, key=lambda r: r["metrics"]["val_loss"])["run_id"])
+a, b = runs[1]["config"], runs[3]["config"]
+print("all keys of both configs:", sorted(set(a) | set(b)))
+print("warmup:", a.get("warmup"), "->", b.get("warmup"))
+
+@@ concept
+title: A model registry: register, promote, history
+ref: day24
+--- body
+You keep training models. Which one is in production? Which one was before it? Which run produced it? A **model registry** answers these questions. Tools like MLflow and Weights & Biases have one. Today we build the smallest possible one in a JSON file:
+
+```
+{"versions": [{"version": 1, "run_id": "run-01", "metrics": {"val_acc": 0.842}},
+              {"version": 2, "run_id": "run-04", "metrics": {"val_acc": 0.875}}],
+ "production": 2,
+ "history": [2]}
+```
+
+- **register**: add a new version. Versions count up 1, 2, 3, and each records the run it came from (run_id) and its metrics. Registering is not deploying.
+- **promote**: make a version the `production` one and append it to `history` (the versions that were in production, in order).
+- **production**: which version is in production now, or None.
+
+One important rule: **every method loads the file, changes it and writes it back; nothing is kept only in memory.** The training script, the release script and the inference service are different processes. The file is the only way they all see the same state.
+
+Write the file by "write a temporary file, then `os.replace`", so a crash halfway never leaves a broken file (day 20). Today's `JsonStore` already has `self._load()` and `self._save(data)`; when the file does not exist yet, `_load()` returns an empty registry.
+--- code
+import json
+import tempfile
+
+with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+    reg = BasicRegistry(folder)
+    print("register, version numbers:", reg.register("run-01", {"val_acc": 0.842}), reg.register("run-04", {"val_acc": 0.875}))
+    print("production:", reg.production())
+    reg.promote(2)
+    print("after promote(2), seen by a brand-new object:", BasicRegistry(folder).production())
+    print(json.dumps(reg._load()))
+
+@@ concept
+title: The promotion gate and rollback
+ref: day24
+--- body
+**The gate**: a new version may go to production only if its evaluation metric is not worse than production's. Without it, one careless command ships a worse model. The rules:
+
+- Nothing in production yet: promote it.
+- Mind the direction. With `higher_is_better=True` (accuracy), the new one is worse when it is **smaller**; with `False` (loss), it is worse when it is **larger**.
+- Equally good is fine.
+- Worse: `raise ValueError(...)` and change nothing in the file. Put both numbers in the message; it helps whoever investigates.
+
+**Rollback**: a new version is live and something goes wrong (more complaints, higher latency). The first move is to go back to the previous version, so production is healthy again; find the cause afterwards. With `history`, rollback means: remove the last entry of history and set production to the new last entry. With fewer than 2 versions in history there is nothing to go back to: `raise ValueError`.
+
+Note: **rollback does not go through the gate.** The previous version usually scores lower (that is why it was replaced), so the gate would block every rollback. In an incident you want one step back to a state you know works.
+
+Real systems check more before promoting, for example sending only a small share of traffic first (a canary). That is day 25.
+--- code
+import tempfile
+
+with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+    reg = Registry(folder)                       # compares val_acc, higher is better
+    for run_id, acc in [("run-01", 0.842), ("run-04", 0.875), ("run-05", 0.861)]:
+        reg.register(run_id, {"val_acc": acc})
+    reg.promote(1)
+    reg.promote(2)
+    try:
+        reg.promote(3)
+    except ValueError as e:
+        print("v3 refused:", e)
+    print("production:", reg.production(), " history:", reg._load()["history"])
+    print("rolled back to:", reg.rollback(), " history:", reg._load()["history"])
+
+@@ concept
+title: Model cards: a manual for the people who use the model
+ref: day24
+--- body
+A run record is for **you**: how to reproduce the model. A **model card** is for **the people who use the model**: what it can do, what it cannot do, and when it makes mistakes. Another team that wants to call your model, or a product manager deciding whether to launch, reads it first.
+
+A minimal model card has these sections:
+
+1. **Name and version**: the same version number as in the registry.
+2. **Intended use**: what it was built for, for example "label English product reviews as positive / negative".
+3. **Out of scope**: where it must not be used, for example "other languages", "medical or legal decisions".
+4. **Evaluation**: which metrics and what scores. Besides the overall score, add scores for groups (for example long reviews on their own); an average hides weak spots.
+5. **Training data**: what the data is, plus its fingerprint.
+6. **How to reproduce**: git commit, seed, library versions, all from the run record.
+7. **Limitations and risks**: known problems, for example "often wrong on sarcasm".
+
+Fill the numbers in a model card **with code, from the run record**; never copy them by hand. Hand-copied numbers drift away from the real ones sooner or later.
+--- code
+rec = sample_runs()[3]
+lines = ["# Model card: review-sentiment v2", "## Evaluation"]
+lines += [f"- {k}: {v:.4f}" for k, v in sorted(rec["metrics"].items())]
+lines += ["## How to reproduce", "- git commit: " + rec["git_commit"], "- seed: " + str(rec["seed"])]
+print("\n".join(lines))
+
+@@ item d24-01
+type: predict
+title: Fed in two parts, or in another order: same hash?
+level: 1
+cards: Data fingerprints: sha256 recognises the same data
+--- context
+Data fingerprints rest on two properties of sha256: feeding the bytes in chunks gives the same result as feeding them at once (so big files can be read in chunks), and changing the order of the bytes changes the result (so several files must be sorted first). Check both with your own eyes.
+--- prompt
+Read the code and write the three lines it prints.
+--- code
+import hashlib
+h = hashlib.sha256()
+h.update(b"cat,1\n")
+h.update(b"dog,0\n")                          # fed in two parts
+one_go = hashlib.sha256(b"cat,1\ndog,0\n").hexdigest()
+print(h.hexdigest() == one_go)
+print(len(one_go))
+swapped = hashlib.sha256(b"dog,0\ncat,1\n").hexdigest()
+print(one_go == swapped)
+--- explain
+Line 1, `True`: you can call `update` several times on a sha256, and the result is exactly the same as feeding all the bytes at once. That is why a big file can be read and hashed one chunk at a time, without loading it into memory.
+
+Line 2, `64`: `hexdigest()` returns 64 hexadecimal characters (256 bits, 4 bits per character).
+
+Line 3, `False`: the two lines are the same but in the other order, so the bytes are different and so is the hash. That is why several files are combined into one fingerprint by hashing each one, sorting the hashes, and only then combining them.
+--- hints
+- After the two `update` calls, what bytes has the hash seen in total? Compare them with the bytes behind `one_go`.
+- A hash only sees bytes. Are `b"cat,1\ndog,0\n"` and `b"dog,0\ncat,1\n"` the same bytes?
+
+@@ item d24-02
+type: code
+title: The sha256 of one file
+level: 1
+cards: Data fingerprints: sha256 recognises the same data
+targets: file_sha256
+ref: day24
+--- context
+"Is this the same data we trained on last time?" File names and modification times cannot tell you; only a hash of the contents can. Reading in chunks makes it work for data files of tens of gigabytes too.
+--- prompt
+Write `file_sha256(path)`: return the sha256 of the file's contents as a 64-character hexadecimal string (`hexdigest()`).
+
+- Open the file in binary mode `"rb"`: the hash is over bytes. Text mode turns Windows line endings `\r\n` into `\n`, and it gives you a string, not bytes.
+- Read in chunks: `f.read(1 << 20)` (1 MB) each time, call `h.update(chunk)` for every chunk, and stop when you get the empty `b""`.
+--- starter
+import hashlib
+
+def file_sha256(path):
+    """path -> 64-character hexadecimal string"""
+    raise todo()
+--- solution
+import hashlib
+
+def file_sha256(path):
+    """path -> 64-character hexadecimal string"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:                  # binary mode: read the bytes as they are
+        while True:
+            chunk = f.read(1 << 20)              # 1 MB at a time
+            if not chunk:                        # the empty b"": end of file
+                break
+            h.update(chunk)
+    return h.hexdigest()
+--- tests
+import os, tempfile, hashlib
+
+def _hash_of(data):
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        return file_sha256(write_files(folder, {"f.bin": data})[0])
+
+@check("same as the sha256 of the whole file read at once")
+def _():
+    data = b"x,y\n1,0\n2,1\n"
+    got = _hash_of(data)
+    true(isinstance(got, str) and len(got) == 64, f"return hexdigest(): a 64-character string. You returned {got!r}")
+    true(got == hashlib.sha256(data).hexdigest(), "wrong hash: it must cover all the bytes of the file")
+
+@check("Windows line endings and bytes that are not text are hashed correctly too")
+def _():
+    data = b"a,b\r\n1,2\r\n" + bytes([0, 255, 254, 10])
+    true(_hash_of(data) == hashlib.sha256(data).hexdigest(),
+         "wrong hash for a file with \\r\\n and bytes like 0xFF. Open it in \"rb\" binary mode: text mode changes line endings and cannot read bytes that are not text.")
+
+@check("a big 3 MB file is right too")
+def _():
+    data = torch.randint(0, 256, (3_000_000,), dtype=torch.uint8).numpy().tobytes()
+    true(_hash_of(data) == hashlib.sha256(data).hexdigest(),
+         "wrong hash for the 3 MB file. First make sure you use \"rb\" binary mode; then check the chunk loop: update with every chunk, skip none, and the last chunk may be smaller than 1 MB.")
+
+@check("change one byte and the hash changes")
+def _():
+    true(_hash_of(b"x,y\n1,0\n") != _hash_of(b"x,y\n1,1\n"), "two files that differ in one byte got the same hash: are you reading the file's contents?")
+--- hints
+- Start with `h = hashlib.sha256()` and end with `return h.hexdigest()`.
+- `with open(path, "rb") as f:`, then inside `while True:` do `chunk = f.read(1 << 20)`.
+- `if not chunk: break`, otherwise `h.update(chunk)`.
+
+@@ item d24-03
+type: code
+title: A data fingerprint that ignores file order
+level: 2
+cards: Data fingerprints: sha256 recognises the same data
+targets: data_fingerprint
+ref: day24
+--- context
+If the same data has one fingerprint on your laptop and another on the training cluster, the fingerprint is useless. `os.listdir` and `glob` do not promise any file order, so a fingerprint must not depend on the order, and it should not depend on file names either.
+--- prompt
+Write `data_fingerprint(paths)`: `paths` is a list of file paths; return a 64-character fingerprint. Follow these steps exactly (the checks compare the value):
+
+1. Hash every file with `file_sha256(p)` (already written).
+2. Sort those hash strings (`sorted`).
+3. Join them with a newline `"\n"`, turn the result into bytes with `.encode("utf-8")`, hash it once more with sha256 and return `hexdigest()`.
+
+Then: a different file order gives the same fingerprint; renamed files in another folder give the same fingerprint; changing one byte in any file changes it.
+--- starter
+import hashlib
+
+def data_fingerprint(paths):
+    """a set of files -> one 64-character fingerprint, independent of file order and names"""
+    raise todo()
+--- solution
+import hashlib
+
+def data_fingerprint(paths):
+    """a set of files -> one 64-character fingerprint, independent of file order and names"""
+    hashes = sorted(file_sha256(p) for p in paths)          # sorted: the order no longer counts
+    joined = "\n".join(hashes).encode("utf-8")
+    return hashlib.sha256(joined).hexdigest()
+--- tests
+import os, tempfile, hashlib
+
+FILES = {"train.csv": "x,y\n1,0\n3,1\n", "val.csv": "x,y\n2,1\n", "test.csv": "x,y\n5,0\n"}
+
+def _want(contents):
+    hashes = sorted(hashlib.sha256(c.encode("utf-8")).hexdigest() for c in contents)
+    return hashlib.sha256("\n".join(hashes).encode("utf-8")).hexdigest()
+
+@check("right value: hash each, sort, join with newlines, sha256 again")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        got = data_fingerprint(write_files(folder, FILES))
+    true(isinstance(got, str) and len(got) == 64, f"return a 64-character hexdigest(); you returned {got!r}")
+    true(got == _want(FILES.values()),
+         "wrong fingerprint value. Follow the steps: file_sha256 for each file -> sorted -> \"\\n\".join -> encode(\"utf-8\") -> sha256 -> hexdigest()")
+
+@check("a different file order gives the same fingerprint")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        paths = write_files(folder, FILES)
+        a = data_fingerprint(paths)
+        b = data_fingerprint(paths[::-1])
+    true(a == b, "the same three files in another order gave another fingerprint. Sort the per-file hashes before combining them.")
+
+@check("only contents count: another folder and other file names give the same fingerprint")
+def _():
+    renamed = {f"part-{i}.csv": c for i, c in enumerate(FILES.values())}
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as f1, tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as f2:
+        a = data_fingerprint(write_files(f1, FILES))
+        b = data_fingerprint(write_files(f2, renamed))
+    true(a == b, "exactly the same contents, only another folder and other names, yet the fingerprint changed: you included the paths or file names. A fingerprint only looks at bytes.")
+
+@check("changing one byte in any file changes the fingerprint")
+def _():
+    changed = dict(FILES, **{"val.csv": "x,y\n2,0\n"})
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as f1, tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as f2:
+        a = data_fingerprint(write_files(f1, FILES))
+        b = data_fingerprint(write_files(f2, changed))
+    true(a != b, "one label in val.csv changed from 1 to 0, but the fingerprint did not change: every file's contents must be included.")
+--- hints
+- Step one is a list comprehension, `[file_sha256(p) for p in paths]`, wrapped in `sorted(...)`.
+- Joining: `"\n".join(hashes)` is a string; `.encode("utf-8")` turns it into bytes for sha256.
+- `return hashlib.sha256(joined).hexdigest()`
+
+@@ item d24-04
+type: code
+title: A complete run record
+level: 2
+cards: Six things to record for every run; Saving as JSON: only a few simple types
+targets: make_run_record
+ref: day24
+--- context
+The run record is the only basis for reproducing a model. Leave out one thing and three months later nobody can say why the results changed; store the wrong type (a tensor, say) and it cannot even be saved as JSON.
+--- prompt
+Write `make_run_record(run_id, config, git_commit, data_paths, seed, metrics)`. Return a dict with exactly these 7 keys:
+
+- `"run_id"`, `"git_commit"`, `"seed"`: stored as given.
+- `"config"`: a **deep copy** of config (`copy.deepcopy(config)`). The training script may change that dict later (including dicts nested inside it); the record must not change with it.
+- `"data_fingerprint"`: `data_fingerprint(data_paths)` (already written).
+- `"versions"`: `{"python": platform.python_version(), "torch": torch.__version__, "numpy": np.__version__}`.
+- `"metrics"`: every value turned into a Python number with `float(v)`. The values may arrive as 0-dim tensors or numpy float32, and those cannot be saved as JSON.
+--- starter
+import copy
+import platform
+import numpy as np
+
+def make_run_record(run_id, config, git_commit, data_paths, seed, metrics):
+    """Return the record (a dict) of one run, ready to be saved as JSON."""
+    raise todo()
+--- solution
+import copy
+import platform
+import numpy as np
+
+def make_run_record(run_id, config, git_commit, data_paths, seed, metrics):
+    """Return the record (a dict) of one run, ready to be saved as JSON."""
+    return {
+        "run_id": run_id,
+        "config": copy.deepcopy(config),                  # a copy: later changes to config do not reach the record
+        "git_commit": git_commit,
+        "data_fingerprint": data_fingerprint(data_paths),
+        "seed": seed,
+        "versions": {"python": platform.python_version(), "torch": torch.__version__, "numpy": np.__version__},
+        "metrics": {k: float(v) for k, v in metrics.items()},   # tensor, float32 -> Python float
+    }
+--- tests
+import os, json, tempfile, platform
+
+COMMIT = "3f9a2c1d0b7e4f6a8c5d2e1f0a9b8c7d6e5f4a3b"
+KEYS = ["run_id", "config", "git_commit", "data_fingerprint", "seed", "versions", "metrics"]
+
+def _record():
+    config = {"lr": 0.001, "optim": {"name": "adamw", "betas": [0.9, 0.95]}}
+    metrics = {"val_loss": torch.tensor(0.25), "val_acc": np.float32(0.875)}
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        paths = write_files(folder, {"train.csv": "x,y\n1,0\n3,1\n", "val.csv": "x,y\n2,1\n"})
+        fp = data_fingerprint(paths)
+        rec = make_run_record("run-07", config, COMMIT, paths, 42, metrics)
+    return rec, fp, config
+
+@check("all 7 keys are there")
+def _():
+    rec, _, _ = _record()
+    true(isinstance(rec, dict), f"return a dict; you returned {type(rec).__name__}")
+    missing = [k for k in KEYS if k not in rec]
+    true(not missing, f"the record is missing: {missing}")
+    extra = sorted(set(rec) - set(KEYS))
+    true(not extra, f"the record has unknown keys: {extra} (the names must match the prompt exactly)")
+
+@check("run_id, config, commit, seed and data fingerprint are right")
+def _():
+    rec, fp, _ = _record()
+    true(rec.get("run_id") == "run-07", f"run_id should be 'run-07', yours is {rec.get('run_id')!r}")
+    true(rec.get("git_commit") == COMMIT, "store git_commit exactly as the string passed in")
+    true(rec.get("seed") == 42, f"seed should be 42, yours is {rec.get('seed')!r}")
+    true(rec.get("config") == {"lr": 0.001, "optim": {"name": "adamw", "betas": [0.9, 0.95]}}, f"config differs from the one passed in: {rec.get('config')}")
+    true(rec.get("data_fingerprint") == fp, "data_fingerprint should be the result of data_fingerprint(data_paths)")
+
+@check("library versions: python, torch, numpy")
+def _():
+    rec, _, _ = _record()
+    v = rec.get("versions")
+    true(isinstance(v, dict), "versions should be a dict")
+    for k, want in [("python", platform.python_version()), ("torch", torch.__version__), ("numpy", np.__version__)]:
+        true(v.get(k) == want, f"versions[{k!r}] should be {want!r}, yours is {v.get(k)!r}")
+
+@check("metrics are Python floats and the whole record saves as JSON")
+def _():
+    rec, _, _ = _record()
+    m = rec.get("metrics")
+    true(isinstance(m, dict), "metrics should be a dict")
+    for k, want in [("val_loss", 0.25), ("val_acc", 0.875)]:
+        true(k in m, f"metrics is missing {k!r}")
+        true(type(m[k]) is float, f"metrics[{k!r}] is a {type(m[k]).__name__}; turn it into a Python float with float(v), or it cannot be saved as JSON")
+        true(close(m[k], want, 1e-6), f"metrics[{k!r}] should be {want}, yours is {m[k]}")
+    true(json.loads(json.dumps(rec)) == rec, "saved as JSON and read back, the record is different")
+
+@check("config is stored as a copy: changing config later does not change the record")
+def _():
+    rec, _, config = _record()
+    config["lr"] = 999
+    config["optim"]["name"] = "sgd"                 # change the nested dict
+    got = rec.get("config", {})
+    true(got.get("lr") == 0.001, "config['lr'] was changed to 999 outside, and the record changed too: you stored the same dict, not a copy")
+    true(got.get("optim", {}).get("name") == "adamw",
+         "the nested config['optim']['name'] was changed outside, and the record changed too. dict(config) and config.copy() only copy the outer level; use copy.deepcopy.")
+--- hints
+- `return {...}` directly, one key per line, following the 7 points of the prompt.
+- Metrics: `{k: float(v) for k, v in metrics.items()}`.
+- The config contains another dict, and `dict(config)` only copies the outer level. Use `copy.deepcopy(config)`.
+
+@@ item d24-05
+type: fill
+title: Save run records as JSON and read them all back
+level: 1
+cards: Saving as JSON: only a few simple types
+targets: save_run, load_runs
+ref: day24
+--- context
+A run record must be on disk before other people and other scripts can see it. One JSON file per run, named after the run_id; to compare runs, read them all back at once.
+--- prompt
+Fill in the blanks:
+
+- `save_run(record, folder)`: save the record as `folder/<run_id>.json` (indented by 2, keys sorted) and return the file path.
+- `load_runs(folder)`: read back every `.json` record in the folder, sorted by file name, and return them as a list. Ignore other files (like `notes.txt`).
+--- template
+def save_run(record, folder):
+    path = os.path.join(folder, record["run_id"] + "[[.json]]")
+    with open(path, "[[w]]", encoding="utf-8") as f:
+        json.[[dump]](record, f, indent=2, sort_keys=True)
+    return path
+
+
+def load_runs(folder):
+    runs = []
+    for name in [[sorted]](os.listdir(folder)):
+        if name.endswith(".json"):
+            with open(os.path.join(folder, name), encoding="utf-8") as f:
+                runs.append(json.[[load]](f))
+    return runs
+--- tests
+import os, json, tempfile
+
+@check("saved as folder/run_id.json, as indented JSON")
+def _():
+    rec = sample_runs()[1]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        path = save_run(rec, folder)
+        want = os.path.join(folder, "run-02.json")
+        true(isinstance(path, str) and os.path.normcase(path) == os.path.normcase(want), f"should return {want}; you returned {path!r}")
+        true(os.path.exists(want), "the file was not written")
+        with open(want, encoding="utf-8") as f:
+            text = f.read()
+    true(json.loads(text) == rec, "the JSON in the file differs from the original record")
+    true("\n  " in text, "the file should be on several indented lines (indent=2), so people can read it")
+
+@check("read back: the same records, sorted by file name")
+def _():
+    runs = sample_runs()
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        for rec in (runs[3], runs[0], runs[2]):          # saved out of order on purpose
+            save_run(rec, folder)
+        with open(os.path.join(folder, "notes.txt"), "w", encoding="utf-8") as f:
+            f.write("not a run record")
+        back = load_runs(folder)
+    true(isinstance(back, list), f"load_runs should return a list; you returned {type(back).__name__}")
+    ids = [r.get("run_id") for r in back]
+    true(ids == ["run-01", "run-03", "run-04"], f"should read back run-01, run-03, run-04 (sorted by file name, notes.txt ignored); you read back {ids}")
+    true(back == [runs[0], runs[2], runs[3]], "the records read back differ from the ones saved")
+--- hints
+- The file name is the run_id plus an extension; the mode for writing a file is one letter.
+- `json.dump` writes to a file and `json.load` reads from one; the two with an s are for strings.
+- `os.listdir` does not promise any order. Which built-in Python function sorts?
+
+@@ item d24-06
+type: fix
+title: Only torch was seeded
+level: 2
+cards: Seeds: torch, numpy and random each need one
+targets: train_run
+ref: day24
+--- context
+"I set the seed, so why do two runs give different results?" The most common reason: only `torch.manual_seed` was called, but the data is shuffled with numpy and augmented with random. The result then depends on whatever used random numbers before, and the run cannot be reproduced.
+--- prompt
+`train_run(seed, x, y)` trains a small linear model and returns `(weight, orders)`: the trained weights and the shuffled sample order of every epoch. It uses three kinds of random numbers: torch (weight init, noise), numpy (`np.random.permutation` shuffles the data) and random (half of the batches get noise, as data augmentation).
+
+The checks imitate real life: between two calls, other code has used numpy's and random's random numbers.
+
+Fix it so that:
+
+1. The same seed gives exactly the same weights and orders.
+2. Different seeds shuffle into different orders.
+3. Within one run, every epoch has a different order (the shuffle must still work).
+--- starter
+import random
+import numpy as np
+
+def train_run(seed, x, y, epochs=2, batch_size=8):
+    """Return (trained weight, the sample order of every epoch)"""
+    torch.manual_seed(seed)
+    model = nn.Linear(x.shape[1], 1)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    orders = []
+    for epoch in range(epochs):
+        order = np.random.permutation(len(x))          # numpy shuffles the data
+        orders.append(order.tolist())
+        for i in range(0, len(x), batch_size):
+            idx = torch.from_numpy(order[i:i + batch_size])
+            xb, yb = x[idx], y[idx]
+            if random.random() < 0.5:                  # augmentation: add a little noise to half of the batches
+                xb = xb + 0.1 * torch.randn_like(xb)
+            loss = F.mse_loss(model(xb), yb)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+    return model.weight.detach().clone(), orders
+--- solution
+import random
+import numpy as np
+
+def train_run(seed, x, y, epochs=2, batch_size=8):
+    """Return (trained weight, the sample order of every epoch)"""
+    torch.manual_seed(seed)
+    np.random.seed(seed)                               # numpy: shuffling
+    random.seed(seed)                                  # random: augmentation
+    model = nn.Linear(x.shape[1], 1)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    orders = []
+    for epoch in range(epochs):
+        order = np.random.permutation(len(x))          # numpy shuffles the data
+        orders.append(order.tolist())
+        for i in range(0, len(x), batch_size):
+            idx = torch.from_numpy(order[i:i + batch_size])
+            xb, yb = x[idx], y[idx]
+            if random.random() < 0.5:                  # augmentation: add a little noise to half of the batches
+                xb = xb + 0.1 * torch.randn_like(xb)
+            loss = F.mse_loss(model(xb), yb)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+    return model.weight.detach().clone(), orders
+--- tests
+import random
+import numpy as np
+
+def _data():
+    x = torch.randn(32, 4)
+    y = x @ torch.tensor([[1.0], [-2.0], [0.5], [3.0]]) + 0.1 * torch.randn(32, 1)
+    return x, y
+
+@check("other code used numpy's random numbers: the same seed still gives the same result")
+def _():
+    x, y = _data()
+    random.seed(7); np.random.seed(1)            # pretend other code used random numbers before
+    w1, o1 = train_run(0, x, y)
+    random.seed(7); np.random.seed(2)            # this time numpy's state is different
+    w2, o2 = train_run(0, x, y)
+    true(o1 == o2, "same seed, but the two shuffles differ: numpy's random numbers are not seeded, and torch.manual_seed does not reach them.")
+    eq(w2, w1, tol=0.0, msg="same seed, but the trained weights differ")
+
+@check("other code used random's random numbers: the same seed still gives the same result")
+def _():
+    x, y = _data()
+    np.random.seed(1); random.seed(7)
+    w1, o1 = train_run(0, x, y)
+    np.random.seed(1); random.seed(8)            # this time random's state is different
+    w2, o2 = train_run(0, x, y)
+    eq(w2, w1, tol=0.0, msg="same data order, different weights: random.random() decides which batches get noise. Python's own random needs a seed too.")
+
+@check("different seeds give different orders, and so do different epochs")
+def _():
+    x, y = _data()
+    _, o0 = train_run(0, x, y)
+    _, o1 = train_run(1, x, y)
+    true(len(o0) == 2 and all(sorted(o) == list(range(32)) for o in o0), "orders should hold 2 epochs, each a permutation of 0..31")
+    true(o0 != o1, "seed 0 and seed 1 gave the same sample order: is the seed hard-coded, or is nothing shuffled? Use the seed passed in, and keep the shuffle.")
+    true(o0[0] != o0[1], "both epochs have exactly the same order: seed once, at the start. Inside the epoch loop, every epoch goes back to the same order.")
+--- hints
+- This code uses three sources of random numbers: torch, numpy and random. How many of them are seeded now?
+- Below `torch.manual_seed(seed)`, seed numpy and random too, with the same seed.
+- Add two lines: `np.random.seed(seed)` and `random.seed(seed)`. Not inside the for loop.
+
+@@ item d24-07
+type: choice
+title: Which records cannot reproduce the run?
+level: 2
+cards: Six things to record for every run; Data fingerprints: sha256 recognises the same data; Saving as JSON: only a few simple types
+--- context
+The worst run record is not a missing one; it is one that looks complete but cannot be trusted. Every field is there, and only when you try to reproduce the run do you find it did not record the code, config or data that were really used.
+--- prompt
+Which of these make a run record **useless for reproducing** the run? (Choose all that apply.)
+--- options
+- The git commit says `3f9a2c1…`, but there were uncommitted changes during training and the diff was not saved
+- The config in the record is the original dict itself (not a copy), and the sweep code changed it afterwards
+- The data fingerprint is the sha256 of the list of file names; the file contents were never read
+- The metrics were stored as Python floats instead of tensors
+- The JSON was saved with `sort_keys=True`, so the key order differs from the training code
+answer: 1,2,3
+--- explain
+The first three make the record lie:
+
+1. With uncommitted changes, the code at that commit is not the code you ran. Commit first, or save the `git diff` with the record.
+2. The record holds the same dict, so every later change outside reaches the record, and it no longer shows the config you trained with. Store `copy.deepcopy(config)`.
+3. A file can keep its name while its contents change (someone re-exported or cleaned the data). A fingerprint must hash the file's bytes.
+
+Option 4 is the right way: floats can be saved as JSON, tensors cannot. Option 5 is fine as well: key order does not change the contents, and `sort_keys=True` makes two files easier to compare.
+--- hints
+- For each option, ask: following this record, would I get the same code, config and data as the original run?
+- The last two are only about the storage format; the stored contents do not change.
+
+@@ item d24-08
+type: code
+title: Comparing runs: find the best one and what changed
+level: 2
+cards: Comparing runs: which is best, and what changed
+targets: best_run, config_diff
+ref: day24
+--- context
+Twenty tuning runs later: which one was best, and which hyperparameter separates it from the runner-up? Every team has these two small functions. Typical mistakes are the wrong direction (max for a loss) and crashing on one run that blew up.
+--- prompt
+Write two functions:
+
+1. `best_run(runs, metric, higher_is_better=True)`: `runs` is a list of run records, each with a `"metrics"` dict. Return the **whole record** with the best `metric`. Higher is better: use `max`; lower is better (`higher_is_better=False`): use `min`. Skip records without that metric (for example crashed runs); if none has it, `raise ValueError`.
+2. `config_diff(a, b)`: compare two config dicts and return `{key: (value in a, value in b)}`, only for keys whose values differ. A key that appears on one side only counts as None on the other. Keys with equal values must not appear.
+
+The checks use the four records of `sample_runs()` (printed on the card).
+--- starter
+def best_run(runs, metric, higher_is_better=True):
+    """Return the record with the best metric; skip records without that metric"""
+    raise todo()
+
+
+def config_diff(a, b):
+    """{key: (value in a, value in b)}, only for keys whose values differ; a missing side is None"""
+    raise todo()
+--- solution
+def best_run(runs, metric, higher_is_better=True):
+    """Return the record with the best metric; skip records without that metric"""
+    have = [r for r in runs if metric in r["metrics"]]      # skip crashed runs
+    if not have:
+        raise ValueError(f"no record has the metric {metric!r}")
+    pick = max if higher_is_better else min
+    return pick(have, key=lambda r: r["metrics"][metric])
+
+
+def config_diff(a, b):
+    """{key: (value in a, value in b)}, only for keys whose values differ; a missing side is None"""
+    diff = {}
+    for k in sorted(set(a) | set(b)):                       # every key of both sides
+        if a.get(k) != b.get(k):                            # for the missing side, get returns None
+            diff[k] = (a.get(k), b.get(k))
+    return diff
+--- tests
+def _finished():
+    return [r for r in sample_runs() if r["run_id"] != "run-03"]
+
+def _id(r):
+    return r.get("run_id") if isinstance(r, dict) else r
+
+@check("val_acc, higher is better: picks run-04")
+def _():
+    r = best_run(_finished(), "val_acc")
+    true(_id(r) == "run-04", f"the highest val_acc is run-04 (0.875); you returned {_id(r)!r}. Return the whole record.")
+
+@check("val_loss, lower is better: picks run-02")
+def _():
+    r = best_run(_finished(), "val_loss", higher_is_better=False)
+    true(_id(r) == "run-02", f"the lowest val_loss is run-02 (0.44); you returned {_id(r)!r}. With higher_is_better=False, use min.")
+
+@check("records without the metric are skipped; none at all raises ValueError")
+def _():
+    r = best_run(sample_runs(), "val_acc")          # run-03 crashed; its metrics are empty
+    true(_id(r) == "run-04", f"with the crashed run-03 included, the highest val_acc is still run-04; you returned {_id(r)!r}")
+    try:
+        best_run(sample_runs(), "f1")
+    except ValueError:
+        pass
+    else:
+        true(False, "no record has f1: raise ValueError instead of returning None or some record")
+
+@check("config_diff: only keys whose values differ")
+def _():
+    runs = sample_runs()
+    got = config_diff(runs[1]["config"], runs[3]["config"])
+    true(isinstance(got, dict), f"return a dict; you returned {type(got).__name__}")
+    want = {"batch_size": (32, 64), "warmup": (None, 100)}
+    for k, v in want.items():
+        true(k in got, f"{k!r} is missing: run-02 and run-04 differ in {k}" + (" (run-02 does not have this key at all; count it as None)" if v[0] is None else ""))
+        true(tuple(got[k]) == v, f"{k!r} should be {v} (the value in a first); yours is {got[k]}")
+    extra = sorted(set(got) - set(want))
+    true(not extra, f"these keys have equal values on both sides and must not appear: {extra}")
+
+@check("config_diff: the order is (a, b); two equal configs give an empty dict")
+def _():
+    runs = sample_runs()
+    got = config_diff(runs[3]["config"], runs[0]["config"])
+    true(isinstance(got, dict), f"return a dict; you returned {type(got).__name__}")
+    want = {"batch_size": (64, 32), "lr": (0.003, 0.001), "warmup": (100, None)}
+    for k, v in want.items():
+        true(k in got and tuple(got[k]) == v, f"{k!r} should be {v}; yours is {got.get(k, '(missing)')}")
+    true(set(got) == set(want), f"the keys should be exactly {sorted(want)}; yours are {sorted(got)}")
+    same = config_diff(runs[0]["config"], dict(runs[0]["config"]))
+    true(same == {}, f"two equal configs should give an empty dict; you returned {same}")
+--- hints
+- best_run: first keep the records with `metric in r["metrics"]` using a list comprehension; if the list is empty, raise.
+- `max(have, key=lambda r: r["metrics"][metric])`; when lower is better, use `min`.
+- config_diff: `for k in set(a) | set(b):`, compare `a.get(k)` with `b.get(k)`, and add the key to the result when they differ.
+
+@@ item d24-09
+type: code
+title: Model registry 1: register and promote
+level: 2
+cards: A model registry: register, promote, history; Saving as JSON: only a few simple types
+targets: Registry
+ref: day24
+--- context
+"Which model is in production, and which run produced it?" With a registry, one line of code answers that. The key is that all state lives in one file, so the training script, the release script and the inference service all see the same thing.
+--- prompt
+Write three methods of `class Registry(JsonStore)`. `JsonStore` is already written:
+
+- Usage: `Registry(folder)`; the file is `folder/registry.json` (its path is in `self.path`).
+- `self._load()` returns the whole registry dict; if the file does not exist yet it returns `{"versions": [], "production": None, "history": []}`.
+- `self._save(data)` writes the dict back to the file (atomically).
+
+To write:
+
+1. `register(run_id, metrics)`: append `{"version": number, "run_id": run_id, "metrics": metrics}` to `versions`. Version numbers start at 1 and count up. Save, and return the version number. Registering does not change `production`.
+2. `production()`: return the production version number, or None.
+3. `promote(version)`: if that version number does not exist, `raise ValueError`; otherwise set `production` to it, append it to the end of `history`, and save.
+
+Every method that changes something starts with `self._load()` and ends with `self._save(data)`. Do not keep state on `self`: the checks create a new `Registry(folder)` to look.
+--- starter
+class Registry(JsonStore):
+    def register(self, run_id, metrics):
+        """Add a new version; return its number (1, 2, 3, ...)"""
+        raise todo()
+
+    def production(self):
+        """The production version number, or None"""
+        raise todo()
+
+    def promote(self, version):
+        """Make version the production version and record it in history"""
+        raise todo()
+--- solution
+class Registry(JsonStore):
+    def register(self, run_id, metrics):
+        """Add a new version; return its number (1, 2, 3, ...)"""
+        data = self._load()
+        version = len(data["versions"]) + 1
+        data["versions"].append({"version": version, "run_id": run_id, "metrics": metrics})
+        self._save(data)
+        return version
+
+    def production(self):
+        """The production version number, or None"""
+        return self._load()["production"]
+
+    def promote(self, version):
+        """Make version the production version and record it in history"""
+        data = self._load()
+        if not any(v["version"] == version for v in data["versions"]):
+            raise ValueError(f"no version {version}")
+        data["production"] = version
+        data["history"].append(version)
+        self._save(data)
+--- tests
+import os, json, tempfile
+
+def _file(folder):
+    with open(os.path.join(folder, "registry.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+@check("register returns 1, 2, 3 and writes registry.json")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = Registry(folder)
+        vs = [reg.register("run-01", {"val_acc": 0.842}),
+              reg.register("run-02", {"val_acc": 0.861}),
+              reg.register("run-04", {"val_acc": 0.875})]
+        true(vs == [1, 2, 3], f"the version numbers should be [1, 2, 3]; yours are {vs}")
+        true(os.path.exists(reg.path), "registry.json was not written: register must end with self._save(data)")
+        data = _file(folder)
+    want = [{"version": 1, "run_id": "run-01", "metrics": {"val_acc": 0.842}},
+            {"version": 2, "run_id": "run-02", "metrics": {"val_acc": 0.861}},
+            {"version": 3, "run_id": "run-04", "metrics": {"val_acc": 0.875}}]
+    got = data.get("versions", [])
+    true(len(got) == 3, f"versions should hold 3 versions; the file has {len(got)}")
+    for w, g in zip(want, got):
+        true(g == w, f"version {w['version']} should be {w}; the file has {g}")
+
+@check("registering is not promoting: production stays None")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = Registry(folder)
+        true(reg.production() is None, "before anything is registered, production() should return None")
+        reg.register("run-01", {"val_acc": 0.842})
+        true(reg.production() is None, "after registering, production() should still be None: registering is not promoting")
+        data = _file(folder)
+    true(data.get("production") is None and data.get("history") == [],
+         f"in the file, production should be None and history []; they are {data.get('production')!r} and {data.get('history')!r}")
+
+@check("promote: a new Registry sees it too, and history is kept in order")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = Registry(folder)
+        for run_id in ("run-01", "run-02", "run-04"):
+            reg.register(run_id, {"val_acc": 0.8})
+        reg.promote(2)
+        true(Registry(folder).production() == 2, "after promote(2), a new Registry(folder) does not see version 2 in production: the state must go into the file, not only onto self")
+        reg.promote(3)
+        true(Registry(folder).production() == 3, "after promote(3), production should be 3")
+        data = _file(folder)
+    true(data.get("history") == [2, 3], f"history should be [2, 3] (promoted versions, in order); the file has {data.get('history')!r}")
+
+@check("promoting an unknown version raises ValueError and leaves production alone")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = Registry(folder)
+        reg.register("run-01", {"val_acc": 0.842})
+        reg.promote(1)
+        try:
+            reg.promote(7)
+        except ValueError:
+            pass
+        else:
+            true(False, "there is only 1 version; promote(7) should raise ValueError")
+        true(Registry(folder).production() == 1, "after the failed promote, production should still be version 1")
+--- hints
+- register: `data = self._load()`, the version number is `len(data["versions"]) + 1`, `append` a dict, `self._save(data)`, return the number.
+- production: `return self._load()["production"]`.
+- promote: first check `any(v["version"] == version for v in data["versions"])` and raise if it is missing; then set `production`, `history.append(version)`, and save.
+
+@@ item d24-10
+type: code
+title: Model registry 2: promotion gate and rollback
+level: 3
+cards: The promotion gate and rollback; A model registry: register, promote, history
+targets: Registry
+ref: day24
+--- context
+Without a gate, one command ships a worse model; without rollback, an incident means retraining through the night. Together these two features are under twenty lines, and they are the first thing you reach for in a production incident.
+--- prompt
+`BasicRegistry` already has `register`, `production()` and `get(version)`, which returns that version's dict (`{"version", "run_id", "metrics"}`) or raises `ValueError` if it does not exist. Write two methods of `class Registry(BasicRegistry)`:
+
+1. `promote(version)`: promotion with a gate.
+   - The new version's score: `self.get(version)["metrics"][self.metric]`.
+   - If a version is already in production, compare the same metric. When `self.higher_is_better` is True, a **smaller** new score is worse; when it is False (a loss, say), a **larger** new score is worse. If it is worse, `raise ValueError` (put both numbers in the message) and leave the file unchanged.
+   - If it is not worse (equal, or nothing in production yet): set `production` to it, append it to `history`, save.
+2. `rollback()`: with fewer than 2 versions in `history`, `raise ValueError`. Otherwise remove the last entry of `history`, set `production` to the new last entry, save, and return that version number. Rollback does **not** go through the gate.
+
+Use `self._load()` / `self._save(data)` to read and write.
+--- starter
+class Registry(BasicRegistry):
+    def promote(self, version):
+        """Promote only if not worse than production; if worse, raise ValueError"""
+        raise todo()
+
+    def rollback(self):
+        """Go back to the previously promoted version; return its number"""
+        raise todo()
+--- solution
+class Registry(BasicRegistry):
+    def promote(self, version):
+        """Promote only if not worse than production; if worse, raise ValueError"""
+        new = self.get(version)["metrics"][self.metric]
+        data = self._load()
+        current = data["production"]
+        if current is not None:
+            old = self.get(current)["metrics"][self.metric]
+            worse = new < old if self.higher_is_better else new > old
+            if worse:
+                raise ValueError(f"v{version} has {self.metric}={new}, worse than production v{current} with {old}")
+        data["production"] = version
+        data["history"].append(version)
+        self._save(data)
+
+    def rollback(self):
+        """Go back to the previously promoted version; return its number"""
+        data = self._load()
+        if len(data["history"]) < 2:
+            raise ValueError("nothing to roll back to")
+        data["history"].pop()                          # drop the version that caused trouble
+        data["production"] = data["history"][-1]       # back to the previous one, no gate
+        self._save(data)
+        return data["production"]
+--- tests
+import os, json, tempfile
+
+def _setup(folder, scores, metric="val_acc", higher=True):
+    reg = Registry(folder, metric=metric, higher_is_better=higher)
+    for i, s in enumerate(scores, 1):
+        reg.register(f"run-{i:02d}", {metric: s})
+    return reg
+
+def _refused(fn):
+    try:
+        fn()
+    except ValueError:
+        return True
+    return False
+
+@check("the first version goes straight to production; a version that is not worse can follow")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.80, 0.85, 0.85])
+        reg.promote(1)
+        true(reg.production() == 1, "with nothing in production, the first version should be promoted directly")
+        reg.promote(2)
+        true(reg.production() == 2, "v2 (0.85) is better than v1 in production (0.80); it should be promoted")
+        reg.promote(3)
+        true(reg.production() == 3, "v3 equals v2 in production (both 0.85); that is not worse, so it should be promoted")
+        history = reg._load()["history"]
+    true(history == [1, 2, 3], f"history should be [1, 2, 3]; it is {history}")
+
+@check("a version worse than production is refused; production and history stay the same")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.80, 0.85, 0.78])
+        reg.promote(1)
+        reg.promote(2)
+        true(_refused(lambda: reg.promote(3)), "v3 (0.78) is worse than v2 in production (0.85); promote(3) should raise ValueError")
+        other = Registry(folder)
+        true(other.production() == 2, f"after the refusal, production should still be v2; it is v{other.production()}")
+        history = other._load()["history"]
+    true(history == [1, 2], f"after the refusal, history should still be [1, 2]; it is {history}: check first, and change the file only if the check passes")
+
+@check("val_loss, lower is better: the direction flips")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.50, 0.40, 0.45], metric="val_loss", higher=False)
+        reg.promote(1)
+        true(not _refused(lambda: reg.promote(2)), "v2 has val_loss 0.40, lower than v1's 0.50, so it is better, yet it was refused. With higher_is_better=False, lower is better.")
+        true(reg.production() == 2, "v2 should be in production now")
+        true(_refused(lambda: reg.promote(3)), "v3 has val_loss 0.45, higher than production v2's 0.40, so it is worse and should be refused")
+
+@check("rollback: back to the previous production version, whatever its score")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.80, 0.85])
+        reg.promote(1)
+        reg.promote(2)
+        try:
+            back = reg.rollback()
+        except ValueError as e:
+            true(False, f"rollback raised: {e}. Rollback does not go through the gate: the previous version usually scores lower. Change production and history directly; do not call promote.")
+        true(back == 1, f"rollback() should return the version it went back to, 1; you returned {back!r}")
+        other = Registry(folder)
+        true(other.production() == 1, "after rollback, production should be v1 (a new Registry must see it too)")
+        history = other._load()["history"]
+    true(history == [1], f"after rollback, history should be [1]; it is {history}")
+
+@check("nothing to roll back to: raise ValueError")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.80, 0.85])
+        reg.promote(1)
+        true(_refused(reg.rollback), "only v1 was ever promoted, there is nothing earlier: rollback() should raise ValueError")
+        true(Registry(folder).production() == 1, "after a failed rollback, production should still be v1")
+--- hints
+- promote: get the new score first; `data = self._load()`; `current = data["production"]`. Only when current is not None, get the old score and compare.
+- "Worse": `new < old if self.higher_is_better else new > old`. If worse, raise, before changing data.
+- rollback: if `len(data["history"]) < 2`, raise; otherwise `data["history"].pop()`, `data["production"] = data["history"][-1]`, save, return it. Do not call `self.promote`: the gate would block the rollback.
+
+@@ item d24-11
+type: choice
+title: A new version is live and things go wrong: what first?
+level: 1
+cards: The promotion gate and rollback
+--- context
+During an incident, time is your users' patience. Restore first, investigate later: this is the first rule of operations, and a favourite scenario question in interviews.
+--- prompt
+v3 scored 1 point higher than v2 in offline evaluation, passed the gate and went live. An hour later, support reports that complaints about wrong answers have doubled. What do you do first?
+--- options
+- Roll back to v2 right away so production is healthy again, then investigate v3
+- Delete v3 from the registry so nobody promotes it again
+- Train a v4 on the latest data right away and promote it when it is ready
+- Change the gate to "at least 2 points better than production" and promote v3 again
+answer: 1
+--- explain
+One rollback step returns to a state you know works. Users stop being affected at once, and you have time to investigate.
+
+Deleting v3 destroys the evidence you need: which run it came from, which data, which commit. Retraining takes hours, users suffer the whole time, and since you do not know the cause yet, v4 may have the same problem. Changing the gate does nothing: v3 is already live, and the gate looks at the offline score, which is exactly what failed to predict production (perhaps training and serving process data differently, day 18; perhaps production data changed, day 25).
+--- hints
+- Which option stops users from being affected within a minute?
+- Investigating needs v3's records; do not delete the evidence.
+
+@@ item d24-12
+type: fill
+title: Generate a model card from the run record
+level: 1
+cards: Model cards: a manual for the people who use the model
+targets: model_card
+ref: day24
+--- context
+If the numbers in a model card are copied by hand, sooner or later they stop matching the real ones. Generate the card from the run record with code, one for every newly registered version, and the numbers always match the record.
+--- prompt
+Fill in the blanks so that `model_card(name, version, record, intended_use, out_of_scope, limitations)` returns a model card in Markdown (one string):
+
+- `record` is a run record (same format as before).
+- `out_of_scope` and `limitations` are lists of strings, one line each, each in its own section.
+- Metrics are sorted by name, with 4 decimal places.
+- The reproduction details (data fingerprint, git commit, seed) come from `record`.
+--- template
+def model_card(name, version, record, intended_use, out_of_scope, limitations):
+    m = record["metrics"]
+    v = record["versions"]
+    lines = ["# Model card: " + name + " v" + str(version), ""]
+    lines += ["## Intended use", intended_use, ""]
+    lines += ["## Out of scope"] + ["- " + x for x in [[out_of_scope]]] + [""]
+    lines += ["## Evaluation"] + [f"- {k}: {m[k]:.4f}" for k in [[sorted(m)]]] + [""]
+    lines += ["## Training data", "- data fingerprint: " + record["[[data_fingerprint]]"], ""]
+    lines += ["## How to reproduce",
+              "- git commit: " + record["[[git_commit]]"],
+              "- seed: " + str(record["[[seed]]"]),
+              "- torch " + v["torch"] + ", numpy " + v["numpy"], ""]
+    lines += ["## Limitations and risks"] + ["- " + x for x in [[limitations]]]
+    return "\n".join(lines)
+--- tests
+HEADINGS = ["# Model card: review-sentiment v2", "## Intended use", "## Out of scope", "## Evaluation", "## Training data", "## How to reproduce", "## Limitations and risks"]
+
+def _card():
+    rec = sample_runs()[3]
+    rec["metrics"] = {"val_loss": 0.4412, "val_acc": 0.8611, "val_acc_long_text": 0.7702}
+    oos = ["reviews in other languages", "medical or legal decisions"]
+    limits = ["often wrong on sarcasm", "reviews longer than 512 tokens are cut off"]
+    card = model_card("review-sentiment", 2, rec, "label English product reviews as positive / negative", oos, limits)
+    return card.split("\n"), rec, oos, limits
+
+@check("all seven sections, in the right order")
+def _():
+    lines, _, _, _ = _card()
+    missing = [h for h in HEADINGS if h not in lines]
+    true(not missing, f"these sections are missing: {missing}")
+    pos = [lines.index(h) for h in HEADINGS]
+    true(pos == sorted(pos), "the sections are in the wrong order")
+
+@check("reproduction details come from the run record")
+def _():
+    lines, rec, _, _ = _card()
+    for want in ["- data fingerprint: " + rec["data_fingerprint"], "- git commit: " + rec["git_commit"], "- seed: 0"]:
+        true(want in lines, f"the model card should contain this line: {want}")
+
+@check("one line per metric, sorted by name, 4 decimal places")
+def _():
+    lines, _, _, _ = _card()
+    want = ["- val_acc: 0.8611", "- val_acc_long_text: 0.7702", "- val_loss: 0.4412"]
+    for w in want:
+        true(w in lines, f"the model card should contain this line: {w}")
+    pos = [lines.index(w) for w in want]
+    true(pos == sorted(pos), "sort the metrics by name (sorted), so two model cards can be compared line by line")
+
+@check("out-of-scope uses and limitations are each in their own section")
+def _():
+    lines, _, oos, limits = _card()
+    a, b, c = lines.index("## Out of scope"), lines.index("## Evaluation"), lines.index("## Limitations and risks")
+    for x in oos:
+        true("- " + x in lines[a:b], f"\"{x}\" belongs in the \"Out of scope\" section")
+    for x in limits:
+        true("- " + x in lines[c:], f"\"{x}\" belongs in the \"Limitations and risks\" section")
+--- hints
+- Which parameter of the function does each of the two `for x in ...` loops go through? Look at the section each one is under.
+- The metrics must be sorted by name: `sorted(...)` on a dict gives its keys in sorted order.
+- Inside `record[...]` goes a key of the run record: what are the keys for the data fingerprint, the git commit and the seed?
+
+@@ item d24-13
+type: code
+title: Closed book: a complete run record
+level: 2
+exam: yes
+cards: Six things to record for every run
+targets: make_run_record
+ref: day24
+--- context
+A common interview question: "How do you make sure your experiments can be reproduced?" If you can write this function without looking, you can list everything you record, and say why, in one go.
+--- prompt
+Write `make_run_record(run_id, config, git_commit, data_paths, seed, metrics)`. Return a dict with exactly 7 keys: `run_id`, `config`, `git_commit`, `data_fingerprint`, `seed`, `versions`, `metrics`.
+
+- Deep-copy the config; compute the data fingerprint with the existing `data_fingerprint(data_paths)`.
+- versions holds three version strings: `"python"`, `"torch"`, `"numpy"`.
+- Turn every metric value into a Python float.
+--- starter
+def make_run_record(run_id, config, git_commit, data_paths, seed, metrics):
+    raise todo()
+--- solution
+import copy
+import platform
+import numpy as np
+
+def make_run_record(run_id, config, git_commit, data_paths, seed, metrics):
+    return {
+        "run_id": run_id,
+        "config": copy.deepcopy(config),                  # a copy: later changes to config do not reach the record
+        "git_commit": git_commit,
+        "data_fingerprint": data_fingerprint(data_paths),
+        "seed": seed,
+        "versions": {"python": platform.python_version(), "torch": torch.__version__, "numpy": np.__version__},
+        "metrics": {k: float(v) for k, v in metrics.items()},   # tensor, float32 -> Python float
+    }
+--- tests
+import os, json, tempfile, platform
+
+COMMIT = "3f9a2c1d0b7e4f6a8c5d2e1f0a9b8c7d6e5f4a3b"
+KEYS = ["run_id", "config", "git_commit", "data_fingerprint", "seed", "versions", "metrics"]
+
+def _record():
+    config = {"lr": 0.001, "optim": {"name": "adamw", "betas": [0.9, 0.95]}}
+    metrics = {"val_loss": torch.tensor(0.25), "val_acc": np.float32(0.875)}
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        paths = write_files(folder, {"train.csv": "x,y\n1,0\n3,1\n", "val.csv": "x,y\n2,1\n"})
+        fp = data_fingerprint(paths)
+        rec = make_run_record("run-07", config, COMMIT, paths, 42, metrics)
+    return rec, fp, config
+
+@check("all 7 keys are there")
+def _():
+    rec, _, _ = _record()
+    true(isinstance(rec, dict), f"return a dict; you returned {type(rec).__name__}")
+    missing = [k for k in KEYS if k not in rec]
+    true(not missing, f"the record is missing: {missing}")
+    extra = sorted(set(rec) - set(KEYS))
+    true(not extra, f"the record has unknown keys: {extra} (the names must match the prompt exactly)")
+
+@check("run_id, config, commit, seed and data fingerprint are right")
+def _():
+    rec, fp, _ = _record()
+    true(rec.get("run_id") == "run-07", f"run_id should be 'run-07', yours is {rec.get('run_id')!r}")
+    true(rec.get("git_commit") == COMMIT, "store git_commit exactly as the string passed in")
+    true(rec.get("seed") == 42, f"seed should be 42, yours is {rec.get('seed')!r}")
+    true(rec.get("config") == {"lr": 0.001, "optim": {"name": "adamw", "betas": [0.9, 0.95]}}, f"config differs from the one passed in: {rec.get('config')}")
+    true(rec.get("data_fingerprint") == fp, "data_fingerprint should be the result of data_fingerprint(data_paths)")
+
+@check("library versions: python, torch, numpy")
+def _():
+    rec, _, _ = _record()
+    v = rec.get("versions")
+    true(isinstance(v, dict), "versions should be a dict")
+    for k, want in [("python", platform.python_version()), ("torch", torch.__version__), ("numpy", np.__version__)]:
+        true(v.get(k) == want, f"versions[{k!r}] should be {want!r}, yours is {v.get(k)!r}")
+
+@check("metrics are Python floats and the whole record saves as JSON")
+def _():
+    rec, _, _ = _record()
+    m = rec.get("metrics")
+    true(isinstance(m, dict), "metrics should be a dict")
+    for k, want in [("val_loss", 0.25), ("val_acc", 0.875)]:
+        true(k in m, f"metrics is missing {k!r}")
+        true(type(m[k]) is float, f"metrics[{k!r}] is a {type(m[k]).__name__}; turn it into a Python float with float(v), or it cannot be saved as JSON")
+        true(close(m[k], want, 1e-6), f"metrics[{k!r}] should be {want}, yours is {m[k]}")
+    true(json.loads(json.dumps(rec)) == rec, "saved as JSON and read back, the record is different")
+
+@check("config is stored as a copy: changing config later does not change the record")
+def _():
+    rec, _, config = _record()
+    config["lr"] = 999
+    config["optim"]["name"] = "sgd"                 # change the nested dict
+    got = rec.get("config", {})
+    true(got.get("lr") == 0.001, "config['lr'] was changed to 999 outside, and the record changed too: you stored the same dict, not a copy")
+    true(got.get("optim", {}).get("name") == "adamw",
+         "the nested config['optim']['name'] was changed outside, and the record changed too. dict(config) and config.copy() only copy the outer level; use copy.deepcopy.")
+--- hints
+- Six things plus a run_id.
+- One line each for the copy, the versions and the floats.
+
+@@ item d24-14
+type: code
+title: Closed book: promotion gate and rollback
+level: 3
+exam: yes
+cards: The promotion gate and rollback
+targets: Registry
+ref: day24
+--- context
+"What do you do when a new model breaks production? How do you stop a worse model from being promoted?" These are common ML engineering interview questions. If you can write the gate and rollback without looking, you can explain every decision behind them.
+--- prompt
+Write `promote(version)` and `rollback()` of `class Registry(BasicRegistry)`. You can use `self.get(version)`, `self._load()`, `self._save(data)`, `self.metric` and `self.higher_is_better`.
+
+- `promote`: if a version is in production, the new version's `self.metric` must not be worse (the direction comes from `higher_is_better`). If it is worse, `raise ValueError` and leave the file unchanged; otherwise make it `production`, append it to `history`, save.
+- `rollback`: with fewer than 2 entries in `history`, `raise ValueError`; otherwise go back to the previously promoted version and return its number. Rollback does not go through the gate.
+--- starter
+class Registry(BasicRegistry):
+    def promote(self, version):
+        raise todo()
+
+    def rollback(self):
+        raise todo()
+--- solution
+class Registry(BasicRegistry):
+    def promote(self, version):
+        new = self.get(version)["metrics"][self.metric]
+        data = self._load()
+        current = data["production"]
+        if current is not None:
+            old = self.get(current)["metrics"][self.metric]
+            worse = new < old if self.higher_is_better else new > old
+            if worse:
+                raise ValueError(f"v{version} has {self.metric}={new}, worse than production v{current} with {old}")
+        data["production"] = version
+        data["history"].append(version)
+        self._save(data)
+
+    def rollback(self):
+        data = self._load()
+        if len(data["history"]) < 2:
+            raise ValueError("nothing to roll back to")
+        data["history"].pop()                          # drop the version that caused trouble
+        data["production"] = data["history"][-1]       # back to the previous one, no gate
+        self._save(data)
+        return data["production"]
+--- tests
+import os, json, tempfile
+
+def _setup(folder, scores, metric="val_acc", higher=True):
+    reg = Registry(folder, metric=metric, higher_is_better=higher)
+    for i, s in enumerate(scores, 1):
+        reg.register(f"run-{i:02d}", {metric: s})
+    return reg
+
+def _refused(fn):
+    try:
+        fn()
+    except ValueError:
+        return True
+    return False
+
+@check("the first version goes straight to production; a version that is not worse can follow")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.80, 0.85, 0.85])
+        reg.promote(1)
+        true(reg.production() == 1, "with nothing in production, the first version should be promoted directly")
+        reg.promote(2)
+        true(reg.production() == 2, "v2 (0.85) is better than v1 in production (0.80); it should be promoted")
+        reg.promote(3)
+        true(reg.production() == 3, "v3 equals v2 in production (both 0.85); that is not worse, so it should be promoted")
+        history = reg._load()["history"]
+    true(history == [1, 2, 3], f"history should be [1, 2, 3]; it is {history}")
+
+@check("a version worse than production is refused; production and history stay the same")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.80, 0.85, 0.78])
+        reg.promote(1)
+        reg.promote(2)
+        true(_refused(lambda: reg.promote(3)), "v3 (0.78) is worse than v2 in production (0.85); promote(3) should raise ValueError")
+        other = Registry(folder)
+        true(other.production() == 2, f"after the refusal, production should still be v2; it is v{other.production()}")
+        history = other._load()["history"]
+    true(history == [1, 2], f"after the refusal, history should still be [1, 2]; it is {history}: check first, and change the file only if the check passes")
+
+@check("val_loss, lower is better: the direction flips")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.50, 0.40, 0.45], metric="val_loss", higher=False)
+        reg.promote(1)
+        true(not _refused(lambda: reg.promote(2)), "v2 has val_loss 0.40, lower than v1's 0.50, so it is better, yet it was refused. With higher_is_better=False, lower is better.")
+        true(reg.production() == 2, "v2 should be in production now")
+        true(_refused(lambda: reg.promote(3)), "v3 has val_loss 0.45, higher than production v2's 0.40, so it is worse and should be refused")
+
+@check("rollback: back to the previous production version, whatever its score")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.80, 0.85])
+        reg.promote(1)
+        reg.promote(2)
+        try:
+            back = reg.rollback()
+        except ValueError as e:
+            true(False, f"rollback raised: {e}. Rollback does not go through the gate: the previous version usually scores lower. Change production and history directly; do not call promote.")
+        true(back == 1, f"rollback() should return the version it went back to, 1; you returned {back!r}")
+        other = Registry(folder)
+        true(other.production() == 1, "after rollback, production should be v1 (a new Registry must see it too)")
+        history = other._load()["history"]
+    true(history == [1], f"after rollback, history should be [1]; it is {history}")
+
+@check("nothing to roll back to: raise ValueError")
+def _():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        reg = _setup(folder, [0.80, 0.85])
+        reg.promote(1)
+        true(_refused(reg.rollback), "only v1 was ever promoted, there is nothing earlier: rollback() should raise ValueError")
+        true(Registry(folder).production() == 1, "after a failed rollback, production should still be v1")
+--- hints
+- promote: compare first; change data only if the check passes.
+- rollback: pop the last entry; production becomes the new last entry.

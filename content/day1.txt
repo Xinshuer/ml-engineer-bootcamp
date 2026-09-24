@@ -3,32 +3,413 @@ title: 只学写模型用得上的那 20% Python
 part: 地基
 hours: 3–4 小时
 --- goal
-TODO: 一句话写今天学完能做什么。
+读懂并亲手写出模型代码里天天出现的 Python：函数和 return、切片和循环、dict 计数、class 和 self、继承和 super()、@property、dataclass 配置、装饰器、f-string 日志、pathlib 路径。看到报错，知道先看哪一行。
 --- checklist
-- 先清空复习区
-- 读完知识卡片并改动运行
-- 练习区全部通过
+- 按顺序读完 8 张知识卡片，每张的例子都点「运行」，再改一个数字运行一次
+- 练习区的题全部通过（卡住超过 5 分钟再点提示）
+- 看过答案的题会进复习区，明天从空白重做一次
+- 最后做 2 道闭卷题：不看卡片，从空白写出 RunningMean 和 make_xy
+
+@@ concept
+title: 函数：return 才把结果交出去
+--- body
+函数就是「一段起了名字的代码」。用 `def` 定义它的时候，里面的代码不执行；写函数名加括号（调用它）时才执行。
+
+`return` 做三件事：
+
+1. 把一个值交给调用它的地方。`r = double(5)` 之后，r 里就是那个值。
+2. 让函数立刻结束。`return` 下面的代码不会再执行。
+3. 没写 `return` 的函数，返回 `None`（意思是「没有值」）。函数里算对了也没用，结果被扔掉了。
+
+参数可以有默认值：`def power(base, exp=2)`，调用时不给 `exp` 就用 2。也可以按名字传：`power(3, exp=4)`，更清楚，模型代码里到处是这种写法。
+
+一次返回多个值：`return lo, hi` 返回的是一个元组（tuple），调用的地方可以拆开接住：`lo, hi = min_max(xs)`。这叫「解包」。以后天天见：`logits, loss = model(x, y)`。
+
+### 读报错：从最后一行往上看
+
+报错信息（traceback）的最后一行说「什么错」，往上几行说「在哪一行」。出错的那一行常常只是受害者，原因在更早的地方。最常见的几种：
+
+- `TypeError: ... 'NoneType' ...`：拿 `None` 去算了。第一反应：这个值是哪个函数给的，那个函数有没有 `return`？
+- `NameError: name 'x' is not defined`：名字拼错了，或者用了别的函数里的局部变量。
+- `AttributeError: 'X' object has no attribute 'y'`：对象上没有 y。常见原因：忘了在 `__init__` 里写 `self.y = ...`，或者忘了 `super().__init__()`。
+- `KeyError`：dict 里没有这个键。`IndexError`：下标越界（最大的下标是 `len(xs) - 1`）。
+--- code
+def double(n):
+    return n * 2
+
+def no_return(n):
+    n * 2              # 算了，但没有 return，结果被扔掉
+
+def min_max(xs):
+    return min(xs), max(xs)
+
+print(double(5))
+print(no_return(5))
+lo, hi = min_max([3, 1, 4, 1, 5])
+print(lo, hi)
+
+try:
+    no_return(5) * 3   # 拿 None 去乘 3
+except TypeError as e:
+    print("TypeError:", e)
+
+@@ concept
+title: 切片和循环：含头不含尾
+--- body
+`xs[a:b]` 取下标 a、a+1、……、b-1 的元素：**含头不含尾**，一共 b-a 个。下标从 0 开始，`xs[-1]` 是最后一个。`xs[:k]` 和 `xs[k:]` 正好把列表切成不重叠的两半。字符串也能这样切，切出来还是字符串。
+
+`range(start, stop, step)` 也是含头不含尾：`range(0, 10, 3)` 给出 0, 3, 6, 9。
+
+`for x in xs:` 把元素一个一个拿出来，每拿一个，就把下面缩进的代码从头到尾执行一遍。几个常用写法：
+
+- 累加：先 `total = 0`，循环里 `total += x`。训练时统计 loss 就是这样。
+- 推导式：`[x * x for x in xs]` 一行造出一个新列表。读法：先看中间的 `for`，再看最前面「每轮产出什么」。
+- `enumerate(xs)` 同时给出下标和元素。`zip(a, b)` 把两个列表按位置配成对，按短的那个停，所以 `zip(xs, xs[1:])` 正好是所有相邻的两个。
+- `continue` 跳过这一轮剩下的代码，直接进下一轮；`break` 让整个循环立刻结束。
+
+### 预测下一个 token 的数据，就是两行切片
+
+`x = data[i:i + T]`，`y = data[i + 1:i + 1 + T]`。y 的每个元素，正好是 x 同一位置元素的「下一个」。这一个 `+ 1` 写错，模型会学会抄答案，而且不报任何错。
+--- code
+xs = [10, 20, 30, 40, 50]
+print(xs[1:3], xs[:2], xs[2:], xs[-1])
+print("abcdef"[1:4])
+print(list(range(0, 10, 3)))
+
+total = 0
+for x in xs:
+    total += x
+print("total =", total)
+print([x // 10 for x in xs])
+
+for i, (a, b) in enumerate(zip(xs, xs[1:])):
+    print(i, a, b, b - a)
+
+data = list(range(10))
+i, T = 3, 4
+print("x =", data[i:i + T])
+print("y =", data[i + 1:i + 1 + T])
+
+@@ concept
+title: dict：计数和排序
+--- body
+list 用数字下标（`xs[0]`），dict 用你自己定的「键」：`cfg["lr"]`。键不存在时，`cfg["x"]` 会报 `KeyError`；`cfg.get("x", 0)` 不报错，返回你给的默认值 0。
+
+数数的固定写法，读作「取出 c 现在的次数，没有就当 0，加 1，再存回去」：
+
+```
+counts[c] = counts.get(c, 0) + 1
+```
+
+`d.items()` 给出所有 `(键, 值)` 对。`sorted(一串东西, key=函数)` 按「函数算出来的值」从小到大排，返回一个新 list：
+
+- `lambda kv: ...` 是一个没有名字的小函数，这里 kv 就是一个 `(键, 值)` 对，`kv[1]` 是值。
+- 想从大到小：key 取负号，`key=lambda kv: -kv[1]`。
+- 想「先按次数从大到小，次数一样再按键从小到大」：key 返回一个元组 `(-kv[1], kv[0])`。元组比较时先比第一个，一样再比第二个。
+
+dict 推导式和列表推导式一样：`{c: i for i, c in enumerate(chars)}`。第 3 天写分词器（tokenizer）就用它把字符换成编号。
+--- code
+counts = {}
+for c in "banana":
+    counts[c] = counts.get(c, 0) + 1
+print(counts)
+print(counts.get("z", 0))
+
+for k, v in counts.items():
+    print(k, v)
+
+print(sorted(counts.items(), key=lambda kv: -kv[1]))
+print(sorted([("x", 1), ("r", 2), ("b", 2)], key=lambda kv: (-kv[1], kv[0])))
+
+stoi = {c: i for i, c in enumerate("abc")}
+print(stoi)
+
+@@ concept
+title: 赋值是贴标签，不是复制
+--- body
+Python 里 `b = a` 从来不复制数据。它只是给 a 指着的那个东西，再贴一张标签 b。如果那个东西能被就地修改（list、dict，以及以后的张量和模型），通过 b 改了它，从 a 看也变了。把 list 传进函数也一样：函数拿到的是同一个 list，不是副本。
+
+- 想真的复制，要明说：`a.copy()` 或 `list(a)`。
+- `==` 问「值一样吗」，`is` 问「是不是同一个东西」。
+- 数字、字符串、元组不能就地修改。`n = n + 1` 是让 n 指向一个新的数，不影响别的名字，所以不用担心。
+
+### 由此而来的坑：可变默认参数
+
+`def f(x, acc=[])` 里的那个 `[]`，是在**定义函数的时候**建好的，只建一次。之后每次调用用的都是同一个列表，上一次的结果会留到下一次。
+
+正确写法：默认值写 `None`，在函数体里现建一个（`if acc is None: acc = []`）；或者干脆不把它做成参数，函数体第一行写 `acc = []`。
+
+dataclass 里的 list 字段要写 `field(default_factory=list)`，是同一个道理：让每个对象现建一个新列表。
+--- code
+a = [1, 2, 3]
+b = a
+b.append(4)
+print("a =", a, "| a is b:", a is b)
+
+c = a.copy()
+c.append(5)
+print("a =", a, "| c =", c, "| a is c:", a is c)
+
+def bad(x, acc=[]):
+    acc.append(x)
+    return acc
+
+print(bad(1))
+print(bad(2))      # 你以为是 [2]
+
+def good(x, acc=None):
+    if acc is None:
+        acc = []   # 每次调用现建一个新的
+    acc.append(x)
+    return acc
+
+print(good(1))
+print(good(2))
+
+@@ concept
+title: class：self、__init__ 和 __call__
+--- body
+class 是一张图纸：把「一份数据」和「操作这份数据的函数」打包在一起。照图纸造出来的东西叫实例（对象），可以造很多个，互不干扰。
+
+- `__init__(self, ...)`：造对象时 Python 自动调用它，用来把初始数据挂到对象上。它不写 `return`。
+- `self` 就是点号左边的那个对象。你写 `a.add(5)`，Python 实际执行的是 `Counter.add(a, 5)`。所以定义方法时第一个参数写 `self`，调用时不用传。
+- `self.n = 0` 把数据挂在对象上，别的方法和外面都读得到。方法里不带 `self.` 的变量是局部变量，方法一结束就没了。一句话：**想让数据活过这个函数，就挂到 self 上。**
+- `__call__(self, ...)`：定义了它，对象就能像函数一样加括号调用，`obj(x)` 等于 `obj.__call__(x)`。
+
+前后带两个下划线的方法（读作 dunder）都是「Python 在特定时机自动调用」的。
+
+PyTorch 里 `y = model(x)` 能加括号，就是因为 `nn.Module` 定义了 `__call__`，它再去调用你写的 `forward`。所以永远写 `model(x)`，不要写 `model.forward(x)`（那样会跳过 PyTorch 注册的钩子 hooks）。
+--- code
+class Scaler:
+    def __init__(self, factor):
+        self.factor = factor      # 挂到 self 上，之后的方法都用得到
+        self.calls = 0
+
+    def __call__(self, x):
+        self.calls += 1
+        return x * self.factor
+
+double = Scaler(2)
+triple = Scaler(3)
+print(double(21), triple(21))
+print(double(1), double.calls, triple.calls)
+print(Scaler.__call__(double, 5))  # 和 double(5) 完全一样
+
+class Tiny(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(4, 2)
+
+    def forward(self, x):
+        return self.fc(x)
+
+m = Tiny()
+y = m(torch.ones(3, 4))            # nn.Module 的 __call__ -> 你的 forward
+print(y.shape)
+
+@@ concept
+title: 继承、super() 和 @property
+--- body
+继承：`class B(A):` 表示 B 先照抄 A 的所有方法，再加几样、改几样。子类里写一个同名方法，就覆盖了父类的那个。
+
+`super()` 指「父类」。两个固定用法：
+
+- 子类自己写了 `__init__`，父类的 `__init__` 就被盖掉了，不会自动执行。所以子类 `__init__` 的第一行写 `super().__init__(...)`，先让父类把它那部分属性挂好，再加自己的。
+- 子类改写一个方法，但还想保留父类的行为：在里面先调 `super().方法名(...)`，再加自己的步骤。
+
+每个 `nn.Module` 子类的 `__init__` 第一行都是 `super().__init__()`。忘了写，给 `self.fc = nn.Linear(...)` 赋值时就会报 `AttributeError: cannot assign module before Module.__init__() call`。
+
+### @property：读的时候不带括号的方法
+
+在方法上面加一行 `@property`，读它就不用写括号：`m.left` 而不是 `m.left()`。适合「由别的属性算出来」的值：每次读都现算，永远和原始数据同步，不会忘了更新。
+
+property 默认只能读。写 `m.left = 1` 会报错（`property 'left' of ... object has no setter`）。子类想换一种算法，就在子类里重新写一个同名的 `@property`。
+--- code
+class Meter:
+    def __init__(self, total):
+        self.total = total
+        self.used = 0
+
+    def use(self, k):
+        self.used += k
+
+    @property
+    def left(self):                # 每次读都现算
+        return self.total - self.used
+
+class LoggedMeter(Meter):
+    def __init__(self, total):
+        super().__init__(total)    # 先让父类挂好 total 和 used
+        self.history = []
+
+    def use(self, k):
+        super().use(k)             # 保留父类的行为
+        self.history.append(k)     # 再加自己的
+
+m = LoggedMeter(10)
+m.use(3)
+m.use(4)
+print(m.used, m.left, m.history)
+
+class Forgot(Meter):
+    def __init__(self, total):
+        self.history = []          # 忘了 super().__init__(total)
+
+try:
+    Forgot(10).left
+except AttributeError as e:
+    print("AttributeError:", e)
+
+class BadNet(nn.Module):
+    def __init__(self):
+        self.fc = nn.Linear(2, 2)  # 忘了 super().__init__()
+
+try:
+    BadNet()
+except AttributeError as e:
+    print("AttributeError:", e)
+
+@@ concept
+title: 训练脚本的外壳：dataclass、f-string、pathlib
+--- body
+打开任何一个训练项目，最外面这层都差不多：一个配置对象，每隔几步打一行日志，把 checkpoint（模型权重的存档）存到某个目录。
+
+### dataclass：配置对象
+
+在 class 上面加 `@dataclass`，只写「字段名: 类型 = 默认值」，`__init__`、打印格式、比较都会自动生成。想改哪个值就按名字传：`Cfg(lr=1e-3)`。dataclass 里照样可以写方法。冒号后面的类型只是给人看的，Python 不检查。
+
+list、dict 这种可变的默认值不能直接写 `= []`（dataclass 会直接报错），要写 `field(default_factory=list)`，让每个对象现建一个新列表（原因见卡片「赋值是贴标签，不是复制」）。
+
+### f-string：日志
+
+字符串前面加 `f`，`{}` 里就能放变量和表达式，冒号后面写格式：
+
+- `{step:5d}`：整数，右对齐，宽度 5
+- `{loss:.4f}`：保留 4 位小数
+- `{lr:.2e}`：科学计数法，2 位小数（`3e-4` 显示成 `3.00e-04`）
+- `{step:06d}`：宽度 6，前面补 0
+- `{dt * 1000:.1f}`：先算，再格式化
+
+### pathlib：路径
+
+`Path("runs") / "gpt-tiny" / "ckpt.pt"` 用 `/` 拼路径，Windows 和 Linux 都对。`p.name` 是文件名，`p.parent` 是所在的目录。`d.mkdir(parents=True, exist_ok=True)` 把目录建出来：`parents=True` 连不存在的上级目录一起建，`exist_ok=True` 表示目录已经存在也不报错。
+
+文件名里的步数要补零（`ckpt_000009.pt`），按名字排序时顺序才对。
+--- code
+from dataclasses import dataclass, field
+from pathlib import Path
+
+@dataclass
+class Cfg:
+    lr: float = 3e-4
+    n_layer: int = 6
+    tags: list = field(default_factory=list)
+
+a = Cfg()
+b = Cfg(lr=1e-3)
+a.tags.append("baseline")
+print(a)
+print(b)
+
+step, loss, lr, dt = 7, 2.718281, 6e-4, 0.0421
+print(f"[{step:5d}] [{loss:.4f}] [{lr:.2e}] [{dt * 1000:.1f}ms] [{step:06d}]")
+
+p = Path("runs") / "gpt-tiny" / "last.pt"
+print(p.name, p.parent.name, p.suffix)
+print(sorted(f"ckpt_{s}.pt" for s in [9, 10, 100]))
+print(sorted(f"ckpt_{s:06d}.pt" for s in [9, 10, 100]))
+
+@@ concept
+title: *args / **kwargs 和装饰器
+--- body
+`def f(*args, **kwargs)` 能收下任何参数：按位置传的收进 `args`（一个元组），按名字传的收进 `kwargs`（一个 dict）。反过来，调用时加星号是「拆开传」：`g(*args, **kwargs)` 把它们原样交给另一个函数。
+
+装饰器就是「接收一个函数、返回一个新函数」的函数。
+
+```
+@deco
+def f(x): ...
+```
+
+等于先定义 `f`，再执行 `f = deco(f)`。
+
+写装饰器的固定骨架：在里面定义一个 `wrapper(*args, **kwargs)`，先做你想加的事，再 `return fn(*args, **kwargs)` 原样转发，最后 `return wrapper`。在 wrapper 上面加 `@functools.wraps(fn)`，新函数才会保留原函数的名字（`__name__`），不然名字会变成 `wrapper`。
+
+模型代码里天天见的装饰器：`@dataclass`、`@property`、`@torch.no_grad()`（这个函数里不记录求导信息，推理时用）。
+--- code
+import functools
+
+def show_all(*args, **kwargs):
+    print("args =", args, "| kwargs =", kwargs)
+
+show_all(1, 2, lr=0.01)
+
+def power(base, exp):
+    return base ** exp
+
+print(power(*(2, 10)), power(**{"base": 3, "exp": 4}))
+
+def traced(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        print("calling", fn.__name__, args, kwargs)
+        return fn(*args, **kwargs)
+    return wrapper
+
+@traced
+def add(a, b):
+    return a + b
+
+print(add(1, b=2))
+print(add.__name__)
+
+def no_wraps(fn):
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+    return wrapper
+
+@no_wraps
+def mul(a, b):
+    return a * b
+
+print(mul.__name__)   # 名字丢了
 
 @@ item d1-01
 type: code
 title: dataclass 当 config
 level: 2
+cards: 训练脚本的外壳：dataclass、f-string、pathlib; 赋值是贴标签，不是复制
 targets: TrainConfig
 ref: day1
 --- context
-TODO
+几乎每个开源训练脚本的开头都是一个配置类：学习率、batch 大小、层数全写在这里。用 dataclass 写，只列字段和默认值，打印、按名字改一个值、存进 checkpoint 都很方便。
 --- prompt
-01  dataclass 当 config —— 所有训练脚本的入口就长这样
-要求: 定义 TrainConfig，字段与默认值:
-  lr=3e-4(float)  batch_size=32(int)  n_layer=6(int)
-  device="cuda"(str)  betas=(0.9, 0.95)(tuple)
-  tags=[] (list，注意：可变默认值不能直接写 []，会报错，要用 field)
-再加一个方法 scaled_lr(self, k) 返回 self.lr * k
+定义一个 dataclass `TrainConfig`，字段和默认值如下：
+
+- `lr: float = 3e-4`
+- `batch_size: int = 32`
+- `n_layer: int = 6`
+- `device: str = "cuda"`
+- `betas: tuple = (0.9, 0.95)`
+- `tags: list`，默认是空列表。不能直接写 `= []`（dataclass 会报错），要写成 `field(default_factory=list)`，这样每个实例都有自己的新列表。
+
+再加一个方法 `scaled_lr(self, k)`，返回 `self.lr * k`。
+
+```
+TrainConfig().batch_size          ->  32
+TrainConfig(lr=1e-3).scaled_lr(2) ->  0.002
+```
 --- starter
+from dataclasses import dataclass, field
+
 @dataclass
 class TrainConfig:
     lr: float = 3e-4
+    # 接着写 batch_size、n_layer、device、betas、tags
+    # 最后加方法 scaled_lr(self, k)
 --- solution
+from dataclasses import dataclass, field
+
 @dataclass
 class TrainConfig:
     lr: float = 3e-4
@@ -36,74 +417,106 @@ class TrainConfig:
     n_layer: int = 6
     device: str = "cuda"
     betas: tuple = (0.9, 0.95)
-    tags: list = field(default_factory=list)   # 可变默认值必须走 default_factory
+    tags: list = field(default_factory=list)   # 可变默认值必须用 default_factory
 
     def scaled_lr(self, k):
         return self.lr * k
 --- tests
-@check("dataclass 当 config")
-def t01():
+@check("默认值都对")
+def t01a():
     c = TrainConfig()
-    true(c.lr == 3e-4, "lr 默认值不对")
-    true(c.batch_size == 32 and c.n_layer == 6, "batch_size / n_layer 不对")
-    true(c.device == "cuda", "device 不对")
-    true(c.betas == (0.9, 0.95), "betas 不对")
+    true(c.lr == 3e-4, f"lr 默认值应为 3e-4，你的: {c.lr!r}")
+    true(c.batch_size == 32 and c.n_layer == 6, f"batch_size / n_layer 应为 32 / 6，你的: {c.batch_size!r} / {c.n_layer!r}")
+    true(c.device == "cuda", f"device 默认值应为 'cuda'，你的: {c.device!r}")
+    true(c.betas == (0.9, 0.95), f"betas 默认值应为 (0.9, 0.95)，你的: {c.betas!r}")
+
+@check("两个实例不共用同一个 tags 列表")
+def t01b():
     a, b = TrainConfig(), TrainConfig()
     a.tags.append("x")
     true(b.tags == [], "两个实例共享了同一个 list —— 这就是必须用 field(default_factory=list) 的原因")
-    true(close(TrainConfig(lr=1e-3).scaled_lr(2), 2e-3), "scaled_lr 不对")
+
+@check("scaled_lr(k) 返回 lr * k")
+def t01c():
+    got = TrainConfig(lr=1e-3).scaled_lr(2)
+    true(close(got, 2e-3), f"TrainConfig(lr=1e-3).scaled_lr(2) 应为 0.002，你的: {got!r}")
 --- hints
-- TODO
+- 每个字段一行：`名字: 类型 = 默认值`，照着 `lr` 那一行往下写。
+- 列表字段写成 `tags: list = field(default_factory=list)`，`field` 已经在第一行导入了。
+- 方法和普通 class 里一样写，注意缩进在 class 里面：`def scaled_lr(self, k):`，下一行 `return self.lr * k`。
 
 @@ item d1-02
 type: code
 title: 切片: chunk
 level: 2
+cards: 切片和循环：含头不含尾
 targets: chunk
 ref: day1
 --- context
-TODO
+训练语言模型时，一长串 token 要切成一段段等长的样本。长度不一样的段没法拼成一个 batch，所以末尾凑不满的那一截通常直接丢掉。
 --- prompt
-02  切片 —— 把一个序列切成固定长度的块，最后不足的丢掉
+写 `chunk(seq, n)`：把序列 `seq` 按顺序切成每段 `n` 个元素，返回这些段组成的 list。最后凑不满 `n` 个的那一截丢掉。
+
+```
+chunk([0, 1, 2, 3, 4, 5, 6], 3)  ->  [[0, 1, 2], [3, 4, 5]]    # 6 凑不满 3 个，丢掉
+chunk("abcdefg", 2)              ->  ["ab", "cd", "ef"]
+chunk([], 3)                     ->  []
+```
+
+要求：用切片取每一段，这样 list 和字符串都能用（字符串切出来还是字符串）。返回一个真正的 list。
 --- starter
 def chunk(seq, n):
-    """chunk([0,1,2,3,4,5,6], 3) -> [[0,1,2],[3,4,5]]   (7 号元素被丢掉)"""
-    # --- TODO 02 ---
-    for chunk in range(0, len(seq), n):
-        if chunk + n <= len(seq):
-            yield seq[chunk:chunk+n]
+    """chunk([0, 1, 2, 3, 4, 5, 6], 3) -> [[0, 1, 2], [3, 4, 5]]（最后的 6 凑不满 3 个，丢掉）"""
     raise todo()
 --- solution
 def chunk(seq, n):
     return [seq[i:i + n] for i in range(0, len(seq) - n + 1, n)]
 --- tests
-@check("切片: chunk")
-def t02():
-    true(chunk(list(range(7)), 3) == [[0, 1, 2], [3, 4, 5]])
-    true(chunk(list(range(6)), 3) == [[0, 1, 2], [3, 4, 5]])
-    true(chunk([], 3) == [])
-    true(chunk("abcdefg", 2) == ["ab", "cd", "ef"], "对字符串也要能用（切片是通用的）")
+@check("list：每 n 个一段，末尾凑不满的丢掉")
+def t02a():
+    got = chunk(list(range(7)), 3)
+    true(got == [[0, 1, 2], [3, 4, 5]], f"chunk(list(range(7)), 3) 应为 [[0, 1, 2], [3, 4, 5]]，你的: {got!r}")
+    got = chunk(list(range(6)), 3)
+    true(got == [[0, 1, 2], [3, 4, 5]], f"chunk(list(range(6)), 3) 应为 [[0, 1, 2], [3, 4, 5]]，你的: {got!r}")
+    got = chunk([], 3)
+    true(got == [], f"chunk([], 3) 应为 []，你的: {got!r}")
+
+@check("字符串也能切")
+def t02b():
+    got = chunk("abcdefg", 2)
+    true(got == ["ab", "cd", "ef"], f"对字符串也要能用（切片是通用的）：chunk('abcdefg', 2) 应为 ['ab', 'cd', 'ef']，你的: {got!r}")
 --- hints
-- TODO
+- 每一段的起点是 0、n、2n、……，`range(0, len(seq), n)` 能一个个给出这些起点。起点为 `i` 的那一段是 `seq[i:i + n]`。
+- 最后一段可能不满 n 个：用 `len(piece) == n` 判断一下再收；或者让 range 在 `len(seq) - n + 1` 停下，这样最后一个起点后面一定还有 n 个。
+- 循环写法：先 `out = []`，对每个起点取 `piece = seq[i:i + n]`，满 n 个才 `out.append(piece)`，最后 `return out`。
 
 @@ item d1-03
 type: code
 title: 下一 token 预测的 x / y 错位
-level: 2
+level: 1
+cards: 切片和循环：含头不含尾
 targets: make_xy
 ref: day1
 --- context
-TODO
+语言模型的训练目标是「预测下一个 token」。输入 x 和答案 y 来自同一段数据，y 只是往右错一位。这一位错了，模型会直接抄答案：loss 很快掉到接近 0，却什么都没学会，而且不报任何错。
 --- prompt
-03  下一 token 预测的数据长什么样 —— 纯 Python 版，明天用张量重写一遍
+写 `make_xy(data, i, block_size)`：从位置 `i` 取一个训练样本，返回 `(x, y)` 两个 list：
+
+- `x = data[i : i + block_size]`
+- `y` 和 `x` 一样长，但整体往右挪一位：`y` 的每个元素，是 `x` 同一位置元素在 `data` 里的「下一个」。
+
+```
+data = list(range(20))
+make_xy(data, 3, 5)  ->  ([3, 4, 5, 6, 7], [4, 5, 6, 7, 8])
+```
+
+这是纯 Python 版。第 3 天的 `get_batch` 会用张量一次取一整个 batch，做的是同一件事。
 --- starter
 def make_xy(data, i, block_size):
-    """从位置 i 取一个训练样本。
+    """从位置 i 取一个训练样本，返回 (x, y)，两个都是长度 block_size 的 list。
     x = data[i : i+block_size]
-    y = x 右移一位（也就是每个位置的"下一个"）
-    返回 (x, y)，两个都是长度 block_size 的 list。
+    y = x 右移一位（每个位置的「下一个」）
     """
-    # --- TODO 03 ---
     raise todo()
 --- solution
 def make_xy(data, i, block_size):
@@ -111,35 +524,47 @@ def make_xy(data, i, block_size):
     y = data[i + 1:i + 1 + block_size]
     return x, y
 --- tests
-@check("下一 token 预测的 x / y 错位")
-def t03():
-    d = list(range(20))
-    x, y = make_xy(d, 3, 5)
-    true(x == [3, 4, 5, 6, 7], f"x 不对: {x}")
-    true(y == [4, 5, 6, 7, 8], f"y 不对: {y}  —— y 是 x 右移一位，不是 x 本身")
-    true(len(x) == len(y) == 5)
+@check("x 是从 i 开始的 block_size 个")
+def t03a():
+    x, y = make_xy(list(range(20)), 3, 5)
+    true(x == [3, 4, 5, 6, 7], f"x 应为 [3, 4, 5, 6, 7]，你的: {x}")
+
+@check("y 是 x 右移一位，长度相同")
+def t03b():
+    x, y = make_xy(list(range(20)), 3, 5)
+    true(y == [4, 5, 6, 7, 8], f"y 应为 [4, 5, 6, 7, 8]，你的: {y}  —— y 是 x 右移一位，不是 x 本身")
+    true(len(x) == len(y) == 5, f"x 和 y 都应该有 5 个元素，你的: {len(x)} 和 {len(y)}")
 --- hints
-- TODO
+- x 直接照题目写：`x = data[i:i + block_size]`。
+- y 的起点和终点都比 x 大 1：`data[i + 1 : ...]`。
+- 最后 `return x, y`，一次返回两个值。
 
 @@ item d1-04
 type: code
 title: dict 计数与排序
 level: 2
+cards: dict：计数和排序; 切片和循环：含头不含尾
 targets: char_freq, top_k
 ref: day1
 --- context
-TODO
+做分词器（tokenizer）的第一步，就是数每个字符出现几次，再按次数排序，决定谁先进词表。BPE 分词器每一轮也是「数一数，挑出现最多的那一对」。
 --- prompt
-04  dict 计数 + 推导式
+写两个函数：
+
+1. `char_freq(text)`：数出字符串 `text` 里每个字符出现几次，返回 dict `{字符: 次数}`。不许用 `collections.Counter`，自己用 dict 数。
+2. `top_k(freq, k)`：拿上面那样的 dict，按次数从多到少排，返回前 `k` 个 `(字符, 次数)` 元组组成的 list。次数一样时，字符小的排前面（`"b"` 排在 `"r"` 前面）。
+
+```
+f = char_freq("abracadabra")   ->  {"a": 5, "b": 2, "r": 2, "c": 1, "d": 1}
+top_k(f, 3)                    ->  [("a", 5), ("b", 2), ("r", 2)]
+```
 --- starter
 def char_freq(text):
     """统计每个字符出现次数，返回 dict。不许用 collections.Counter。"""
-    # --- TODO 04 ---
     raise todo()
 
 def top_k(freq, k):
     """按次数从高到低返回前 k 个 (字符, 次数)。次数相同时按字符升序。"""
-    # --- TODO 04b ---
     raise todo()
 --- solution
 def char_freq(text):
@@ -151,37 +576,55 @@ def char_freq(text):
 def top_k(freq, k):
     return sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[:k]
 --- tests
-@check("dict 计数与排序")
-def t04():
+@check("char_freq 数对了每个字符")
+def t04a():
     f = char_freq("abracadabra")
-    true(f == {"a": 5, "b": 2, "r": 2, "c": 1, "d": 1}, f"计数不对: {f}")
-    true(top_k(f, 3) == [("a", 5), ("b", 2), ("r", 2)], f"top_k 不对: {top_k(f, 3)}")
+    want = {"a": 5, "b": 2, "r": 2, "c": 1, "d": 1}
+    true(f == want, f"char_freq('abracadabra') 应为 {want}，你的: {f}")
+
+@check("top_k：次数从多到少，次数一样按字符")
+def t04b():
+    f = {"a": 5, "b": 2, "r": 2, "c": 1, "d": 1}
+    got = top_k(f, 3)
+    want = [("a", 5), ("b", 2), ("r", 2)]
+    true(got == want, f"top_k(f, 3) 应为 {want}，你的: {got}")
 --- hints
-- TODO
+- 计数：先 `f = {}`，对 text 里的每个字符 `ch` 写 `f[ch] = f.get(ch, 0) + 1`，最后 `return f`。
+- `freq.items()` 给出 `(字符, 次数)` 对；`sorted(..., key=...)` 按 key 算出的值从小到大排。次数大的要在前，key 里给次数取负号。
+- `key=lambda kv: (-kv[1], kv[0])`：先按次数从大到小，一样再按字符。排好以后切片 `[:k]` 取前 k 个。
 
 @@ item d1-05
 type: code
 title: class: __init__ / __call__
 level: 2
+cards: class：self、__init__ 和 __call__; 继承、super() 和 @property
 targets: RunningMean
 ref: day1
 --- context
-TODO
+训练时每一步都有一个 loss，打印时看的是一段时间的平均。这种「边喂数边记状态」的小工具最适合写成 class：总和、个数挂在 self 上，`m(loss)` 调一次更新一次，和 `model(x)` 是同一个机制。
 --- prompt
-05  class 的最小集: __init__ / self / __call__
+写一个 class `RunningMean`，算「到目前为止喂进来的所有数的平均值」：
+
+- `m = RunningMean()`：新建时，个数 `m.n` 是 `0`，平均值 `m.value` 是 `0.0`。
+- `m(x)`：像函数一样调用对象，就把数字 `x` 记进去（要写 `__call__`）。返回值不检查，参考答案返回当前平均值。
+- `m.value`：当前平均值，读的时候**不带括号**。
+- `m.n`：已经记了几个数。
+- `m.reset()`：清空，回到新建时的状态。
+
+```
+m = RunningMean()
+m(1.0); m(3.0)
+m.value   ->  2.0
+m.n       ->  2
+m.reset()
+m.value   ->  0.0
+```
 --- starter
 class RunningMean:
-    """滑动统计器。用法:
-        m = RunningMean()
-        m(1.0); m(3.0)
-        m.value  -> 2.0
-        m.n      -> 2
-        m.reset(); m.value -> 0.0
-    """
-
-    # --- TODO 05 ---
     def __init__(self):
         raise todo()
+
+    # 还要写：reset、__call__、value
 --- solution
 class RunningMean:
     def __init__(self):
@@ -200,37 +643,62 @@ class RunningMean:
     def value(self):
         return self.total / self.n if self.n else 0.0
 --- tests
-@check("class: __init__ / __call__")
-def t05():
+@check("新建时 n = 0，value = 0.0")
+def t05a():
     m = RunningMean()
-    true(m.value == 0.0 and m.n == 0, "初始状态不对")
+    true(not callable(m.value), "value 是个普通方法 —— 在它上面加一行 @property，读的时候就不用写括号")
+    true(m.value == 0.0 and m.n == 0, f"新建时应该 n == 0、value == 0.0，你的: n={m.n!r}, value={m.value!r}")
+
+@check("m(1.0); m(3.0) 之后 value = 2.0，n = 2")
+def t05b():
+    m = RunningMean()
     m(1.0)
     m(3.0)
-    true(close(m.value, 2.0), f"均值不对: {m.value}")
-    true(m.n == 2)
+    true(close(m.value, 2.0), f"均值应为 2.0，你的: {m.value}")
+    true(m.n == 2, f"n 应为 2，你的: {m.n}")
+
+@check("reset() 回到新建时的状态")
+def t05c():
+    m = RunningMean()
+    m(1.0)
+    m(3.0)
     m.reset()
-    true(m.value == 0.0 and m.n == 0, "reset 不对")
+    true(m.value == 0.0 and m.n == 0, f"reset() 之后应该 n == 0、value == 0.0，你的: n={m.n!r}, value={m.value!r}")
 --- hints
-- TODO
+- 要记住的东西挂到 self 上：总和 `self.total = 0.0`、个数 `self.n = 0`。`reset()` 做的是同一件事，所以 `__init__` 里直接调 `self.reset()` 就行。
+- `def __call__(self, x):` 里把 x 加进 `self.total`，`self.n` 加 1。
+- `value` 写成方法，上面加 `@property`：返回 `self.total / self.n`，但 `n` 为 0 时要返回 `0.0`，不然会除以 0。
 
 @@ item d1-06
 type: code
 title: 继承与 super()
-level: 2
+level: 3
+cards: 继承、super() 和 @property; class：self、__init__ 和 __call__
 targets: EMAMean
 ref: day1
 --- context
-TODO
+每个 PyTorch 模型都是继承 `nn.Module` 写出来的：父类提供现成的功能，你只改需要的部分，而且 `__init__` 第一行一定是 `super().__init__()`。这道题用一个小例子练同一个套路。
 --- prompt
-06  继承 + super()  —— nn.Module 全靠这个
+写子类 `EMAMean(RunningMean)`：指数滑动平均（EMA）。越新的数权重越大，训练日志里常用它把抖动的 loss 曲线变平滑。
+
+父类 `RunningMean` 用的是上一题的参考答案，已经放在隐藏的准备代码里，直接继承就行（上一题没做完也不影响这题）。
+
+- `EMAMean(decay=0.9)`：`__init__` 里第一件事是调 `super().__init__()`，父类的 `n` 才会被建出来；再把 `decay` 存到 self 上。
+- `e(x)`：第一次调用时，EMA 值直接等于 `x`；之后每次：`新值 = decay * 旧值 + (1 - decay) * x`。每调用一次 `n` 加 1，和父类一样。
+- `e.value`：当前的 EMA 值；还没喂过数时是 `0.0`。
+
+```
+e = EMAMean(decay=0.5)
+e(1.0)     # value = 1.0（第一次直接等于 x）
+e(3.0)     # value = 0.5 * 1.0 + 0.5 * 3.0 = 2.0
+e.n   ->  2
+```
+
+注意：父类的 `value` 是 `@property`，只能读，不能赋值（写 `self.value = ...` 会报错）。所以把 EMA 值存在另一个属性里（比如 `self._v`），再在子类里重写 `value` 这个 property，把它返回。
+
+加分（不检查）：重写 `reset()`，先 `super().reset()`，再把 `self._v` 清成 `None`。
 --- starter
 class EMAMean(RunningMean):
-    """指数滑动平均。__init__(self, decay=0.9) 里必须调 super().__init__()。
-    调用时: value = decay * value + (1 - decay) * x   （第一次直接等于 x）
-    n 的行为和父类一样，继续累加。
-    """
-
-    # --- TODO 06 ---
     pass
 --- solution
 class EMAMean(RunningMean):
@@ -253,33 +721,61 @@ class EMAMean(RunningMean):
         super().reset()
         self._v = None
 --- tests
-@check("继承与 super()")
-def t06():
+@check("__init__ 里调了 super().__init__()")
+def t06a():
     e = EMAMean(decay=0.5)
     true(hasattr(e, "n"), "忘了调 super().__init__()，父类的 n 没建出来")
+
+@check("第一次等于 x，之后 decay * 旧值 + (1 - decay) * x")
+def t06b():
+    e = EMAMean(decay=0.5)
     e(1.0)
-    true(close(e.value, 1.0), "第一次应该直接等于 x")
+    true(close(e.value, 1.0), f"第一次应该直接等于 x（1.0），你的: {e.value}")
     e(3.0)
-    true(close(e.value, 2.0), f"EMA 不对: {e.value}")
-    true(e.n == 2, "n 应该由父类逻辑继续累加")
+    true(close(e.value, 2.0), f"第二次应为 0.5 * 1.0 + 0.5 * 3.0 = 2.0，你的: {e.value}")
+
+@check("n 和父类一样继续累加")
+def t06c():
+    e = EMAMean(decay=0.5)
+    e(1.0)
+    e(3.0)
+    true(e.n == 2, f"调用两次后 n 应为 2，你的: {e.n}（n 由父类的 __init__ 建出来，每次调用加 1）")
 --- hints
-- TODO
+- `def __init__(self, decay=0.9):` 第一行 `super().__init__()`，然后 `self.decay = decay`、`self._v = None`（None 表示「还没喂过数」）。
+- `__call__` 里：如果 `self._v is None` 就让 `self._v = x`，否则按公式更新；最后 `self.n += 1`。
+- 重写 value：`@property` 下面写 `def value(self):`，返回 `0.0 if self._v is None else self._v`。
 
 @@ item d1-07
 type: code
 title: @property
-level: 2
+level: 1
+cards: 继承、super() 和 @property
 targets: Budget
 ref: day1
 --- context
-TODO
+训练代码里有很多「由别的值算出来」的量：训练进度、是不是该停了。写成 @property，读的时候像普通属性，而且每次都现算，永远和原始数据同步，不会忘了更新。
 --- prompt
-07  @property —— 只读的计算属性
+给下面的 `Budget` 加两个 property（只读、每次现算的属性）：
+
+- `progress`：返回 `step / total_steps`
+- `done`：返回 `step >= total_steps`（`True` 或 `False`）
+
+它们是属性，读的时候不带括号：
+
+```
+b = Budget(100, 25)
+b.progress   ->  0.25
+b.done       ->  False
+b.step = 100
+b.done       ->  True     # step 改了，done 自动跟着变
+```
 --- starter
 class Budget:
     def __init__(self, total_steps, step=0):
         self.total_steps = total_steps
         self.step = step
+
+    # 在这里加 progress 和 done 两个 property
 --- solution
 class Budget:
     def __init__(self, total_steps, step=0):
@@ -294,33 +790,56 @@ class Budget:
     def done(self):
         return self.step >= self.total_steps
 --- tests
-@check("@property")
-def t07():
+@check("progress 是属性，等于 step / total_steps")
+def t07a():
     b = Budget(100, 25)
-    true(close(b.progress, 0.25), "progress 不对（注意：是属性不是方法，不要写成 b.progress()）")
-    true(b.done is False)
+    true(not callable(b.progress), "progress 是个普通方法 —— 在它上面加一行 @property，读的时候不带括号")
+    true(close(b.progress, 0.25), f"Budget(100, 25).progress 应为 0.25，你的: {b.progress}")
+
+@check("done 跟着 step 变")
+def t07b():
+    b = Budget(100, 25)
+    true(b.done is False, f"step=25、total_steps=100 时 done 应为 False，你的: {b.done!r}")
     b.step = 100
-    true(b.done is True)
+    true(b.done is True, f"step 改成 100 以后 done 应为 True，你的: {b.done!r}（要每次读的时候现算，不要在 __init__ 里算好存起来）")
 --- hints
-- TODO
+- 先写一个普通方法 `def progress(self): return self.step / self.total_steps`，再在它上面一行加 `@property`。
+- `done` 同理。比较的结果 `self.step >= self.total_steps` 本身就是 True 或 False，直接 return，不用写 if。
 
 @@ item d1-08
 type: code
 title: *args / **kwargs 与装饰器
-level: 2
+level: 3
+cards: *args / **kwargs 和装饰器
 targets: logged
 ref: day1
 --- context
-TODO
+模型代码里到处是 `@torch.no_grad()`、`@dataclass` 这种 @ 开头的一行，它们都是装饰器：接收一个函数，返回包了一层的新函数。自己写一次，以后读任何装饰器都不怕；用 `*args, **kwargs` 原样转发参数的写法也会反复见到。
 --- prompt
-TODO
+写装饰器 `logged(fn)`。被它装饰的函数，每次被调用时：
+
+1. 先把元组 `(函数名, args, kwargs)` 追加到全局列表 `CALLS` 里。`CALLS = []` 已经在隐藏的准备代码里建好了，直接用。
+2. 再用同样的参数调用原函数，把结果原样返回。
+
+要能装饰任何参数形式的函数，而且装饰以后函数名不变（`add.__name__` 还是 `"add"`）。
+
+```
+@logged
+def add(a, b, scale=1):
+    return (a + b) * scale
+
+add(1, 2)             ->  3     CALLS 里多了 ("add", (1, 2), {})
+add(1, 2, scale=10)   ->  30    CALLS 里多了 ("add", (1, 2), {"scale": 10})
+```
 --- starter
+import functools
+
 def logged(fn):
-    """装饰器: 调用时把 (函数名, args, kwargs) 追加到 CALLS，然后原样调用并返回结果。
-    必须能装饰任意签名的函数。"""
-    # --- TODO 08 ---
+    """装饰器：调用时把 (函数名, args, kwargs) 追加到 CALLS，然后原样调用 fn 并返回结果。"""
     raise todo()
 --- solution
+import functools
+
 def logged(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
@@ -328,72 +847,111 @@ def logged(fn):
         return fn(*args, **kwargs)
     return wrapper
 --- tests
-@check("*args / **kwargs 与装饰器")
-def t08():
+@check("返回值和原函数一样")
+def t08a():
+    @logged
+    def add(a, b, scale=1):
+        return (a + b) * scale
+
+    got = add(1, 2)
+    true(got == 3, f"add(1, 2) 应该返回 3，你的: {got!r}（wrapper 里有没有 return fn(*args, **kwargs)？）")
+    got = add(1, 2, scale=10)
+    true(got == 30, f"add(1, 2, scale=10) 应该返回 30，你的: {got!r}（按名字传的参数也要转发：**kwargs）")
+
+@check("CALLS 按顺序记下 (函数名, args, kwargs)")
+def t08b():
     CALLS.clear()
 
     @logged
     def add(a, b, scale=1):
         return (a + b) * scale
 
-    true(add(1, 2) == 3)
-    true(add(1, 2, scale=10) == 30)
+    add(1, 2)
+    add(1, 2, scale=10)
     true(CALLS == [("add", (1, 2), {}), ("add", (1, 2), {"scale": 10})], f"记录不对: {CALLS}")
-    true(add.__name__ == "add", "被装饰后函数名丢了 —— 用 @functools.wraps(fn)")
+
+@check("装饰以后函数名还是 add")
+def t08c():
+    @logged
+    def add(a, b, scale=1):
+        return (a + b) * scale
+
+    true(add.__name__ == "add", f"被装饰后函数名变成了 {add.__name__!r} —— 在 wrapper 上面加 @functools.wraps(fn)")
 --- hints
-- TODO
+- 骨架：在 `logged` 里面定义一个函数 `wrapper`，最后 `return wrapper`。`@logged` 等于 `add = logged(add)`，所以之后调用 add 就是在调用 wrapper。
+- `def wrapper(*args, **kwargs):` 能收下任何参数。里面先 `CALLS.append((fn.__name__, args, kwargs))`，再 `return fn(*args, **kwargs)`。
+- 在 `def wrapper` 上面一行加 `@functools.wraps(fn)`，函数名就保住了。
 
 @@ item d1-09
 type: code
 title: f-string 格式化
-level: 2
+level: 1
+cards: 训练脚本的外壳：dataclass、f-string、pathlib
 targets: log_line
 ref: day1
 --- context
-TODO
+训练时每隔几十步打印一行日志，你要一眼看出 loss 在不在降、每步有多慢。数字对齐、位数固定，这些行上下排在一起才看得出趋势。
 --- prompt
-09  f-string 格式化 —— 训练日志天天写
+写 `log_line(step, loss, lr, dt)`，**返回**（不是 print）这样一行字符串：
+
+```
+step  1200 | loss 1.4832 | lr 3.00e-04 | 125.3ms
+```
+
+规则：
+
+- `step`：整数，右对齐，宽度 5（1200 只有 4 位，前面补一个空格）
+- `loss`：保留 4 位小数
+- `lr`：科学计数法，2 位小数
+- `dt`：传进来的单位是秒，要换成毫秒（乘 1000），保留 1 位小数，后面紧跟 `ms`
+- 各段之间用 ` | ` 隔开（竖线两边各一个空格）
+
+`log_line(1200, 1.48321, 3e-4, 0.12534)` 要和上面那行一字不差。
 --- starter
 def log_line(step, loss, lr, dt):
-    """输出形如:
-        step  1200 | loss 1.4832 | lr 3.00e-04 | 125.3ms
-    规则: step 右对齐宽度 5；loss 保留 4 位小数；lr 用科学计数 2 位小数；
-          dt 传入的是秒，要转成毫秒保留 1 位小数并加 'ms'。
-    """
-    # --- TODO 09 ---
+    """返回形如  step  1200 | loss 1.4832 | lr 3.00e-04 | 125.3ms  的字符串。"""
     raise todo()
 --- solution
 def log_line(step, loss, lr, dt):
     return f"step {step:5d} | loss {loss:.4f} | lr {lr:.2e} | {dt * 1000:.1f}ms"
 --- tests
-@check("f-string 格式化")
+@check("日志格式一字不差")
 def t09():
     got = log_line(1200, 1.48321, 3e-4, 0.12534)
     want = "step  1200 | loss 1.4832 | lr 3.00e-04 | 125.3ms"
     true(got == want, f"\n       你的: {got!r}\n       应为: {want!r}")
 --- hints
-- TODO
+- `{}` 里冒号后面写格式：`{step:5d}` 是宽度 5 的整数，`{loss:.4f}` 是 4 位小数，`{lr:.2e}` 是科学计数法。
+- `{}` 里可以先算再格式化：`{dt * 1000:.1f}ms`。
+- 整行是一个 f-string：`return f"step {step:5d} | loss {loss:.4f} | ..."`。用 return，不要用 print，判题拿的是返回值。
 
 @@ item d1-10
 type: code
 title: zip / enumerate
 level: 2
+cards: 切片和循环：含头不含尾
 targets: deltas, label_pairs
 ref: day1
 --- context
-TODO
+训练时常要看「相邻两步」的变化（这一步的 loss 比上一步降了多少），或者给一串结果编上号打印出来。用 `zip` 和 `enumerate` 就不用手写下标，少一类「差一位」的 bug。
 --- prompt
-10  zip / enumerate
+写两个函数：
+
+1. `deltas(xs)`：返回相邻两个数的差（后一个减前一个）。用 `zip`，不要用下标 `xs[i]`。
+2. `label_pairs(names, values)`：`names` 和 `values` 一样长。把它们按位置配成对并编号，返回字符串 list，格式是 `"序号:名字=值"`，序号从 0 开始。
+
+```
+deltas([3, 5, 4])                  ->  [2, -1]
+deltas([1])                        ->  []
+label_pairs(["a", "b"], [1, 2])    ->  ["0:a=1", "1:b=2"]
+```
 --- starter
 def deltas(xs):
-    """相邻差: [3, 5, 4] -> [2, -1]。用 zip，不要用索引。"""
-    # --- TODO 10 ---
+    """相邻差: [3, 5, 4] -> [2, -1]。用 zip，不要用下标。"""
     raise todo()
 
 def label_pairs(names, values):
-    """[("a",1),("b",2)] 这种，但要带序号:
-    ["0:a=1", "1:b=2"]。names 和 values 等长。"""
-    # --- TODO 10b ---
+    """带序号的配对: (["a", "b"], [1, 2]) -> ["0:a=1", "1:b=2"]"""
     raise todo()
 --- solution
 def deltas(xs):
@@ -402,63 +960,115 @@ def deltas(xs):
 def label_pairs(names, values):
     return [f"{i}:{n}={v}" for i, (n, v) in enumerate(zip(names, values))]
 --- tests
-@check("zip / enumerate")
-def t10():
-    true(deltas([3, 5, 4]) == [2, -1])
-    true(deltas([1]) == [])
-    true(label_pairs(["a", "b"], [1, 2]) == ["0:a=1", "1:b=2"])
+@check("deltas：相邻两个数的差")
+def t10a():
+    got = deltas([3, 5, 4])
+    true(got == [2, -1], f"deltas([3, 5, 4]) 应为 [2, -1]，你的: {got!r}")
+    got = deltas([1])
+    true(got == [], f"只有一个数时没有相邻的一对，deltas([1]) 应为 []，你的: {got!r}")
+
+@check("label_pairs：编号 + 配对")
+def t10b():
+    got = label_pairs(["a", "b"], [1, 2])
+    true(got == ["0:a=1", "1:b=2"], f"label_pairs(['a', 'b'], [1, 2]) 应为 ['0:a=1', '1:b=2']，你的: {got!r}")
 --- hints
-- TODO
+- `zip(xs, xs[1:])` 正好给出所有相邻对 `(前, 后)`：`[3, 5, 4]` 给出 `(3, 5)` 和 `(5, 4)`。用推导式 `[b - a for a, b in ...]`。
+- `zip(names, values)` 把两个列表配成对；外面再套一层 `enumerate(...)`，就多了一个从 0 开始的序号：`for i, (n, v) in enumerate(zip(names, values))`。
+- 每个字符串用 f-string 拼：`f"{i}:{n}={v}"`。
 
 @@ item d1-11
 type: code
 title: pathlib 与目录创建
-level: 2
+level: 1
+cards: 训练脚本的外壳：dataclass、f-string、pathlib
 targets: ckpt_path
 ref: day1
 --- context
-TODO
+训练几个小时会存下很多 checkpoint。路径用 pathlib 拼，Windows 和 Linux 都不出错；目录不存在要先建；步数补零到固定位数，按名字排序时顺序才对（不然 ckpt_10 会排在 ckpt_9 前面）。
 --- prompt
-11  pathlib —— checkpoint 路径管理
+写 `ckpt_path(root, run_name, step)`：
+
+- 返回一个 `Path` 对象：`root / run_name / ckpt_000500.pt`，文件名里的步数补零到 6 位（`step=500` 写成 `000500`）。
+- 返回之前，确保目录 `root / run_name` 已经存在：不存在就建出来，上级目录不存在也要一起建；已经存在也不能报错。
+- `root` 可能是字符串，先用 `Path(root)` 包一下。
+
+```
+p = ckpt_path(root, "gpt-tiny", 500)
+p.name          ->  "ckpt_000500.pt"
+p.parent.name   ->  "gpt-tiny"
+p.parent.is_dir()  ->  True
+```
 --- starter
+from pathlib import Path
+
 def ckpt_path(root, run_name, step):
-    """返回 Path 对象: root/run_name/ckpt_000500.pt   (step 补零到 6 位)
-    同时要保证 root/run_name 这个目录被创建出来（父目录不存在也要一起建）。"""
-    # --- TODO 11 ---
+    """返回 Path: root/run_name/ckpt_000500.pt（step 补零到 6 位），并确保 root/run_name 目录存在。"""
     raise todo()
 --- solution
+from pathlib import Path
+
 def ckpt_path(root, run_name, step):
     d = Path(root) / run_name
     d.mkdir(parents=True, exist_ok=True)
     return d / f"ckpt_{step:06d}.pt"
 --- tests
-@check("pathlib 与目录创建")
-def t11():
+@check("返回 Path，文件名是 ckpt_000500.pt")
+def t11a():
     import tempfile, shutil
     tmp = tempfile.mkdtemp()
     try:
         p = ckpt_path(tmp, "gpt-tiny", 500)
-        true(isinstance(p, Path), "要返回 Path 对象，不是 str")
-        true(p.name == "ckpt_000500.pt", f"文件名不对: {p.name}")
+        true(isinstance(p, Path), f"要返回 Path 对象，不是 {type(p).__name__}")
+        true(p.name == "ckpt_000500.pt", f"文件名应为 ckpt_000500.pt，你的: {p.name}")
+        true(p.parent.name == "gpt-tiny", f"文件应该在 gpt-tiny 目录里，你的在: {p.parent.name}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+@check("目录建出来了（上级不存在也建，已存在不报错）")
+def t11b():
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        p = ckpt_path(tmp, "gpt-tiny", 500)
         true(p.parent.is_dir(), "父目录没建出来（用 mkdir(parents=True, exist_ok=True)）")
-        true(p.parent.name == "gpt-tiny")
+        try:
+            p = ckpt_path(Path(tmp) / "runs", "gpt-tiny", 500)
+        except FileNotFoundError:
+            true(False, "root 本身还不存在时报错了：要连上级目录一起建（mkdir 加 parents=True）")
+        true(p.parent.is_dir(), "root 本身还不存在时，要连它一起建出来（mkdir 加 parents=True）")
+        try:
+            ckpt_path(tmp, "gpt-tiny", 600)
+        except FileExistsError:
+            true(False, "目录已经存在时报错了（mkdir 加 exist_ok=True）")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 --- hints
-- TODO
+- 用 `/` 拼路径：`d = Path(root) / run_name`。
+- 建目录：`d.mkdir(parents=True, exist_ok=True)`。`parents=True` 连上级一起建，`exist_ok=True` 已存在不报错。
+- 文件名：`f"ckpt_{step:06d}.pt"`（宽度 6，前面补 0），最后 `return d / 文件名`。
 
 @@ item d1-12
 type: fix
 title: 找 bug: bucket_by_len
 level: 2
+cards: 赋值是贴标签，不是复制; 切片和循环：含头不含尾
 targets: bucket_by_len
 ref: day1
 --- context
-TODO
+把长度相同的样本放进同一个桶，一个 batch 里就不用补太多 padding（为了对齐长度而填充的无用 token），训练更快。这段代码里有 Python 最经典的坑：可变默认参数，第二次调用会带着上一次的结果。
 --- prompt
-12  找 bug —— 下面这段有 3 个错误，修到测试过为止
-意图: 把一批样本按长度分桶，每桶最多 bucket_size 个，返回 {长度: [样本, ...]}
-      桶满了就丢弃后来的，不要报错。
+下面的 `bucket_by_len` 本来想做的是：
+
+- 把样本按长度分桶，返回 `{长度: [样本, ...]}`
+- 每个桶最多放 `bucket_size` 个；桶满了，后来的同长度样本直接丢掉，**不报错**
+- 每次调用都从空桶开始，两次调用互不影响
+
+它有 3 处错误。修好它，让所有检查通过。
+
+```
+bucket_by_len(["ab", "cd", "ef", "xyz"], bucket_size=2)  ->  {2: ["ab", "cd"], 3: ["xyz"]}
+bucket_by_len(["q"])                                      ->  {1: ["q"]}
+```
 --- starter
 def bucket_by_len(samples, bucket_size=2, out={}):
     for s in samples:
@@ -470,24 +1080,250 @@ def bucket_by_len(samples, bucket_size=2, out={}):
     return out
 --- solution
 def bucket_by_len(samples, bucket_size=2):
-    out = {}                       # 修 1: 可变默认值挪进函数体
+    out = {}                       # 修 1：可变默认值挪进函数体，每次调用现建
     for s in samples:
         L = len(s)
         out.setdefault(L, [])
         if len(out[L]) >= bucket_size:
-            continue               # 修 2+3: 满了跳过，不 append 也不报错
+            continue               # 修 2 + 3：先检查再 append；满了就跳过，不报错
         out[L].append(s)
     return out
 --- tests
-@check("找 bug: bucket_by_len")
-def t12():
+@check("正常分桶，桶满了就丢")
+def t12a():
     got = bucket_by_len(["ab", "cd", "ef", "xyz"], bucket_size=2)
-    true(got == {2: ["ab", "cd"], 3: ["xyz"]}, f"结果不对: {got}")
-    # 陷阱 1: 默认参数如果写成可变对象会跨调用共享
+    true(got == {2: ["ab", "cd"], 3: ["xyz"]}, f"结果应为 {{2: ['ab', 'cd'], 3: ['xyz']}}，你的: {got}")
+
+@check("两次调用互不影响")
+def t12b():
+    bucket_by_len(["ab", "cd"])
     got2 = bucket_by_len(["q"])
-    true(got2 == {1: ["q"]}, f"第二次调用被上一次污染了: {got2}")
-    # 陷阱 2: 满了之后应该跳过，而不是报错
+    true(got2 == {1: ["q"]}, f"第二次调用被上一次污染了: {got2}（默认参数 out={{}} 只在定义函数时建一次）")
+
+@check("桶满了跳过，不报错")
+def t12c():
     got3 = bucket_by_len(["ab", "cd", "ef"], bucket_size=2)
-    true(got3 == {2: ["ab", "cd"]}, f"超出桶容量没被丢弃: {got3}")
+    true(got3 == {2: ["ab", "cd"]}, f"结果应为 {{2: ['ab', 'cd']}}（桶满了，'ef' 要被丢掉），你的: {got3}")
 --- hints
-- TODO
+- 先看参数表：`out={}` 这个 dict 在定义函数时就建好了，只建一次，每次调用都在往同一个里塞。把它挪进函数体：`out = {}`。
+- 再看顺序：现在是先 `append`、后检查满没满。应该先检查，满了就不放。
+- 「跳过这一个、接着看下一个」用 `continue`。先检查的话，满的条件是 `len(out[L]) >= bucket_size`。
+
+@@ item d1-13
+type: predict
+title: 预测输出：把 list 传进函数
+level: 2
+cards: 赋值是贴标签，不是复制
+--- context
+张量和模型也是「能就地修改」的对象。把它传进函数，函数拿到的是同一个东西，不是副本；函数里改了它，外面也跟着变。分不清这一点，会写出「我没动它，它怎么变了」的 bug。
+--- prompt
+不要运行，写出下面代码打印的 3 行。
+--- code
+def add_tag(tags):
+    tags.append("new")
+    return tags
+
+a = ["x"]
+b = add_tag(a)
+c = list(a)
+c.append("y")
+print(a)
+print(b is a, c is a)
+print(len(a), len(c))
+--- explain
+`add_tag(a)` 拿到的就是 a 那个列表（只是多贴了一个标签 `tags`），所以 `append("new")` 改的是 a 本身，返回的 b 也是它：`b is a` 为 True。`list(a)` 才真的复制出一个新列表，所以 `c is a` 为 False，往 c 里加 `"y"` 不影响 a。最后 a 有 2 个元素，c 有 3 个。
+--- hints
+- `add_tag` 里的 `tags` 和外面的 `a` 是不是同一个列表？
+- `list(a)` 会造出一个新列表；`is` 问的是「是不是同一个东西」，不是「值一样吗」。
+
+@@ item d1-14
+type: predict
+title: 预测输出：忘了 return 会怎样
+level: 1
+cards: 函数：return 才把结果交出去
+--- context
+函数里算对了，外面却拿到 `None`，是新手最常见的 bug。报错往往出现在后面好几行（`'NoneType'` 那种），离真正的原因很远。先练会一眼看出「这个函数有没有 return」。
+--- prompt
+不要运行，写出下面代码打印的 3 行。
+--- code
+def double(n):
+    n * 2
+
+def triple(n):
+    return n * 3
+    print(n)          # return 之后的代码不会执行
+
+print(double(5))
+print(triple(5))
+r = triple(2) + 1
+print(r)
+--- explain
+`double` 算了 `n * 2`，但没有 `return`，结果被扔掉了，所以返回 `None`。`triple` 遇到 `return` 就立刻结束，下面的 `print(n)` 永远不会执行，所以只有 3 行输出。`triple(2)` 是 6，加 1 得 7。
+--- hints
+- 没写 `return` 的函数返回什么？
+- `return` 之后的那行 `print(n)` 会执行吗？
+
+@@ item d1-15
+type: choice
+title: 读报错：NoneType 从哪来
+level: 1
+cards: 函数：return 才把结果交出去
+--- context
+报错要从下往上读：最后一行说「什么错」，上面几行说「在哪一行」。但报错的那一行常常只是受害者，真正的原因在更早的地方。会读报错，能省下大半调试时间。
+--- prompt
+训练脚本报了下面这个错。最可能的原因是什么？
+
+```text
+Traceback (most recent call last):
+  File "train.py", line 14, in <module>
+    total = scale(compute_loss(batch))
+  File "train.py", line 9, in scale
+    return v * 2
+TypeError: unsupported operand type(s) for *: 'NoneType' and 'int'
+```
+--- options
+- `scale` 里的 `v * 2` 写错了，应该写成 `v * 2.0`
+- `compute_loss` 忘了写 `return`，所以传进 `scale` 的 `v` 是 `None`
+- `batch` 是空的
+- `scale` 要挪到 `compute_loss` 前面定义
+answer: 2
+--- explain
+最后一行说：拿 `None` 去乘了一个整数。出事的地方是 `scale` 里的 `v * 2`，但 `v` 是从哪来的？是 `compute_loss(batch)` 的返回值。一个函数返回 `None`，最常见的原因就是忘了写 `return`。看到 `NoneType`，先找「这个值是哪个函数给的，那个函数有没有 return」。
+--- hints
+- 最后一行说 `*` 左边是 `NoneType`，也就是 `None`。那个 None 是谁？
+- `v` 是谁交给 `scale` 的？一个函数什么时候会返回 `None`？
+
+@@ item d1-16
+type: predict
+title: 预测输出：self 是谁
+level: 2
+cards: class：self、__init__ 和 __call__
+--- context
+两个模型用的是同一份 class 代码，却各有各的权重，靠的就是 self：调用方法时，点号左边的那个对象被当作 `self` 传进去。看懂这一点，读 PyTorch 代码时就不会再问「这个 self 是哪来的」。
+--- prompt
+不要运行，写出下面代码打印的 3 行。
+--- code
+class Counter:
+    def __init__(self, start):
+        self.n = start
+
+    def add(self, k):
+        self.n = self.n + k
+        return self.n
+
+a = Counter(0)
+b = Counter(100)
+a.add(5)
+a.add(5)
+print(a.n, b.n)
+print(Counter.add(b, 1))
+print(a.n, b.n)
+--- explain
+`a` 和 `b` 是照同一张图纸造的两个对象，各有各的 `n`。`a.add(5)` 时 self 就是 a，只改 `a.n`，加两次是 10，`b.n` 还是 100。`Counter.add(b, 1)` 就是 `b.add(1)` 的「手动版」：把 b 当作 self 传进去，所以 `b.n` 变成 101 并被返回。
+--- hints
+- `a.add(5)` 时，self 是 a 还是 b？
+- `Counter.add(b, 1)` 和 `b.add(1)` 是一回事。
+
+@@ item d1-17
+type: code
+title: 闭卷：RunningMean
+level: 2
+exam: yes
+cards: class：self、__init__ 和 __call__; 继承、super() 和 @property
+targets: RunningMean
+ref: day1
+--- context
+一个带状态的 class：数据挂在 self 上，`__call__` 让对象能被调用，`@property` 让算出来的值像属性一样读。`nn.Module`、优化器、日志统计器都是这个骨架。
+--- prompt
+不看卡片，从空白写出 class `RunningMean`：
+
+- `RunningMean()`：新建时 `n` 是 `0`，`value` 是 `0.0`
+- `m(x)`：记下数字 x
+- `m.value`：到目前为止的平均值（不带括号读）
+- `m.n`：记了几个数
+- `m.reset()`：回到新建时的状态
+--- starter
+class RunningMean:
+    def __init__(self):
+        raise todo()
+--- solution
+class RunningMean:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.total = 0.0
+        self.n = 0
+
+    def __call__(self, x):
+        self.total += float(x)
+        self.n += 1
+        return self.value
+
+    @property
+    def value(self):
+        return self.total / self.n if self.n else 0.0
+--- tests
+@check("新建时 n = 0，value = 0.0")
+def t05a():
+    m = RunningMean()
+    true(not callable(m.value), "value 是个普通方法 —— 在它上面加一行 @property，读的时候就不用写括号")
+    true(m.value == 0.0 and m.n == 0, f"新建时应该 n == 0、value == 0.0，你的: n={m.n!r}, value={m.value!r}")
+
+@check("m(1.0); m(3.0) 之后 value = 2.0，n = 2")
+def t05b():
+    m = RunningMean()
+    m(1.0)
+    m(3.0)
+    true(close(m.value, 2.0), f"均值应为 2.0，你的: {m.value}")
+    true(m.n == 2, f"n 应为 2，你的: {m.n}")
+
+@check("reset() 回到新建时的状态")
+def t05c():
+    m = RunningMean()
+    m(1.0)
+    m(3.0)
+    m.reset()
+    true(m.value == 0.0 and m.n == 0, f"reset() 之后应该 n == 0、value == 0.0，你的: n={m.n!r}, value={m.value!r}")
+--- hints
+- 需要记住的两样东西：总和和个数，都挂在 self 上。
+- `__call__` 负责更新，`value` 用 `@property` 现算，n 为 0 时返回 0.0。
+
+@@ item d1-18
+type: code
+title: 闭卷：make_xy
+level: 1
+exam: yes
+cards: 切片和循环：含头不含尾
+targets: make_xy
+ref: day1
+--- context
+「x 和往右错一位的 y」是所有语言模型训练数据的样子。闭着眼也要写对这个 +1。
+--- prompt
+不看卡片，从空白写出 `make_xy(data, i, block_size)`：从位置 `i` 取长度 `block_size` 的 x，y 是 x 往右错一位，返回 `(x, y)`。
+
+```
+make_xy(list(range(20)), 3, 5)  ->  ([3, 4, 5, 6, 7], [4, 5, 6, 7, 8])
+```
+--- starter
+def make_xy(data, i, block_size):
+    raise todo()
+--- solution
+def make_xy(data, i, block_size):
+    x = data[i:i + block_size]
+    y = data[i + 1:i + 1 + block_size]
+    return x, y
+--- tests
+@check("x 是从 i 开始的 block_size 个")
+def t03a():
+    x, y = make_xy(list(range(20)), 3, 5)
+    true(x == [3, 4, 5, 6, 7], f"x 应为 [3, 4, 5, 6, 7]，你的: {x}")
+
+@check("y 是 x 右移一位，长度相同")
+def t03b():
+    x, y = make_xy(list(range(20)), 3, 5)
+    true(y == [4, 5, 6, 7, 8], f"y 应为 [4, 5, 6, 7, 8]，你的: {y}  —— y 是 x 右移一位，不是 x 本身")
+    true(len(x) == len(y) == 5, f"x 和 y 都应该有 5 个元素，你的: {len(x)} 和 {len(y)}")
+--- hints
+- 切片含头不含尾：`data[i:i + block_size]` 正好 block_size 个。
+- y 的起点和终点都比 x 大 1。

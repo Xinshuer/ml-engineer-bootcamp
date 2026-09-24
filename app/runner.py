@@ -13,6 +13,7 @@ import io
 import json
 import linecache
 import os
+import re
 import sys
 import time
 import traceback
@@ -28,13 +29,18 @@ MSG = {
 
 
 # ---------------------------------------------------------------- the helpers every exercise can use
+class NotWrittenYet(BaseException):
+    """What `todo()` raises. Not an Exception (NotImplementedError is a RuntimeError), so a test that wraps the
+    learner's call in `except Exception` / `except RuntimeError` cannot swallow an unwritten starter."""
+
+
 def _helpers(lang):
     import torch
 
     zh = lang != "en"
 
     def todo(hint=""):
-        raise NotImplementedError(hint or MSG[lang]["todo"])
+        raise NotWrittenYet(hint or MSG[lang]["todo"])
 
     def eq(got, want, tol=1e-4, msg=""):
         """Compare numbers or tensors: the shape first, then the largest absolute difference."""
@@ -73,23 +79,88 @@ def _helpers(lang):
     return dict(todo=todo, eq=eq, shape_is=shape_is, true=true, close=close, seed=seed, params=params, trainable=trainable)
 
 
-def _reset_torch():
-    """Undo global state a previous run may have changed."""
+_BACKEND_FLAGS = None  # (getter, setter, value at start-up) for backend switches a run may flip
+_DYNAMO_DIRTY = False  # the last run may have used torch.compile
+
+
+def _backend_flags(torch):
+    b = torch.backends
+    pairs = [(lambda o=o, n=n: getattr(o, n), lambda v, o=o, n=n: setattr(o, n, v))
+             for o, n in ((b.cudnn, "benchmark"), (b.cudnn, "deterministic"), (b.cudnn, "allow_tf32"),
+                          (b.cuda.matmul, "allow_tf32"))]
+    pairs.append((torch.get_float32_matmul_precision, torch.set_float32_matmul_precision))
+    out = []
+    for get, put in pairs:
+        try:
+            out.append((get, put, get()))
+        except Exception:
+            pass
+    return out
+
+
+def _reset_torch(dynamo=False):
+    """Undo global state a previous run may have changed. Everything here runs before every run and every
+    check, so it only touches what changed (turning deterministic mode off, or resetting dynamo, costs ~40 ms)."""
+    global _BACKEND_FLAGS
+    import random
+
     import torch
 
+    if _BACKEND_FLAGS is None:
+        _BACKEND_FLAGS = _backend_flags(torch)
+    for get, put, start in _BACKEND_FLAGS:
+        try:
+            if get() != start:  # some of these print deprecation warnings when set
+                put(start)
+        except Exception:  # e.g. reading the precision after a run mixed the old and new TF32 APIs
+            pass
+    if dynamo and "torch._dynamo" in sys.modules:  # compiled code and "automatic dynamic" choices outlive a run
+        try:
+            sys.modules["torch._dynamo"].reset()
+        except Exception:
+            pass
+    random.seed(0)
+    if "numpy" in sys.modules:
+        sys.modules["numpy"].random.seed(0)
     torch.manual_seed(0)
     torch.set_default_dtype(torch.float32)
     torch.set_grad_enabled(True)
     try:
-        torch.set_default_device("cpu")
+        torch.set_default_device(None)  # not "cpu": that installs a Python hook every torch call then goes through
     except Exception:
         pass
     try:
-        torch.use_deterministic_algorithms(False)
+        if torch.are_deterministic_algorithms_enabled() or torch.is_deterministic_algorithms_warn_only_enabled():
+            torch.use_deterministic_algorithms(False)
     except Exception:
         pass
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+_WARN_FILTERS = None
+# a traceback that a warning prints (e.g. detect_anomaly's "Traceback of forward call") starts in this file:
+# those frames are the course's plumbing, not the learner's code, so they are cut from the output
+_RUNNER_FRAME = re.compile(r'^ *File "' + re.escape(os.path.abspath(__file__)) + r'", line \d+, in .*\n(?: {4,}.*\n)?',
+                           re.M | re.I)
+
+
+def _reset_warnings():
+    """Each run sees warnings like a fresh process would: the start-up filters (a run's setup may add its own
+    again) and no memory of warnings an earlier run already showed."""
+    global _WARN_FILTERS
+    import warnings
+
+    if _WARN_FILTERS is None:
+        _WARN_FILTERS = list(warnings.filters)
+    warnings.filters[:] = _WARN_FILTERS
+    for fn in ("_filters_mutated", "_filters_mutated_lock_held"):  # invalidates the "already shown" registries
+        if hasattr(warnings, fn):
+            try:
+                getattr(warnings, fn)()
+                break
+            except Exception:
+                pass
 
 
 def _user_line(tb):
@@ -126,7 +197,10 @@ def run_job(job):
     for name, text in ((USER_FILE, code), (TESTS_FILE, tests), (SETUP_FILE, setup)):
         linecache.cache[name] = (len(text), None, [ln + "\n" for ln in text.splitlines()], name)
 
-    _reset_torch()
+    global _DYNAMO_DIRTY
+    _reset_warnings()
+    _reset_torch(dynamo=_DYNAMO_DIRTY)
+    _DYNAMO_DIRTY = any(w in s for s in (code, setup, tests) for w in ("compile", "_dynamo"))
     ns = {"__name__": "__main__", "__file__": USER_FILE}
     ns.update(_helpers(lang))
     registered = []
@@ -165,7 +239,7 @@ def run_job(job):
                 try:
                     fn()
                     c["passed"] = True
-                except NotImplementedError as e:
+                except (NotWrittenYet, NotImplementedError) as e:
                     c["todo"] = True
                     c["message"] = str(e) or MSG[lang]["todo"]
                 except AssertionError as e:
@@ -182,9 +256,23 @@ def run_job(job):
                 result["checks"].append(c)
             if not registered and not result["error"]:
                 result["error"] = MSG[lang]["no_checks"]
-    result["stdout"] = out.getvalue()[-20000:]
+    result["stdout"] = _RUNNER_FRAME.sub("", out.getvalue())[-20000:]
     result["seconds"] = round(time.time() - t0, 3)
     return result
+
+
+def _leaked_mode(torch):
+    """True when a run left inference mode on (e.g. `with torch.inference_mode():` inside a generator the learner
+    never finished). Collecting garbage closes such generators; if the mode is still on, it cannot be undone here."""
+    try:
+        if not torch.is_inference_mode_enabled():
+            return False
+        import gc
+
+        gc.collect()
+        return torch.is_inference_mode_enabled()
+    except Exception:
+        return False
 
 
 def worker():
@@ -200,12 +288,15 @@ def worker():
         line = line.strip()
         if not line:
             continue
+        job = None
         try:
             job = json.loads(line)
             res = run_job(job)
         except BaseException as e:  # noqa: BLE001
             res = {"checks": [], "stdout": "", "error": f"worker: {type(e).__name__}: {e}", "error_line": None}
         res["id"] = job.get("id") if isinstance(job, dict) else None
+        if _leaked_mode(torch):
+            res["recycle"] = True  # the pool replaces this process: the next run must not inherit the mode
         proto.write(json.dumps(res, ensure_ascii=False) + "\n")
 
 

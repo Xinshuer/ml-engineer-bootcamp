@@ -1,0 +1,1243 @@
+@@ day 4
+title: nanoGPT: write a Transformer in a day
+part: LLMs
+hours: 3–4 hours
+--- goal
+Write a working GPT from scratch: causal mask, attention, multiple heads, Block, the full model, the parameter-count formula and greedy generation. Prove every step with a test (compare with PyTorch's own attention, the causality test). This is the most important day of the course; later days reuse today's Block.
+--- checklist
+- Empty the Review list first (redo from blank anything where you saw the answer yesterday)
+- Read the 8 knowledge cards; run each card's code, change one number, run it again
+- Pass every practice exercise (for the two find-the-bug exercises, read the code first; don't just run it)
+- With every reference closed, write the Block from memory (exercise d4-11)
+- Closed book: write CausalSelfAttention and GPT from blank once each
+
+@@ concept
+title: The big picture: shapes from start to end
+ref: day4
+--- body
+Today you write a GPT from scratch. First the whole picture; the next cards take it apart piece by piece.
+
+A GPT does one thing: it reads a sequence of tokens and, at **every position**, guesses the next token.
+
+Every shape today uses these letters:
+- B: batch size (how many sequences at once)
+- T: sequence length (tokens per sequence)
+- C: the vector length of each token (`n_embd` in the code)
+- V: vocabulary size (`vocab_size`)
+- nh: number of heads (`n_head`); hs: the size of each head, hs = C / nh
+
+How the data flows:
+1. `idx` (B, T): integer token ids
+2. `wte(idx) + wpe(pos)` → `x` (B, T, C): token embedding plus position embedding
+3. L Blocks. Each Block takes (B, T, C) and returns (B, T, C)
+4. `ln_f`, then `lm_head` → `logits` (B, T, V): a raw score for every word in the vocabulary, at every position (before softmax)
+5. `cross_entropy` against the targets → one number: the loss
+
+The key point: **a Block does not change the shape**. So you can stack as many Blocks as you like. GPT-2 small stacks 12; GPT-3 stacks 96.
+
+Today's order: causal mask → attention → multiple heads → Block → GPT → parameter count → generation. The code below uses the GPT you will have written by the end of today. Treat it as a black box for now and just watch the shapes.
+--- code
+torch.manual_seed(0)
+m = GPT(vocab_size=10, block_size=8, n_layer=2, n_head=4, n_embd=16)
+idx = torch.randint(0, 10, (2, 5))          # B=2 sequences, T=5 tokens each
+print("idx           ", tuple(idx.shape), "sequence 0:", idx[0].tolist())
+
+x = m.wte(idx) + m.wpe(torch.arange(5))     # token embedding + position embedding
+print("embedded      ", tuple(x.shape))
+for i, block in enumerate(m.h):
+    x = block(x)
+    print(f"after Block {i} ", tuple(x.shape))  # same shape
+
+logits = m.lm_head(m.ln_f(x))
+print("logits        ", tuple(logits.shape))  # 10 scores per position
+print("next-token guess at each position of sequence 0:", logits[0].argmax(-1).tolist())
+
+@@ concept
+title: Causal mask: look only at the past
+--- body
+A language model is trained on whole sequences at once, and **every position** guesses the next token. Position 2 has to guess token 3. If position 2 could "see" token 3, it would just copy the answer and learn nothing.
+
+So attention has one rule: **position i may look at positions 0…i (the past and itself), never at anything after i (the future)**. That rule is the causal mask.
+
+Attention computes a (T, T) matrix of scores:
+- row i = position i, the one that is looking (the query)
+- column j = position j, the one being looked at (the key)
+- allowed: j ≤ i, the diagonal and everything below-left of it. That is the lower triangle → `torch.tril`
+
+Two ways to write it, same result:
+- **additive mask**: 0 where allowed, `-inf` where forbidden; add it to the scores
+- **masked_fill**: `scores.masked_fill(mask == 0, float("-inf"))`, where the mask has 1 = allowed and 0 = forbidden
+
+Why `-inf`? Softmax computes e to the power of each score, and e^(-inf) = 0. So a masked cell gets a weight of **exactly 0**, and the remaining weights still add up to 1.
+
+With T positions, T·(T−1)/2 cells are masked: 6 cells when T=4.
+
+The mask usually has shape (1, 1, T, T). Attention scores are (B, nh, T, T); the two leading 1s broadcast over the batch and the heads, so one mask serves every sequence and every head.
+--- code
+T = 4
+allowed = torch.tril(torch.ones(T, T))      # 1 = may look, 0 = may not
+print(allowed)
+
+bias = torch.zeros(T, T).masked_fill(allowed == 0, float("-inf"))
+print(bias)
+print("masked cells:", int(torch.isinf(bias).sum()), "  T*(T-1)/2 =", T * (T - 1) // 2)
+
+torch.manual_seed(0)
+scores = torch.randn(T, T)                  # some arbitrary scores
+att = (scores + bias).softmax(dim=-1)
+print(att.round(decimals=2))                # the upper-right part is all 0
+print("each row sums to:", att.sum(dim=-1))
+
+# (1, 1, T, T) broadcasts to (B, nh, T, T)
+print((torch.randn(2, 3, T, T) + bias.view(1, 1, T, T)).shape)
+
+@@ concept
+title: Scaled dot-product attention, step by step
+--- body
+Attention lets each position pull information from other positions. Each position has three vectors:
+- **q** (query): what am I looking for?
+- **k** (key): what do I have?
+- **v** (value): what I hand over if you pick me
+
+q, k and v all have shape (B, nh, T, hs). Here is one pass with B=1, nh=1, T=4, hs=8:
+
+1. **Scores**: `scores = q @ k.transpose(-2, -1)`. (1,1,4,8) @ (1,1,8,4) → (1,1,4,4). `scores[i, j]` is the dot product of q_i and k_j: how interested position i is in position j.
+2. **Scale**: divide by `math.sqrt(hs)`, here √8 ≈ 2.83. See below for why.
+3. **Mask**: fill the future cells with `-inf` (previous card).
+4. **softmax(dim=-1)**: along the last dimension, i.e. along each **row**, turn scores into weights: all ≥ 0, each row sums to 1. `dim=-2` would normalise the columns instead, which is wrong.
+5. **Weighted sum**: `att @ v`. (1,1,4,4) @ (1,1,4,8) → (1,1,4,8). The output at position i is the sum of all the v's, weighted by row i.
+
+As one formula: `softmax(q @ kᵀ / √hs + mask) @ v`.
+
+PyTorch has the same computation built in: `F.scaled_dot_product_attention(q, k, v, is_causal=True)`, SDPA for short (on a GPU it also picks a faster implementation). Checking your own version against it is called a reference comparison: the difference should be tiny (1e-6 or less, just floating-point noise).
+
+### Why divide by √hs
+Each number in q and k is roughly mean 0, standard deviation 1. A dot product adds up hs such products, so its standard deviation is about √hs: about 8 when hs=64. When softmax sees scores that differ by 10 or 20, it gives almost all the weight to the largest one (close to one-hot), the other positions get almost no gradient, and the model learns slowly. Dividing by √hs brings the standard deviation back to about 1. The last two lines of the code print both numbers.
+--- code
+torch.manual_seed(0)
+B, nh, T, hs = 1, 1, 4, 8                   # 1 sequence, 1 head, 4 tokens, 8 numbers per head
+q, k, v = (torch.randn(B, nh, T, hs) for _ in range(3))
+
+s = q @ k.transpose(-2, -1)                 # (1,1,4,8) @ (1,1,8,4)
+print("1. scores          ", tuple(s.shape))
+s = s / math.sqrt(hs)                       # 2. divide by √8
+s = s.masked_fill(torch.tril(torch.ones(T, T)) == 0, float("-inf"))
+print("3. scaled + masked:\n", s[0, 0].round(decimals=2))
+att = s.softmax(dim=-1)
+print("4. after softmax, each row sums to 1:\n", att[0, 0].round(decimals=2))
+out = att @ v                               # (1,1,4,4) @ (1,1,4,8)
+print("5. output          ", tuple(out.shape))
+
+sdpa = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+print("largest difference from SDPA:", (out - sdpa).abs().max().item())
+
+a, b = torch.randn(1000, 64), torch.randn(1000, 64)    # 1000 pairs of q, k with hs=64
+dots = (a * b).sum(-1)
+print("std of the dot products with hs=64: unscaled", round(dots.std().item(), 2), "  divided by √64", round((dots / 8).std().item(), 2))
+
+@@ concept
+title: The causality test: change the future, the past must not move
+--- body
+Comparing with SDPA proves the numbers are right. But there is a nastier kind of bug: **information leakage**. If the mask is missing or backwards, the model peeks at the answer during training. The loss drops beautifully, and generation produces garbage. Nothing raises an error.
+
+The test is simple and works for any causal model:
+1. Compute the output once: `out1`
+2. Change only the **last few positions** of the input (below: the k and v of the last 2 positions) and compute `out2`
+3. The earlier positions must **not change at all**: `out1[:, :, :4]` equals `out2[:, :, :4]`
+4. The changed positions' own outputs **should change**. If even they don't, your test didn't actually change anything
+
+This is an invariant test: you don't need to know the right answer, you only check a property that must always hold. It works the same on a whole module or a whole model: change the second half of x, and the outputs of the first half must stay the same. Day 17 has more tests of this kind.
+
+The code compares "with a causal mask" and "without a mask", using SDPA.
+--- code
+torch.manual_seed(0)
+q, k, v = (torch.randn(1, 1, 6, 4) for _ in range(3))   # T=6
+k2, v2 = k.clone(), v.clone()
+k2[:, :, 4:] = torch.randn(1, 1, 2, 4)      # change only the last 2 positions
+v2[:, :, 4:] = torch.randn(1, 1, 2, 4)
+
+def changes(causal):
+    out1 = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+    out2 = F.scaled_dot_product_attention(q, k2, v2, is_causal=causal)
+    past = (out1[:, :, :4] - out2[:, :, :4]).abs().max().item()
+    future = (out1[:, :, 4:] - out2[:, :, 4:]).abs().max().item()
+    return round(past, 4), round(future, 4)
+
+print("causal mask: first 4 positions changed by", changes(True)[0], "  last 2 changed by", changes(True)[1])
+print("no mask    : first 4 positions changed by", changes(False)[0], "  last 2 changed by", changes(False)[1])
+
+@@ concept
+title: Multi-head: split heads, merge heads, register_buffer
+--- body
+One head can learn only one way of "looking". Multi-head attention cuts the C numbers into nh pieces of hs = C / nh each, runs attention on each piece independently, and joins the results. It costs about the same as one big head, but each head can focus on something different (one looks at the previous word, another at the start of the sentence).
+
+All the shapes, with B=2, T=5, C=12, nh=3 (so hs=4):
+1. `self.qkv(x)`: (2, 5, 12) → (2, 5, 36). One Linear produces q, k and v at once, faster than three Linears
+2. `.split(C, dim=-1)` → q, k, v, each (2, 5, 12)
+3. `.view(B, T, nh, hs)` → (2, 5, 3, 4): cut the 12 numbers into 3 heads × 4
+4. `.transpose(1, 2)` → (2, 3, 5, 4): move "head" to dimension 1. Now each head is its own (T, hs) matrix, and the attention matmuls run as a batch over (B, nh)
+5. attention → (2, 3, 5, 4)
+6. `.transpose(1, 2)` → (2, 5, 3, 4), then `.contiguous().view(B, T, C)` → (2, 5, 12): merge the heads
+7. `self.proj(y)` → (2, 5, 12): mix the heads' results together
+
+Why `.contiguous()`? `transpose` moves no data; it only changes the order in which memory is read. `view` needs the data laid out in order in memory, which is no longer true after a transpose, so a direct `view` fails. `.contiguous()` makes a copy in the new order. (`.reshape` also works; it copies when needed.)
+
+### Keep the mask in a buffer
+The mask is the same in every forward pass, so don't rebuild it each time. In `__init__`:
+```
+self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
+```
+- a buffer belongs to the module: it moves with `model.to("cuda")` and it is in `state_dict()`
+- but it is **not a parameter**: it is not in `parameters()`, and the optimizer never changes it
+- the input can be shorter than block_size; take a slice when you use it: `self.bias[:, :, :T, :T]`
+
+nanoGPT calls it "bias" for historical reasons; it is really the mask.
+--- code
+torch.manual_seed(0)
+B, T, C, nh = 2, 5, 12, 3
+hs = C // nh                                # 4 numbers per head
+x = torch.randn(B, T, C)
+qkv = nn.Linear(C, 3 * C, bias=False)
+
+big = qkv(x)
+print("qkv(x)           ", tuple(big.shape))
+q, k, v = big.split(C, dim=-1)
+print("q after split    ", tuple(q.shape))
+q = q.view(B, T, nh, hs)
+print("view: split heads", tuple(q.shape))
+q = q.transpose(1, 2)
+print("transpose(1, 2)  ", tuple(q.shape))
+
+y = torch.randn(B, nh, T, hs)               # pretend this is the attention output
+y = y.transpose(1, 2)
+print("back again       ", tuple(y.shape), " contiguous?", y.is_contiguous())
+try:
+    y.view(B, T, C)
+except RuntimeError as e:
+    print("view right away: ", str(e)[:60], "...")
+y = y.contiguous().view(B, T, C)
+print("heads merged     ", tuple(y.shape))
+
+class WithMask(nn.Module):
+    def __init__(self, block_size):
+        super().__init__()
+        self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
+
+m = WithMask(8)
+print("in state_dict:", list(m.state_dict().keys()), "  number of parameters:", sum(p.numel() for p in m.parameters()))
+print("mask slice for T=5:", tuple(m.bias[:, :, :5, :5].shape))
+
+@@ concept
+title: Block: MLP + pre-LN residual
+ref: day4
+--- body
+A Block is two sub-layers. Both follow the same pattern: `x = x + sublayer(LayerNorm(x))`.
+```
+x = x + self.attn(self.ln1(x))    # tokens exchange information
+x = x + self.mlp(self.ln2(x))     # each token is processed on its own
+```
+
+**MLP**: `Linear(C, 4C)` → GELU → `Linear(4C, C)`, both with a bias. It widens the vector 4 times, applies a non-linear function (GELU, a smooth version of ReLU), and shrinks it back to C. It works on each position separately; positions don't talk to each other here.
+
+**Residual**: `x = x + sublayer(...)`. The sub-layer only has to learn "what to change in x". Picture a main road from the input straight to the output (the residual stream); each sub-layer adds a little to it. Gradients also travel back along that road directly to the early layers, which is why dozens of layers still train.
+
+**Pre-LN**: the LayerNorm sits **inside** the branch (normalise first, then the sub-layer); the x on the main road is never normalised. The original 2017 Transformer used post-LN, `x = LN(x + sublayer(x))`, which becomes unstable with many layers and needs a careful warmup. GPT-2 switched to pre-LN. Because the main road never goes through a LayerNorm, the model adds one more, `ln_f`, at the exit (next card).
+
+**A handy test**: if both sub-layers output 0, a pre-LN Block must return x unchanged (the identity). Post-LN cannot, because LN(x) ≠ x. The practice exercise uses exactly this test.
+
+### How many parameters in one Block
+- ln1, ln2: 2C each (a LayerNorm has C weights and C biases)
+- qkv: 3C²; proj: C² (no biases here, as in nanoGPT)
+- fc1: 4C² + 4C; fc2: 4C² + C
+- total **12C² + 9C**. Attention has 4C², the MLP 8C²: most of it is in the MLP
+
+The code lists every parameter of one Block (C=16), then runs the identity test: the same parts wired pre-LN and post-LN.
+--- code
+torch.manual_seed(0)
+C = 16
+blk = Block(n_embd=C, n_head=4, block_size=8)      # the Block you write today (reference version)
+for name, p in blk.named_parameters():
+    print(f"{name:18s} {str(tuple(p.shape)):9s} {p.numel()}")
+print("total", sum(p.numel() for p in blk.parameters()), "  12*C*C + 9*C =", 12 * C * C + 9 * C)
+
+x = torch.randn(2, 5, C)
+with torch.no_grad():                        # make both sub-layers output 0
+    blk.attn.proj.weight.zero_()
+    for p in blk.mlp.parameters():
+        p.zero_()
+print("pre-LN : max |Block(x) - x| =", (blk(x) - x).abs().max().item())
+h = blk.ln1(x + blk.attn(x))                 # the same parts, wired post-LN
+post = blk.ln2(h + blk.mlp(h))
+print("post-LN: max |out - x|      =", round((post - x).abs().max().item(), 3))
+
+@@ concept
+title: GPT: embeddings, init and weight tying
+ref: day4
+--- body
+Putting the parts together:
+```
+x = wte(idx) + wpe(pos)        # (B,T,C) + (T,C), broadcast
+for block in h: x = block(x)
+logits = lm_head(ln_f(x))      # (B,T,V)
+```
+- `wte = nn.Embedding(V, C)`: looks up one row (a vector) per token id
+- `wpe = nn.Embedding(block_size, C)`: looks up one row per position 0…block_size−1, with `pos = torch.arange(T)`. Attention itself has no idea of order; all order information comes from here (day 5 replaces it with RoPE)
+- `ln_f`: the pre-LN main road was never normalised, so normalise once at the exit
+- `lm_head = nn.Linear(C, V, bias=False)`: turns each position's vector into V scores
+
+### Init: the first loss should be about ln V
+nanoGPT initialises the weights of every Linear and Embedding from a normal distribution with mean 0 and standard deviation 0.02, and sets biases to zero. How: write a function `_init(m)`, then call `self.apply(self._init)`. `apply` calls it once on every sub-module.
+
+A freshly initialised model knows nothing, so it should treat all V words alike: each gets probability about 1/V, and the cross-entropy is about ln V (the baseline from day 3). A standard deviation of 0.02 keeps the logits small and the prediction close to uniform. `nn.Embedding` uses a standard deviation of 1 by default, 50 times larger: the logits start huge, the loss starts far from ln V, and the first few hundred training steps are spent cleaning up that mess.
+
+### Weight tying
+`self.lm_head.weight = self.wte.weight`: the output layer and the input embedding **share one** (V, C) parameter. The idea: "the vector for this word" and "the vector used to predict this word" should be similar anyway. The gain: V·C fewer parameters (about 38.6 million in GPT-2).
+- it must be **the same object**: `m.lm_head.weight is m.wte.weight` must be True. Copying the values with `copy_` doesn't count; they drift apart after one training step
+- `parameters()` removes duplicates, so the shared weight is counted once
+- both of nanoGPT's inits are N(0, 0.02), so the tying line can go before or after `apply`
+
+### The loss
+`F.cross_entropy` wants scores of shape (N, V) and answers of shape (N,), so flatten batch and time first: `logits.reshape(-1, V)` is (B·T, V) and `targets.reshape(-1)` is (B·T,).
+
+The whole GPT's parameter count = wte + wpe + L Blocks + ln_f; lm_head shares with wte, so it adds nothing. Exercise d4-07 turns this into a formula.
+--- code
+torch.manual_seed(0)
+V = 65
+m = GPT(vocab_size=V, block_size=16, n_layer=2, n_head=4, n_embd=32)
+idx = torch.randint(0, V, (4, 16))
+targets = torch.randint(0, V, (4, 16))
+logits, loss = m(idx, targets)
+print("logits", tuple(logits.shape), " flattened", tuple(logits.reshape(-1, V).shape))
+print("first loss =", round(loss.item(), 3), "  ln(V) =", round(math.log(V), 3))
+
+print("lm_head.weight is wte.weight:", m.lm_head.weight is m.wte.weight)
+print("std of wte:", round(m.wte.weight.std().item(), 4))
+print("parameters:", sum(p.numel() for p in m.parameters()), "  without tying, add", V * 32)
+
+with torch.no_grad():
+    m.wte.weight.normal_(0, 1.0)             # nn.Embedding's default init, N(0, 1)
+print("loss with wte at std 1 =", round(m(idx, targets)[1].item(), 1))
+
+@@ concept
+title: Generation: greedy decoding + context cropping
+ref: day4
+--- body
+A GPT guesses only **one** next token at a time. To write a whole passage, it goes step by step (this is called autoregressive generation):
+1. Feed the current sequence to the model and get logits (B, T, V)
+2. Keep only the logits of the **last position**: `logits[:, -1]`, shape (B, V). The tokens guessed at earlier positions are already in the sequence
+3. Pick a token. **Greedy**: take the highest score, `argmax(-1, keepdim=True)` → (B, 1)
+4. Append it to the sequence: `torch.cat([idx, nxt], dim=1)`; the length grows by 1
+5. Go back to step 1
+
+**Context cropping**: `wpe` has only block_size rows, and the mask buffer is only block_size×block_size. Once the sequence is longer than block_size, looking up the position embedding goes out of range and fails. So at each step feed only the last block_size tokens: `idx[:, -block_size:]`. While the sequence is still short, this slice changes nothing.
+
+Two small habits:
+- generation needs no gradients: put `@torch.no_grad()` on the function; it saves memory and time
+- call `model.eval()` first: it turns off training-only randomness such as dropout
+
+The nice thing about greedy decoding is that it is **deterministic**: the same input always gives the same output, which makes it easy to test. The downside is that it tends to repeat itself. Sampling methods (temperature, top-k) are on day 5.
+
+The code runs only **one** step, and shows what happens without cropping.
+--- code
+torch.manual_seed(0)
+m = GPT(vocab_size=11, block_size=8, n_layer=1).eval()
+idx = torch.tensor([[3, 1, 4]])              # B=1, T=3
+
+with torch.no_grad():
+    logits, _ = m(idx)
+print("logits       ", tuple(logits.shape))  # one guess per position
+last = logits[:, -1]                         # keep only the last position
+print("last position", tuple(last.shape))
+nxt = last.argmax(-1, keepdim=True)
+print("next token   ", nxt.tolist(), tuple(nxt.shape))
+idx = torch.cat([idx, nxt], dim=1)
+print("appended     ", idx.tolist())
+
+too_long = torch.randint(0, 11, (1, 9))      # 9 tokens > block_size=8
+try:
+    m(too_long)
+except IndexError as e:
+    print("feeding 9 tokens:", type(e).__name__, "-", e)
+print("cropped to the last 8:", tuple(too_long[:, -8:].shape))
+
+@@ item d4-01
+type: code
+title: The direction of the causal mask
+level: 1
+cards: Causal mask: look only at the past
+targets: causal_bias
+ref: day4
+--- context
+A GPT sees a whole sequence during training, but position t may only use the tokens before it to guess the next one. The causal mask enforces that rule. Get the direction wrong and the model peeks at the answer while training: the loss looks great and generation is garbage.
+--- prompt
+Write `causal_bias(T, device=None)`. It returns an **additive mask** (a matrix you add to the attention scores) of shape `(1, 1, T, T)`:
+- row i, column j: `0.0` when j ≤ i (the past and itself), `float("-inf")` when j > i (the future)
+- the two leading 1s are for the batch and head dimensions, so the mask broadcasts straight onto `(B, nh, T, T)` scores
+- use `torch.tril`; create the tensor on `device` (`device=None` means the default, the CPU)
+
+For T=3 the last two dimensions should be:
+```
+[[0., -inf, -inf],
+ [0.,   0., -inf],
+ [0.,   0.,   0.]]
+```
+--- starter
+def causal_bias(T, device=None):
+    """Return a (1, 1, T, T) additive mask: 0.0 where allowed, -inf where forbidden.
+    Position t may only see positions <= t. Use torch.tril.
+    """
+    raise todo()
+--- solution
+def causal_bias(T, device=None):
+    m = torch.tril(torch.ones(T, T, device=device))
+    return torch.zeros(1, 1, T, T, device=device).masked_fill(m == 0, float("-inf"))
+--- tests
+@check("the direction of the causal mask")
+def t01():
+    m = causal_bias(4)
+    shape_is(m, (1, 1, 4, 4))
+    true(m[0, 0, 0, 0] == 0, "the diagonal (looking at itself) must be allowed, i.e. 0")
+    true(m[0, 0, 0, 1] == float("-inf"), "position 0 must not see position 1: your mask points the wrong way (tril and triu mixed up?)")
+    true(m[0, 0, 3, 0] == 0, "position 3 should be able to see position 0")
+    true(torch.isinf(m).sum() == 6, f"with T=4 exactly 6 cells should be masked; you masked {int(torch.isinf(m).sum())}")
+--- hints
+- `torch.tril(torch.ones(T, T))` is 1 on and below the diagonal and 0 in the upper right: 1 means "may look".
+- Start from zeros of shape `(1, 1, T, T)`, then `.masked_fill(condition, float("-inf"))` the cells where the tril matrix is 0.
+- `m = torch.tril(torch.ones(T, T, device=device))`, then `return torch.zeros(1, 1, T, T, device=device).masked_fill(m == 0, float("-inf"))`.
+
+@@ item d4-02
+type: code
+title: Hand-written attention, checked against SDPA
+level: 2
+cards: Scaled dot-product attention, step by step; The causality test: change the future, the past must not move; Causal mask: look only at the past
+targets: attention
+ref: day4
+--- context
+Attention is the heart of the Transformer, and the thing interviewers most often ask you to write on the spot. Writing it yourself and then matching PyTorch's own implementation number for number is the fastest way to be sure you really understand it.
+--- prompt
+Write `attention(q, k, v, causal=True)`:
+- q, k and v all have shape `(B, nh, T, hs)` (batch, heads, sequence length, size of each head); return a tensor of the same shape
+- steps: `q @ kᵀ` → divide by `√hs` → add the causal mask when `causal=True` → softmax over the last dimension → multiply by `v`
+- `causal_bias(T, device)` from the previous exercise is preloaded; you can use it
+- do **not** call `F.scaled_dot_product_attention`: the tests use it to check your answer
+
+The tests do two things:
+1. Reference comparison: match `F.scaled_dot_product_attention`, both causal and non-causal (difference < 1e-4)
+2. Causality test: change only the k and v of the last 2 positions; the outputs of the first 4 positions must not change at all
+--- starter
+def attention(q, k, v, causal=True):
+    """q, k, v: (B, nh, T, hs)  ->  (B, nh, T, hs)
+    Write scores -> scale -> mask -> softmax -> @v yourself. Do not call F.scaled_dot_product_attention.
+    """
+    raise todo()
+--- solution
+def attention(q, k, v, causal=True):
+    T = q.size(-2)
+    att = q @ k.transpose(-2, -1) / math.sqrt(q.size(-1))
+    if causal:
+        att = att + causal_bias(T, q.device)
+    att = att.softmax(dim=-1)
+    return att @ v
+--- tests
+@check("matches SDPA (causal and non-causal)")
+def t02():
+    seed(0)
+    q, k, v = (torch.randn(2, 3, 6, 8) for _ in range(3))
+    eq(attention(q, k, v, causal=True), F.scaled_dot_product_attention(q, k, v, is_causal=True),
+       msg="does not match SDPA with causal=True: check the scaling, the mask direction and the softmax dimension")
+    eq(attention(q, k, v, causal=False), F.scaled_dot_product_attention(q, k, v, is_causal=False),
+       msg="does not match SDPA with causal=False: no mask should be added then")
+
+@check("causality test")
+def t03():
+    seed(1)
+    q, k, v = (torch.randn(1, 2, 6, 4) for _ in range(3))
+    out1 = attention(q, k, v, causal=True)
+    k2, v2 = k.clone(), v.clone()
+    k2[:, :, 4:] = torch.randn(1, 2, 2, 4)     # change only the last two time steps
+    v2[:, :, 4:] = torch.randn(1, 2, 2, 4)
+    out2 = attention(q, k2, v2, causal=True)
+    eq(out1[:, :, :4], out2[:, :, :4],
+       msg="changing the future k/v also changed the outputs of the first 4 positions: information leaks")
+    true(not torch.allclose(out1[:, :, 4:], out2[:, :, 4:]), "the last two positions' own outputs should have changed")
+--- hints
+- Transpose the last two dimensions of k: `k.transpose(-2, -1)` turns (B, nh, T, hs) into (B, nh, hs, T), and `q @` that is (B, nh, T, T).
+- Scale with `math.sqrt(q.size(-1))`; mask with `att + causal_bias(T, q.device)`, where `T = q.size(-2)`.
+- The last two steps: `att = att.softmax(dim=-1)`, then `return att @ v`.
+
+@@ item d4-03
+type: code
+title: The CausalSelfAttention module
+level: 3
+cards: Multi-head: split heads, merge heads, register_buffer; Scaled dot-product attention, step by step
+targets: CausalSelfAttention
+ref: day4
+--- context
+This is the attention layer a real GPT uses: one Linear produces q, k and v, the heads run in parallel, and the results are merged back. Splitting and merging the heads is where most multi-head attention bugs hide.
+--- prompt
+Write `CausalSelfAttention(n_embd, n_head, block_size)`, an `nn.Module`. The input `x` is `(B, T, C)` (C = n_embd) and the output is `(B, T, C)` too.
+
+In `__init__`:
+- `self.qkv = nn.Linear(C, 3 * C, bias=False)`: produces q, k and v in one go
+- `self.proj = nn.Linear(C, C, bias=False)`: the output projection
+- store a `(1, 1, block_size, block_size)` lower-triangular mask with `self.register_buffer("bias", ...)` (the name must be `"bias"`). Don't rebuild it in every forward pass
+- remember `n_head`; forward needs it
+
+`forward(x)`:
+1. `qkv(x)` → `split` into q, k, v, each `(B, T, C)`
+2. split the heads: each becomes `(B, nh, T, hs)`, with hs = C // nh
+3. causal attention: divide the scores by √hs; mask with the slice `[:, :, :T, :T]` of the buffer (T can be shorter than block_size)
+4. merge the heads back to `(B, T, C)`, then apply `proj`
+
+The parameter count must be exactly 3C² + C² (neither Linear has a bias). The tests also check that a T shorter than block_size works, and that changing the last few positions of x leaves the earlier outputs unchanged.
+--- starter
+class CausalSelfAttention(nn.Module):
+    """Requirements:
+      - self.qkv:  nn.Linear(C, 3C, bias=False)
+      - self.proj: nn.Linear(C, C,  bias=False)
+      - forward(x): (B,T,C) -> (B,T,C): split heads, causal attention, merge heads, proj
+      - keep the mask in a buffer named "bias" (register_buffer); don't rebuild it in every forward
+    """
+
+    def __init__(self, n_embd, n_head, block_size):
+        super().__init__()
+        raise todo()
+
+    def forward(self, x):
+        raise todo()
+--- solution
+class CausalSelfAttention(nn.Module):
+    def __init__(self, n_embd, n_head, block_size):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.n_head = n_head
+        self.qkv = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        self.proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        hs = C // self.n_head
+        q, k, v = self.qkv(x).split(C, dim=-1)
+        q = q.view(B, T, self.n_head, hs).transpose(1, 2)
+        k = k.view(B, T, self.n_head, hs).transpose(1, 2)
+        v = v.view(B, T, self.n_head, hs).transpose(1, 2)
+        att = q @ k.transpose(-2, -1) / math.sqrt(hs)
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf")).softmax(-1)
+        y = (att @ v).transpose(1, 2).contiguous().view(B, T, C)
+        return self.proj(y)
+--- tests
+@check("the CausalSelfAttention module")
+def t04():
+    seed(2)
+    m = CausalSelfAttention(32, 4, 16)
+    x = torch.randn(2, 9, 32)
+    shape_is(m(x), (2, 9, 32))
+    true("bias" in dict(m.named_buffers()), "the mask should be a buffer named \"bias\" (register_buffer), not rebuilt each time")
+    true(params(m) == 32 * 32 * 3 + 32 * 32,
+         f"{params(m)} parameters, expected 3C²+C² = 4096: qkv and proj both need bias=False")
+    # shorter inputs must work too (T < block_size)
+    shape_is(m(torch.randn(1, 3, 32)), (1, 3, 32), "T=3 is shorter than block_size=16 and must work too: slice the mask to [:, :, :T, :T]")
+    # causality
+    x2 = x.clone()
+    x2[:, 5:] = torch.randn(2, 4, 32)
+    eq(m(x)[:, :5], m(x2)[:, :5], msg="changing the last 4 positions of x also changed the first 5 outputs: the module is not causal (mask unused or backwards)")
+--- hints
+- Split the heads: `q.view(B, T, self.n_head, hs).transpose(1, 2)`, the same for k and v; `hs = C // self.n_head`.
+- Mask: `att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))`, then `.softmax(-1)`.
+- Merge the heads: `y = (att @ v).transpose(1, 2).contiguous().view(B, T, C)`, then `return self.proj(y)`.
+
+@@ item d4-04
+type: code
+title: MLP
+level: 1
+cards: Block: MLP + pre-LN residual
+targets: MLP
+ref: day4
+--- context
+Attention lets tokens exchange information; the MLP lets each token "think" on its own. Two thirds of a GPT Block's parameters are in the MLP.
+--- prompt
+Write GPT-2's `MLP(n_embd)` (also called the feed-forward layer):
+- `Linear(C, 4C)` → GELU → `Linear(4C, C)`, both with a bias (`nn.Linear` has one by default)
+- input and output are both `(B, T, C)`
+- `F.gelu` or `nn.GELU()`, either is fine
+
+The tests check the output shape and the parameter count: with C=16 it should be 16·64 + 64 + 64·16 + 16 = 2128.
+--- starter
+class MLP(nn.Module):
+    """Standard GPT-2 MLP: Linear(C, 4C) -> GELU -> Linear(4C, C), both with a bias."""
+
+    def __init__(self, n_embd):
+        super().__init__()
+        raise todo()
+
+    def forward(self, x):
+        raise todo()
+--- solution
+class MLP(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.fc1 = nn.Linear(n_embd, 4 * n_embd)
+        self.fc2 = nn.Linear(4 * n_embd, n_embd)
+
+    def forward(self, x):
+        return self.fc2(F.gelu(self.fc1(x)))
+--- tests
+@check("MLP shape and parameter count")
+def t05():
+    m = MLP(16)
+    shape_is(m(torch.randn(2, 5, 16)), (2, 5, 16))
+    true(params(m) == 16 * 64 + 64 + 64 * 16 + 16,
+         f"{params(m)} parameters, expected 2128: Linear(16, 64) and Linear(64, 16), both with a bias")
+--- hints
+- In `__init__`, make two Linears: `self.fc1 = nn.Linear(n_embd, 4 * n_embd)` and `self.fc2 = nn.Linear(4 * n_embd, n_embd)`.
+- forward is one line: `return self.fc2(F.gelu(self.fc1(x)))`.
+
+@@ item d4-05
+type: code
+title: Block: pre-LN residual
+level: 2
+cards: Block: MLP + pre-LN residual
+targets: Block
+ref: day4
+--- context
+A GPT is the same Block stacked many times. Residuals plus pre-LN are what let networks with dozens of layers train stably. You will reuse this Block on days 5, 10 and 13.
+--- prompt
+Write `Block(n_embd, n_head, block_size)`:
+```
+x = x + self.attn(self.ln1(x))
+x = x + self.mlp(self.ln2(x))
+```
+- the sub-modules must be named `ln1`, `attn`, `ln2`, `mlp` (the tests use `attn.proj` and `mlp`)
+- `CausalSelfAttention` and `MLP` are preloaded (reference versions); just use them
+- pre-LN: the LayerNorm is **inside** the residual branch; the `x` on the main road is not normalised
+
+The test: zero the attention's `proj` and all MLP parameters, so both sub-layers output 0. Then the Block must return x unchanged.
+--- starter
+class Block(nn.Module):
+    """x = x + attn(ln1(x));  x = x + mlp(ln2(x))
+    Note: pre-LN (the LN is inside the residual branch), not post-LN.
+    """
+
+    def __init__(self, n_embd, n_head, block_size):
+        super().__init__()
+        raise todo()
+
+    def forward(self, x):
+        raise todo()
+--- solution
+class Block(nn.Module):
+    def __init__(self, n_embd, n_head, block_size):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.attn = CausalSelfAttention(n_embd, n_head, block_size)
+        self.ln2 = nn.LayerNorm(n_embd)
+        self.mlp = MLP(n_embd)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+--- tests
+@check("Block: pre-LN residual")
+def t06():
+    seed(3)
+    b = Block(32, 4, 16)
+    x = torch.randn(2, 7, 32)
+    shape_is(b(x), (2, 7, 32))
+    # zero the output weights of both sub-layers: the Block must become the identity. This checks both the residual and where the LN sits
+    with torch.no_grad():
+        b.attn.proj.weight.zero_()
+        for p in b.mlp.parameters():
+            p.zero_()
+    eq(b(x), x, tol=1e-5,
+       msg="with both sub-layers outputting 0, the Block should return x unchanged. If not, the residual is wrong (e.g. x = attn(ln(x))) or the LN is on the main road (post-LN)")
+--- hints
+- `__init__`: `self.ln1 = nn.LayerNorm(n_embd)`, `self.attn = CausalSelfAttention(n_embd, n_head, block_size)`, and the same idea for `ln2` and `mlp`.
+- "Residual" means **adding** the sub-layer's output back to its input: `x = x + sublayer(...)`, not `x = sublayer(...)`.
+- forward is exactly the two lines in the prompt, then `return x`.
+
+@@ item d4-06
+type: code
+title: GPT: forward + loss + weight tying
+level: 3
+cards: GPT: embeddings, init and weight tying; The big picture: shapes from start to end
+targets: GPT
+ref: day4
+--- context
+This is the core of nanoGPT's model.py, and the architecture of GPT-2. Init and weight tying are details interviewers love to ask about: the first decides whether the loss starts at a sane value, the second saves a large block of parameters.
+--- prompt
+Write the full `GPT(vocab_size, block_size, n_layer=2, n_head=4, n_embd=32)` (below, C = n_embd and V = vocab_size):
+- `self.wte = nn.Embedding(V, C)`: token embedding
+- `self.wpe = nn.Embedding(block_size, C)`: position embedding
+- `self.h = nn.ModuleList([...])`: n_layer `Block(C, n_head, block_size)` (Block is preloaded)
+- `self.ln_f = nn.LayerNorm(C)`
+- `self.lm_head = nn.Linear(C, V, bias=False)`
+- init (the nanoGPT way): the weights of every Linear and Embedding with `nn.init.normal_(w, 0.0, 0.02)`, Linear biases set to zero. Use `self.apply(function)` to call it on every sub-module
+- weight tying: `self.lm_head.weight = self.wte.weight` (the same parameter object)
+
+`forward(idx, targets=None)` returns `(logits, loss)`:
+- `idx` is `(B, T)` integers, `logits` is `(B, T, V)`
+- when `targets` is None, `loss` is None; otherwise `loss` is the `F.cross_entropy` value (a scalar)
+
+The tests: a freshly initialised model's loss must be near ln(17) ≈ 2.83 (±0.7); `lm_head.weight` and `wte.weight` must be the same object; with n_layer=1 the parameter count must be exactly 13696.
+--- starter
+class GPT(nn.Module):
+    """Requirements:
+      - wte: nn.Embedding(vocab_size, C)
+      - wpe: nn.Embedding(block_size, C)
+      - h:   nn.ModuleList of n_layer Blocks
+      - ln_f: nn.LayerNorm(C)
+      - lm_head: nn.Linear(C, vocab_size, bias=False), its weight **shared** with wte
+      - every Linear / Embedding weight initialised with normal_(mean=0, std=0.02), biases zeroed
+        (the nanoGPT way. Without it the first loss is far from ln(V))
+      - forward(idx, targets=None) -> (logits, loss). loss is None when targets is None.
+    """
+
+    def __init__(self, vocab_size, block_size, n_layer=2, n_head=4, n_embd=32):
+        super().__init__()
+        raise todo()
+
+    def forward(self, idx, targets=None):
+        raise todo()
+--- solution
+class GPT(nn.Module):
+    def __init__(self, vocab_size, block_size, n_layer=2, n_head=4, n_embd=32):
+        super().__init__()
+        self.block_size = block_size
+        self.wte = nn.Embedding(vocab_size, n_embd)
+        self.wpe = nn.Embedding(block_size, n_embd)
+        self.h = nn.ModuleList([Block(n_embd, n_head, block_size) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        self.apply(self._init)
+        self.lm_head.weight = self.wte.weight     # tying: one shared Parameter object
+
+    @staticmethod
+    def _init(m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, 0.0, 0.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device)
+        x = self.wte(idx) + self.wpe(pos)          # (B,T,C) + (T,C), broadcast
+        for b in self.h:
+            x = b(x)
+        logits = self.lm_head(self.ln_f(x))
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+--- tests
+@check("GPT forward + loss")
+def t07():
+    seed(4)
+    m = GPT(vocab_size=17, block_size=16, n_layer=2)
+    idx = torch.randint(0, 17, (2, 9))
+    logits, loss = m(idx)
+    shape_is(logits, (2, 9, 17))
+    true(loss is None, "without targets the loss should be None")
+    logits, loss = m(idx, idx)
+    true(loss.dim() == 0, "the loss must be a scalar: before cross_entropy, flatten logits to (B*T, V) and targets to (B*T,)")
+    # a freshly initialised model's loss should be close to ln(V)
+    true(abs(loss.item() - math.log(17)) < 0.7,
+         f"first loss = {loss.item():.3f}; it should be close to ln(17)={math.log(17):.3f}. "
+         "It is too far off: check the init (std=0.02) and how the loss is flattened")
+
+@check("weight tying")
+def t08():
+    m = GPT(vocab_size=17, block_size=16, n_layer=1)
+    true(m.lm_head.weight is m.wte.weight,
+         "lm_head.weight and wte.weight must be the same object (tested with is, not equal values): self.lm_head.weight = self.wte.weight")
+    n = params(m)
+    true(n == 13696, f"{n} parameters, expected 13696 (off by {n - 13696}). lm_head needs bias=False, and the shared weight must exist only once")
+--- hints
+- Positions: `pos = torch.arange(T, device=idx.device)`, then `x = self.wte(idx) + self.wpe(pos)`; (B,T,C) + (T,C) broadcasts.
+- Init: write `_init(m)`: when `isinstance(m, (nn.Linear, nn.Embedding))`, `nn.init.normal_(m.weight, 0.0, 0.02)`, and `nn.init.zeros_(m.bias)` if there is a bias; then `self.apply(self._init)`.
+- Loss: `F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))`; tying: `self.lm_head.weight = self.wte.weight`.
+
+@@ item d4-07
+type: code
+title: The parameter-count formula
+level: 2
+cards: Block: MLP + pre-LN residual; GPT: embeddings, init and weight tying
+targets: gpt_param_count
+ref: day4
+--- context
+"Why does GPT-2 small have 124M parameters?" is a common interview question. Estimating GPU memory (weights, gradients and optimizer states all scale with the parameter count) starts here too. Being able to count parameters in your head shows you know what every part of the model is.
+--- prompt
+Write `gpt_param_count(V, C, L, block_size, tied=True)` using **arithmetic only** (don't build a model and count). Return the parameter count of the GPT from the previous exercise:
+- wte: V·C; wpe: block_size·C
+- each Block: ln1 (2C) + qkv (3C²) + proj (C²) + ln2 (2C) + fc1 (4C² + 4C) + fc2 (4C² + C)
+- ln_f at the end: 2C
+- with `tied=True`, lm_head shares wte's weight and adds nothing; with `tied=False`, add V·C
+
+The test builds real models for 3 settings of (V, C, L, block_size), counts their parameters and compares with your result.
+--- starter
+def gpt_param_count(V, C, L, block_size, tied=True):
+    """Count the parameters by hand from this structure (don't build a model to count):
+       wte: V*C     wpe: block_size*C
+       each block:  ln1(2C) + qkv(3C*C) + proj(C*C) + ln2(2C) + fc1(4C*C+4C) + fc2(4C*C+C)
+       at the end: ln_f(2C)
+       with tied=True, lm_head adds nothing.
+    """
+    raise todo()
+--- solution
+def gpt_param_count(V, C, L, block_size, tied=True):
+    per_block = 12 * C * C + 9 * C          # 12C² weights + 9C biases/norms
+    n = V * C + block_size * C + L * per_block + 2 * C
+    if not tied:
+        n += V * C
+    return n
+--- tests
+@check("parameter-count formula")
+def t09():
+    for V, C, L, bs in [(17, 32, 2, 16), (65, 64, 3, 32), (1000, 128, 4, 64)]:
+        m = GPT(V, bs, n_layer=L, n_head=C // 8, n_embd=C)
+        real = sum(p.numel() for p in set(m.parameters()))
+        got = gpt_param_count(V, C, L, bs)
+        true(got == real, f"V={V}, C={C}, L={L}, block_size={bs}: you got {got}, the model has {real}, off by {got - real}")
+--- hints
+- First add up the six parts of one Block and write the result as `a·C² + b·C`.
+- One Block is `12 * C * C + 9 * C`; the total is `V * C + block_size * C + L * per_block + 2 * C`, plus `V * C` when not tied.
+
+@@ item d4-08
+type: code
+title: Greedy generation + context cropping
+level: 2
+cards: Generation: greedy decoding + context cropping
+targets: generate_greedy
+ref: day4
+--- context
+When ChatGPT prints its answer one word at a time, this loop is what runs underneath. Greedy decoding (always take the highest score) is the simplest version, and the easiest to test: the same input always gives the same output.
+--- prompt
+Write `generate_greedy(model, idx, max_new_tokens, block_size)`. `idx` holds the starting tokens, shape `(B, T0)`. Loop `max_new_tokens` times; at each step:
+1. Context cropping: if the sequence is longer than block_size, keep only its last block_size tokens (otherwise the position embedding goes out of range)
+2. Feed it to the model. `model(x)` returns `(logits, loss)`; logits is `(B, T, V)`
+3. Take the logits of the **last position** and `argmax` them to get the next token
+4. Append it to the end of the sequence
+
+Return `(B, T0 + max_new_tokens)`; the first T0 tokens are the original idx. The function already has `@torch.no_grad()`: generation needs no gradients.
+
+The test uses a model with block_size=8 to generate 10 tokens after 3 (13 in total, more than 8, so cropping is required), and checks that two runs give exactly the same result.
+--- starter
+@torch.no_grad()
+def generate_greedy(model, idx, max_new_tokens, block_size):
+    """Append the argmax token at every step. When the sequence is longer than block_size, feed only the last block_size tokens.
+    Return (B, T0+max_new_tokens).
+    """
+    raise todo()
+--- solution
+@torch.no_grad()
+def generate_greedy(model, idx, max_new_tokens, block_size):
+    for _ in range(max_new_tokens):
+        cond = idx[:, -block_size:]
+        logits, _ = model(cond)
+        nxt = logits[:, -1].argmax(-1, keepdim=True)
+        idx = torch.cat([idx, nxt], dim=1)
+    return idx
+--- tests
+@check("greedy generation + context cropping")
+def t10():
+    seed(5)
+    m = GPT(vocab_size=11, block_size=8, n_layer=1).eval()
+    idx = torch.randint(0, 11, (2, 3))
+    out = generate_greedy(m, idx, 10, 8)
+    shape_is(out, (2, 13), "the total length after generation should be T0 + max_new_tokens")
+    eq(out[:, :3], idx, msg="the first 3 tokens were changed: new tokens go at the end")
+    true(out.max() < 11 and out.min() >= 0, "generated token ids fall outside the vocabulary [0, 11): take argmax over the last (vocabulary) dimension")
+    eq(out, generate_greedy(m, idx, 10, 8), msg="greedy generation must be deterministic: the same input must give the same result twice")
+    # must not crash when the sequence is too long (that is why the context is cropped)
+    long_idx = torch.randint(0, 11, (1, 20))
+    shape_is(generate_greedy(m, long_idx, 3, 8), (1, 23), "it must also work when the start already has 20 tokens (> block_size)")
+--- hints
+- Crop first at every step: `cond = idx[:, -block_size:]`, then `logits, _ = model(cond)`.
+- `logits[:, -1]` is (B, V); `.argmax(-1, keepdim=True)` gives (B, 1), which is what `idx = torch.cat([idx, nxt], dim=1)` needs.
+
+@@ item d4-09
+type: fix
+title: Find the bugs: attention_buggy
+level: 2
+cards: Scaled dot-product attention, step by step; Causal mask: look only at the past
+targets: attention_buggy
+ref: day4
+--- context
+A wrong attention usually raises no error: every shape is right and the loss still goes down; the model just learns badly or peeks at the future. Finding such bugs by reading the code and comparing with a reference is everyday work.
+--- prompt
+This causal attention has **3** bugs. Fix it so it matches `F.scaled_dot_product_attention(q, k, v, is_causal=True)`.
+- q, k and v are all `(B, nh, T, hs)`
+- keep the function name and arguments
+
+Read it line by line against the formula `softmax(q @ kᵀ / √hs + mask) @ v` first; run it once you think you have found them.
+--- starter
+def attention_buggy(q, k, v):
+    T = q.size(-2)
+    att = q @ k.transpose(-2, -1)
+    mask = torch.triu(torch.ones(T, T))
+    att = att.masked_fill(mask == 0, float("-inf"))
+    att = F.softmax(att, dim=-2)
+    return att @ v
+--- solution
+def attention_buggy(q, k, v):
+    T = q.size(-2)
+    att = q @ k.transpose(-2, -1) / math.sqrt(q.size(-1))   # fix 1: the scaling was missing
+    mask = torch.tril(torch.ones(T, T))                     # fix 2: triu -> tril
+    att = att.masked_fill(mask == 0, float("-inf"))
+    att = F.softmax(att, dim=-1)                            # fix 3: dim=-2 -> -1
+    return att @ v
+--- tests
+@check("matches SDPA")
+def t11():
+    seed(6)
+    q, k, v = (torch.randn(1, 2, 5, 8) for _ in range(3))
+    eq(attention_buggy(q, k, v), F.scaled_dot_product_attention(q, k, v, is_causal=True),
+       msg="three places: the scaling factor / which triangle the mask keeps / the softmax dimension")
+--- explain
+1. The division by √hs was missing: the scores are too large and softmax is close to one-hot.
+2. `torch.triu` is the upper triangle: its 1s are in the upper right, meaning "may only look at the future", exactly backwards. It must be `torch.tril`.
+3. Softmax must make each query's weights (each **row**) add up to 1, so it is `dim=-1`. `dim=-2` normalises the columns.
+--- hints
+- Go through the formula term by term: are the scores divided by √hs?
+- In the mask, 1 means "may look": row 0 should have a 1 only in cell 0. Which triangle does `torch.triu` keep?
+- Softmax must make each query's weights (each row) add up to 1: which dimension is that?
+
+@@ item d4-10
+type: fix
+title: Find the bugs: BlockBuggy
+level: 2
+cards: Block: MLP + pre-LN residual
+targets: BlockBuggy
+ref: day4
+--- context
+Post-LN and a missing residual raise no error, and a small model may even train; with more layers it stops training. Bugs that "run but are wrong" are caught with invariant tests like the identity test.
+--- prompt
+This Block has **2** bugs, both in `forward` (`__init__` is fine). Fix it into a correct pre-LN residual Block, where every sub-layer is `x = x + sublayer(LN(x))`.
+- `CausalSelfAttention` and `MLP` are preloaded reference versions
+- the test: after zeroing the attention's `proj` and the whole MLP, the Block must return x unchanged
+--- starter
+class BlockBuggy(nn.Module):
+    def __init__(self, n_embd, n_head, block_size):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+        self.attn = CausalSelfAttention(n_embd, n_head, block_size)
+        self.mlp = MLP(n_embd)
+
+    def forward(self, x):
+        x = self.ln1(x + self.attn(x))
+        x = self.mlp(self.ln2(x))
+        return x
+--- solution
+class BlockBuggy(nn.Module):
+    def __init__(self, n_embd, n_head, block_size):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+        self.attn = CausalSelfAttention(n_embd, n_head, block_size)
+        self.mlp = MLP(n_embd)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))    # fix 1: post-LN -> pre-LN
+        x = x + self.mlp(self.ln2(x))     # fix 2: the residual was missing
+        return x
+--- tests
+@check("identity when the sub-layers output 0")
+def t12():
+    seed(7)
+    b = BlockBuggy(32, 4, 16)
+    x = torch.randn(2, 7, 32)
+    with torch.no_grad():
+        b.attn.proj.weight.zero_()
+        for p in b.mlp.parameters():
+            p.zero_()
+    eq(b(x), x, tol=1e-5, msg="two places: the LN belongs inside the residual branch (pre-LN); the MLP line lost its residual")
+--- explain
+1. The first line is post-LN: the LN wraps `x + attn(x)`, and attn gets the un-normalised x. Change it to `x = x + self.attn(self.ln1(x))`.
+2. The second line has no `x +`: the MLP output replaces x, so the residual is gone. Change it to `x = x + self.mlp(self.ln2(x))`.
+--- hints
+- The correct structure: every sub-layer is `x = x + sublayer(LN(x))`. Compare line by line.
+- The first line applies the LN after the residual addition (post-LN), and attn gets the un-normalised x; the second line drops the residual entirely.
+
+@@ item d4-11
+type: self
+title: Write the Block from memory (self-check)
+level: 1
+cards: Block: MLP + pre-LN residual; Multi-head: split heads, merge heads, register_buffer; Scaled dot-product attention, step by step
+--- context
+Writing from memory is how "I understand it" becomes "I can write it". Interviews ask you to write this on the spot, and day 5 (turning it into a Llama block) assumes you can write this Block with your eyes closed. Nothing runs here, but it is the most important exercise of the day.
+--- prompt
+Close every reference (cards, answers, your earlier code). In an empty file (VS Code or paper), write `Block` from memory, together with the `CausalSelfAttention` and `MLP` it uses.
+
+Then check it against the list below, one line at a time. Tick a line only when your code really does it; if it doesn't, fix it first, then tick.
+
+To confirm it runs: paste all three classes into the editor of exercise d4-05 and run it.
+--- checklist
+- `class Block(nn.Module)`, and the first line of `__init__` is `super().__init__()`
+- all four sub-modules exist: ln1 / attn / ln2 / mlp
+- forward has `x = x + self.attn(self.ln1(x))`, not `x = self.attn(self.ln1(x))`
+- the mlp line has its residual too
+- attention projects qkv to 3C in one Linear, then `split(C, dim=-1)`
+- `view` to (B, T, nh, hs), then `transpose(1, 2)`
+- the scores are divided by `math.sqrt(hs)` (hs = the size of one head)
+- the mask uses `tril`, and `masked_fill` puts `-inf` in it
+- softmax over the last dimension (`dim=-1`)
+- merging heads: `transpose(1, 2)` back, then `.contiguous()`, then `view(B, T, C)`
+- a final `proj` layer
+--- hints
+- Write the skeleton first: the `__init__` and `forward` signatures of all three classes, then fill them in.
+- If you forget a shape, say the route out loud: (B, T, C) → (B, nh, T, hs) → attention → (B, T, C).
+
+@@ item d4-12
+type: predict
+title: Predict the shapes: one pass of multi-head attention
+level: 2
+cards: Multi-head: split heads, merge heads, register_buffer
+--- context
+Most multi-head attention bugs are shape bugs. If you can work out every step's shape in your head, you know which line is wrong as soon as you see the error.
+--- prompt
+B=3, T=7, C=32, nh=4. Without running it, write the 4 lines this code prints (one shape tuple per line).
+--- code
+B, T, C, nh = 3, 7, 32, 4
+hs = C // nh
+x = torch.randn(B, T, C)
+qkv = nn.Linear(C, 3 * C, bias=False)
+q, k, v = qkv(x).split(C, dim=-1)
+q = q.view(B, T, nh, hs).transpose(1, 2)
+k = k.view(B, T, nh, hs).transpose(1, 2)
+v = v.view(B, T, nh, hs).transpose(1, 2)
+att = (q @ k.transpose(-2, -1) / math.sqrt(hs)).softmax(dim=-1)
+y = att @ v
+print(tuple(q.shape))
+print(tuple(att.shape))
+print(tuple(y.shape))
+print(tuple(y.transpose(1, 2).contiguous().view(B, T, C).shape))
+--- explain
+- hs = 32 / 4 = 8. After splitting the heads, q is (B, nh, T, hs) = (3, 4, 7, 8).
+- The scores are a T×T matrix per head: (3, 4, 7, 7). They don't depend on hs.
+- `att @ v`: (3, 4, 7, 7) @ (3, 4, 7, 8) → (3, 4, 7, 8).
+- Merging the heads gives back the input shape (3, 7, 32).
+--- hints
+- Compute hs = C // nh first.
+- After splitting the heads the shape is (B, nh, T, hs); the last two dimensions of the scores are both T.
+
+@@ item d4-13
+type: predict
+title: What attention computes when all scores are equal
+level: 1
+cards: Scaled dot-product attention, step by step; Causal mask: look only at the past
+--- context
+When all scores are equal, causal attention is simply "the average of the past". This special case shows what attention really is: a weighted average whose weights the model chooses itself.
+--- prompt
+All scores are 0; add the causal mask, apply softmax and multiply by v. The values of v at the 4 positions are 1, 2, 3, 4. Without running it, write the 3 lines this code prints.
+--- code
+T = 4
+scores = torch.zeros(1, 1, T, T)                      # all scores equal
+bias = torch.zeros(T, T).masked_fill(torch.tril(torch.ones(T, T)) == 0, float("-inf"))
+att = (scores + bias).softmax(dim=-1)
+v = torch.tensor([1.0, 2.0, 3.0, 4.0]).view(1, 1, T, 1)
+out = att @ v
+print(int((att > 0).sum()))
+print([round(w, 2) for w in att[0, 0, 2].tolist()])
+print([round(o, 2) for o in out.flatten().tolist()])
+--- explain
+- Position i can see i+1 positions, so the non-zero weights number 1+2+3+4 = 10.
+- With equal scores, softmax splits the weight evenly over the visible positions. Row 2 sees 3 positions: 1/3 ≈ 0.33 each, and 0 for the fourth.
+- The output is the average of all v's so far: 1, (1+2)/2 = 1.5, (1+2+3)/3 = 2.0, (1+2+3+4)/4 = 2.5. Training makes the scores unequal, so the model decides whom to look at more.
+--- hints
+- Masked cells become 0 after softmax; the remaining cells all have the same score, so they get the same weight.
+- The output at position i is the average of v over positions 0…i.
+
+@@ item d4-14
+type: choice
+title: Why divide by √hs?
+level: 1
+cards: Scaled dot-product attention, step by step
+--- context
+"Why does attention divide by √d?" is close to a guaranteed interview question. The answer is not "because the paper says so"; it is about softmax saturating and the gradients vanishing.
+--- prompt
+hs = 64, and every number in q and k is roughly mean 0, standard deviation 1. What happens if attention does **not** divide by √hs?
+--- options
+- The scores have a standard deviation of about 8; softmax gives almost all the weight to the single largest position, the other positions get gradients close to 0, and training becomes slow and unstable
+- All the scores become negative and softmax returns NaN
+- The output shape changes from (B, nh, T, hs) to (B, nh, T, T)
+- Nothing changes: softmax normalises each row to sum to 1 anyway, so the division makes no difference
+answer: 1
+--- explain
+A dot product is a sum of 64 products, each with a variance of about 1, so the dot product has a variance of about 64 and a standard deviation of about 8. When softmax sees scores that differ by 10 or more, the output is close to one-hot: it looks at almost one position only, and the others get no gradient. Dividing by √64 = 8 brings the standard deviation back to about 1. Option 4 is wrong because, although softmax does make each row sum to 1, the **shape** of the distribution (flat or peaked) depends on how large the scores are.
+--- hints
+- Add up 64 products that each have a standard deviation of 1: what is the standard deviation of the sum?
+- How different are softmax([0, 16]) and softmax([0, 2])?
+
+@@ item d4-15
+type: choice
+title: How many parameters does GPT-2 small have?
+level: 2
+cards: GPT: embeddings, init and weight tying; Block: MLP + pre-LN residual
+--- context
+Estimating a model's parameter count from a formula is a basic skill for interviews and for estimating memory. GPT-2 small is called "124M", and this is where that number comes from.
+--- prompt
+Use today's GPT structure (weight tying, no biases in qkv and proj) with V = 50257, C = 768, L = 12, block_size = 1024. Which is closest to the parameter count?
+--- options
+- about 85 million
+- about 124 million
+- about 163 million
+- about 1.5 billion
+answer: 2
+--- explain
+- 12 Blocks: 12 × (12·768² + 9·768) = 85,017,600, about 85 million (option 1 counts only the Blocks)
+- wte: 50257 × 768 = 38,597,376, about 38.6 million; wpe: 1024 × 768 = 786,432; ln_f: 1536
+- total 124,402,944, about 124 million. Without weight tying you add another 38.6 million, about 163 million (option 3)
+- the real GPT-2 also has biases in qkv and proj, 36,864 more, for 124,439,808 in total: that is the "124M"
+--- hints
+- One Block is 12C² + 9C; with C = 768, C² = 589,824.
+- Don't forget how big the vocabulary embedding V·C is, and that with tying it counts only once.
+
+@@ item d4-16
+type: code
+title: Closed book: CausalSelfAttention
+level: 3
+exam: yes
+cards: Multi-head: split heads, merge heads, register_buffer; Scaled dot-product attention, step by step
+targets: CausalSelfAttention
+ref: day4
+--- context
+Writing multi-head causal attention from a blank page, without notes, is the core skill of today, and the most common "write a Transformer" interview question.
+--- prompt
+From blank, write `CausalSelfAttention(n_embd, n_head, block_size)`; input and output are both `(B, T, C)`:
+- `self.qkv = nn.Linear(C, 3C, bias=False)`, `self.proj = nn.Linear(C, C, bias=False)`
+- keep the lower-triangular mask in a buffer named `"bias"` (`register_buffer`), shape `(1, 1, block_size, block_size)`
+- forward: qkv → split → split heads → scale, mask, softmax → multiply by v → merge heads → proj
+- T may be shorter than block_size; it must be causal
+--- starter
+class CausalSelfAttention(nn.Module):
+    def __init__(self, n_embd, n_head, block_size):
+        super().__init__()
+        raise todo()
+
+    def forward(self, x):
+        raise todo()
+--- solution
+class CausalSelfAttention(nn.Module):
+    def __init__(self, n_embd, n_head, block_size):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.n_head = n_head
+        self.qkv = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        self.proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        hs = C // self.n_head
+        q, k, v = self.qkv(x).split(C, dim=-1)
+        q = q.view(B, T, self.n_head, hs).transpose(1, 2)
+        k = k.view(B, T, self.n_head, hs).transpose(1, 2)
+        v = v.view(B, T, self.n_head, hs).transpose(1, 2)
+        att = q @ k.transpose(-2, -1) / math.sqrt(hs)
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf")).softmax(-1)
+        y = (att @ v).transpose(1, 2).contiguous().view(B, T, C)
+        return self.proj(y)
+--- tests
+@check("the CausalSelfAttention module")
+def t04():
+    seed(2)
+    m = CausalSelfAttention(32, 4, 16)
+    x = torch.randn(2, 9, 32)
+    shape_is(m(x), (2, 9, 32))
+    true("bias" in dict(m.named_buffers()), "the mask should be a buffer named \"bias\" (register_buffer), not rebuilt each time")
+    true(params(m) == 32 * 32 * 3 + 32 * 32,
+         f"{params(m)} parameters, expected 3C²+C² = 4096: qkv and proj both need bias=False")
+    # shorter inputs must work too (T < block_size)
+    shape_is(m(torch.randn(1, 3, 32)), (1, 3, 32), "T=3 is shorter than block_size=16 and must work too: slice the mask to [:, :, :T, :T]")
+    # causality
+    x2 = x.clone()
+    x2[:, 5:] = torch.randn(2, 4, 32)
+    eq(m(x)[:, :5], m(x2)[:, :5], msg="changing the last 4 positions of x also changed the first 5 outputs: the module is not causal (mask unused or backwards)")
+--- hints
+- The shape route: (B, T, C) → (B, T, nh, hs) → (B, nh, T, hs) → attention → back → (B, T, C).
+- Call `.contiguous()` before merging the heads.
+
+@@ item d4-17
+type: code
+title: Closed book: the full GPT
+level: 3
+exam: yes
+cards: GPT: embeddings, init and weight tying; The big picture: shapes from start to end
+targets: GPT
+ref: day4
+--- context
+Write the whole GPT from a blank page: embeddings, the stack of Blocks, the output head, nanoGPT init, weight tying and the loss. If you can write this, you can really write a Transformer.
+--- prompt
+From blank, write `GPT(vocab_size, block_size, n_layer=2, n_head=4, n_embd=32)` (`Block` is preloaded):
+- sub-module names: `wte`, `wpe`, `h` (a ModuleList), `ln_f`, `lm_head` (bias=False)
+- initialise Linear and Embedding weights from N(0, 0.02), Linear biases to zero
+- `lm_head.weight` and `wte.weight` are shared (the same object)
+- `forward(idx, targets=None)` returns `(logits, loss)`; without targets the loss is None
+--- starter
+class GPT(nn.Module):
+    def __init__(self, vocab_size, block_size, n_layer=2, n_head=4, n_embd=32):
+        super().__init__()
+        raise todo()
+
+    def forward(self, idx, targets=None):
+        raise todo()
+--- solution
+class GPT(nn.Module):
+    def __init__(self, vocab_size, block_size, n_layer=2, n_head=4, n_embd=32):
+        super().__init__()
+        self.block_size = block_size
+        self.wte = nn.Embedding(vocab_size, n_embd)
+        self.wpe = nn.Embedding(block_size, n_embd)
+        self.h = nn.ModuleList([Block(n_embd, n_head, block_size) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        self.apply(self._init)
+        self.lm_head.weight = self.wte.weight     # tying: one shared Parameter object
+
+    @staticmethod
+    def _init(m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, 0.0, 0.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device)
+        x = self.wte(idx) + self.wpe(pos)          # (B,T,C) + (T,C), broadcast
+        for b in self.h:
+            x = b(x)
+        logits = self.lm_head(self.ln_f(x))
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+--- tests
+@check("GPT forward + loss")
+def t07():
+    seed(4)
+    m = GPT(vocab_size=17, block_size=16, n_layer=2)
+    idx = torch.randint(0, 17, (2, 9))
+    logits, loss = m(idx)
+    shape_is(logits, (2, 9, 17))
+    true(loss is None, "without targets the loss should be None")
+    logits, loss = m(idx, idx)
+    true(loss.dim() == 0, "the loss must be a scalar: before cross_entropy, flatten logits to (B*T, V) and targets to (B*T,)")
+    # a freshly initialised model's loss should be close to ln(V)
+    true(abs(loss.item() - math.log(17)) < 0.7,
+         f"first loss = {loss.item():.3f}; it should be close to ln(17)={math.log(17):.3f}. "
+         "It is too far off: check the init (std=0.02) and how the loss is flattened")
+
+@check("weight tying")
+def t08():
+    m = GPT(vocab_size=17, block_size=16, n_layer=1)
+    true(m.lm_head.weight is m.wte.weight,
+         "lm_head.weight and wte.weight must be the same object (tested with is, not equal values): self.lm_head.weight = self.wte.weight")
+    n = params(m)
+    true(n == 13696, f"{n} parameters, expected 13696 (off by {n - 13696}). lm_head needs bias=False, and the shared weight must exist only once")
+--- hints
+- Order: build the modules → `self.apply(self._init)` → tie the weights.
+- forward: add the embeddings → every Block → ln_f → lm_head → with targets, flatten and compute cross_entropy.

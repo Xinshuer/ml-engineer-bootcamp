@@ -1,0 +1,1039 @@
+@@ day 17
+title: 调试三：不报错的 bug
+part: 调试与排错
+hours: 3–4 小时
+--- goal
+学完能认出训练代码里最常见的「不报错、结果却悄悄变差」的 bug：忘了 `eval()`、数据泄漏、标签没错位、padding 算进平均、梯度累积没加权、weight decay 压到 LayerNorm、scheduler 调错频率。还会写不变量测试，让这些 bug 在浪费你一周 GPU 之前自己现身。
+--- checklist
+- 先清空复习区（昨天看过答案的题从空白重做）
+- 读完 8 张知识卡片，每张的代码都改一个数再运行一次
+- 练习区全部通过：先读失败信息，想清楚 bug 在哪一行，再动手改
+- 闭卷区两题不看答案写出来
+
+@@ concept
+title: train() 和 eval()：Dropout 和 BatchNorm 会变
+--- body
+有两种常见的层，训练和推理时的行为不一样。`model.train()` 和 `model.eval()` 就是切换它们的开关，会自动作用到所有子模块。
+
+- **Dropout**：train 模式下，每个数以概率 p 被置 0，活下来的数乘以 1/(1-p)，让平均值不变。eval 模式下它什么都不做。
+- **BatchNorm**：train 模式下，用「当前这个 batch」的均值和方差做归一化，顺手更新 `running_mean` / `running_var`（一路累积下来的统计量）。eval 模式下，改用这两个存下来的统计量。
+
+所以预测时忘了 `model.eval()`，代码不会报错，但是：
+
+1. 同一个输入预测两次，结果不一样（Dropout 在随机丢）。
+2. 一个样本的预测，会随同 batch 的其他样本变化（BatchNorm 用的是 batch 的统计量）。
+3. 每预测一次，BatchNorm 的 running 统计量就被改一次。`torch.no_grad()` 拦不住：它只管梯度，不管模式。
+
+记住：**`no_grad` 和 `eval()` 是两件事，推理时两个都要。** 反过来，训练循环里做完评估，要用 `model.train()` 切回来，不然后面的训练就没有 Dropout 了。
+--- code
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(4, 8), nn.BatchNorm1d(8), nn.Dropout(0.5), nn.Linear(8, 2))
+x = torch.randn(6, 4)
+with torch.no_grad():
+    model.train()
+    print("train 模式，预测两次一样吗:", torch.equal(model(x), model(x)))
+    print("running_mean 被悄悄改了:", model[1].running_mean[:3])
+    model.eval()
+    print("eval 模式，预测两次一样吗:", torch.equal(model(x), model(x)))
+    print("eval 模式，前 2 个样本单独算 == 放在 batch 里算:", torch.allclose(model(x[:2]), model(x)[:2]))
+
+@@ concept
+title: 数据泄漏：统计量只能来自训练集
+--- body
+数据泄漏（data leakage）：测试集的信息偷偷流进了训练过程。结果是评估分数比上线后的真实表现好，而你不知道。
+
+最常见的一种：标准化（减均值、除标准差）时，均值和标准差是在「全部数据」上算的，算完才切分训练集和测试集。这样测试集的数值参与了训练数据的变换。
+
+正确顺序：
+
+1. 先切分：训练集、测试集分开。
+2. 只在训练集上算 `mean` 和 `std`（这叫「拟合」统计量）。
+3. 用这同一组 `mean` / `std` 去变换训练集、测试集，以及上线后的每一个请求。
+
+一个简单的检查（这就是一个不变量测试）：**只改测试集，训练集变换后的结果必须一模一样。** 变了，就说明有泄漏。
+
+tokenizer 的词表、特征选择、去重也是同一个道理：只能在训练集上「学」。
+
+下面的例子里，测试集的分布偏了。泄漏版把这个偏移藏掉了一半：评估时看起来只偏了 1.74 个标准差，上线后模型面对的其实是 3.39 个。
+--- code
+torch.manual_seed(0)
+train = torch.randn(100, 1) + 5.0      # 训练集：均值约 5
+test = torch.randn(20, 1) + 8.0        # 测试集：分布偏了，均值约 8
+both = torch.cat([train, test])
+print(f"用全部数据算的均值: {both.mean().item():.2f}")
+print(f"只用训练集算的均值: {train.mean().item():.2f}")
+leaky = ((test - both.mean()) / both.std()).mean().item()
+clean = ((test - train.mean()) / train.std()).mean().item()
+print(f"测试集标准化后的均值，泄漏版: {leaky:.2f}")
+print(f"测试集标准化后的均值，正确版: {clean:.2f}  <- 上线后模型看到的是这个")
+
+@@ concept
+title: next-token 标签要错开一位
+--- body
+语言模型的任务：看到位置 0..t 的 token，猜位置 t+1 的 token。所以输入和标签要**错开一位**：
+
+- `inputs = tokens[:, :-1]`（去掉最后一个）
+- `targets = tokens[:, 1:]`（去掉第一个）
+
+模型在位置 t 的输出 `logits[:, t]`，和 `targets[:, t]` 比，也就是原序列的第 t+1 个 token。
+
+忘了错开会怎样？标签就是模型已经看到的当前 token。模型只要学会「复读」，loss 就几乎是 0。训练曲线漂亮极了，生成的文本却一团乱。**loss 好得不真实，本身就是 bug 信号。**
+
+另一种错法是方向错反了（`inputs = tokens[:, 1:]`，`targets = tokens[:, :-1]`），变成了「看后面猜前面」。
+
+算 `F.cross_entropy` 前，要把 (B, T, V) 的 logits 摊平成 (B·T, V)，标签摊平成 (B·T,)。切片后的张量内存不一定连续，用 `.reshape`，不用 `.view`（第 16 天讲过）。
+--- code
+tokens = torch.tensor([[5, 6, 7, 8, 9]])
+inputs, targets = tokens[:, :-1], tokens[:, 1:]
+print("inputs :", inputs.tolist())
+print("targets:", targets.tolist())
+for t in range(inputs.shape[1]):
+    print(f"看到 {inputs[0, :t + 1].tolist()} -> 要猜 {targets[0, t].item()}")
+
+@@ concept
+title: padding 不能算进平均
+--- body
+一个 batch 里的句子长短不一。短的要在后面补 padding（填充用的假 token），才能拼成一个 (B, T) 的张量。再配一个 mask：1 表示真 token，0 表示 padding。
+
+padding 不是数据。loss、平均池化（mean pooling）、准确率，都只能在真 token 上算。正确写法：
+
+```
+masked_mean = (x * mask).sum() / mask.sum()
+```
+
+常见错法：先 `x * mask` 把 padding 置 0，再 `.mean()`。分子对了，分母却是「所有位置」的个数。后果：padding 越多，loss 看起来越小。换一个 batch 大小，或者按长度分桶，loss 就莫名其妙地变了。
+
+用 `F.cross_entropy` 还有一条路：把 padding 位置的 target 设成 -100。它的默认参数 `ignore_index=-100` 会跳过这些位置，分母也只数真 token。
+
+检查方法（又一个不变量）：**多补几列 padding，loss 必须完全不变。**
+--- code
+loss = torch.tensor([[2.0, 1.0, 3.0, 0.0, 0.0],
+                     [4.0, 0.0, 0.0, 0.0, 0.0]])   # 每个位置的 loss（padding 处已经是 0）
+mask = torch.tensor([[1., 1., 1., 0., 0.],
+                     [1., 0., 0., 0., 0.]])
+print("错误 (loss*mask).mean()          =", (loss * mask).mean().item())
+print("正确 (loss*mask).sum()/mask.sum() =", ((loss * mask).sum() / mask.sum()).item())
+wide_loss = torch.cat([loss, torch.zeros(2, 5)], 1)     # 再补 5 列 padding
+wide_mask = torch.cat([mask, torch.zeros(2, 5)], 1)
+print("多补 5 列后，错误写法 =", (wide_loss * wide_mask).mean().item())
+print("多补 5 列后，正确写法 =", ((wide_loss * wide_mask).sum() / wide_mask.sum()).item())
+
+@@ concept
+title: 梯度累积要按样本数加权
+--- body
+显存装不下大 batch 时，可以把它切成几个小 batch（micro-batch）。每个小 batch 都 `backward()`，梯度会**自动累加**到 `.grad` 上，最后只 `step()` 一次。这叫梯度累积（gradient accumulation）。
+
+坑就在「累加」上。每个小 batch 的 loss 已经是它自己的平均值，K 个梯度加起来，就是大 batch 梯度的 **K 倍**。
+
+- 小 batch 一样大：每个 loss 除以 K。
+- 小 batch 不一样大（最后一个常常更小）：每个 loss 乘以 `len(xb) / N`，N 是总样本数。只除以 K 的话，小 batch 里的样本权重会偏大。
+
+这个 bug 为什么能藏很久？用 Adam 时几乎看不出来：Adam 会按梯度的大小自动缩放，梯度整体大 K 倍，更新几乎一样。但是用 SGD 时步子大了 K 倍；梯度裁剪（clip）的阈值不再对；日志里的 loss 也大了 K 倍。
+
+检查方法（和参考对比）：**累积出来的梯度 == 直接在大 batch 上算的梯度。**
+--- code
+torch.manual_seed(0)
+x, y = torch.randn(8, 3), torch.randn(8, 1)
+m = nn.Linear(3, 1)
+F.mse_loss(m(x), y).backward()
+full = m.weight.grad.clone()                  # 大 batch 的梯度（参考答案）
+m.zero_grad()
+for xb, yb in zip(x.split(2), y.split(2)):    # 4 个小 batch，每个 2 条
+    F.mse_loss(m(xb), yb).backward()          # 没有加权
+print("没加权：是大 batch 梯度的", (m.weight.grad / full).round(decimals=3).tolist(), "倍")
+m.zero_grad()
+for xb, yb in zip(x.split(2), y.split(2)):
+    (F.mse_loss(m(xb), yb) * len(xb) / len(x)).backward()
+print("按样本数加权后，和大 batch 一样:", torch.allclose(m.weight.grad, full))
+
+@@ concept
+title: weight decay 不该压在 1 维参数上
+--- body
+weight decay：每一步都把参数往 0 拉一点（AdamW 里大约是 `p = p - lr * wd * p`），防止权重矩阵变得太大。
+
+但有两类参数不该往 0 拉：
+
+- **bias**：只是整体平移，拉向 0 起不到正则化的作用。
+- **LayerNorm / RMSNorm 的 weight**（缩放系数）：初始值是 1。被拉向 0，等于把这一层的输出越压越小。
+
+它们有一个共同点：都是 1 维的（`p.ndim == 1`）。权重矩阵、embedding 都是 2 维的。所以标准做法是按维数分成两组，交给优化器的 param groups（参数组：每组可以有自己的超参数）：
+
+```
+decay    = [p for p in model.parameters() if p.ndim >= 2]
+no_decay = [p for p in model.parameters() if p.ndim < 2]
+opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1},
+                         {"params": no_decay, "weight_decay": 0.0}], lr=3e-4)
+```
+
+按名字过滤（`"bias" in name`）很常见，但会漏掉 LayerNorm 的 weight：它的名字是 `norm.weight` 这种，里面没有 bias。
+--- code
+torch.manual_seed(0)
+net = nn.Sequential(nn.Linear(4, 4), nn.LayerNorm(4))
+for name, p in net.named_parameters():
+    print(f"{name:9s} ndim={p.ndim}  ->", "decay" if p.ndim >= 2 else "不 decay")
+opt = torch.optim.AdamW(net.parameters(), lr=0.1, weight_decay=0.1)   # 反面教材：全部 decay
+for _ in range(10):
+    for p in net.parameters():
+        p.grad = torch.zeros_like(p)          # 梯度是 0，只剩 weight decay 在起作用
+    opt.step()
+print("10 步后 LayerNorm 的 weight:", net[1].weight.data)
+
+@@ concept
+title: 学习率调度器每一步都要 step
+--- body
+学习率调度器（scheduler）按「`scheduler.step()` 被调用了几次」来决定当前学习率。warmup（开头几百步把学习率从很小慢慢升上去）、cosine 这些常用调度，都是按**优化器的步数**设计的。
+
+所以它的位置在内层循环里，紧跟在 `optimizer.step()` 后面：
+
+```
+for x, y in loader:
+    loss = ...
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    scheduler.step()      # 每一步一次
+```
+
+两种常见错法，都不报错：
+
+- 放在 epoch 循环里：一个 epoch 才走一步。warmup 本来 1000 步结束，结果要 1000 个 epoch，学习率一直很小，loss 降得慢得离谱。
+- 放在 `optimizer.step()` 前面：整个计划提前一步，第一步的学习率被跳过。PyTorch 只打印一条 warning。
+
+检查方法：把每一步实际用的学习率记下来（`optimizer.param_groups[0]["lr"]`），和你设计的计划逐项对比。
+--- code
+def used_lrs(per_step):
+    m = nn.Linear(2, 1)
+    opt = torch.optim.SGD(m.parameters(), lr=0.1)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / 4))  # 4 步 warmup
+    used = []
+    for epoch in range(2):
+        for step in range(3):
+            used.append(round(opt.param_groups[0]["lr"], 4))
+            opt.step()
+            if per_step:
+                sched.step()
+        if not per_step:
+            sched.step()
+    return used
+
+print("每步 step 一次:      ", used_lrs(True))
+print("每个 epoch step 一次:", used_lrs(False))
+
+@@ concept
+title: 不变量测试：让不报错的 bug 现身
+ref: day17
+--- body
+不报错的 bug 最贵：代码能跑，loss 也在降，只是结果悄悄差了一截。可能要训练好几天才发现。
+
+办法是写**不变量测试**（invariant test）：找一个「不管输入是什么都必须成立」的性质，用随机输入去验证它。今天用到这几个：
+
+- **因果性**：改掉位置 t 之后的输入，位置 0..t 的输出不能变。抓 attention mask 写错、卷积偷看下一个位置。
+- **批内独立**：把 batch 拆成两半分别算，结果要和整个 batch 一起算一样。抓忘了 `eval()` 的 BatchNorm、softmax 的 dim 写成 0。
+- **padding 不变**：多补几列 padding，loss 不变。抓 padding 被算进平均。
+- **只改测试集，训练数据不变**：抓数据泄漏。
+- **和参考实现对比**：梯度累积 vs 大 batch；手写 attention vs `F.scaled_dot_product_attention`。
+- **在一个 batch 上过拟合**（第 15 天）：loss 降不到接近 0，有 bug；loss 一下子就到 0，也要怀疑（比如标签没错位）。
+
+写这类测试有两个细节。第一，先 `model.eval()`，否则 Dropout 的随机性会让「应该不变」的输出也在变。第二，比较浮点数用 `torch.allclose(a, b, atol=1e-5)`，不用 `==`。
+
+下面的代码只在一个位置上做因果性检查。`CumMean`（位置 t 输出前 t+1 个输入的平均）和 `TinyAttention`（单头 attention，`mask="none"` 表示没加 mask）是今天准备好的小模型。练习里你会把它写成对每个位置都检查的工具。
+--- code
+torch.manual_seed(0)
+x = torch.randn(1, 6, 8)
+x2 = x.clone()
+x2[:, 4:] = torch.randn(1, 2, 8)          # 只改位置 4、5，也就是「未来」
+for name, m in [("CumMean", CumMean()), ("没加 mask 的 attention", TinyAttention(8, mask="none"))]:
+    m.eval()
+    with torch.no_grad():
+        same = torch.allclose(m(x)[:, :4], m(x2)[:, :4], atol=1e-5)
+    print(f"{name}: 前 4 个位置的输出没变 = {same}")
+
+@@ item d17-01
+type: predict
+title: Dropout 在 train 和 eval 下各输出什么
+level: 1
+cards: train() 和 eval()：Dropout 和 BatchNorm 会变
+--- context
+「同一个输入，每次预测结果都不一样」是新手最常问的问题之一，原因几乎总是忘了 `model.eval()`。先亲眼看看 Dropout 在两种模式下各做了什么。
+--- prompt
+读下面的代码，写出它打印的两行。
+
+提示：`p=0.5` 的 Dropout 在 train 模式下，没被置 0 的数会乘以 1/(1-p)。
+--- code
+torch.manual_seed(0)
+drop = nn.Dropout(p=0.5)
+x = torch.ones(4)
+drop.eval()
+print(drop(x).tolist())
+drop.train()
+print(sorted(set(drop(x).tolist())))
+--- explain
+第一行：eval 模式下 Dropout 什么都不做，输出等于输入，`[1.0, 1.0, 1.0, 1.0]`。
+
+第二行：train 模式下，每个数有一半的概率变成 0，没变成 0 的乘以 1/(1-0.5) = 2，这样平均值还是 1。`set` 去掉重复，`sorted` 排好序，得到 `[0.0, 2.0]`（这个种子下两种值都出现了）。
+
+所以推理时忘了 `eval()`，模型里一部分神经元会被随机关掉，预测自然每次都不一样。
+--- hints
+- eval 模式下的 Dropout 是「直通」的：输入是什么，输出就是什么。
+- train 模式下，每个 1.0 要么变成 0，要么变成 1.0 / (1 - 0.5)。
+
+@@ item d17-02
+type: fix
+title: 预测时忘了 model.eval()
+level: 1
+cards: train() 和 eval()：Dropout 和 BatchNorm 会变
+targets: predict
+ref: day17
+--- context
+线上服务里，同一张图请求两次给出两个不同的答案；一个用户的结果随同一批请求里别人的数据变化。这些都是真实发生过的事故，原因常常只是少了一行 `model.eval()`。
+--- prompt
+`predict(model, x)` 把 x（形状 (B, 8)）交给一个分类模型，返回每个样本 3 个类别的概率，形状 (B, 3)。模型来自 `make_classifier()`，里面有 BatchNorm 和 Dropout。
+
+它已经用了 `torch.no_grad()`，能跑，也不报错。但测试发现了三个问题：
+
+1. 同一个输入预测两次，结果不一样。
+2. 一个样本的预测结果，会随同 batch 的其他样本变化。
+3. 每预测一次，BatchNorm 的 `running_mean` 就被改一次。
+
+修好 `predict`，让这三个问题都消失。
+--- starter
+def predict(model, x):
+    """x: (B, 8) -> 概率 (B, 3)"""
+    with torch.no_grad():
+        logits = model(x)
+    return logits.softmax(-1)
+--- solution
+def predict(model, x):
+    """x: (B, 8) -> 概率 (B, 3)"""
+    model.eval()                     # Dropout 关掉，BatchNorm 改用存下来的统计量
+    with torch.no_grad():
+        logits = model(x)
+    return logits.softmax(-1)
+--- tests
+@check("同一个输入预测两次，结果一样")
+def _():
+    model = make_classifier()
+    model.train()                    # 刚训练完，模型还在 train 模式
+    x = torch.randn(16, 8)
+    p1 = predict(model, x)
+    p2 = predict(model, x)
+    eq(p2, p1, tol=1e-6, msg="两次预测不一样：Dropout 还开着，每次随机关掉一半神经元。")
+
+@check("一个样本的预测不受同 batch 其他样本影响")
+def _():
+    model = make_classifier()
+    model.train()
+    x = torch.randn(16, 8)
+    whole = predict(model, x)[:4]
+    part = predict(model, x[:4])
+    eq(part, whole, tol=1e-5, msg="同样 4 个样本，单独预测和混在 16 个样本里预测，结果不同。train 模式的 BatchNorm 用的是「这个 batch」的均值和方差。")
+
+@check("预测不会偷偷改掉 BatchNorm 的统计量")
+def _():
+    model = make_classifier()
+    model.train()
+    before = model[1].running_mean.clone()
+    predict(model, torch.randn(16, 8) + 3.0)
+    eq(model[1].running_mean, before, tol=0.0, msg="预测完 running_mean 变了：train 模式下 BatchNorm 每次 forward 都会更新它，torch.no_grad() 也拦不住。")
+--- hints
+- `torch.no_grad()` 只管「记不记录梯度」，不管层的行为。
+- Dropout 和 BatchNorm 的行为由模型的「模式」决定。预测时应该在哪个模式？
+- 在 `with torch.no_grad():` 前面加一行 `model.eval()`。
+
+@@ item d17-03
+type: fix
+title: 评估完忘了切回 train()
+level: 2
+cards: train() 和 eval()：Dropout 和 BatchNorm 会变
+targets: fit
+ref: day17
+--- context
+训练中途评估一次，然后忘了切回 train 模式，后面几万步训练就都没有 Dropout 了。模型更容易过拟合，但日志里什么异常都看不到。
+--- prompt
+`fit(model, train_batches, val_batch, eval_every=2)` 在 `train_batches` 上训练（SGD，lr=0.1，MSE loss），每 `eval_every` 步在 `val_batch` 上评估一次，返回验证 loss 的列表。
+
+评估那一段写得没错：用了 `model.eval()` 和 `torch.no_grad()`。问题出在评估之后。另外，传进来的模型可能正处在 eval 模式（比如刚加载完，或者刚评估过）。
+
+修好它，做到：**每一步训练都在 train 模式下做，每一次评估都在 eval 模式下做。**
+
+测试会在模型最前面放一个 `ModeSpy`，它记下每次 forward 时模型处在哪个模式。
+--- starter
+def fit(model, train_batches, val_batch, eval_every=2):
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    val_losses = []
+    for step, (x, y) in enumerate(train_batches):
+        loss = F.mse_loss(model(x), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if (step + 1) % eval_every == 0:
+            model.eval()
+            with torch.no_grad():
+                xv, yv = val_batch
+                val_losses.append(F.mse_loss(model(xv), yv).item())
+    return val_losses
+--- solution
+def fit(model, train_batches, val_batch, eval_every=2):
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    val_losses = []
+    for step, (x, y) in enumerate(train_batches):
+        model.train()                # 每一步开头都切到 train：不管之前评估过没有
+        loss = F.mse_loss(model(x), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if (step + 1) % eval_every == 0:
+            model.eval()
+            with torch.no_grad():
+                xv, yv = val_batch
+                val_losses.append(F.mse_loss(model(xv), yv).item())
+    return val_losses
+--- tests
+def _toy():
+    spy = ModeSpy()
+    model = nn.Sequential(spy, nn.Linear(4, 8), nn.Dropout(0.2), nn.Linear(8, 1))
+    batches = [(torch.randn(4, 4), torch.randn(4, 1)) for _ in range(6)]   # 训练 batch：4 条
+    val = (torch.randn(7, 4), torch.randn(7, 1))                           # 验证 batch：7 条
+    return spy, model, batches, val
+
+@check("训练时在 train 模式，评估时在 eval 模式")
+def _():
+    spy, model, batches, val = _toy()
+    model.train()
+    fit(model, batches, val, eval_every=2)
+    train_modes = [mode for n, mode in spy.log if n == 4]
+    eval_modes = [mode for n, mode in spy.log if n == 7]
+    true(len(train_modes) == 6 and len(eval_modes) == 3,
+         f"应该有 6 次训练 forward、3 次评估 forward，实际是 {len(train_modes)} 次和 {len(eval_modes)} 次")
+    wrong = [i for i, mode in enumerate(train_modes) if not mode]
+    true(not wrong, f"第 {wrong} 步（从 0 数）训练时模型在 eval 模式：Dropout 被关掉了，可代码不报错。评估完要切回 train 模式。")
+    true(not any(eval_modes), "评估时模型必须在 eval 模式")
+
+@check("传进来的模型在 eval 模式，也要按 train 模式训练")
+def _():
+    spy, model, batches, val = _toy()
+    model.eval()                     # 比如刚加载完 checkpoint
+    fit(model, batches, val, eval_every=2)
+    train_modes = [mode for n, mode in spy.log if n == 4]
+    true(len(train_modes) == 6 and all(train_modes),
+         f"训练 forward 的模式依次是 {train_modes}（True = train 模式）。模型进来时是 eval 模式，fit 却从来没切到 train。")
+--- hints
+- 第一次评估之后，谁把模型切回 train 模式？
+- 与其在评估后面补一句，不如在每一步训练的开头就确定模式。这样模型进来时是 eval 模式也没关系。
+- 在 `for` 循环体的第一行加 `model.train()`。
+
+@@ item d17-04
+type: fix
+title: 数据泄漏：用了测试集的均值
+level: 1
+cards: 数据泄漏：统计量只能来自训练集; 不变量测试：让不报错的 bug 现身
+targets: normalize_split
+ref: day17
+--- context
+用全部数据算均值和标准差，再切分训练集、测试集，是最常见的数据泄漏。评估分数会比上线后好看，因为测试集的信息已经「提前」进了训练数据。
+--- prompt
+`normalize_split(x, n_train)`：`x` 形状 (N, D)，前 `n_train` 行是训练集，其余是测试集。用**训练集的**均值和标准差（按列，`.mean(0)` 和 `.std(0)`，用默认的无偏估计）标准化两部分，返回 `(x_train, x_test, mean, std)`。
+
+现在的代码能跑，但测试集的数据会影响训练集的结果。修好它。
+--- starter
+def normalize_split(x, n_train):
+    mean = x.mean(0)
+    std = x.std(0)
+    x_train = (x[:n_train] - mean) / std
+    x_test = (x[n_train:] - mean) / std
+    return x_train, x_test, mean, std
+--- solution
+def normalize_split(x, n_train):
+    train, test = x[:n_train], x[n_train:]
+    mean = train.mean(0)             # 统计量只从训练集来
+    std = train.std(0)
+    x_train = (train - mean) / std
+    x_test = (test - mean) / std
+    return x_train, x_test, mean, std
+--- tests
+@check("只改测试集，训练集的结果不变")
+def _():
+    x = torch.randn(20, 3) * 2 + 1
+    tr1, _, _, _ = normalize_split(x, 15)
+    x2 = x.clone()
+    x2[15:] += 100.0                 # 测试集里来了一批很大的数
+    tr2, _, _, _ = normalize_split(x2, 15)
+    eq(tr2, tr1, tol=1e-5, msg="只改了测试集，训练集标准化后的结果却变了：均值/标准差用到了测试集。这就是数据泄漏。")
+
+@check("统计量只来自训练集，测试集也用它们")
+def _():
+    x = torch.randn(20, 3) * 2 + 1
+    tr, te, mean, std = normalize_split(x, 15)
+    eq(mean, x[:15].mean(0), tol=1e-5, msg="mean 应该只用训练集（前 n_train 行）算")
+    eq(std, x[:15].std(0), tol=1e-5, msg="std 应该只用训练集算")
+    eq(te, (x[15:] - x[:15].mean(0)) / x[:15].std(0), tol=1e-5, msg="测试集要用训练集的 mean / std 来标准化")
+--- hints
+- `x.mean(0)` 用的是哪些行？
+- 先切出 `x[:n_train]`，只在它上面算 mean 和 std。测试集用同一组 mean 和 std。
+
+@@ item d17-05
+type: fix
+title: next-token 的标签没错位
+level: 2
+cards: next-token 标签要错开一位
+targets: lm_loss
+ref: day17
+--- context
+标签没错位的语言模型，loss 会降得飞快、接近 0，看起来训练得特别好。其实它学会的只是复读当前 token。这类 bug 常常要等到生成文本时才被发现。
+--- prompt
+`lm_loss(model, tokens)`：`tokens` 形状 (B, T)，dtype long。`model(inp)` 把 (B, k) 的 token 变成 (B, k, V) 的 logits，位置 t 的 logits 用来猜**下一个** token。返回整个 batch 的平均 cross-entropy（一个标量）。
+
+测试用两个假模型：`NextModel` 永远猜「当前 token + 1」，`CopyModel` 永远猜「就是当前 token」。在 0,1,2,3… 这样一路加 1 的数据上，前者是完美的语言模型，后者一无是处。可是现在的代码给出的结论正好反过来。修好它。
+--- starter
+def lm_loss(model, tokens):
+    logits = model(tokens)                       # (B, T, V)
+    V = logits.size(-1)
+    return F.cross_entropy(logits.reshape(-1, V), tokens.reshape(-1))
+--- solution
+def lm_loss(model, tokens):
+    logits = model(tokens[:, :-1])               # 用位置 0..T-2 去猜
+    targets = tokens[:, 1:]                      # 位置 1..T-1 的 token：错开一位
+    V = logits.size(-1)
+    return F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1))
+--- tests
+def _counting_tokens(B=4, T=9, V=11):
+    start = torch.randint(0, V, (B, 1))
+    return (start + torch.arange(T)) % V         # 每行都是一路加 1：下一个 token 永远是「当前 + 1」
+
+@check("会猜下一个 token 的模型，loss 接近 0")
+def _():
+    loss = lm_loss(NextModel(11), _counting_tokens())
+    true(loss.item() < 0.01,
+         f"loss = {loss.item():.3f}。NextModel 每次都猜对下一个 token，loss 应该接近 0。"
+         "你是不是拿位置 t 的输出去对位置 t 的 token 了？")
+
+@check("只会复读当前 token 的模型，loss 不能接近 0")
+def _():
+    loss = lm_loss(CopyModel(11), _counting_tokens())
+    true(loss.item() > 1.0,
+         f"loss = {loss.item():.4f}。一个只会复读的模型拿到了几乎完美的 loss，好得不真实：标签没有错位，模型在「抄答案」。")
+--- hints
+- 位置 t 的 logits 要和哪个位置的 token 比？
+- 输入去掉最后一个 token，标签去掉第一个 token。
+- `logits = model(tokens[:, :-1])`，`targets = tokens[:, 1:]`，摊平时用 `.reshape`。
+
+@@ item d17-06
+type: fix
+title: padding 被算进了平均 loss
+level: 2
+cards: padding 不能算进平均; 不变量测试：让不报错的 bug 现身
+targets: masked_lm_loss
+ref: day17
+--- context
+padding 算进平均后，loss 会随 padding 的多少而变。换一个 batch 大小、换一种分桶方式，loss 曲线就跳一下；不同实验的 loss 也没法比。代码却从不报错。
+--- prompt
+`masked_lm_loss(logits, targets, mask)`：
+
+- `logits` (B, T, V)，`targets` (B, T) long
+- `mask` (B, T) float，1.0 = 真 token，0.0 = padding
+
+padding 位置的 target 填的是 0，而 0 也是一个真实的 token id，所以不能直接靠 `ignore_index`。
+
+返回**所有真 token 上**的平均 cross-entropy（按 token 平均，一个标量）。现在的代码已经把 padding 的 loss 乘成了 0，可结果还是不对。修好它。
+--- starter
+def masked_lm_loss(logits, targets, mask):
+    V = logits.size(-1)
+    loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1), reduction="none")
+    loss = loss * mask.reshape(-1)               # padding 位置的 loss 变成 0
+    return loss.mean()
+--- solution
+def masked_lm_loss(logits, targets, mask):
+    V = logits.size(-1)
+    loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1), reduction="none")
+    mask = mask.reshape(-1).to(loss.dtype)
+    return (loss * mask).sum() / mask.sum()      # 分母只数真 token
+--- tests
+def _batch(B=3, T=5, V=7):
+    logits = torch.randn(B, T, V)
+    lengths = torch.tensor([5, 3, 2])
+    mask = (torch.arange(T) < lengths[:, None]).float()      # (B, T)
+    targets = torch.randint(0, V, (B, T)) * mask.long()       # padding 位置的 target 是 0
+    return logits, targets, mask
+
+@check("多补几列 padding，loss 不变")
+def _():
+    logits, targets, mask = _batch()
+    a = masked_lm_loss(logits, targets, mask)
+    B, T, V = logits.shape
+    b = masked_lm_loss(torch.cat([logits, torch.randn(B, 4, V)], 1),
+                       torch.cat([targets, torch.zeros(B, 4, dtype=torch.long)], 1),
+                       torch.cat([mask, torch.zeros(B, 4)], 1))
+    eq(b, a, tol=1e-5,
+       msg=f"多补 4 列 padding，loss 从 {a.item():.4f} 变成了 {b.item():.4f}。padding 越多 loss 越小，说明分母数的是所有位置，不是真 token。")
+
+@check("等于真 token 上的平均 cross-entropy")
+def _():
+    logits, targets, mask = _batch()
+    keep = mask.bool()
+    want = F.cross_entropy(logits[keep], targets[keep])
+    eq(masked_lm_loss(logits, targets, mask), want, tol=1e-5, msg="应该只在真 token 上求平均：(loss * mask).sum() / mask.sum()")
+--- hints
+- 分子已经对了（padding 的 loss 是 0）。`.mean()` 的分母是多少？
+- 分母应该是真 token 的个数，也就是 `mask.sum()`。
+
+@@ item d17-07
+type: fix
+title: 梯度累积：忘了加权
+level: 3
+cards: 梯度累积要按样本数加权
+targets: accum_step
+ref: day17
+--- context
+梯度累积是在小显存上训大 batch 的标准做法。忘了给 loss 加权，梯度就大了好几倍：用 SGD 时步子大得离谱，用 Adam 时梯度裁剪和日志里的 loss 也都是错的，而且没有任何报错。
+--- prompt
+`accum_step(model, opt, micro_batches)`：`micro_batches` 是 `[(x, y), ...]`，这些小 batch 拼起来就是一个大 batch。累积梯度，最后只 `opt.step()` 一次。
+
+要求：效果和「在大 batch 上算一次 `F.mse_loss`（默认求平均），backward，再 step」**完全一样**；返回值是大 batch 的 loss（Python float）。
+
+注意：小 batch 不一定一样大，最后一个可能更小（比如 4, 4, 2）。
+
+测试用 SGD，因为 Adam 对梯度的整体缩放几乎不敏感，会把这个 bug 藏起来。
+--- starter
+def accum_step(model, opt, micro_batches):
+    opt.zero_grad()
+    total = 0.0
+    for x, y in micro_batches:
+        loss = F.mse_loss(model(x), y)
+        loss.backward()
+        total += loss.item()
+    opt.step()
+    return total
+--- solution
+def accum_step(model, opt, micro_batches):
+    n = sum(len(x) for x, _ in micro_batches)    # 大 batch 一共多少条
+    opt.zero_grad()
+    total = 0.0
+    for x, y in micro_batches:
+        loss = F.mse_loss(model(x), y) * (len(x) / n)   # 每份按样本数加权
+        loss.backward()
+        total += loss.item()
+    opt.step()
+    return total
+--- tests
+def _compare(sizes):
+    x, y = torch.randn(sum(sizes), 4), torch.randn(sum(sizes), 2)
+    ref = nn.Linear(4, 2)
+    mine = nn.Linear(4, 2)
+    mine.load_state_dict(ref.state_dict())
+    ref_opt = torch.optim.SGD(ref.parameters(), lr=0.1)
+    ref_opt.zero_grad()
+    full = F.mse_loss(ref(x), y)                 # 参考：直接在大 batch 上算
+    full.backward()
+    ref_opt.step()
+    opt = torch.optim.SGD(mine.parameters(), lr=0.1)
+    got = accum_step(mine, opt, list(zip(x.split(sizes), y.split(sizes))))
+    return ref, mine, full.item(), got
+
+@check("4 个一样大的小 batch == 1 个大 batch")
+def _():
+    ref, mine, _, _ = _compare([4, 4, 4, 4])
+    ratio = (mine.weight.grad.norm() / ref.weight.grad.norm()).item()
+    eq(mine.weight.grad, ref.weight.grad, tol=1e-5, msg=f"累积出来的梯度是大 batch 梯度的 {ratio:.2f} 倍：每个小 batch 的 loss 都是平均值，直接相加就多算了。")
+    eq(mine.weight, ref.weight, tol=1e-5, msg="step 之后的参数和大 batch 训练的不一样")
+
+@check("小 batch 不一样大（4, 4, 2）也要对")
+def _():
+    ref, mine, _, _ = _compare([4, 4, 2])
+    eq(mine.weight.grad, ref.weight.grad, tol=1e-5,
+       msg="只除以小 batch 的个数还不够：最后一份只有 2 条，它的 loss 应该占 2/10，而不是 1/3。每份 loss 乘以 len(x) / 总条数。")
+    eq(mine.weight, ref.weight, tol=1e-5, msg="step 之后的参数和大 batch 训练的不一样")
+
+@check("返回的 loss 等于大 batch 的 loss")
+def _():
+    _, _, full, got = _compare([4, 4, 2])
+    true(isinstance(got, float), f"要返回 Python float（用 .item()），你返回的是 {type(got).__name__}")
+    true(close(got, full, 1e-5), f"你返回 {got:.4f}，大 batch 的 loss 是 {full:.4f}。日志里的 loss 也要按同样的权重加起来。")
+--- hints
+- 每个小 batch 的 loss 已经是平均值。把 4 个平均值的梯度直接加起来，是大 batch 梯度的几倍？
+- 大 batch 的平均 = 每份的平均 × (这份的条数 / 总条数)，再全部加起来。
+- 先算 `n = sum(len(x) for x, _ in micro_batches)`，每份 `loss = F.mse_loss(model(x), y) * (len(x) / n)`，`total` 加的也是这个加权后的值。
+
+@@ item d17-08
+type: fix
+title: weight decay 压到了 LayerNorm 上
+level: 2
+cards: weight decay 不该压在 1 维参数上
+targets: param_groups
+ref: day17
+--- context
+几乎每个训练 Transformer 的代码库都要把参数分成「decay」和「不 decay」两组。按名字过滤是最常见的写法，也最容易漏掉 LayerNorm 的 weight，让它在训练中被一点点压小。
+--- prompt
+`param_groups(model, weight_decay)` 返回给 `torch.optim.AdamW` 用的两个参数组：
+
+- 第一组：要 weight decay 的参数，`"weight_decay": weight_decay`
+- 第二组：不要 weight decay 的参数（所有 bias 和 LayerNorm 的 weight），`"weight_decay": 0.0`
+
+每个参数必须恰好出现在一组里。现在的代码按名字找 bias，能跑，可 LayerNorm 的 weight 还是被 decay 了。改成可靠的规则：**1 维的参数（`p.ndim < 2`）不 decay，2 维及以上的 decay。**
+--- starter
+def param_groups(model, weight_decay):
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if name.endswith("bias"):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [{"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0}]
+--- solution
+def param_groups(model, weight_decay):
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if p.ndim < 2:               # bias、LayerNorm 的 weight 都是 1 维
+            no_decay.append(p)
+        else:                        # 权重矩阵、embedding
+            decay.append(p)
+    return [{"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0}]
+--- tests
+def _net():
+    return nn.Sequential(nn.Embedding(10, 8), nn.LayerNorm(8), nn.Linear(8, 8), nn.LayerNorm(8), nn.Linear(8, 10))
+
+@check("1 维参数不 decay，其余都 decay")
+def _():
+    net = _net()
+    groups = param_groups(net, 0.1)
+    names = {id(p): n for n, p in net.named_parameters()}
+    decay = [p for g in groups if g["weight_decay"] > 0 for p in g["params"]]
+    no_decay = [p for g in groups if g["weight_decay"] == 0 for p in g["params"]]
+    wrong = [names[id(p)] for p in decay if p.ndim < 2]
+    true(not wrong, f"这些 1 维参数被 decay 了：{wrong}。LayerNorm 的 weight 名字里没有 bias，按名字过滤会漏掉它。")
+    true(sorted(names[id(p)] for p in decay) == sorted(n for n, p in net.named_parameters() if p.ndim >= 2),
+         "2 维及以上的参数（Embedding、Linear 的 weight）都要在 decay 组里，而且每个只出现一次")
+    true(sorted(names[id(p)] for p in no_decay) == sorted(n for n, p in net.named_parameters() if p.ndim < 2),
+         "1 维参数要在 weight_decay=0 的组里，而且每个只出现一次")
+
+@check("训练时 LayerNorm 的 weight 不会被悄悄压小")
+def _():
+    net = _net()
+    opt = torch.optim.AdamW(param_groups(net, 0.1), lr=0.1)
+    for _ in range(10):
+        for p in net.parameters():
+            p.grad = torch.zeros_like(p)     # 梯度是 0：参数只可能被 weight decay 改变
+        opt.step()
+    ln = net[1].weight
+    true(torch.all(ln == 1.0),
+         f"梯度一直是 0，LayerNorm 的 weight 却从 1.0 缩到了 {ln.mean().item():.3f}，这全是 weight decay 干的。")
+--- hints
+- `nn.LayerNorm(8)` 的两个参数叫什么名字？哪个的名字不以 bias 结尾？
+- 不看名字，看形状：bias 和 LayerNorm 的 weight 有什么共同点？
+- 把 `if name.endswith("bias"):` 换成 `if p.ndim < 2:`。
+
+@@ item d17-09
+type: fix
+title: scheduler 每个 epoch 才 step 一次
+level: 2
+cards: 学习率调度器每一步都要 step
+targets: train_with_warmup
+ref: day17
+--- context
+warmup 调度按「步」设计，却每个 epoch 才走一步，学习率就会在很小的值上停留很久。loss 降得很慢，人们往往去调模型、调数据，没想到是 scheduler 放错了一行。
+--- prompt
+`train_with_warmup(model, batches, epochs, lr=0.1, warmup=8)` 用 SGD 训练 `epochs` 个 epoch，每个 epoch 把 `batches` 全部过一遍。
+
+学习率计划是线性 warmup：第 s 步（从 0 开始数，每做一次 `opt.step()` 算一步）的学习率是 `lr * min(1, (s + 1) / warmup)`。也就是前 8 步从 0.0125 升到 0.1，之后一直是 0.1。
+
+函数返回每一步 `opt.step()` 实际用到的学习率列表。现在的代码能跑，但学习率涨得太慢。修好它。
+--- starter
+def train_with_warmup(model, batches, epochs, lr=0.1, warmup=8):
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / warmup))
+    used = []
+    for epoch in range(epochs):
+        for x, y in batches:
+            loss = F.mse_loss(model(x), y)
+            opt.zero_grad()
+            loss.backward()
+            used.append(opt.param_groups[0]["lr"])
+            opt.step()
+        sched.step()
+    return used
+--- solution
+def train_with_warmup(model, batches, epochs, lr=0.1, warmup=8):
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / warmup))
+    used = []
+    for epoch in range(epochs):
+        for x, y in batches:
+            loss = F.mse_loss(model(x), y)
+            opt.zero_grad()
+            loss.backward()
+            used.append(opt.param_groups[0]["lr"])
+            opt.step()
+            sched.step()             # 每一步一次，紧跟在 opt.step() 后面
+    return used
+--- tests
+def _run():
+    model = nn.Linear(2, 1)
+    batches = [(torch.randn(5, 2), torch.randn(5, 1)) for _ in range(4)]
+    return train_with_warmup(model, batches, epochs=3, lr=0.1, warmup=8)
+
+@check("第 8 步（下标 7）学习率到达 0.1")
+def _():
+    used = _run()
+    true(len(used) == 12, f"4 个 batch × 3 个 epoch = 12 步，你记录了 {len(used)} 个学习率")
+    true(close(used[7], 0.1, 1e-9),
+         f"下标 7 的学习率应该是 0.1，实际是 {used[7]:.4f}。warmup 是按步设计的，你的 scheduler 走得太慢了。")
+
+@check("每一步的学习率都和计划一致")
+def _():
+    used = _run()
+    want = [0.1 * min(1.0, (s + 1) / 8) for s in range(12)]
+    bad = [i for i in range(min(len(used), 12)) if not close(used[i], want[i], 1e-9)]
+    true(len(used) == 12 and not bad,
+         f"从下标 {bad[0] if bad else len(used)} 开始对不上。\n       计划: {[round(v, 4) for v in want]}\n       实际: {[round(v, 4) for v in used]}\n"
+         "       scheduler.step() 要在每一步的 opt.step() 之后调用，不能放在 epoch 循环里，也不能放在 opt.step() 前面。")
+--- hints
+- `sched.step()` 现在在哪个循环里？一个 epoch 它被调用几次？
+- 把它移进内层循环，放在 `opt.step()` 的下一行。
+
+@@ item d17-10
+type: code
+title: 不变量测试一：因果性检查
+level: 2
+cards: 不变量测试：让不报错的 bug 现身; train() 和 eval()：Dropout 和 BatchNorm 会变
+targets: check_causal
+ref: day17
+--- context
+attention mask 方向写反、多放了一个位置、卷积的 padding 让模型看到下一个 token：这些 bug 都不报错，训练 loss 还会格外好看。一个几行的因果性检查，能在训练开始前把它们全部抓出来。
+--- prompt
+写 `check_causal(model, x)`，检查一个序列模型会不会「偷看未来」。
+
+- `model` 把 (B, T, D) 变成 (B, T, D_out)；`x` 是 (B, T, D) 的 float 输入。
+- 对每个位置 t = 0, 1, …, T-2：复制一份 x，把位置 t 之后（`t+1:`）的输入全换成随机数（`torch.randn_like`），再跑一次模型。位置 0..t 的输出必须和原来的一样（`torch.allclose(..., atol=1e-5)`）。
+- 全都一样返回 `True`；只要有一个位置变了，就返回 `False`。
+- 检查前先 `model.eval()`，并在 `torch.no_grad()` 里跑：有些模型带 Dropout，它的随机性会让输出本来就在变。
+
+测试会用到 `CumMean`（因果）、`TinyAttention(mask="causal" / "none" / "peek1")`、`SameConv`（padding=1 的卷积）和 `PeekMiddle`（只有位置 2 偷看了位置 3）。
+--- starter
+def check_causal(model, x):
+    """model: (B, T, D) -> (B, T, D_out)   x: (B, T, D)
+    把每个位置 t 之后的输入换成随机数，位置 0..t 的输出都不变 -> True，否则 False。"""
+    raise todo()
+--- solution
+def check_causal(model, x):
+    model.eval()                                  # 关掉 Dropout，不然输出本来就在变
+    with torch.no_grad():
+        base = model(x)
+        for t in range(x.shape[1] - 1):
+            x2 = x.clone()
+            x2[:, t + 1:] = torch.randn_like(x2[:, t + 1:])     # 只改「未来」
+            if not torch.allclose(model(x2)[:, :t + 1], base[:, :t + 1], atol=1e-5):
+                return False                      # 过去的输出变了：偷看了未来
+    return True
+--- tests
+@check("因果的模型：返回 True")
+def _():
+    x = torch.randn(2, 6, 8)
+    r = check_causal(CumMean(), x)
+    true(r is not None and bool(r), "CumMean 只用过去和现在的输入，是因果的，你的检查却说它偷看了未来")
+    attn = TinyAttention(8, mask="causal", p_drop=0.3)
+    attn.train()                                  # 带 Dropout，而且现在是 train 模式
+    r = check_causal(attn, x)
+    true(r is not None and bool(r), "带 Dropout 的因果 attention 被判成了「偷看未来」：输出变了，是 Dropout 的随机性造成的。检查前先 model.eval()。")
+
+@check("偷看未来的模型：返回 False")
+def _():
+    x = torch.randn(2, 6, 8)
+    cases = [("没加 mask 的 attention", TinyAttention(8, mask="none")),
+             ("mask 用了 tril(diagonal=1) 的 attention（多看一个位置）", TinyAttention(8, mask="peek1")),
+             ("padding=1 的卷积（能看到下一个位置）", SameConv(8)),
+             ("只有位置 2 偷看了位置 3 的模型（要对每个 t 都检查）", PeekMiddle())]
+    for name, m in cases:
+        r = check_causal(m, x)
+        true(r is not None and not bool(r), f"{name} 会偷看未来，你的检查没抓到")
+--- hints
+- 先算一次原始输出 `base = model(x)`，后面每次都和它比。
+- 对每个 t：`x2 = x.clone()`，`x2[:, t + 1:] = torch.randn_like(x2[:, t + 1:])`，比较 `model(x2)[:, :t + 1]` 和 `base[:, :t + 1]`。
+- 别忘了开头的 `model.eval()` 和 `with torch.no_grad():`。比较用 `torch.allclose(a, b, atol=1e-5)`。
+
+@@ item d17-11
+type: code
+title: 不变量测试二：batch 里的样本互不影响
+level: 2
+cards: 不变量测试：让不报错的 bug 现身; train() 和 eval()：Dropout 和 BatchNorm 会变
+targets: check_batch_independent
+ref: day17
+--- context
+推理时，一个样本的结果不应该取决于它和谁分在同一个 batch。忘了 `eval()` 的 BatchNorm、dim 写错的 softmax 都会破坏这一点。上线后结果随流量大小变化，很难排查；上线前一个检查就够了。
+--- prompt
+写 `check_batch_independent(f, x)`：
+
+- `f` 是一个函数或模型，把 (B, …) 变成 (B, …)，第 0 维是 batch。`f` 本身没有随机性。
+- 把 x 拆成两半：`x[:h]` 和 `x[h:]`，`h = B // 2`。分别算 `f`，再用 `torch.cat` 按第 0 维拼起来。
+- 拼起来的结果和 `f(x)`（整个 batch 一起算）一样（`torch.allclose(..., atol=1e-5)`），返回 `True`，否则返回 `False`。
+- 在 `torch.no_grad()` 里做。
+
+注意：这个检查**不要**调用 `eval()`。它要检查的正是 `f` 在当前状态下的行为，比如你写的 `predict` 函数有没有忘了切模式。
+--- starter
+def check_batch_independent(f, x):
+    """f: (B, ...) -> (B, ...)   x: (B, ...)
+    两半分开算、再拼起来 == 整个 batch 一起算 -> True，否则 False。"""
+    raise todo()
+--- solution
+def check_batch_independent(f, x):
+    h = x.shape[0] // 2
+    with torch.no_grad():
+        whole = f(x)                                   # 整个 batch 一起算
+        parts = torch.cat([f(x[:h]), f(x[h:])])        # 拆成两半分别算
+    return torch.allclose(parts, whole, atol=1e-5)
+--- tests
+@check("样本各算各的：返回 True")
+def _():
+    x = torch.randn(8, 8)
+    model = make_classifier()
+    model.eval()
+    r = check_batch_independent(model, x)
+    true(r is not None and bool(r), "eval 模式的模型里每个样本各算各的，应该返回 True")
+    r = check_batch_independent(lambda t: t.softmax(-1), x)
+    true(r is not None and bool(r), "softmax(dim=-1) 只在每一行内部归一化，样本之间互不影响，应该返回 True")
+
+@check("样本之间会互相影响：返回 False")
+def _():
+    x = torch.randn(8, 8)
+    bn = nn.Sequential(nn.Linear(8, 16), nn.BatchNorm1d(16))
+    bn.train()
+    cases = [("train 模式的 BatchNorm", bn),
+             ("softmax 的 dim 写成了 0", lambda t: t.softmax(0)),
+             ("减去整个 batch 的均值", lambda t: t - t.mean(0))]
+    for name, f in cases:
+        r = check_batch_independent(f, x)
+        true(r is not None and not bool(r), f"{name}：一个样本的输出取决于同 batch 的其他样本，你的检查没抓到")
+--- hints
+- 需要算三次 `f`：整个 x、前一半、后一半。
+- `torch.cat([f(x[:h]), f(x[h:])])` 按第 0 维拼回去，再和 `f(x)` 用 `torch.allclose(..., atol=1e-5)` 比。
+
+@@ item d17-12
+type: choice
+title: 哪个不变量能抓哪个 bug
+level: 2
+cards: 不变量测试：让不报错的 bug 现身
+--- context
+写不变量测试之前，要先想清楚：我担心的是哪种 bug，什么性质被它破坏了。测错了性质，测试全绿，bug 照样在。
+--- prompt
+下面每一项都是「一个不变量测试 → 它能抓到的 bug」。哪些配对是**对的**？（可多选）
+--- options
+- 因果性检查（改掉位置 t 之后的输入，位置 0..t 的输出不变）→ 能抓到：attention 的 mask 写成了 `tril(diagonal=1)`
+- 批内独立检查（两半分开算 == 整个 batch 一起算）→ 能抓到：预测时忘了 `model.eval()`，BatchNorm 在用 batch 的统计量
+- padding 不变性（多补几列 padding，loss 不变）→ 能抓到：loss 把 padding 位置也算进了平均
+- 和大 batch 对比（累积出来的梯度 == 大 batch 的梯度）→ 能抓到：scheduler 每个 epoch 才 step 一次
+- 因果性检查 → 能抓到：标准化用了测试集的均值
+answer: 1,2,3
+--- explain
+前三个都对：每个 bug 都会破坏对应的性质，测试就会失败。
+
+第 4 个不对：和大 batch 对比，抓的是梯度累积没加权。scheduler 的问题要把每一步实际用的学习率记下来，和计划逐项对比。
+
+第 5 个不对：因果性说的是序列里「过去不能看未来」，和训练集、测试集之间的泄漏无关。数据泄漏要用「只改测试集，训练数据不变」来检查。
+--- hints
+- 对每一项问自己：这个 bug 存在时，测试里比较的两个东西会不会不一样？
+- 梯度累积的对比测试里，根本没有调用 scheduler。
+
+@@ item d17-13
+type: code
+title: 闭卷：只在真 token 上平均的 loss
+level: 2
+exam: yes
+cards: padding 不能算进平均
+targets: masked_lm_loss
+ref: day17
+--- context
+带 padding 的 loss 是每个训练 NLP / 语音模型的人每天都要写的代码。不看答案写出来，并且知道为什么分母是 `mask.sum()`。
+--- prompt
+写 `masked_lm_loss(logits, targets, mask)`：`logits` (B, T, V)，`targets` (B, T) long，`mask` (B, T) float（1.0 = 真 token，0.0 = padding；padding 位置的 target 是 0，也是一个合法的 token id）。
+
+返回所有真 token 上的平均 cross-entropy（一个标量）。多补几列 padding，结果必须不变。
+--- starter
+def masked_lm_loss(logits, targets, mask):
+    raise todo()
+--- solution
+def masked_lm_loss(logits, targets, mask):
+    V = logits.size(-1)
+    loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1), reduction="none")
+    mask = mask.reshape(-1).to(loss.dtype)
+    return (loss * mask).sum() / mask.sum()      # 分母只数真 token
+--- tests
+def _batch(B=3, T=5, V=7):
+    logits = torch.randn(B, T, V)
+    lengths = torch.tensor([5, 3, 2])
+    mask = (torch.arange(T) < lengths[:, None]).float()      # (B, T)
+    targets = torch.randint(0, V, (B, T)) * mask.long()       # padding 位置的 target 是 0
+    return logits, targets, mask
+
+@check("多补几列 padding，loss 不变")
+def _():
+    logits, targets, mask = _batch()
+    a = masked_lm_loss(logits, targets, mask)
+    B, T, V = logits.shape
+    b = masked_lm_loss(torch.cat([logits, torch.randn(B, 4, V)], 1),
+                       torch.cat([targets, torch.zeros(B, 4, dtype=torch.long)], 1),
+                       torch.cat([mask, torch.zeros(B, 4)], 1))
+    eq(b, a, tol=1e-5,
+       msg=f"多补 4 列 padding，loss 从 {a.item():.4f} 变成了 {b.item():.4f}。padding 越多 loss 越小，说明分母数的是所有位置，不是真 token。")
+
+@check("等于真 token 上的平均 cross-entropy")
+def _():
+    logits, targets, mask = _batch()
+    keep = mask.bool()
+    want = F.cross_entropy(logits[keep], targets[keep])
+    eq(masked_lm_loss(logits, targets, mask), want, tol=1e-5, msg="应该只在真 token 上求平均：(loss * mask).sum() / mask.sum()")
+--- hints
+- `reduction="none"` 得到每个位置的 loss。
+- 乘上 mask，再除以 `mask.sum()`。
+
+@@ item d17-14
+type: code
+title: 闭卷：因果性检查
+level: 2
+exam: yes
+cards: 不变量测试：让不报错的 bug 现身
+targets: check_causal
+ref: day17
+--- context
+因果性检查是写序列模型时最值钱的几行测试代码。能不看答案写出来，你就能在任何新模型上先跑它，再开始训练。
+--- prompt
+写 `check_causal(model, x)`：`model` 把 (B, T, D) 变成 (B, T, D_out)，`x` 是 (B, T, D)。
+
+对每个位置 t = 0 … T-2，把 t 之后的输入换成随机数，位置 0..t 的输出都必须不变（`atol=1e-5`）。都不变返回 `True`，否则 `False`。模型可能带 Dropout。
+--- starter
+def check_causal(model, x):
+    raise todo()
+--- solution
+def check_causal(model, x):
+    model.eval()                                  # 关掉 Dropout，不然输出本来就在变
+    with torch.no_grad():
+        base = model(x)
+        for t in range(x.shape[1] - 1):
+            x2 = x.clone()
+            x2[:, t + 1:] = torch.randn_like(x2[:, t + 1:])     # 只改「未来」
+            if not torch.allclose(model(x2)[:, :t + 1], base[:, :t + 1], atol=1e-5):
+                return False                      # 过去的输出变了：偷看了未来
+    return True
+--- tests
+@check("因果的模型：返回 True")
+def _():
+    x = torch.randn(2, 6, 8)
+    r = check_causal(CumMean(), x)
+    true(r is not None and bool(r), "CumMean 只用过去和现在的输入，是因果的，你的检查却说它偷看了未来")
+    attn = TinyAttention(8, mask="causal", p_drop=0.3)
+    attn.train()                                  # 带 Dropout，而且现在是 train 模式
+    r = check_causal(attn, x)
+    true(r is not None and bool(r), "带 Dropout 的因果 attention 被判成了「偷看未来」：输出变了，是 Dropout 的随机性造成的。检查前先 model.eval()。")
+
+@check("偷看未来的模型：返回 False")
+def _():
+    x = torch.randn(2, 6, 8)
+    cases = [("没加 mask 的 attention", TinyAttention(8, mask="none")),
+             ("mask 用了 tril(diagonal=1) 的 attention（多看一个位置）", TinyAttention(8, mask="peek1")),
+             ("padding=1 的卷积（能看到下一个位置）", SameConv(8)),
+             ("只有位置 2 偷看了位置 3 的模型（要对每个 t 都检查）", PeekMiddle())]
+    for name, m in cases:
+        r = check_causal(m, x)
+        true(r is not None and not bool(r), f"{name} 会偷看未来，你的检查没抓到")
+--- hints
+- 先 `model.eval()`，在 `torch.no_grad()` 里算原始输出。
+- 对每个 t 只改 `t+1:`，比较 `[:, :t + 1]`。

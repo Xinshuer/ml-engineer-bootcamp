@@ -3,22 +3,282 @@ title: 文本进模型之前发生了什么
 part: 大语言模型
 hours: 3–4 小时
 --- goal
-TODO: 一句话写今天学完能做什么。
+学完今天，你能把一段文字一路变成模型能吃的训练 batch：用字符级 tokenizer 和 BPE 把文字变成 token id，用 memmap 读大语料，用 get_batch 切出错开一位的 x 和 y，给长短不一的句子做 padding、attention mask 和 position ids；还能用 ln(V) 一眼看出 loss 正不正常。
 --- checklist
-- 先清空复习区
-- 读完知识卡片并改动运行
-- 练习区全部通过
+- 先清空复习区（以前看过答案的题，从空白重做一遍）
+- 读完 8 张知识卡片，每张的代码都改一个数再运行一次
+- 练习区 d3-01 到 d3-15 全部通过
+- 合上卡片，在闭卷区从空白写出 get_batch 和 pad_batch
+
+@@ concept
+title: 字符级 tokenizer：字和数字互相转换
+--- body
+模型只认识数字，不认识文字。tokenizer（分词器）做两件事：把文字切成一小块一小块（每块叫一个 token），再把每个 token 换成一个整数，叫 token id。
+
+最简单的切法是一个字符一个 token：
+
+1. 把语料里出现过的字符去重再排序：`sorted(set(text))`。排序是为了每次建出来的表都一样。
+2. 给每个字符一个编号。建两个字典：`stoi`（string to int，字符 → id）和 `itos`（int to string，id → 字符）。
+3. `encode`：字符串 → id 列表。`decode`：id 列表 → 字符串。
+
+词表大小 `vocab_size`（常写成 V）就是不同字符的个数。下面的 "hello world" 有 8 个不同字符（空格也算），V = 8。nanoGPT 用的莎士比亚语料有 65 个不同字符，V = 65。
+
+一个 tokenizer 最基本的要求是能「往返」：`decode(encode(s)) == s`。
+
+小坑：模型输出的 id 常常是 tensor 里的数。tensor 不能直接当字典的键去查（会报 KeyError），decode 时先用 `int(i)` 转成 Python 整数。
+--- code
+text = "hello world"
+chars = sorted(set(text))
+stoi = {c: i for i, c in enumerate(chars)}
+itos = {i: c for c, i in stoi.items()}
+print("词表:", chars)
+print("V =", len(chars))
+ids = [stoi[c] for c in "hello"]
+print("encode('hello') ->", ids)
+print("decode ->", "".join(itos[i] for i in ids))
+t = torch.tensor(ids)
+print("从 tensor decode ->", "".join(itos[int(i)] for i in t))
+
+@@ concept
+title: BPE 与压缩率
+ref: day3
+--- body
+字符级 tokenizer 太「碎」：一句话要很多 token，模型要处理的序列就很长。GPT 系列用的是 BPE（Byte Pair Encoding，字节对编码）。它从最小的单位开始（GPT-2 从 256 个字节开始），反复做三步：
+
+1. 数一数所有相邻的两个 token（叫一个 pair）各出现几次。
+2. 把出现次数最多的 pair 合并成一个新 token，比如 `"t","h"` → `"th"`，加进词表。
+3. 拿合并后的序列回到第 1 步。
+
+GPT-2 一共合并了 50000 次：256 个字节 + 50000 个合并出来的 token + 1 个特殊 token `<|endoftext|>`，词表就是 50257。
+
+合并时从左往右扫。一个位置合并过了，就跳过这两个 token，它们不能再参与这一轮合并。所以 `["a","a","a"]` 合并 `("a","a")` 得到 `["aa", "a"]`，不是两个 `"aa"`。但数 pair 时重叠也算：`["a","a","a"]` 里 `("a","a")` 出现 2 次（位置 0-1 和 1-2）。
+
+### 压缩率
+
+压缩率 = 字符数 ÷ token 数，也就是平均一个 token 装几个字符。数越大，这个 tokenizer 对这段文字越「省」。字符级 tokenizer 的压缩率正好是 1；每合并一次，token 变少，压缩率变大。
+
+token 数为什么要紧：API 按 token 收费，上下文窗口按 token 算长度，训练和生成的时间也按 token 算。
+
+为什么中文常常更「贵」：GPT-2 这类 BPE 从 UTF-8 字节开始合并。一个英文字母是 1 个字节，一个常用汉字是 3 个字节（「你」是 228, 189, 160）。合并规则主要是从英文语料里学来的，很多汉字没被合并过，一个字常常要占不止一个 token。
+
+下面的代码里，`merge_pair` 是今天 d3-02 要你自己写的函数，这里先用参考实现看效果。
+--- code
+from collections import Counter
+
+text = "the cat and the hat"
+tokens = list(text)
+print("开始:", len(tokens), "个 token")
+for step in range(4):
+    counts = Counter(zip(tokens, tokens[1:]))      # 相邻 pair 计数
+    best = max(counts, key=counts.get)             # 出现最多的 pair
+    tokens = merge_pair(tokens, best)
+    print(f"合并 {best}（出现 {counts[best]} 次）-> {len(tokens)} 个 token，压缩率 {len(text) / len(tokens):.2f}")
+print(tokens)
+print("'你' 的 UTF-8 字节:", list("你".encode("utf-8")))
+
+@@ concept
+title: get_batch：x 和 y 错开一位
+--- body
+语言模型的任务是「预测下一个 token」。训练时，整段语料就是一长串 token id（一个 1D tensor `data`）。每一步从里面随机切出 batch_size 段（记作 B），每段长 block_size（上下文长度，记作 T）：
+
+- `x = data[i : i+T]` 是输入。
+- `y = data[i+1 : i+1+T]` 是答案，也就是 x 往右挪一位。
+
+这样 `y[t]` 正好是 `x[t]` 的下一个 token。一段长 T 的 x，一次给模型出了 T 道「猜下一个」的题：看到前 1 个猜第 2 个，看到前 2 个猜第 3 个……
+
+起点 i 能取多大？y 的最后一个元素是 `data[i+T]`，它必须存在，所以 `i + T <= len(data) - 1`，也就是 i 最大是 `len(data) - T - 1`。`torch.randint(high, (B,))` 生成 0 到 high-1 的整数（不含 high），所以写 `torch.randint(len(data) - T, (B,))`。把 B 段用 `torch.stack` 叠起来，x 和 y 的形状都是 `(B, T)`。
+
+想让随机起点可以复现，就建一个 `g = torch.Generator().manual_seed(0)`，再传 `generator=g` 给 `torch.randint`：同一个种子，同一批起点。
+
+dtype 必须是 int64（`torch.long`）：embedding 层（按 id 查表、把 id 换成向量的层）和 `cross_entropy` 的标签都只收整数。
+
+三个常见错误：
+
+- y 忘了右移（y 和 x 一样）：不报错。模型只要「抄输入」就能答对，loss 很快掉到接近 0，但生成出来的全是垃圾。
+- 起点上界写成 `len(data)`：切到末尾时切片变短，`torch.stack` 报错。而且是偶尔才报错，最难查。
+- 转成了 float：embedding 直接报错。
+--- code
+data = torch.arange(10, 20)          # 假装这是 10 个 token id
+T = 4
+i = 3
+x = data[i:i + T]
+y = data[i + 1:i + 1 + T]
+print("x =", x.tolist())
+print("y =", y.tolist())
+for t in range(T):
+    print(f"看到 {x[:t + 1].tolist()} -> 该猜 {y[t].item()}")
+print("起点 i 最大:", len(data) - T - 1)
+g = torch.Generator().manual_seed(0)
+print("随机起点:", torch.randint(len(data) - T, (5,), generator=g).tolist())
+g = torch.Generator().manual_seed(0)
+print("同一个种子再来:", torch.randint(len(data) - T, (5,), generator=g).tolist())
+
+@@ concept
+title: 大语料：uint16 的 .bin 文件和 np.memmap
+--- body
+真实语料有几十 GB，读不进内存。nanoGPT 的做法分两步：
+
+1. 预处理时，把所有 token id 一次写成一个二进制文件：`np.asarray(ids, dtype=np.uint16).tofile(path)`。文件里只有数字，没有任何表头。
+2. 训练时用 `np.memmap(path, dtype=np.uint16, mode="r")` 打开。memmap（内存映射）用起来像一个 numpy 数组，但数据还留在磁盘上：你切哪一段，操作系统才读哪一段。
+
+为什么用 uint16：它表示 0 到 65535 的整数，每个只占 2 字节。GPT-2 的词表是 50257，装得下。比 int64（8 字节）省 4 倍磁盘。1000 个 token 就是 2000 字节。
+
+几个要记住的点：
+
+- `.bin` 文件不记录 dtype。读的时候 dtype 必须和写的时候一样，不然读出来全是错的数（下面的代码故意用 uint8 读了一次）。
+- `mode="r"` 是只读，防止训练代码不小心改坏语料。
+- 词表超过 65536（比如 10 万词的 tokenizer）就不能用 uint16，要用 uint32。uint16 装不下的数不会报错，会悄悄变成别的数。
+- 送进模型前，把切出来的一段转成 int64 tensor：`torch.from_numpy(m[i:i+T].astype(np.int64))`。
+--- code
+import os, tempfile
+import numpy as np
+
+with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+    path = os.path.join(d, "train.bin")
+    np.asarray([5, 50256, 7, 8], dtype=np.uint16).tofile(path)
+    print("文件大小:", os.path.getsize(path), "字节")       # 4 个 token × 2 字节
+    m = np.memmap(path, dtype=np.uint16, mode="r")
+    print(type(m).__name__, m.dtype, len(m), m.tolist())
+    x = torch.from_numpy(m[1:3].astype(np.int64))
+    print(x, x.dtype)
+    wrong = np.memmap(path, dtype=np.uint8, mode="r")
+    print("用 uint8 去读:", wrong.tolist())
+    del m, wrong                                          # 关掉文件，临时目录才删得掉
+
+@@ concept
+title: bigram 计数与 ln(V) 基线
+--- body
+bigram（二元）模型是最简单的语言模型：只看当前这一个 token，猜下一个。它的全部「参数」就是一张 V×V 的计数表 C：`C[i, j]` 是「i 后面紧跟着 j」出现的次数。把每一行除以这一行的和，就变成「i 后面是 j 的概率」。
+
+一段 N 个 token 的序列有 N-1 个相邻对。不写 Python 循环也能数完：
+
+1. 把每一对 (i, j) 编成一个数：`i * V + j`。它在 0 到 V*V-1 之间，不同的对编出来的数一定不同。
+2. `torch.bincount(flat, minlength=V * V)` 数出每个数出现几次。`minlength` 保证结果长度正好是 V*V（最大的几个 pair 没出现也不会变短）。
+3. `.reshape(V, V)` 变回表格。
+
+### ln(V) 基线
+
+一个什么都没学的模型，对 V 个词给一样的概率 1/V。交叉熵是「正确答案概率的负对数」，所以它的 loss = -ln(1/V) = ln(V)。
+
+- V = 65（莎士比亚字符）：ln 65 ≈ 4.17
+- V = 50257（GPT-2）：ln 50257 ≈ 10.82
+
+用法：刚初始化时，loss 应该在 ln(V) 附近。训练很久还在 ln(V) 附近，说明模型什么都没学到，多半是代码有 bug（比如忘了 `optimizer.step()`，或者学习率是 0）。
+--- code
+ids = torch.tensor([0, 1, 0, 1, 2])
+V = 3
+flat = ids[:-1] * V + ids[1:]            # 每一对 (i, j) 编成 i*V + j
+print("相邻对的编码:", flat.tolist())
+counts = torch.bincount(flat, minlength=V * V)
+print("每个编码出现几次:", counts.tolist())
+print(counts.reshape(V, V))
+
+logits = torch.zeros(4, 65)              # 4 个位置，65 个词，分数全一样 = 均匀瞎猜
+y = torch.tensor([3, 10, 0, 64])
+print("瞎猜的 loss:", round(F.cross_entropy(logits, y).item(), 4), "  ln(65) =", round(math.log(65), 4))
+
+@@ concept
+title: padding、attention mask 和 position ids
+--- body
+一个 batch 里的句子长短不一，但 tensor 必须是整齐的矩形。办法是 padding（补齐）：短的句子在右边补上 `pad_id`，补到最长那句的长度 Tmax。
+
+补完要同时给出三样东西，形状都是 `(B, Tmax)`，dtype 都是 int64：
+
+- `ids`：补齐后的 token id。
+- `attention mask`：真实 token 是 1，补上去的位置是 0。attention 靠它忽略 pad。
+- `position ids`：每个 token 在自己那句话里是第几个，从 0 开始，只数真实 token。pad 位置填 0（反正会被 mask 掉）。
+
+为什么不能省：没有 mask，真实 token 会去「看」pad，结果就被 pad 污染了；同一句话放进 pad 多的 batch 和 pad 少的 batch，输出会不一样。
+
+下面的代码用了两个不写循环的小技巧：`torch.arange(Tmax) < lengths[:, None]` 一次比出整个 mask；`(mask.cumsum(-1) - 1) * mask` 从 mask 算出 position ids。练习里用 for 循环逐句填也完全可以。
+--- code
+seqs = [[4, 5], [6, 7, 8, 9]]
+B, Tmax = len(seqs), max(len(s) for s in seqs)
+ids = torch.full((B, Tmax), 0, dtype=torch.long)     # 先全部填 pad_id = 0
+ids[0, :2] = torch.tensor(seqs[0])                    # 第 0 句的前 2 个位置
+ids[1, :4] = torch.tensor(seqs[1])
+print(ids)
+lengths = torch.tensor([len(s) for s in seqs])
+mask = (torch.arange(Tmax) < lengths[:, None]).long()
+print(mask)
+pos = (mask.cumsum(-1) - 1) * mask
+print(pos)
+
+@@ concept
+title: 把 mask 变成 -inf 加性偏置
+--- body
+attention 先算分数 scores，形状 `(B, nh, T, T)`（nh 是头数），再对最后一维做 softmax 得到权重。要让 pad 位置的权重变成 0，做法是在 softmax 之前，给 pad 位置的分数加上 -inf：
+
+- exp(-inf) = 0，所以 softmax 后这个位置的权重正好是 0。其余位置的权重重新分配，加起来还是 1。
+- 真实位置加 0，分数不变。
+
+所以偏置 bias 在真实位是 0.0，在 pad 位是 -inf。形状做成 `(B, 1, 1, T)`：第一维对应每句话；两个 1 让它广播到所有头、所有查询位置；最后的 T 对应「被看的那个位置」（key）。
+
+写法：`torch.zeros(B, 1, 1, T).masked_fill(mask[:, None, None, :] == 0, float("-inf"))`。`masked_fill(cond, v)` 把 cond 为 True 的位置换成 v；`mask[:, None, None, :]` 在中间插入两个长度为 1 的维度。
+
+坑：不能写 `(1 - mask) * float("-inf")`。真实位上算的是 `0 * -inf`，浮点规定结果是 nan（不是数）。nan 一进 softmax，整行都变成 nan。
+--- code
+mask = torch.tensor([[1, 1, 0]])                      # 第 3 个位置是 pad
+bias = torch.zeros(1, 1, 1, 3).masked_fill(mask[:, None, None, :] == 0, float("-inf"))
+print(bias)
+scores = torch.tensor([[[[2.0, 1.0, 5.0]]]])
+print("不加偏置:", scores.softmax(-1))
+print("加了偏置:", (scores + bias).softmax(-1))
+
+@@ concept
+title: 一个训练 step 里的全部 shape
+--- body
+以 GPT-2 small 为例：B = 8（batch 大小），T = 256（block_size），V = 50257（词表大小），C = 768（每个 token 向量的宽度）。一个训练 step 里的张量依次是：
+
+1. `x`、`y`：`(B, T)` = `(8, 256)`，int64。
+2. `tok_emb = wte(x)`：`wte = nn.Embedding(V, C)` 是一张 V 行 C 列的表，每个 id 查出一行，所以在后面加一维 C：`(8, 256, 768)`。
+3. `pos = torch.arange(T)` 是 `(T,)`；`pos_emb = wpe(pos)` 是 `(T, C)` = `(256, 768)`。`tok_emb + pos_emb` 靠广播，还是 `(B, T, C)`。
+4. 每个 Transformer block 进出形状都不变：`(8, 256, 768)`。
+5. `logits = lm_head(hidden)`：`lm_head = nn.Linear(C, V)` 只改最后一维，`(8, 256, 50257)`，每个位置给 V 个词各打一个分。
+6. `F.cross_entropy` 要 `(N, V)` 的 logits 和 `(N,)` 的标签，所以 `logits.view(-1, V)` 是 `(2048, 50257)`，`y.view(-1)` 是 `(2048,)`，N = B*T = 2048。
+7. `loss` 是标量（只有一个数的 tensor），shape 是空 tuple `()`。
+
+logits 是这一步里最大的张量：8 × 256 × 50257 ≈ 1.03 亿个数，fp32 下约 412 MB。
+
+下面用很小的数字真的跑一遍，每个 shape 都打印出来。
+--- code
+torch.manual_seed(0)
+B, T, V, C = 2, 5, 11, 8
+wte = nn.Embedding(V, C)
+wpe = nn.Embedding(T, C)
+lm_head = nn.Linear(C, V, bias=False)
+x = torch.randint(0, V, (B, T))
+y = torch.randint(0, V, (B, T))
+tok_emb = wte(x)
+pos_emb = wpe(torch.arange(T))
+h = tok_emb + pos_emb                 # (B, T, C) + (T, C) 广播
+logits = lm_head(h)
+loss = F.cross_entropy(logits.view(-1, V), y.view(-1))
+for name, t in [("x", x), ("tok_emb", tok_emb), ("pos_emb", pos_emb), ("h", h), ("logits", logits),
+                ("logits.view(-1, V)", logits.view(-1, V)), ("y.view(-1)", y.view(-1)), ("loss", loss)]:
+    print(f"{name:20s} {tuple(t.shape)}")
+print("刚初始化的 loss =", round(loss.item(), 3), "  ln(V) =", round(math.log(V), 3))
 
 @@ item d3-01
 type: code
 title: CharTokenizer 往返
-level: 2
+level: 1
+cards: 字符级 tokenizer：字和数字互相转换
 targets: CharTokenizer
 ref: day3
 --- context
-TODO
+每个语言模型的第一步都是 tokenizer。字符级 tokenizer 只要 20 行，却有完整的 encode / decode 接口；nanoGPT 训练莎士比亚用的就是它，面试也常让你当场写一个。
 --- prompt
-01  char-level tokenizer —— 20 行的完整 tokenizer
+写一个 `CharTokenizer` 类：
+
+- `CharTokenizer(text)`：用 `sorted(set(text))` 建词表（排好序，每次建出来都一样）。
+- `tok.vocab_size`：词表大小，也就是 text 里不同字符的个数。
+- `tok.encode(s)`：字符串 → `list[int]`，每个字符换成它的 id。
+- `tok.decode(ids)`：id 列表 → 字符串。ids 可以是 Python 的 int 列表，也可以是一个 1D tensor。
+
+要求：`decode(encode(s)) == s`；id 都在 0 到 `vocab_size - 1` 之间；同一个字符永远是同一个 id。
+
+例子：`CharTokenizer("hello world")` 的 `vocab_size` 是 8；空格排在最前面，id 是 0；`encode("hello")` 是 `[3, 2, 4, 4, 5]`。
 --- starter
 class CharTokenizer:
     """用法:
@@ -26,11 +286,15 @@ class CharTokenizer:
         tok.vocab_size      -> 去重后的字符数
         tok.encode("hell")  -> [int, int, int, int]
         tok.decode([...])   -> "hell"
-    要求: 字典序建表（sorted(set(text))），保证 decode(encode(s)) == s。
     """
 
     def __init__(self, text):
-        # --- TODO 01 ---
+        raise todo()
+
+    def encode(self, s):
+        raise todo()
+
+    def decode(self, ids):
         raise todo()
 --- solution
 class CharTokenizer:
@@ -50,31 +314,52 @@ class CharTokenizer:
 def t01():
     txt = "the quick brown fox jumps over the lazy dog"
     tok = CharTokenizer(txt)
-    true(tok.vocab_size == len(set(txt)), f"vocab_size 不对: {tok.vocab_size}")
+    true(tok.vocab_size == len(set(txt)), f"vocab_size 不对: 你的是 {tok.vocab_size}，这段文字里有 {len(set(txt))} 个不同字符")
     ids = tok.encode("quick fox")
-    true(all(isinstance(i, int) for i in ids), "encode 要返回 int 列表")
-    true(tok.decode(ids) == "quick fox", "往返不一致")
-    true(tok.encode(" ") == tok.encode(" "), "同一个字符要映射到同一个 id")
-    true(min(ids) >= 0 and max(ids) < tok.vocab_size, "id 越界了")
+    true(isinstance(ids, list) and all(isinstance(i, int) for i in ids), "encode 要返回 Python int 组成的 list")
+    true(tok.decode(ids) == "quick fox", f"往返不一致: decode(encode('quick fox')) 得到 {tok.decode(ids)!r}")
+    same = tok.encode("the the")
+    true(same[0] == same[4] and same[1] == same[5], "同一个字符要映射到同一个 id")
+    true(tok.encode(" ") == [0] and tok.decode([tok.vocab_size - 1]) == "z",
+         "词表要按字典序排：空格最小（id 0），'z' 最大 —— 用 sorted(set(text)) 建表")
+    true(min(ids) >= 0 and max(ids) < tok.vocab_size, "id 越界了：必须在 0 到 vocab_size-1 之间")
+    try:
+        back = tok.decode(torch.tensor(ids))
+    except KeyError:
+        back = None
+    true(back == "quick fox", "decode 也要能处理 tensor：tensor 里的数不能直接当字典的键，先用 int(i) 转一下")
 --- hints
-- TODO
+- 在 `__init__` 里建两个字典：`stoi`（字符 → id）和 `itos`（id → 字符）。`enumerate(sorted(set(text)))` 会同时给你编号和字符。
+- encode 用列表推导式：`[self.stoi[c] for c in s]`。decode 用 `"".join(...)` 把字符拼回字符串。
+- decode 里写 `self.itos[int(i)]`：`int()` 让 tensor 里的数也能当字典的键。
 
 @@ item d3-02
 type: code
 title: BPE: 统计 pair 与合并
 level: 2
+cards: BPE 与压缩率
 targets: pair_counts, merge_pair
 ref: day3
 --- context
-TODO
+GPT、Llama 的 tokenizer 都是用 BPE 训练出来的，核心只有两步：数相邻的 pair，合并最常见的那个。自己写一遍，你就知道词表里那些奇怪的 token（比如带空格的 " the"）是怎么来的。
 --- prompt
-02  BPE 的一步：统计相邻 pair 频次
+写 BPE 一轮里的两个函数。
+
+1. `pair_counts(tokens)`：tokens 是 `list[str]`。返回一个 dict：键是相邻两个 token 组成的 tuple，值是它出现的次数。重叠的 pair 也要数。
+2. `merge_pair(tokens, pair)`：把 tokens 里每一处「连续出现的 pair」换成一个拼接好的新 token（字符串相加），返回新的列表。从左往右扫；一个位置合并过了，就不能再参与这一轮合并。
+
+例子：
+
+```
+pair_counts(["a","b","a","b","c"])      -> {("a","b"): 2, ("b","a"): 1, ("b","c"): 1}
+merge_pair(["a","b","a","b"], ("a","b")) -> ["ab", "ab"]
+merge_pair(["a","a","a"], ("a","a"))     -> ["aa", "a"]
+```
 --- starter
 def pair_counts(tokens):
     """tokens: list[str]。统计所有相邻二元组出现次数。
     ["a","b","a","b","c"] -> {("a","b"): 2, ("b","a"): 1, ("b","c"): 1}
     """
-    # --- TODO 02 ---
     raise todo()
 
 def merge_pair(tokens, pair):
@@ -82,7 +367,6 @@ def merge_pair(tokens, pair):
     从左往右扫，合并过的位置不再参与下一次合并。
     (["a","b","a","b"], ("a","b")) -> ["ab", "ab"]
     """
-    # --- TODO 02b ---
     raise todo()
 --- solution
 def pair_counts(tokens):
@@ -106,29 +390,38 @@ def merge_pair(tokens, pair):
 def t02():
     t = list("abababc")
     c = pair_counts(t)
-    true(c[("a", "b")] == 3, f"('a','b') 应该出现 3 次, 你数出 {c.get(('a','b'))}")
-    true(c[("b", "a")] == 2)
-    true(max(c, key=c.get) == ("a", "b"))
-    true(merge_pair(t, ("a", "b")) == ["ab", "ab", "ab", "c"], f"{merge_pair(t, ('a','b'))}")
+    true(c.get(("a", "b")) == 3, f"'abababc' 里 ('a','b') 应该出现 3 次, 你数出 {c.get(('a','b'))}")
+    true(c.get(("b", "a")) == 2, f"'abababc' 里 ('b','a') 应该出现 2 次, 你数出 {c.get(('b','a'))}")
+    true(max(c, key=c.get) == ("a", "b"), "出现最多的 pair 应该是 ('a','b')")
+    true(merge_pair(t, ("a", "b")) == ["ab", "ab", "ab", "c"],
+         f"merge_pair(list('abababc'), ('a','b')) 应为 ['ab', 'ab', 'ab', 'c']，你的是 {merge_pair(t, ('a','b'))}")
     # 重叠情况: "aaa" 合并 ("a","a") 只能合出一个 "aa"，剩一个 "a"
-    true(merge_pair(list("aaa"), ("a", "a")) == ["aa", "a"], "重叠 pair 处理错了")
+    got = merge_pair(list("aaa"), ("a", "a"))
+    true(got == ["aa", "a"], f"重叠 pair 处理错了：'aaa' 合并 ('a','a') 应为 ['aa', 'a']，你的是 {got}。合并后要跳过两个位置")
 --- hints
-- TODO
+- 相邻的 pair 可以用 `zip(tokens, tokens[1:])` 一次拿到。计数用 `d[k] = d.get(k, 0) + 1`。
+- merge 用 `while i < len(tokens)` 加下标 i，不要用 for：合并时要一次跳过两个位置。
+- 判断条件：`i + 1 < len(tokens) and (tokens[i], tokens[i + 1]) == pair`。成立就放入 `tokens[i] + tokens[i + 1]` 并 `i += 2`；否则放入 `tokens[i]` 并 `i += 1`。
 
 @@ item d3-03
 type: code
 title: 压缩率计算
-level: 2
+level: 1
+cards: BPE 与压缩率
 targets: compression_ratio
 ref: day3
 --- context
-TODO
+API 按 token 收费，上下文窗口也按 token 算。压缩率（平均一个 token 装几个字符）告诉你一个 tokenizer 对某段文字有多「省」，也解释了为什么同样的意思，中文常常比英文花更多 token。
 --- prompt
-03  压缩率 —— 为什么中文更"贵"
+写 `compression_ratio(text, encode_fn)`：
+
+- `encode_fn` 是任意一个 tokenizer 的 encode 函数：输入字符串，返回 token id 的列表。
+- 返回 字符数 ÷ token 数（一个 float）。
+
+例子：一个「两个字符一个 token」的 tokenizer，把 "abcdefgh"（8 个字符）编成 4 个 token，压缩率是 2.0。一个字符一个 token 时，压缩率是 1.0。
 --- starter
 def compression_ratio(text, encode_fn):
     """返回 字符数 / token 数。越大说明这个 tokenizer 对这段文本越高效。"""
-    # --- TODO 03 ---
     raise todo()
 --- solution
 def compression_ratio(text, encode_fn):
@@ -137,21 +430,33 @@ def compression_ratio(text, encode_fn):
 @check("压缩率计算")
 def t03():
     fake = lambda s: list(range(len(s) // 2))     # 假 tokenizer: 两个字符一个 token
-    true(close(compression_ratio("abcdefgh", fake), 2.0))
-    true(close(compression_ratio("abcd", lambda s: [1, 2, 3, 4]), 1.0))
+    r = compression_ratio("abcdefgh", fake)
+    true(close(r, 2.0), f"8 个字符编成 4 个 token，压缩率应为 2.0，你算出 {r}。是不是分子分母反了？")
+    r = compression_ratio("abcd", lambda s: [1, 2, 3, 4])
+    true(close(r, 1.0), f"一个字符一个 token，压缩率应为 1.0，你算出 {r}")
 --- hints
-- TODO
+- 字符数是 `len(text)`；token 数是先调用 `encode_fn(text)`，再取它的 `len`。
+- 两个都是 int。Python 3 里 `/` 直接得到 float，不用手动转换。
 
 @@ item d3-04
 type: code
 title: get_batch 与 x/y 错位
 level: 2
+cards: get_batch：x 和 y 错开一位
 targets: get_batch
 ref: day3
 --- context
-TODO
+训练语言模型的每一步都从 get_batch 开始，后面几天的训练循环都要用它。x 和 y 的错位写错了不会报错，只会让模型学会「抄答案」—— 这是训练代码里最常见的静默 bug 之一。
 --- prompt
-04  get_batch —— 全课最常写的一个函数
+写 `get_batch(data, batch_size, block_size, generator=None)`：
+
+- `data`：1D LongTensor，整段语料的 token id。
+- 用 `torch.randint` 随机选 `batch_size` 个起点 i，并把 `generator` 传给它（同一个种子要得到同一个 batch）。
+- 对每个 i：`x = data[i : i+block_size]`，`y = data[i+1 : i+1+block_size]`。
+- 返回 `(x, y)`，形状都是 `(batch_size, block_size)`，dtype int64。
+- 起点必须让 y 不越界：i 最大是 `len(data) - block_size - 1`。
+
+例子：`data = torch.arange(1000)` 时，y 应该处处等于 x + 1。
 --- starter
 def get_batch(data, batch_size, block_size, generator=None):
     """data: 1D LongTensor（整段语料的 token id）
@@ -161,7 +466,6 @@ def get_batch(data, batch_size, block_size, generator=None):
     形状都是 (batch_size, block_size)，dtype int64。
     起点必须保证 y 不越界。generator 传给 torch.randint 用于复现。
     """
-    # --- TODO 04 ---
     raise todo()
 --- solution
 def get_batch(data, batch_size, block_size, generator=None):
@@ -177,37 +481,50 @@ def t04():
     data = torch.arange(1000)
     g = torch.Generator().manual_seed(0)
     x, y = get_batch(data, 4, 8, g)
-    shape_is(x, (4, 8))
-    shape_is(y, (4, 8))
-    true(x.dtype == torch.long and y.dtype == torch.long, "dtype 必须是 int64")
+    shape_is(x, (4, 8), "x 的形状应为 (batch_size, block_size)")
+    shape_is(y, (4, 8), "y 的形状应为 (batch_size, block_size)")
+    true(x.dtype == torch.long and y.dtype == torch.long, f"dtype 必须是 int64（torch.long），你的是 {x.dtype} / {y.dtype}")
     eq(y, x + 1, msg="y 必须是 x 右移一位。这一行写错，模型会学会抄答案，loss 掉到 0 但生成全是垃圾")
+    x2, _ = get_batch(data, 4, 8, torch.Generator().manual_seed(0))
+    eq(x2, x, msg="同一个种子的 generator 应该给出同一个 batch —— 把 generator 传给 torch.randint")
     # 越界检查: 用最短的合法数据反复采样
     short = torch.arange(9)
     for _ in range(50):
-        a, b = get_batch(short, 2, 8)
-        true(int(b.max()) <= 8, "y 越界了 —— 起点上界应该是 len(data)-block_size-1")
+        try:
+            a, b = get_batch(short, 2, 8)
+        except RuntimeError as e:
+            true(False, f"get_batch(torch.arange(9), 2, 8) 报错了：{str(e)[:80]}。9 个 token、block_size=8 时唯一合法的起点是 0："
+                        "torch.randint 的上界要写 len(data) - block_size")
+        shape_is(b, (2, 8), "起点太靠后，y 被切短了 —— 起点上界应该是 len(data)-block_size")
+        true(int(b.max()) <= 8, "y 越界了 —— 起点 i 最大只能是 len(data)-block_size-1")
 --- hints
-- TODO
+- `torch.randint(high, (batch_size,), generator=generator)` 生成 0 到 high-1 的整数。high 该取多少？想想最大的起点是几。
+- `high = len(data) - block_size`。然后 `torch.stack([data[i:i + block_size] for i in ix])` 把 batch_size 段叠成一个 2D tensor。
+- y 同理，切片的起点和终点都加 1。最后 `.long()` 确保是 int64。
 
 @@ item d3-05
 type: code
 title: np.memmap 存取
 level: 2
+cards: 大语料：uint16 的 .bin 文件和 np.memmap
 targets: save_bin, load_bin
 ref: day3
 --- context
-TODO
+真实语料有几十 GB，放不进内存。nanoGPT 先把所有 token id 写成一个 uint16 的 .bin 文件，训练时用 np.memmap 按需读取：切哪一段，才从磁盘读哪一段。
 --- prompt
-05  memmap 打包 —— 语料大到装不进内存时的标准做法
+写两个函数（`np` 和 `os` 已经 import 好了）：
+
+1. `save_bin(path, ids)`：ids 是 `list[int]` 或 1D numpy 数组。把它们按 uint16 写成二进制文件：每个 token 2 字节，不写任何表头。
+2. `load_bin(path)`：用 `np.memmap` 以只读方式（`mode="r"`）打开，dtype 是 uint16，直接返回这个 memmap 对象。不要用 `np.fromfile` 之类的函数把整个文件读进内存。
+
+例子：存 1000 个 id（0 到 999）后，文件正好 2000 字节，`load_bin(path)[999] == 999`。
 --- starter
 def save_bin(path, ids):
     """把 ids(list[int] 或 1D ndarray) 以 uint16 存成二进制文件。"""
-    # --- TODO 05 ---
     raise todo()
 
 def load_bin(path):
     """用 np.memmap 以只读方式加载，返回 memmap 对象（不要整个读进内存）。"""
-    # --- TODO 05b ---
     raise todo()
 --- solution
 def save_bin(path, ids):
@@ -219,34 +536,44 @@ def load_bin(path):
 @check("np.memmap 存取")
 def t05():
     import tempfile
-    p = os.path.join(tempfile.mkdtemp(), "train.bin")
-    ids = list(range(1000))
-    save_bin(p, ids)
-    m = load_bin(p)
-    true(isinstance(m, np.memmap), "要返回 np.memmap，不是普通 ndarray")
-    true(m.dtype == np.uint16, f"dtype 应为 uint16, 实际 {m.dtype}")
-    true(len(m) == 1000)
-    true(int(m[999]) == 999)
-    true(os.path.getsize(p) == 2000, "uint16 每个 token 占 2 字节，1000 个应该是 2000 字节")
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        p = os.path.join(d, "train.bin")
+        ids = list(range(1000))
+        save_bin(p, ids)
+        m = load_bin(p)
+        true(isinstance(m, np.memmap), f"要返回 np.memmap，你返回的是 {type(m).__name__}（整个读进内存了）")
+        true(m.dtype == np.uint16, f"dtype 应为 uint16, 实际 {m.dtype}")
+        true(len(m) == 1000, f"应该读出 1000 个 token，你读出 {len(m)} 个。写和读的 dtype 要一样")
+        true(int(m[999]) == 999, f"第 999 个应该是 999，你读出 {int(m[999])}")
+        true(os.path.getsize(p) == 2000, f"文件是 {os.path.getsize(p)} 字节。uint16 每个 token 占 2 字节，1000 个应该是 2000 字节，不能有表头")
+        true(not m.flags.writeable, "要用只读模式打开：mode=\"r\"，防止训练代码改坏语料")
+        del m
 --- hints
-- TODO
+- 写：先 `np.asarray(ids, dtype=np.uint16)` 转成 uint16 数组，再调用数组的 `.tofile(path)`。
+- 读：`np.memmap(path, dtype=np.uint16, mode="r")`。dtype 必须和写的时候一样，因为文件里没有记录 dtype。
 
 @@ item d3-06
 type: code
 title: bigram 转移计数（向量化）
-level: 2
+level: 3
+cards: bigram 计数与 ln(V) 基线
 targets: bigram_counts
 ref: day3
 --- context
-TODO
+bigram 模型只用一张 V×V 的计数表猜下一个 token，是最简单的语言模型，也是 Transformer 必须打败的第二条基线。不用 Python 循环数完所有相邻对，是「把循环变成张量运算」的经典练习。
 --- prompt
-06  bigram 的转移计数 —— 你的第一个"模型"
+写 `bigram_counts(ids, vocab_size)`：
+
+- `ids`：1D LongTensor，一段 token id。V = vocab_size。
+- 返回形状 `(V, V)` 的 float tensor C，`C[i, j]` 是「i 后面紧跟着 j」出现的次数。
+- 不许用 Python 循环遍历 ids。用 `torch.bincount`（或者 `index_put_`、`scatter_add_`）。
+
+例子：`ids = [0, 1, 0, 1, 2]`、V = 3。相邻对是 (0,1) (1,0) (0,1) (1,2)，所以 `C[0,1] = 2`、`C[1,0] = 1`、`C[1,2] = 1`，其余都是 0。所有计数加起来是 `len(ids) - 1`。
 --- starter
 def bigram_counts(ids, vocab_size):
     """ids: 1D LongTensor。返回 (V, V) 的计数矩阵 C，C[i, j] = i 后面紧跟 j 的次数。
     不许用 python 循环遍历 ids（用 index_put_ 或 bincount 或 scatter_add_）。
     """
-    # --- TODO 06 ---
     raise todo()
 --- solution
 def bigram_counts(ids, vocab_size):
@@ -257,32 +584,38 @@ def bigram_counts(ids, vocab_size):
 def t06():
     ids = torch.tensor([0, 1, 0, 1, 2])
     C = bigram_counts(ids, 3)
-    shape_is(C, (3, 3))
-    eq(C, torch.tensor([[0., 2., 0.], [1., 0., 1.], [0., 0., 0.]]))
+    shape_is(C, (3, 3), "C 的形状应为 (V, V)")
+    eq(C, torch.tensor([[0., 2., 0.], [1., 0., 1.], [0., 0., 0.]]), msg="[0, 1, 0, 1, 2] 的相邻对是 (0,1) (1,0) (0,1) (1,2)。行是前一个 token，列是后一个")
     big = torch.randint(0, 50, (20000,))
-    true(bigram_counts(big, 50).sum().item() == 19999, "总计数应该是 len(ids)-1")
+    true(bigram_counts(big, 50).sum().item() == 19999, "总计数应该是 len(ids)-1：N 个 token 有 N-1 个相邻对")
 --- hints
-- TODO
+- 相邻对：前一个是 `ids[:-1]`，后一个是 `ids[1:]`，两个 tensor 一样长。
+- 把每一对编成一个数：`ids[:-1] * V + ids[1:]`。它在 0 到 V*V-1 之间，不同的对编出来的数一定不同。
+- `torch.bincount(flat, minlength=V * V)` 数出每个数出现几次，再 `.reshape(V, V).float()`。`minlength` 不能省。
 
 @@ item d3-07
 type: code
 title: ln(V) 基线
-level: 2
+level: 1
+cards: bigram 计数与 ln(V) 基线
 targets: uniform_loss, is_broken
 ref: day3
 --- context
-TODO
+一个什么都没学的模型，loss 等于 ln(V)。这是看训练日志时的第一把尺子：第 0 步应该在它附近；训练很久还在它附近，就说明代码有 bug。
 --- prompt
-07  ln(V) 直觉 —— 每天都要用它判断"是不是写错了"
+写两个函数：
+
+1. `uniform_loss(vocab_size)`：模型给 V 个词一样的概率 1/V 时，交叉熵 loss 是多少？返回这个 float。
+2. `is_broken(loss, vocab_size, tol=0.05)`：loss 离 `uniform_loss(vocab_size)` 的相对误差小于 tol，也就是 `|loss - base| / base < tol` 时，返回 True（训练了半天还在瞎猜）；否则返回 False。
+
+例子：V = 65 时基线约 4.17。训练很久后 loss 还是 4.17 → True；loss 是 1.48 → False。
 --- starter
 def uniform_loss(vocab_size):
     """一个什么都没学到的模型，交叉熵应该是多少？返回这个数。"""
-    # --- TODO 07 ---
     raise todo()
 
 def is_broken(loss, vocab_size, tol=0.05):
     """训练了半天 loss 还在 uniform_loss 附近（相对误差 < tol）就返回 True。"""
-    # --- TODO 07b ---
     raise todo()
 --- solution
 def uniform_loss(vocab_size):
@@ -294,30 +627,47 @@ def is_broken(loss, vocab_size, tol=0.05):
 --- tests
 @check("ln(V) 基线")
 def t07():
-    true(close(uniform_loss(65), math.log(65)))
-    true(is_broken(4.17, 65) is True, "4.17 ≈ ln(65)，这就是没学到东西")
-    true(is_broken(1.48, 65) is False)
+    got = uniform_loss(65)
+    true(close(got, math.log(65)), f"V=65 时应为 ln(65) ≈ 4.1744，你的是 {got}")
+    true(is_broken(4.17, 65) is True, "4.17 ≈ ln(65)，这就是没学到东西，应返回 True")
+    true(is_broken(1.48, 65) is False, "1.48 远低于 ln(65) ≈ 4.17，模型学到了东西，应返回 False")
 --- hints
-- TODO
+- 交叉熵是「正确答案的概率」的负对数。每个词的概率都是 1/V，所以 loss 是 -ln(1/V)。
+- -ln(1/V) = ln(V)，用 `math.log(vocab_size)` 算（`math.log` 默认就是自然对数 ln）。
+- `is_broken` 里先算 `base = uniform_loss(vocab_size)`，然后直接 `return abs(loss - base) / base < tol`：比较的结果本身就是 True / False。
 
 @@ item d3-08
 type: code
 title: padding + mask + position ids
 level: 2
+cards: padding、attention mask 和 position ids
 targets: pad_batch
 ref: day3
 --- context
-TODO
+真实数据里句子长短不一，一个 batch 却必须是整齐的矩形。补齐之后还要给出 attention mask 和 position ids，否则模型会把 pad 当成真内容，同一句话放进不同的 batch，结果还不一样。
 --- prompt
-08  padding 批次的 mask 与 position ids
+写 `pad_batch(seqs, pad_id=0)`：
+
+- `seqs`：`list[list[int]]`，B 个长短不一的句子。Tmax 是最长那句的长度。
+- 返回 `(ids, attn_mask, pos_ids)` 三个 tensor，形状都是 `(B, Tmax)`，dtype 都是 int64。
+- `ids`：每句右边补 `pad_id`，补到 Tmax。
+- `attn_mask`：真实 token 是 1，pad 位置是 0。
+- `pos_ids`：每句从 0 开始数真实 token 的位置；pad 位置填 0。
+
+例子：`pad_batch([[5, 6, 7], [8], [9, 10]], pad_id=-1)` 返回
+
+```
+ids  = [[5, 6, 7], [8, -1, -1], [9, 10, -1]]
+mask = [[1, 1, 1], [1,  0,  0], [1,  1,  0]]
+pos  = [[0, 1, 2], [0,  0,  0], [0,  1,  0]]
+```
 --- starter
 def pad_batch(seqs, pad_id=0):
     """seqs: list[list[int]]，返回 (ids, attn_mask, pos_ids)，都是 (B, Tmax) int64。
     - ids: 右侧补 pad_id
     - attn_mask: 有效位 1，pad 位 0
-    - pos_ids: 每个样本从 0 开始数**有效位**的位置；pad 位置填 0
+    - pos_ids: 每个样本从 0 开始数有效位的位置；pad 位置填 0
     """
-    # --- TODO 08 ---
     raise todo()
 --- solution
 def pad_batch(seqs, pad_id=0):
@@ -335,29 +685,39 @@ def pad_batch(seqs, pad_id=0):
 @check("padding + mask + position ids")
 def t08():
     ids, m, pos = pad_batch([[5, 6, 7], [8], [9, 10]], pad_id=-1)
-    eq(ids, torch.tensor([[5, 6, 7], [8, -1, -1], [9, 10, -1]]))
-    eq(m, torch.tensor([[1, 1, 1], [1, 0, 0], [1, 1, 0]]))
-    eq(pos, torch.tensor([[0, 1, 2], [0, 0, 0], [0, 1, 0]]))
-    true(ids.dtype == torch.long)
+    eq(ids, torch.tensor([[5, 6, 7], [8, -1, -1], [9, 10, -1]]), msg="ids：每句右边补 pad_id，补到最长那句的长度")
+    eq(m, torch.tensor([[1, 1, 1], [1, 0, 0], [1, 1, 0]]), msg="attn_mask：真实 token 是 1，pad 是 0")
+    eq(pos, torch.tensor([[0, 1, 2], [0, 0, 0], [0, 1, 0]]), msg="pos_ids：每句从 0 开始数真实 token，pad 位置填 0")
+    true(ids.dtype == torch.long and m.dtype == torch.long and pos.dtype == torch.long,
+         f"三个 tensor 都要是 int64，你的是 {ids.dtype} / {m.dtype} / {pos.dtype}")
 --- hints
-- TODO
+- 先建三个「空白」tensor：`torch.full((B, Tmax), pad_id, dtype=torch.long)`，和两个 `torch.zeros(B, Tmax, dtype=torch.long)`。
+- 用 `for i, s in enumerate(seqs):` 逐句填。`L = len(s)`，然后给第 i 行的前 L 个位置赋值：`ids[i, :L] = torch.tensor(s)`。
+- 同一个循环里再写 `mask[i, :L] = 1` 和 `pos[i, :L] = torch.arange(L)`。
 
 @@ item d3-09
 type: code
 title: mask -> 加性 -inf 偏置
 level: 2
+cards: 把 mask 变成 -inf 加性偏置
 targets: mask_to_bias
 ref: day3
 --- context
-TODO
+attention 靠 mask 忽略 pad。常见做法不是把权重乘 0，而是在 softmax 之前给 pad 位的分数加 -inf：exp(-inf) = 0，pad 的权重正好是 0，其余权重加起来仍然是 1。
 --- prompt
-09  把 mask 变成 attention 用的加性偏置
+写 `mask_to_bias(attn_mask)`：
+
+- `attn_mask`：`(B, T)`，1 是真实 token，0 是 pad。
+- 返回 `(B, 1, 1, T)` 的 float tensor：真实位是 `0.0`，pad 位是 `float("-inf")`。
+- 两个 1 是为了广播：加到 `(B, nh, T, T)` 的 scores 上时，每个头、每个查询位置都用同一行偏置。
+- 不许写 `(1 - mask) * float("-inf")`：真实位会算出 `0 * -inf = nan`。
+
+例子：`mask_to_bias(torch.tensor([[1, 1, 0]]))` 返回 `tensor([[[[0., 0., -inf]]]])`，形状 `(1, 1, 1, 3)`。
 --- starter
 def mask_to_bias(attn_mask):
     """attn_mask: (B, T) 的 0/1  ->  (B, 1, 1, T) 的加性偏置:
     有效位 0.0，pad 位 -inf。加到 scores 上再 softmax，pad 位的权重就会变成 0。
     """
-    # --- TODO 09 ---
     raise todo()
 --- solution
 def mask_to_bias(attn_mask):
@@ -369,25 +729,30 @@ def mask_to_bias(attn_mask):
 def t09():
     m = torch.tensor([[1, 1, 0]])
     b = mask_to_bias(m)
-    shape_is(b, (1, 1, 1, 3))
-    true(b[0, 0, 0, 0].item() == 0.0)
-    true(b[0, 0, 0, 2].item() == float("-inf"), "pad 位要用 -inf，不是 -1e9 之外的随便一个数")
+    shape_is(b, (1, 1, 1, 3), "偏置的形状应为 (B, 1, 1, T)")
+    true(b[0, 0, 0, 0].item() == 0.0, f"真实位的偏置应为 0.0，你的是 {b[0, 0, 0, 0].item()}（是不是算出了 0 * -inf = nan？）")
+    true(b[0, 0, 0, 2].item() == float("-inf"), f"pad 位的偏置要正好是 float('-inf')，你的是 {b[0, 0, 0, 2].item()}")
     scores = torch.zeros(1, 1, 1, 3) + b
     w = scores.softmax(-1)
     eq(w, torch.tensor([[[[0.5, 0.5, 0.0]]]]), msg="加完偏置 softmax 后 pad 位应该正好是 0")
 --- hints
-- TODO
+- 先建一个全 0 的 `(B, 1, 1, T)` tensor：`torch.zeros(B, 1, 1, T)`，B 和 T 从 `attn_mask.shape` 拿。
+- 把 mask 也变成 `(B, 1, 1, T)`：`attn_mask[:, None, None, :]`（None 就是在那里插入一个长度为 1 的维度）。
+- `zeros.masked_fill(mask4d == 0, float("-inf"))`：条件为 True 的位置填 -inf，其余位置保持 0。
 
 @@ item d3-10
 type: fix
 title: 找 bug: get_batch_buggy
 level: 2
+cards: get_batch：x 和 y 错开一位
 targets: get_batch_buggy
 ref: day3
 --- context
-TODO
+这个 get_batch 有 3 个 bug：一个偶尔才报错，一个让 embedding 直接报错，最危险的一个完全不报错，只让模型学会抄答案。review 训练代码时，这几行是第一眼要查的地方。
 --- prompt
-10  找 bug —— 这个 get_batch 有 3 处错
+`get_batch_buggy(data, batch_size, block_size)` 应该和 d3-04 的 get_batch 做一样的事：随机选起点，x 是一段，y 是 x 右移一位，形状都是 `(batch_size, block_size)`，dtype int64。
+
+它有 3 处错。找出来改好，函数名和参数不要改。
 --- starter
 def get_batch_buggy(data, batch_size, block_size):
     ix = torch.randint(len(data), (batch_size,))
@@ -405,24 +770,34 @@ def get_batch_buggy(data, batch_size, block_size):
 def t10():
     data = torch.arange(200)
     for _ in range(30):
-        x, y = get_batch_buggy(data, 4, 16)
-        shape_is(x, (4, 16))
-        true(x.dtype == torch.long and y.dtype == torch.long, "embedding 层只吃 int64")
-        eq(y, x + 1, msg="y 没有右移")
+        try:
+            x, y = get_batch_buggy(data, 4, 16)
+        except RuntimeError as e:
+            true(False, f"报错了：{str(e)[:80]}。起点太靠后，切片变短，torch.stack 叠不起来 —— 起点上界应该是 len(data) - block_size")
+        shape_is(x, (4, 16), "x 的形状应为 (batch_size, block_size)")
+        true(x.dtype == torch.long and y.dtype == torch.long, f"embedding 层只吃 int64，你返回的是 {x.dtype} / {y.dtype}")
+        eq(y, x + 1, msg="y 没有右移：y 的切片应该从 i + 1 开始")
 --- hints
-- TODO
+- 第 1 处：起点的上界。i 取到 `len(data) - 1` 时，`data[i:i + block_size]` 还剩几个元素？
+- 第 2 处：y 和 x 的切片一模一样。y 应该从 `i + 1` 开始，到 `i + 1 + block_size` 结束。
+- 第 3 处：最后一行的 `.float()`。embedding 的输入和 cross_entropy 的标签要的是什么 dtype？
 
 @@ item d3-11
 type: code
 title: 一个训练 step 的全部 shape
 level: 2
+cards: 一个训练 step 里的全部 shape
 targets: BATCH_SHAPES
 ref: day3
 --- context
-TODO
+面试和 debug 时最常被问的就是「这一步的 shape 是多少」。能脱口说出一个训练 step 里每个张量的 shape，读 nanoGPT 这类代码就不会迷路。
 --- prompt
-11  shape 速算 —— 一个训练 step 里的所有张量
-设 B=8, T=256, V=50257, C=768。填 tuple。
+设 B = 8（batch 大小），T = 256（block_size），V = 50257（词表大小），C = 768（每个 token 向量的宽度）。先在脑子里算，再把字典里的每个 `None` 换成一个 shape tuple，比如 `(8, 256)`。
+
+- `wte = nn.Embedding(V, C)`，`wpe = nn.Embedding(T, C)`，`lm_head = nn.Linear(C, V)`。
+- `pos = torch.arange(T)`，形状 `(T,)`。
+- 标量（只有一个数的 tensor）的 shape 是空 tuple `()`。
+- 可以直接写乘法，比如 `8 * 256`。键名不要改。
 --- starter
 BATCH_SHAPES = {
     "x  (输入 token id)":        None,
@@ -462,8 +837,201 @@ def t11():
         "y.view(-1)": (B * T,),
         "loss": (),
     }
+    missing = [k for k in want if k not in BATCH_SHAPES]
+    true(not missing, f"字典里少了这些键（键名不要改）: {missing}")
     wrong = [f"{k!r}: 你填 {v}, 应为 {want[k]}" for k, v in BATCH_SHAPES.items()
-             if v is None or tuple(v) != want[k]]
-    true(not wrong, "\n       " + "\n       ".join(wrong))
+             if k in want and (not isinstance(v, (tuple, list)) or tuple(v) != want[k])]
+    true(not wrong, "（只有一个元素的 tuple 要写逗号，比如 (2048,)）\n       " + "\n       ".join(wrong))
 --- hints
-- TODO
+- Embedding 是查表：输入是什么形状，输出就在后面多一维 C。`(B, T)` → `(B, T, C)`。
+- 每个 Transformer block 进出形状不变；lm_head 只改最后一维：C → V。
+- `cross_entropy` 要 `(N, V)` 的 logits 和 `(N,)` 的标签，N = B*T。只有一个元素的 tuple 要写逗号：`(8 * 256,)`。
+
+@@ item d3-12
+type: predict
+title: BPE：数出来 2 次，只合出 1 个
+level: 1
+cards: BPE 与压缩率
+ref: day3
+--- context
+BPE 数 pair 时允许重叠，合并时却不允许。所以「出现次数最多」的 pair，真正合并后少掉的 token 可能比计数少。想清楚这一点，d3-02 的边界情况就不会错。
+--- prompt
+下面的代码用到 d3-02 的 `pair_counts` 和 `merge_pair`（这里已经放好了参考实现）。先别运行，写出它打印的两行。
+--- code
+tokens = list("aaab")
+print(pair_counts(tokens))
+print(merge_pair(tokens, ("a", "a")))
+--- explain
+`"aaab"` 的相邻对有 3 个：位置 0-1 是 (a,a)，位置 1-2 是 (a,a)，位置 2-3 是 (a,b)。数的时候重叠也算，所以 `('a', 'a')` 是 2 次，`('a', 'b')` 是 1 次。
+
+合并时从左往右扫：位置 0-1 合成 `'aa'`，然后直接跳到位置 2。位置 2-3 是 (a,b)，不是要合并的 pair，所以 `'a'` 和 `'b'` 原样保留。结果是 `['aa', 'a', 'b']`：计数说有 2 个，实际只合出 1 个。
+--- hints
+- 数 pair 时，每两个相邻的都算一对，可以重叠：4 个 token 有 3 对。
+- 合并从左往右扫：位置 0-1 合并以后，直接跳到位置 2，看位置 2 和 3 这一对。
+- dict 打印出来像 `{('x', 'y'): 1}`，list 像 `['x', 'y']`。
+
+@@ item d3-13
+type: predict
+title: uint16 装不下时会发生什么
+level: 2
+cards: 大语料：uint16 的 .bin 文件和 np.memmap
+--- context
+.bin 文件用 uint16 存 token id，比 int64 省 4 倍磁盘。但 uint16 最大只有 65535：词表更大的 tokenizer 硬存进去，numpy 不报错，只会悄悄把 id 变成别的数，训练数据就这样坏掉了。
+--- prompt
+先别运行，写出下面代码打印的两行。uint16 能表示 0 到 65535；`.nbytes` 是数组一共占多少字节。
+--- code
+import numpy as np
+ids = np.array([50256, 65535, 65536, 70000], dtype=np.int64)
+print(ids.astype(np.uint16).tolist())
+print(np.array([1, 2, 3], dtype=np.uint16).nbytes, np.array([1, 2, 3], dtype=np.int64).nbytes)
+--- explain
+50256 和 65535 装得下，原样保留。65536 变成了 0，70000 变成了 4464：转 dtype 时，numpy 只留下低 16 位，相当于对 65536 取余数（70000 - 65536 = 4464），不报错也不警告。所以词表超过 65536 的 tokenizer（比如 10 万词的）要用 uint32 存。
+
+第二行：3 个 uint16 占 3 × 2 = 6 字节，3 个 int64 占 3 × 8 = 24 字节。这就是 .bin 文件用 uint16 的原因。
+--- hints
+- uint16 装不下的数不会报错，只保留「除以 65536 的余数」。
+- 65536 % 65536 = 0，70000 % 65536 = 4464。
+- uint16 每个元素 2 字节，int64 每个 8 字节，两个数组都是 3 个元素。
+
+@@ item d3-14
+type: predict
+title: 用乘法做 mask，冒出 nan
+level: 2
+cards: 把 mask 变成 -inf 加性偏置
+--- context
+用乘法把 mask 变成 -inf 偏置，看起来很自然，却是一个经典 bug：结果里会冒出 nan，而 nan 一进 softmax 就会传染整行，接着 loss 也变成 nan。
+--- prompt
+先别运行，写出下面代码打印的两行。tensor 打印出来的格式是 `tensor([..., ..., ...])`，逗号后面有一个空格。
+--- code
+mask = torch.tensor([1., 1., 0.])
+bias = (1 - mask) * float("-inf")
+print(bias)
+print((torch.zeros(3) + bias).softmax(-1))
+--- explain
+`1 - mask` 是 `[0., 0., 1.]`。浮点数规定 `0 × (-inf)` 的结果是 nan（not a number，「不是一个数」），而 `1 × (-inf)` 还是 -inf。所以 bias 是 `tensor([nan, nan, -inf])`：本该是 0 的真实位全变成了 nan。
+
+softmax 要把整行的 exp 加起来当分母。分母里只要有一个 nan，整行就全是 nan。正确写法是 `torch.zeros(...).masked_fill(mask == 0, float("-inf"))`：它只改 pad 位，真实位保持 0。
+--- hints
+- 先算 `1 - mask`：得到 `[0., 0., 1.]`。
+- 浮点规定 `0 × (-inf)` 是 nan，不是 0；`1 × (-inf)` 还是 -inf。
+- softmax 的分母是整行 exp 的和：只要有一个 nan，每个位置都是 nan。
+
+@@ item d3-15
+type: choice
+title: 拿 loss 和 ln(V) 比
+level: 2
+cards: bigram 计数与 ln(V) 基线
+--- context
+看训练日志的第一件事，就是拿 loss 和 ln(V) 比。这个比较只要几秒钟，就能告诉你初始化正不正常、模型到底有没有在学。
+--- prompt
+你在用 GPT-2 的 tokenizer 训练一个模型：V = 50257，ln(V) ≈ 10.82。下面哪些判断是对的？（可以多选）
+--- options
+- 第 0 步 loss 是 10.9：正常。刚初始化的模型差不多在均匀瞎猜，loss 本来就该在 ln(V) 附近。
+- 第 0 步 loss 是 10.9：太高了，说明初始化坏了。好的初始化应该让 loss 一开始就接近 0。
+- 训练了 5000 步，loss 还在 10.8 左右：模型什么都没学到，先查训练循环，比如是不是忘了 `optimizer.step()`，或者学习率是 0。
+- 第 0 步 loss 是 45：远高于 ln(V)，说明模型一开始就「很自信地猜错」（logits 太大），应该检查初始化。
+answer: 1,3,4
+--- explain
+均匀瞎猜时，正确答案的概率是 1/V，loss = -ln(1/V) = ln(V) ≈ 10.82。所以第 0 步的 10.9 完全正常（选项 1 对）。一个还没学过任何东西的模型，不可能一开始就接近 0（选项 2 错）。
+
+训练很久还在 ln(V) 附近，说明模型还在瞎猜，参数多半根本没有更新（选项 3 对）。
+
+loss 比 ln(V) 高很多，说明模型给正确答案的概率比 1/V 还小：它不是在瞎猜，而是自信地押在了错的词上，通常是初始化让 logits 太大（选项 4 对）。
+--- hints
+- 均匀瞎猜时，正确答案的概率是 1/V，loss = -ln(1/V) = ln(V)。
+- loss 比 ln(V) 还高，意味着模型给正确答案的概率比 1/V 还小。
+
+@@ item d3-16
+type: code
+title: 闭卷：get_batch
+level: 2
+cards: get_batch：x 和 y 错开一位
+targets: get_batch
+ref: day3
+exam: yes
+--- context
+get_batch 是训练循环里最常写的函数，面试手写训练循环时几乎一定会用到。闭卷从空白写出来，才算真的会了。
+--- prompt
+不看卡片和前面的答案，写出 `get_batch(data, batch_size, block_size, generator=None)`：
+
+- `data` 是 1D LongTensor；随机选 `batch_size` 个起点，`generator` 传给 `torch.randint`。
+- `x` 是从起点开始的 `block_size` 个 token，`y` 是 x 右移一位。
+- 返回 `(x, y)`，形状都是 `(batch_size, block_size)`，dtype int64；y 不能越界。
+--- starter
+def get_batch(data, batch_size, block_size, generator=None):
+    raise todo()
+--- solution
+def get_batch(data, batch_size, block_size, generator=None):
+    hi = len(data) - block_size
+    ix = torch.randint(hi, (batch_size,), generator=generator)
+    x = torch.stack([data[i:i + block_size] for i in ix]).long()
+    y = torch.stack([data[i + 1:i + 1 + block_size] for i in ix]).long()
+    return x, y
+--- tests
+@check("get_batch 与 x/y 错位")
+def t04():
+    data = torch.arange(1000)
+    g = torch.Generator().manual_seed(0)
+    x, y = get_batch(data, 4, 8, g)
+    shape_is(x, (4, 8), "x 的形状应为 (batch_size, block_size)")
+    shape_is(y, (4, 8), "y 的形状应为 (batch_size, block_size)")
+    true(x.dtype == torch.long and y.dtype == torch.long, f"dtype 必须是 int64（torch.long），你的是 {x.dtype} / {y.dtype}")
+    eq(y, x + 1, msg="y 必须是 x 右移一位。这一行写错，模型会学会抄答案，loss 掉到 0 但生成全是垃圾")
+    x2, _ = get_batch(data, 4, 8, torch.Generator().manual_seed(0))
+    eq(x2, x, msg="同一个种子的 generator 应该给出同一个 batch —— 把 generator 传给 torch.randint")
+    # 越界检查: 用最短的合法数据反复采样
+    short = torch.arange(9)
+    for _ in range(50):
+        try:
+            a, b = get_batch(short, 2, 8)
+        except RuntimeError as e:
+            true(False, f"get_batch(torch.arange(9), 2, 8) 报错了：{str(e)[:80]}。9 个 token、block_size=8 时唯一合法的起点是 0："
+                        "torch.randint 的上界要写 len(data) - block_size")
+        shape_is(b, (2, 8), "起点太靠后，y 被切短了 —— 起点上界应该是 len(data)-block_size")
+        true(int(b.max()) <= 8, "y 越界了 —— 起点 i 最大只能是 len(data)-block_size-1")
+--- hints
+- 起点上界：`len(data) - block_size`。
+- `torch.stack` 把每段叠起来，y 的切片起止都比 x 多 1。
+
+@@ item d3-17
+type: code
+title: 闭卷：pad_batch
+level: 2
+cards: padding、attention mask 和 position ids
+targets: pad_batch
+ref: day3
+exam: yes
+--- context
+变长句子的 padding、attention mask 和 position ids，在训练、批量推理和部署服务里都会遇到。闭卷写一遍，确认三样东西你都能一次写对。
+--- prompt
+不看卡片和前面的答案，写出 `pad_batch(seqs, pad_id=0)`：
+
+- `seqs` 是 `list[list[int]]`，返回 `(ids, attn_mask, pos_ids)`，形状都是 `(B, Tmax)`，dtype 都是 int64。
+- `ids` 右边补 `pad_id`；`attn_mask` 真实 token 是 1、pad 是 0；`pos_ids` 每句从 0 开始数真实 token，pad 位置填 0。
+--- starter
+def pad_batch(seqs, pad_id=0):
+    raise todo()
+--- solution
+def pad_batch(seqs, pad_id=0):
+    B, Tmax = len(seqs), max(len(s) for s in seqs)
+    ids = torch.full((B, Tmax), pad_id, dtype=torch.long)
+    mask = torch.zeros(B, Tmax, dtype=torch.long)
+    pos = torch.zeros(B, Tmax, dtype=torch.long)
+    for i, s in enumerate(seqs):
+        L = len(s)
+        ids[i, :L] = torch.tensor(s, dtype=torch.long)
+        mask[i, :L] = 1
+        pos[i, :L] = torch.arange(L)
+    return ids, mask, pos
+--- tests
+@check("padding + mask + position ids")
+def t08():
+    ids, m, pos = pad_batch([[5, 6, 7], [8], [9, 10]], pad_id=-1)
+    eq(ids, torch.tensor([[5, 6, 7], [8, -1, -1], [9, 10, -1]]), msg="ids：每句右边补 pad_id，补到最长那句的长度")
+    eq(m, torch.tensor([[1, 1, 1], [1, 0, 0], [1, 1, 0]]), msg="attn_mask：真实 token 是 1，pad 是 0")
+    eq(pos, torch.tensor([[0, 1, 2], [0, 0, 0], [0, 1, 0]]), msg="pos_ids：每句从 0 开始数真实 token，pad 位置填 0")
+    true(ids.dtype == torch.long and m.dtype == torch.long and pos.dtype == torch.long,
+         f"三个 tensor 都要是 int64，你的是 {ids.dtype} / {m.dtype} / {pos.dtype}")
+--- hints
+- 先用 `torch.full` 和 `torch.zeros` 建好三个 `(B, Tmax)` 的 tensor。
+- 逐句循环，给第 i 行的前 `len(s)` 个位置赋值。

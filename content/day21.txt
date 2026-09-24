@@ -1,0 +1,1255 @@
+@@ day 21
+title: 部署一：导出与压缩
+part: 部署
+hours: 3–4 小时
+--- goal
+学完今天，你能把训练好的 PyTorch 模型导出成 batch 大小可变的 ONNX 文件，用 onnxruntime 对拍证明导出没出错，认出并修好最常见的导出失败（对张量的值写 Python if），还能用 int8 动态量化把模型缩小约 4 倍，并量出它在精度和速度上的代价。
+--- checklist
+- 先清空复习区（昨天看过答案的题从空白重做）
+- 读完 8 张知识卡片，每段代码都点「运行」，改一个数字再跑一次
+- 练习区全部通过（d21-01 到 d21-12）
+- 最后做闭卷：不看卡片，写出 batch 可变的导出和 verify_export
+
+@@ concept
+title: 上线前的推理检查单
+ref: day21
+--- body
+同一个模型，训练时和上线时要换一种跑法。上线（推理，inference）之前，先过这张检查单：
+
+1. **`model.eval()`**：切到推理模式。Dropout 不再随机丢值；BatchNorm 改用训练时攒下的统计量（`running_mean` / `running_var`），也不再更新它们。忘了这一步，同一个输入两次预测，结果都不一样。
+2. **`with torch.inference_mode():`**：告诉 PyTorch 不用记计算图（计算图是给 backward 求梯度用的）。省内存，也更快。输出的 `requires_grad` 是 False。
+3. **预处理和训练时一模一样**：同样的归一化统计量、同样版本的 tokenizer（第 18 天细讲）。
+
+今天的题目都用这个小模型 `Net`，它已经在隐藏的准备代码里定义好了：
+
+```
+class Net(nn.Module):              # 8 个特征 -> 3 类
+    def __init__(self, hidden=16, p_drop=0.5):
+        super().__init__()
+        self.fc1 = nn.Linear(8, hidden)
+        self.bn = nn.BatchNorm1d(hidden)
+        self.drop = nn.Dropout(p_drop)
+        self.fc2 = nn.Linear(hidden, 3)
+
+    def forward(self, x):
+        return self.fc2(self.drop(F.relu(self.bn(self.fc1(x)))))
+```
+
+`trained_net()` 返回一个「训练过」的 Net：BatchNorm 的统计量已经攒好了，模型还处在 train 模式，就像刚训练完一样。
+
+下面的代码里，`num_batches_tracked` 数的是 BatchNorm 在 train 模式下被更新了几次。
+--- code
+torch.manual_seed(0)
+net = trained_net()               # train 模式
+x = torch.randn(3, 8)
+
+print("train 模式，两次结果一样吗:", torch.equal(net(x), net(x)))
+print("BatchNorm 被更新了几次:", net.bn.num_batches_tracked.item())
+
+net.eval()
+with torch.inference_mode():
+    a, b = net(x), net(x)
+print("eval 模式，两次结果一样吗:", torch.equal(a, b))
+print("BatchNorm 被更新了几次:", net.bn.num_batches_tracked.item())
+print("输出要梯度吗:", a.requires_grad)
+
+@@ concept
+title: 导出：把 Python 模型变成一张固定的图
+ref: day21
+--- body
+训练时用 PyTorch 很方便，但上线的机器上不一定有 Python 和 PyTorch：可能是一个 C++ 服务、一部手机，或者专门的推理引擎（onnxruntime、TensorRT）。所以要先把模型「导出（export）」成一张计算图：一串固定的运算，每一步算什么、形状多大，都写在里面。
+
+`torch.export.export(model, (x,))` 是这样工作的：
+
+1. 拿你给的示例输入 `x`，把 `forward` 跑一遍。
+2. 一边跑，一边把每个张量运算（linear、relu……）记下来。记下来的就是图。
+3. Python 自己的东西不进图：`print` 只在导出时跑那一次；`for` 循环被展开（循环 3 次，图里就有 3 份运算）；`if self.use_relu:` 这种看 Python 变量的判断，导出时就定好走哪边。
+
+两个要记住的后果：
+
+- 图里的形状默认是**固定的**：用 `(2, 4)` 的示例导出，图就只认 `(2, 4)`。怎么让 batch 维可变，见「动态 batch 维」那张卡。
+- 导出时模型处在什么模式，图就记下什么行为。用 `torch.export` 在 train 模式下导出，图里的 Dropout 是开着的（下面代码的最后两行）。所以导出前一定先 `model.eval()`。`torch.onnx.export` 发现模型在 train 模式，也会警告：`Exporting a model while it is in training mode`。
+
+第一次调用 `torch.export` 要 1～2 秒（在加载东西），之后就快了。
+--- code
+class Tiny(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(4, 4)
+
+    def forward(self, x):
+        print("forward 在跑，x 的形状:", tuple(x.shape))
+        for _ in range(3):                    # Python 循环：导出时展开成 3 份
+            x = torch.relu(self.fc(x))
+        return x
+
+ep = torch.export.export(Tiny(), (torch.randn(2, 4),))
+print("图里的运算:", [n.target.__name__ for n in ep.graph.nodes if n.op == "call_function"])
+
+net = Net()
+for mode in ("train", "eval"):
+    getattr(net, mode)()                      # 就是 net.train() 或 net.eval()
+    ep = torch.export.export(net, (torch.randn(2, 8),))
+    drop = [n.args[2] for n in ep.graph.nodes if n.op == "call_function" and "dropout" in n.target.__name__]
+    print(mode, "模式导出，图里的 Dropout 开着吗:", drop)
+
+@@ concept
+title: 导出成 ONNX，再用 onnxruntime 对拍
+ref: day21
+--- body
+ONNX 是一种通用的模型文件格式：一个 `.onnx` 文件里存着计算图和权重。onnxruntime 是专门跑 ONNX 文件的推理引擎，不需要 PyTorch，CPU、GPU 都能跑。
+
+导出（`dynamo=True` 表示用新的导出器：先用 `torch.export` 抓图，再翻译成 ONNX）：
+
+```
+model.eval()
+prog = torch.onnx.export(model, (example,), dynamo=True, verbose=False)
+prog.save(path)                    # 写成 .onnx 文件
+```
+
+- 第二个参数是**元组**：`(example,)`，逗号不能少。
+- `verbose=False` 关掉导出过程的进度信息。
+- 返回的 `prog` 是一个 `ONNXProgram`，`.save(path)` 把它写成文件。今天的文件都写进 `tempfile.TemporaryDirectory()` 建的临时文件夹，用完自动删掉。
+- 导出一次要 1～3 秒。
+
+用 onnxruntime 跑：
+
+```
+sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+name = sess.get_inputs()[0].name              # 输入叫什么，从文件里读
+out = sess.run(None, {name: x.numpy()})[0]    # None = 要所有输出；返回一个列表
+```
+
+onnxruntime 吃 numpy 数组，吐 numpy 数组。
+
+**导出之后一定要对拍**：同一个输入，PyTorch 和 onnxruntime 各跑一遍，看最大误差 `np.abs(a - b).max()`。两边不会完全相等：不同的库做加法的顺序不同，而浮点数的 `(a + b) + c` 和 `a + (b + c)` 可能差最后一位。fp32 下误差在 1e-7～1e-5 很正常，一般用 1e-4 当容差。误差到了 1e-2 甚至更大，就是真 bug：导出的权重不对、PyTorch 这边忘了 `eval()`、预处理不一样……
+--- code
+import os, tempfile
+import numpy as np
+import onnxruntime as ort
+
+torch.manual_seed(0)
+net = trained_net().eval()
+x = torch.randn(2, 8)
+prog = torch.onnx.export(net, (x,), dynamo=True, verbose=False)
+
+with tempfile.TemporaryDirectory() as folder:
+    path = os.path.join(folder, "net.onnx")
+    prog.save(path)
+    print("文件大小:", os.path.getsize(path), "字节")
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    inp = sess.get_inputs()[0]
+    print("输入:", inp.name, inp.shape)
+    got = sess.run(None, {inp.name: x.numpy()})[0]
+    del sess                                  # 先关掉 session，临时文件夹才好删
+
+with torch.inference_mode():
+    want = net(x).numpy()
+print("onnxruntime 第 1 行:", got.round(4)[0])
+print("PyTorch    第 1 行:", want.round(4)[0])
+print("最大误差:", np.abs(got - want).max())
+
+@@ concept
+title: 动态 batch 维：说清楚哪一维会变
+ref: day21
+--- body
+上一张卡用 `(2, 8)` 的示例导出，文件里输入的形状是 `[2, 8]`：只认 batch = 2。喂它 5 个样本，onnxruntime 会报错：
+
+```
+INVALID_ARGUMENT : Got invalid dimensions for input: x for the following indices
+ index: 0 Got: 5 Expected: 2
+```
+
+上线时每次请求的样本数都不一样。所以导出时要说清楚：第 0 维（batch）是可变的。
+
+```
+prog = torch.onnx.export(
+    model, (example,), dynamo=True, verbose=False,
+    input_names=["x"], output_names=["logits"],     # 文件里输入、输出的名字
+    dynamic_shapes={"x": {0: "batch"}},             # 参数 x 的第 0 维可变，名字叫 batch
+)
+```
+
+- `dynamic_shapes` 的 key 是 **forward 的参数名**。`Net.forward(self, x)` 的参数叫 `x`；`nn.Sequential` 的参数叫 `input`，写错了会报 `its top-level keys must be the arg names`。也可以不写名字，按位置写成元组：`dynamic_shapes=({0: "batch"},)`。
+- `input_names` / `output_names` 是存进文件里的名字。不写的话，输入默认用参数名，输出名是自动起的（比如 `linear_1`），调用的人不好用。
+- 导出后，输入的形状变成 `['batch', 8]`：字符串表示这一维可变。
+- 导出后用几个不同的 batch 大小（1、中等、很大）各对拍一次。
+--- code
+import os, tempfile
+import numpy as np
+import onnxruntime as ort
+
+torch.manual_seed(0)
+net = trained_net().eval()
+prog = torch.onnx.export(net, (torch.randn(2, 8),), dynamo=True, verbose=False,
+                         input_names=["x"], output_names=["logits"],
+                         dynamic_shapes={"x": {0: "batch"}})
+
+with tempfile.TemporaryDirectory() as folder:
+    path = os.path.join(folder, "net.onnx")
+    prog.save(path)
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    print("输入:", sess.get_inputs()[0].name, sess.get_inputs()[0].shape)
+    print("输出:", sess.get_outputs()[0].name, sess.get_outputs()[0].shape)
+    for b in (1, 7, 64):
+        x = torch.randn(b, 8)
+        got = sess.run(None, {"x": x.numpy()})[0]
+        with torch.inference_mode():
+            diff = np.abs(got - net(x).numpy()).max()
+        print(f"batch = {b}: 输出形状 {got.shape}，最大误差 {diff:.1e}")
+    del sess
+
+@@ concept
+title: 导出失败头号原因：对张量的值写 Python if
+ref: day21
+--- body
+导出时 forward 只跑一遍，图里只记张量运算。Python 的 `if` 必须当场决定走哪边：
+
+- `if x.shape[1] != 8:`、`if self.use_relu:`：导出时就知道答案（形状、Python 变量），没问题。走了哪边，就记哪边。
+- `if x.mean() > 0:`：答案取决于**输入的值**。今天的输入走这边，明天的输入可能走那边。一张固定的图装不下这种 Python 分支，导出直接失败：
+
+```
+GuardOnDataDependentSymNode: Could not guard on data-dependent expression Eq(u0, 1)
+```
+
+「data-dependent」就是「取决于数据的值」。用 `torch.onnx.export(dynamo=True)` 时，这个错误被包在 `TorchExportError: Failed to export the model with torch.export. This is step 1/3 ...` 里面，真正的原因写在下面的 `Exception summary`。
+
+一行一行处理数据的 `for row in x:` 里面如果有 `if row.sum() > 0:`，也是同样的问题。
+
+**修法：两条路都算出来，再用 `torch.where` 按条件挑。** `torch.where(cond, a, b)`：cond 为 True 的位置取 a，否则取 b。它是普通的张量运算，能进图。cond 的形状可以比 a、b 小，会自动广播（broadcast）：
+
+- 整个输入一个条件：`torch.where(x.mean() > 0, x * 2, -x)`
+- 每一行一个条件：`n = x.norm(dim=1, keepdim=True)`，形状 `(B, 1)`；`torch.where(n > 1, x / n, x)` 对每一行分别挑。
+
+有些分支有现成的运算可以代替：`x.clamp(max=10)`、`torch.maximum(x, y)`、`F.relu(x)`。
+
+下面的代码用了准备代码里的小工具 `export_error(model, x)`：它安静地调用 `torch.export.export`，成功返回 None，失败返回一行原因。
+--- code
+class Bad(nn.Module):
+    def forward(self, x):
+        if x.mean() > 0:                      # 要看 x 的值才知道走哪边
+            return x * 2
+        return -x
+
+class Good(nn.Module):
+    def forward(self, x):
+        return torch.where(x.mean() > 0, x * 2, -x)   # 两边都算，按条件挑
+
+x = torch.randn(3, 4)
+print("Bad :", export_error(Bad(), x))
+print("Good:", export_error(Good(), x))       # None = 导出成功
+for inp in (x.abs(), -x.abs()):               # 两个分支各试一次
+    print("结果一样吗:", torch.equal(Bad()(inp), Good()(inp)))
+
+@@ concept
+title: int8 量化：1 个字节存一个权重
+--- body
+fp32 的权重，每个数占 4 个字节。量化（quantization）就是改用更少的字节来存。int8 是 -128～127 的整数，只占 1 个字节。
+
+怎么把小数变成整数（对称量化）：
+
+```
+scale = max(|w|) / 127                   # 最大的 |w| 对应 127
+q = round(w / scale)，限制在 [-127, 127]  # 存成 int8
+w ≈ q * scale                            # 用的时候乘回来（反量化）
+```
+
+- 存的是 `q`（每个数 1 字节）和 `scale`（一个小数）。权重大约小 4 倍。
+- 四舍五入带来误差：每个数最多差 `scale / 2`。
+- 比 `scale / 2` 还小的权重，会直接变成 0。
+- 整个矩阵只用一个 scale（per-tensor）时，一个特别大的数会把 scale 撑大，其他小数就只能用到很少几个整数，误差变大（下面代码的第 2 行）。所以实际上常常每一行（每个输出通道）各用一个 scale（per-channel）。
+
+「动态（dynamic）量化」的「动态」说的是激活值（每一层的输入）：权重提前量化好，存成 int8；激活值每次推理时才看这一批数据的范围，当场量化。所以它不需要额外的校准数据，一行代码就能用。PyTorch 的动态量化只在 CPU 上跑，主要替换 `nn.Linear`（下一张卡）。
+--- code
+w = torch.tensor([[0.50, -0.20, 0.01],
+                  [0.02, 0.03, -0.04]])
+scale = w.abs().max() / 127                  # 整个矩阵一个 scale
+q = torch.round(w / scale).clamp(-127, 127).to(torch.int8)
+w_back = q.float() * scale                   # 反量化
+
+print("scale:", round(scale.item(), 5))
+print("q:", q.tolist(), q.dtype)
+print("误差都 <= scale / 2 吗:", bool(((w - w_back).abs() <= scale / 2 + 1e-7).all()))
+print("第 2 行原来:", [round(v, 4) for v in w[1].tolist()])
+print("第 2 行还原:", [round(v, 4) for v in w_back[1].tolist()])
+
+@@ concept
+title: 动态量化的账：大小、精度、速度
+ref: day21
+--- body
+PyTorch 一行代码就能把模型里所有的 `nn.Linear` 换成 int8 版本：
+
+```
+q = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+```
+
+- 返回一个**新模型**，原模型不变（它内部先复制一份）。
+- `{nn.Linear}`：只替换这些类型的层。
+- 新模型里的层，打印出来是 `DynamicQuantizedLinear`。
+
+量化不是白送的。上线前把三笔账都算一遍：
+
+1. **大小**：量「存下来有多大」。把 `state_dict` 用 `torch.save` 存进内存里的 `io.BytesIO()`，看写了多少字节。**不能数 `parameters()`**：量化后的权重被打包成特殊的格式，不再是 `nn.Parameter`，`parameters()` 里什么都没有。
+2. **精度**：同一批输入，比较两个模型的输出。最大误差是一个参考；更实用的是「预测类别（argmax）一致的比例」。真实项目里，要在验证集上把指标（准确率等）重新算一遍。
+3. **速度**：取决于 CPU 型号、计算后端和 batch 大小。有的机器上快不少，有的机器上反而更慢。一定要在上线用的那台机器上测（先预热，测很多次取中位数，第 19 天讲过）。
+
+在 GPU 上跑大语言模型时，常用的是别的量化方法（只量化权重的 int8 / int4，比如 bitsandbytes、GPTQ、AWQ）。道理一样：用更少的字节存权重，换来一点精度损失。
+
+下面的 `make_mlp()` 来自准备代码：`Linear(256, 512) -> ReLU -> Linear(512, 10)`。
+--- code
+import io, time
+
+torch.manual_seed(0)
+model = make_mlp().eval()
+q = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+print(q[0])
+
+def size_bytes(m):
+    buf = io.BytesIO()
+    torch.save(m.state_dict(), buf)
+    return buf.getbuffer().nbytes
+
+print("parameters() 里的数:", sum(p.numel() for p in model.parameters()), "->", sum(p.numel() for p in q.parameters()))
+print("存下来的字节数:", size_bytes(model), "->", size_bytes(q))
+
+x = torch.randn(256, 256)
+with torch.inference_mode():
+    a, b = model(x), q(x)
+print("最大误差:", round((a - b).abs().max().item(), 4))
+print("argmax 一致的比例:", (a.argmax(1) == b.argmax(1)).float().mean().item())
+
+def median_ms(m, n=30):
+    ts = []
+    with torch.inference_mode():
+        for i in range(n + 5):
+            t0 = time.perf_counter()
+            m(x)
+            if i >= 5:                        # 前 5 次是预热，不算
+                ts.append(time.perf_counter() - t0)
+    return sorted(ts)[n // 2] * 1000
+
+print(f"fp32 {median_ms(model):.2f} ms，int8 {median_ms(q):.2f} ms（每台机器都不一样）")
+
+@@ concept
+title: fp16 和 bf16 推理
+ref: day21
+--- body
+另一种压缩：每个数用 2 个字节（半精度）代替 4 个字节。显存和带宽省一半，在支持的 GPU 上还快得多（用上了 Tensor Core）。半精度有两种：
+
+- **fp16**：最大只能表示 65504。更大的数变成 `inf`，再往后算就是 `nan`。好处是有效数字多一些（3 位多）。
+- **bf16**：能表示的范围和 fp32 一样大（最大约 3.4e38），不容易溢出。代价是有效数字只有 2～3 位：70000 会变成 70144，1.001 会变成 1.0。
+
+怎么选：较新的 NVIDIA GPU（A100、RTX 30 系列及以后）优先用 bf16，大语言模型基本都用它。用 fp16 要小心溢出：注意力分数、很大的激活值，都可能超过 65504。
+
+怎么用：`model.to(torch.bfloat16)`，**输入也要转**：`x.to(torch.bfloat16)`。只转了模型、没转输入，会报 `mat1 and mat2 must have the same dtype`。也可以用 `torch.autocast`，让 PyTorch 自动挑哪些运算用半精度。
+
+和 fp32 对比时，容差要放宽：bf16 的误差常在 1e-3～1e-2。精度和容差的细节，第 18 天讲过。
+--- code
+for dt in (torch.float32, torch.float16, torch.bfloat16):
+    fi = torch.finfo(dt)
+    print(f"{str(dt):15} 每个数 {torch.tensor([], dtype=dt).element_size()} 字节，最大 {fi.max:.3g}，精度 eps {fi.eps:.3g}")
+
+big = torch.tensor([70000.0, 1.001])
+print("fp16:", big.half().tolist())
+print("bf16:", big.bfloat16().tolist())
+
+torch.manual_seed(0)
+net = trained_net().eval()
+x = torch.randn(4, 8)
+with torch.inference_mode():
+    want = net(x)
+    out = net.to(torch.bfloat16)(x.to(torch.bfloat16))
+print(f"bf16 输出: {out.dtype}，和 fp32 的最大误差: {(out.float() - want).abs().max().item():.4f}")
+
+@@ item d21-01
+type: code
+title: 上线用的 predict
+level: 1
+cards: 上线前的推理检查单
+targets: predict
+ref: day21
+--- context
+线上最常见的一类事故：模型没切到 eval 模式，同一个请求两次返回不同的结果，BatchNorm 的统计量还被线上数据悄悄改掉。每个推理入口都应该先过这张检查单。
+--- prompt
+写 `predict(model, x)`：上线时做一次预测。
+
+- 先 `model.eval()`：关掉 Dropout，BatchNorm 改用存下来的统计量
+- 在 `with torch.inference_mode():` 里跑 `model(x)`，不建计算图
+- 返回模型的输出（形状 `(B, 3)`）
+
+测试会传进来一个 `trained_net()`，它处在 train 模式。
+--- starter
+def predict(model, x):
+    """上线时的一次预测。传进来的 model 可能还在 train 模式。"""
+    # 1) 切到推理模式
+    # 2) 不建计算图，跑模型，返回输出
+    raise todo()
+--- solution
+def predict(model, x):
+    model.eval()
+    with torch.inference_mode():
+        return model(x)
+--- tests
+@check("同一个输入，两次结果一样")
+def _():
+    net = trained_net()
+    x = torch.randn(4, FEATURES)
+    a = predict(net, x)
+    b = predict(net, x)
+    shape_is(a, (4, CLASSES), "输出应该是 (batch, 3)")
+    eq(a, b, tol=0, msg="两次预测结果不一样 —— Dropout 还开着。先调 model.eval()")
+
+@check("BatchNorm 的统计量没有被改")
+def _():
+    net = trained_net()
+    before = net.bn.running_mean.clone()
+    predict(net, torch.randn(4, FEATURES) + 5)
+    eq(net.bn.running_mean, before, tol=0,
+       msg="预测一次，BatchNorm 的 running_mean 就变了 —— 模型还在 train 模式，每次 forward 都拿线上数据更新统计量")
+
+@check("输出不带计算图")
+def _():
+    net = trained_net()
+    out = predict(net, torch.randn(2, FEATURES))
+    true(not out.requires_grad,
+         "输出的 requires_grad 是 True：PyTorch 为它建了计算图，白占内存。把 model(x) 放进 with torch.inference_mode(): 里")
+--- hints
+- 两步：先 `model.eval()`，再 `with torch.inference_mode():`。
+- `with` 里面直接 `return model(x)` 就行。
+
+@@ item d21-02
+type: code
+title: 导出成 ONNX 文件
+level: 2
+cards: 导出：把 Python 模型变成一张固定的图; 导出成 ONNX，再用 onnxruntime 对拍
+targets: export_onnx
+ref: day21
+timeout: 120
+--- context
+把模型交给别的团队或别的推理引擎，最常用的格式就是 ONNX。导出只有几行，但每一行都有讲究：先 eval()，示例输入写成元组，存到指定的路径。
+--- prompt
+写 `export_onnx(model, example, path)`：
+
+- 先 `model.eval()`
+- 用 `torch.onnx.export(model, (example,), dynamo=True, verbose=False)` 导出（第二个参数是元组）
+- 用返回值的 `.save(path)` 写文件
+- 返回 `path`
+
+测试会传进来一个 train 模式的 `trained_net()`、一个 `(2, 8)` 的示例输入，和临时文件夹里的一个路径。导出要 1～3 秒。
+--- starter
+def export_onnx(model, example, path):
+    """把 model 导出成一个 .onnx 文件，写到 path，返回 path。"""
+    # 1) 切到推理模式
+    # 2) torch.onnx.export(..., dynamo=True, verbose=False)
+    # 3) 存到 path，返回 path
+    raise todo()
+--- solution
+def export_onnx(model, example, path):
+    model.eval()
+    prog = torch.onnx.export(model, (example,), dynamo=True, verbose=False)
+    prog.save(path)
+    return path
+--- tests
+import os, tempfile
+
+_got = {}
+
+def _export():
+    """导出一次，把要检查的东西记下来（临时文件夹马上删掉）。"""
+    if not _got:
+        net = trained_net()
+        example = torch.randn(2, FEATURES)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+            path = os.path.join(folder, "net.onnx")
+            ret = export_onnx(net, example, path)
+            facts = {"net": net, "example": example, "ret": ret, "path": path, "exists": os.path.isfile(path)}
+            if facts["exists"]:
+                facts["out"] = run_onnx(path, example)
+        _got.update(facts)
+    return _got
+
+@check("文件写出来了，返回的是 path")
+def _():
+    f = _export()
+    true(f["exists"], "path 那里没有文件 —— 别忘了 prog.save(path)")
+    true(str(f["ret"]) == f["path"], f"应该返回 path，你返回的是 {f['ret']!r}")
+
+@check("导出前切到了 eval 模式")
+def _():
+    f = _export()
+    true(not f["net"].training, "导出后模型还在 train 模式 —— 导出前先 model.eval()（torch.onnx.export 也会发警告）")
+
+@check("onnxruntime 跑出来和 PyTorch 一样")
+def _():
+    f = _export()
+    true(f["exists"], "没有文件，没法对拍")
+    net = f["net"].eval()
+    with torch.inference_mode():
+        want = net(f["example"])
+    eq(torch.from_numpy(f["out"]), want, tol=1e-4, msg="ONNX 的输出和 PyTorch 对不上")
+--- hints
+- 第二个参数必须是元组：`(example,)`，逗号不能少。
+- `prog = torch.onnx.export(model, (example,), dynamo=True, verbose=False)`，然后 `prog.save(path)`，最后 `return path`。
+
+@@ item d21-03
+type: choice
+title: 对拍误差多大算正常
+level: 1
+cards: 导出成 ONNX，再用 onnxruntime 对拍
+--- context
+对拍（拿两个实现跑同一个输入、比较结果）是部署里最重要的习惯。但先得知道多大的误差算正常：容差定得太严，天天误报；定得太松，真 bug 就溜过去了。
+--- prompt
+你把一个 fp32 模型导出成 ONNX。同一个输入，onnxruntime 和 PyTorch 输出的最大误差是 `3e-7`。这说明什么？
+--- options
+- 导出有 bug：两边应该完全相等，误差必须是 0
+- 正常：两个库做加法的顺序不同，fp32 下这么小的误差很常见，用 1e-4 左右的容差比较就行
+- 说明 onnxruntime 偷偷用了 fp16 在算
+- 说明 PyTorch 这边忘了 model.eval()
+answer: 2
+--- explain
+浮点数的加法不满足结合律：`(a + b) + c` 和 `a + (b + c)` 可能差最后一位。PyTorch 和 onnxruntime 用的计算核（kernel）不一样，加法的顺序、有没有把几步合成一步，都不一样，所以结果差一点点。fp32 大约有 7 位有效数字，1e-7～1e-5 的误差很正常。
+
+真 bug 的误差会大得多：忘了 `eval()` 时 Dropout 丢掉一半的值，误差常常到 0.1 甚至 1；权重导错了也一样。就算 onnxruntime 真的用 fp16 在算，误差一般也在 1e-4～1e-3，比 3e-7 大得多。
+--- hints
+- fp32 大约能精确到几位有效数字？
+- 忘了 eval()（Dropout 丢掉一半的值）造成的误差，会只有 3e-7 这么小吗？
+
+@@ item d21-04
+type: code
+title: 导出时让 batch 维可变
+level: 2
+cards: 动态 batch 维：说清楚哪一维会变; 导出成 ONNX，再用 onnxruntime 对拍
+targets: export_onnx_dynamic
+ref: day21
+timeout: 120
+--- context
+线上每次请求的样本数都不一样。导出时没说 batch 维可变，文件就只认示例的大小，第一个 batch 大小不同的请求就会报错。这是新手导出最常踩的坑。
+--- prompt
+下面的 `export_onnx_dynamic` 已经能导出了，但 batch 维被写死成了示例的大小（2）。改好它：
+
+- 输入名 `"x"`，输出名 `"logits"`（已经写好了）
+- 第 0 维（batch）可变，名字叫 `"batch"`：加上 `dynamic_shapes`
+- 导出前 `model.eval()`，写到 `path`，返回 `path`
+
+测试会用 batch = 1、5、64 去跑导出的文件，并和 PyTorch 对拍。`Net.forward` 的参数名是 `x`。
+--- starter
+def export_onnx_dynamic(model, example, path):
+    """导出一个 batch 维可变的 ONNX 文件：输入叫 x，输出叫 logits。"""
+    model.eval()
+    prog = torch.onnx.export(model, (example,), dynamo=True, verbose=False,
+                             input_names=["x"], output_names=["logits"])
+    prog.save(path)
+    return path
+--- solution
+def export_onnx_dynamic(model, example, path):
+    model.eval()
+    prog = torch.onnx.export(model, (example,), dynamo=True, verbose=False,
+                             input_names=["x"], output_names=["logits"],
+                             dynamic_shapes={"x": {0: "batch"}})
+    prog.save(path)
+    return path
+--- tests
+import os, tempfile
+
+_got = {}
+
+def _export():
+    """导出一次，用 batch = 1、5、64 各跑一次，把结果记下来（临时文件夹马上删掉）。"""
+    if not _got:
+        net = trained_net()
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+            path = os.path.join(folder, "net.onnx")
+            export_onnx_dynamic(net, torch.randn(2, FEATURES), path)
+            sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+            name = sess.get_inputs()[0].name
+            facts = {"net": net, "inputs": [(i.name, i.shape) for i in sess.get_inputs()],
+                     "outputs": [o.name for o in sess.get_outputs()], "runs": {}}
+            for b in (1, 5, 64):
+                x = torch.randn(b, FEATURES)
+                try:
+                    facts["runs"][b] = (x, sess.run(None, {name: x.numpy()})[0])
+                except Exception as e:
+                    facts["runs"][b] = (x, e)
+            del sess
+        _got.update(facts)
+    return _got
+
+@check("输入叫 x，输出叫 logits")
+def _():
+    f = _export()
+    true(f["inputs"][0][0] == "x", f"输入名是 {f['inputs'][0][0]!r}，应该是 'x'（input_names）")
+    true(f["outputs"] == ["logits"], f"输出名是 {f['outputs']}，应该是 ['logits']（output_names）")
+
+@check("batch 维是可变的")
+def _():
+    shape = _export()["inputs"][0][1]
+    true(isinstance(shape[0], str),
+         f"文件里输入的形状是 {shape}：batch 维被写死了。加上 dynamic_shapes={{'x': {{0: 'batch'}}}}")
+
+@check("batch = 1、5、64 都能跑，结果和 PyTorch 一样")
+def _():
+    f = _export()
+    net = f["net"].eval()
+    for b, (x, got) in f["runs"].items():
+        if isinstance(got, Exception):
+            true(False, f"batch = {b} 跑不了：{' '.join(str(got).strip().splitlines()[:2])[:200]}")
+        with torch.inference_mode():
+            want = net(x)
+        eq(torch.from_numpy(got), want, tol=1e-4, msg=f"batch = {b} 时 ONNX 和 PyTorch 对不上")
+--- hints
+- 在 `torch.onnx.export(...)` 里再加一个参数 `dynamic_shapes`。
+- `dynamic_shapes={"x": {0: "batch"}}`：key 是 forward 的参数名 `x`，里面是「第几维 → 给它起的名字」。
+
+@@ item d21-05
+type: code
+title: verify_export：导出后自动对拍
+level: 2
+cards: 导出成 ONNX，再用 onnxruntime 对拍; 动态 batch 维：说清楚哪一维会变; 上线前的推理检查单
+targets: verify_export
+ref: day21
+timeout: 120
+--- context
+「导出成功」不等于「导出正确」。靠谱的团队会把对拍写成一个函数，每次导出后自动跑，放进测试和发布流程：误差超标就报错，不许上线。
+--- prompt
+写 `verify_export(model, path, example, batch_sizes=(1, 4, 16), tol=1e-4)`：
+
+- 先 `model.eval()`（传进来的模型可能还在 train 模式）
+- 用 onnxruntime（`providers=["CPUExecutionProvider"]`）打开 `path`，输入名从 `sess.get_inputs()[0].name` 读
+- 对 `batch_sizes` 里的每个 b：造随机输入 `torch.randn(b, *example.shape[1:])`，PyTorch（在 `torch.inference_mode()` 里）和 onnxruntime 各跑一遍，算最大绝对误差
+- 所有 batch 里最大的那个误差超过 `tol`：`raise AssertionError(...)`，信息里写上误差
+- 否则返回这个最大误差（Python 的 float）
+
+测试会给你一个已经导出好的文件（batch 维可变）。
+--- starter
+import numpy as np
+import onnxruntime as ort
+
+def verify_export(model, path, example, batch_sizes=(1, 4, 16), tol=1e-4):
+    """ONNX 文件和 PyTorch 模型在几个 batch 大小上对拍。返回最大误差；超过 tol 就 raise AssertionError。"""
+    raise todo()
+--- solution
+import numpy as np
+import onnxruntime as ort
+
+def verify_export(model, path, example, batch_sizes=(1, 4, 16), tol=1e-4):
+    model.eval()
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    name = sess.get_inputs()[0].name
+    worst = 0.0
+    for b in batch_sizes:
+        x = torch.randn(b, *example.shape[1:])
+        with torch.inference_mode():
+            want = model(x).numpy()
+        got = sess.run(None, {name: x.numpy()})[0]
+        worst = max(worst, float(np.abs(got - want).max()))
+    if worst > tol:
+        raise AssertionError(f"ONNX 和 PyTorch 的最大误差 {worst:.2e} 超过了容差 {tol}")
+    return worst
+--- tests
+_cache = {}
+
+def _net_and_file():
+    """只导出一次（batch 维可变）；每项检查拿一份新的模型副本。"""
+    if not _cache:
+        net = trained_net().eval()
+        _cache["net"] = net
+        _cache["data"] = onnx_bytes(net, torch.randn(2, FEATURES))
+    return copy.deepcopy(_cache["net"]), _cache["data"]
+
+@check("导出正确时，返回一个很小的误差")
+def _():
+    net, data = _net_and_file()
+    with onnx_file(data) as path:
+        d = verify_export(net, path, torch.randn(2, FEATURES))
+    true(isinstance(d, float), f"要返回一个 Python float，你返回的是 {type(d).__name__}（用 float(...) 转一下）")
+    true(0 <= d < 1e-4, f"导出是正确的，误差应该在 1e-4 以内，你返回了 {d}")
+
+@check("模型还在 train 模式，也能正确对拍")
+def _():
+    net, data = _net_and_file()
+    net.train()
+    try:
+        with onnx_file(data) as path:
+            verify_export(net, path, torch.randn(2, FEATURES))
+    except AssertionError as e:
+        true(False, f"导出没问题，你的函数却说误差太大（{e}）。传进来的模型在 train 模式，PyTorch 这边的 Dropout 还开着 —— 先 model.eval()")
+
+@check("权重对不上时报错；放宽 tol 就不报")
+def _():
+    net, data = _net_and_file()
+    with torch.no_grad():
+        net.fc2.bias += 0.5                   # 模拟「导出的是旧的 checkpoint」
+    with onnx_file(data) as path:
+        raised = False
+        try:
+            verify_export(net, path, torch.randn(2, FEATURES))
+        except AssertionError:
+            raised = True
+        true(raised, "模型和文件的输出差了 0.5，verify_export 应该 raise AssertionError，却正常返回了")
+        d = verify_export(net, path, torch.randn(2, FEATURES), tol=1.0)
+    true(0.4 < d < 0.6, f"tol=1.0 时应该正常返回误差（约 0.5），你返回了 {d}")
+
+@check("batch_sizes 里的每个大小都试了")
+def _():
+    net, data = _net_and_file()
+
+    class Spy(nn.Module):                     # 记下 PyTorch 这边跑过哪些 batch 大小
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+            self.seen = []
+
+        def forward(self, x):
+            self.seen.append(x.shape[0])
+            return self.inner(x)
+
+    spy = Spy(net)
+    with onnx_file(data) as path:
+        verify_export(spy, path, torch.randn(2, FEATURES), batch_sizes=(1, 3, 7))
+    true(sorted(set(spy.seen)) == [1, 3, 7], f"PyTorch 这边跑过的 batch 大小是 {spy.seen}，应该把 1、3、7 都试一遍")
+--- hints
+- 结构：`model.eval()` → 建 session、读输入名 → `for b in batch_sizes:` 里造输入、两边各跑一次、更新 `worst` → 循环结束后判断 `worst > tol`。
+- PyTorch 这边：`with torch.inference_mode(): want = model(x).numpy()`（带梯度的张量不能直接 `.numpy()`）。误差：`float(np.abs(got - want).max())`。
+- 最后：`if worst > tol: raise AssertionError(f"误差 {worst:.2e} 超过了 {tol}")`，否则 `return worst`。
+
+@@ item d21-06
+type: choice
+title: 哪一行会让导出失败
+level: 1
+cards: 导出失败头号原因：对张量的值写 Python if; 导出：把 Python 模型变成一张固定的图
+--- context
+导出失败时，报错信息又长又吓人。先学会一眼认出「对张量的值做 Python 判断」这种写法，大部分导出问题几秒钟就能找到位置。
+--- prompt
+下面四行分别写在 `forward(self, x)` 里（`x` 的形状是 `(B, 8)`，`self.layers` 是一个 `nn.ModuleList`）。哪一行会让 `torch.export`（也就是 `torch.onnx.export(dynamo=True)` 的第一步）失败？
+--- options
+- `if x.shape[1] != 8: raise ValueError("要 8 个特征")`
+- `if x.max() > 100: x = x / 100`
+- `x = torch.where(x > 100, x / 100, x)`
+- `for layer in self.layers: x = layer(x)`
+answer: 2
+--- explain
+- `x.shape[1]` 是形状，导出时就知道是 8，Python 当场判断完，不进图。没问题。
+- `x.max() > 100` 取决于输入的**值**。导出时不知道将来的输入走哪边，一张固定的图装不下这个 Python 分支，报 `Could not guard on data-dependent expression`。
+- `torch.where` 是张量运算：两边都算，按条件挑，能进图。它正是第 2 行的修法。
+- 遍历 `ModuleList`：层数是固定的，导出时循环被展开，每一层都记进图里。没问题。
+--- hints
+- 导出的时候，哪些东西已经确定了（形状、层数），哪些要等真正的输入来了才知道？
+- 找那个要看 x 里面**具体的数**才能决定走哪边的 `if`。
+
+@@ item d21-07
+type: fix
+title: 找 bug：导出失败的 ClipNorm
+level: 2
+cards: 导出失败头号原因：对张量的值写 Python if; 导出成 ONNX，再用 onnxruntime 对拍
+targets: ClipNorm
+ref: day21
+timeout: 120
+--- context
+「一行一行判断」的代码在研究代码里很常见（限制向量长度、特殊样本特殊处理）。它在 PyTorch 里跑得好好的，一导出就失败。上线前把它改写成张量运算，是部署工程师的日常工作。
+--- prompt
+`ClipNorm` 把每一行（每个样本的向量）的长度限制在 `max_norm` 以内：长度（L2 范数）超过 `max_norm` 的行，等比例缩小到长度正好是 `max_norm`；其余的行不变。
+
+它在 PyTorch 里结果是对的，但 `torch.onnx.export(dynamo=True)` 导出会失败。改写 `forward`：
+
+- 不用 Python 的 `for` 和 `if`，改用张量运算（`torch.where`）
+- 结果和原来一样
+- 输入形状是 `(B, D)`，B 可变
+
+不要改类名和 `__init__`。
+--- starter
+class ClipNorm(nn.Module):
+    def __init__(self, max_norm=1.0):
+        super().__init__()
+        self.max_norm = max_norm
+
+    def forward(self, x):                     # x: (B, D)
+        rows = []
+        for row in x:
+            n = row.norm()
+            if n > self.max_norm:
+                row = row * (self.max_norm / n)
+            rows.append(row)
+        return torch.stack(rows)
+--- solution
+class ClipNorm(nn.Module):
+    def __init__(self, max_norm=1.0):
+        super().__init__()
+        self.max_norm = max_norm
+
+    def forward(self, x):                     # x: (B, D)
+        n = x.norm(dim=1, keepdim=True)       # (B, 1)：每一行的长度
+        return torch.where(n > self.max_norm, x * (self.max_norm / n), x)
+--- tests
+def _clip_ref(x, max_norm):
+    """原来的逐行写法（只在 PyTorch 里用来对答案）。"""
+    out = x.clone()
+    for i in range(len(x)):
+        n = x[i].norm()
+        if n > max_norm:
+            out[i] = x[i] * (max_norm / n)
+    return out
+
+_got = {}
+
+def _export():
+    """用 torch.onnx.export(dynamo=True) 导出一次（batch 维可变），记下结果或者错误。"""
+    if not _got:
+        try:
+            _got["data"] = onnx_bytes(ClipNorm(1.0), torch.randn(4, 2) * 2)
+        except NameError:
+            raise
+        except Exception as e:
+            _got["error"] = short_error(e)
+    return _got
+
+@check("PyTorch 里的结果和原来一样")
+def _():
+    x = torch.tensor([[3.0, 4.0], [0.3, 0.4], [0.0, 0.0], [-6.0, 8.0]])
+    eq(ClipNorm(1.0)(x), _clip_ref(x, 1.0), msg="长度 > 1 的行要缩到长度正好是 1，其余的行（包括全 0 的行）不变")
+    y = torch.randn(6, 5) * 2
+    eq(ClipNorm(2.0)(y), _clip_ref(y, 2.0), msg="max_norm = 2.0 时结果不对：判断和缩放都要用 self.max_norm")
+
+@check("torch.onnx.export(dynamo=True) 能导出")
+def _():
+    f = _export()
+    true("error" not in f, f"导出失败：{f.get('error')}。对张量的值写的 Python if / for 要换成张量运算（torch.where）")
+
+@check("onnxruntime 的结果对，batch 大小可变")
+def _():
+    f = _export()
+    true("data" in f, "导出失败了，先让上一项通过")
+    with onnx_file(f["data"]) as path:
+        for x in (torch.tensor([[3.0, 4.0], [0.3, 0.4], [0.0, 0.0], [-6.0, 8.0]]), torch.randn(9, 2) * 2):
+            got = torch.from_numpy(run_onnx(path, x))
+            eq(got, _clip_ref(x, 1.0), tol=1e-5, msg=f"batch = {len(x)} 时 ONNX 的结果不对")
+--- hints
+- 先一次算出每一行的长度：`n = x.norm(dim=1, keepdim=True)`，形状 `(B, 1)`，能和 `(B, D)` 的 x 广播。
+- 两条路都算出来，再按条件挑：`torch.where(n > self.max_norm, x * (self.max_norm / n), x)`。
+
+@@ item d21-08
+type: predict
+title: 手算 int8 量化
+level: 1
+cards: int8 量化：1 个字节存一个权重
+--- context
+面试常让你手算一次量化：scale 是多少，每个权重变成哪个整数。算过一遍，你就知道量化的误差从哪来，为什么很小的权重会直接变成 0。
+--- prompt
+这段代码会打印什么？每个 print 占一行。
+--- code
+w = torch.tensor([0.5, -1.27, 0.02, 0.004])
+scale = w.abs().max() / 127
+q = torch.round(w / scale).to(torch.int8)
+print(q.tolist())
+print(q.dtype, q.element_size())
+--- explain
+- 最大的 |w| 是 1.27，所以 scale = 1.27 / 127 = 0.01。
+- 每个数除以 0.01 再四舍五入：0.5 → 50，-1.27 → -127，0.02 → 2，0.004 → 0.4 → 0。
+- 0.004 比 scale / 2 = 0.005 还小，量化后直接变成 0，这个权重的信息丢了。
+- `q` 的类型是 `torch.int8`，每个数占 1 个字节（fp32 是 4 个字节）。
+--- hints
+- 先算 scale：最大的 |w| 除以 127。
+- 0.004 / 0.01 = 0.4，四舍五入是几？
+
+@@ item d21-09
+type: code
+title: 每行一个 scale 的 int8 量化
+level: 2
+cards: int8 量化：1 个字节存一个权重
+targets: quantize_int8
+ref: day21
+--- context
+真实的 int8 量化几乎都是「每个输出通道一个 scale」（per-channel）：权重矩阵里有的行数大、有的行数小，共用一个 scale，小的那些行几乎全变成 0。亲手写一遍，你就知道 quantize_dynamic 里存的是什么。
+--- prompt
+写 `quantize_int8(w)`，对 `(out, in)` 的权重矩阵做对称 int8 量化，**每一行一个 scale**：
+
+- `scale`：每一行最大的 |w| 除以 127，形状 `(out, 1)`（用 `amax(dim=1, keepdim=True)`）。再 `clamp_min(1e-8)`，这样全 0 的行不会除以 0
+- `q = round(w / scale)`，限制在 `[-127, 127]`，转成 `torch.int8`
+- 返回 `(q, scale)`
+
+用的时候 `q.float() * scale` 就能还原（反量化），每个数的误差不超过它那一行的 `scale / 2`。
+--- starter
+def quantize_int8(w):
+    """w: (out, in) 小数 -> (q: (out, in) int8, scale: (out, 1) 小数)，每行一个 scale。"""
+    raise todo()
+--- solution
+def quantize_int8(w):
+    scale = (w.abs().amax(dim=1, keepdim=True) / 127).clamp_min(1e-8)   # (out, 1)
+    q = torch.round(w / scale).clamp(-127, 127).to(torch.int8)
+    return q, scale
+--- tests
+@check("形状和类型对")
+def _():
+    q, scale = quantize_int8(torch.randn(5, 7))
+    true(q.dtype == torch.int8, f"q 要是 torch.int8，你的是 {q.dtype}")
+    shape_is(q, (5, 7), "q 和 w 一样大")
+    shape_is(scale, (5, 1), "每行一个 scale，形状 (out, 1)。用 amax(dim=1, keepdim=True)")
+    true(scale.dtype == torch.float32, f"scale 要是小数（float32），你的是 {scale.dtype}")
+
+@check("每行最大的数变成 ±127，误差不超过 scale / 2")
+def _():
+    w = torch.randn(6, 10) * torch.tensor([[0.01], [0.1], [1.0], [3.0], [10.0], [0.5]])
+    q, scale = quantize_int8(w)
+    eq(q.abs().amax(dim=1).float(), torch.full((6,), 127.0), tol=0, msg="每一行里 |w| 最大的那个数，应该量化成 ±127")
+    err = (w - q.float() * scale).abs()
+    true(bool((err <= scale / 2 + 1e-6).all()), f"反量化的误差超过了 scale / 2（最大 {err.max().item():.3g}）。检查 round 和 scale")
+
+@check("每行一个 scale：小的行不被大的行拖累")
+def _():
+    w = torch.tensor([[100.0, -50.0, 1.0],
+                      [0.01, -0.02, 0.005]])
+    q, scale = quantize_int8(w)
+    err = (w[1] - q[1].float() * scale[1]).abs().max().item()
+    true(err < 1e-4, f"第 2 行的误差是 {err:.3g}：它的数很小，却用了第 1 行那么大的 scale，几乎全变成 0 了。每行要有自己的 scale")
+
+@check("全 0 的行不出 NaN")
+def _():
+    w = torch.tensor([[0.0, 0.0, 0.0], [0.3, -0.6, 0.9]])
+    q, scale = quantize_int8(w)
+    true(bool(torch.isfinite(scale).all()) and bool((scale > 0).all()),
+         f"scale 里有 0、inf 或 nan：{scale.flatten().tolist()}。用 clamp_min(1e-8)")
+    true(q[0].tolist() == [0, 0, 0], f"全 0 的行应该量化成 [0, 0, 0]，你的是 {q[0].tolist()}")
+--- hints
+- 每行最大的 |w|：`w.abs().amax(dim=1, keepdim=True)`，形状 `(out, 1)`，和 w 相除时会自动广播。
+- `scale = (w.abs().amax(dim=1, keepdim=True) / 127).clamp_min(1e-8)`，`q = torch.round(w / scale).clamp(-127, 127).to(torch.int8)`。
+
+@@ item d21-10
+type: code
+title: 模型存下来有多大
+level: 1
+cards: 动态量化的账：大小、精度、速度
+targets: model_size_bytes
+ref: day21
+--- context
+「量化后小了多少」要用同一把尺子量。最稳的尺子是「state_dict 存下来有多少字节」：部署时真正要搬运、要加载的就是这些字节。只数 parameters() 会漏掉 buffer，量化模型更是一个都数不到。
+--- prompt
+写 `model_size_bytes(model)`：把 `model.state_dict()` 用 `torch.save` 存进一个 `io.BytesIO()`（内存里的「文件」），返回写了多少字节（int）。
+
+`buf.getbuffer().nbytes` 或 `len(buf.getvalue())` 都能拿到字节数。
+
+测试会量一个 fp32 模型，和它的 int8 量化版。
+--- starter
+import io
+
+def model_size_bytes(model):
+    """state_dict 存下来有多少字节。"""
+    raise todo()
+--- solution
+import io
+
+def model_size_bytes(model):
+    buf = io.BytesIO()
+    torch.save(model.state_dict(), buf)
+    return buf.getbuffer().nbytes
+--- tests
+@check("fp32 模型：大约是「参数个数 × 4」字节")
+def _():
+    model = make_mlp()
+    n = sum(p.numel() for p in model.parameters())
+    s = model_size_bytes(model)
+    true(isinstance(s, int), f"要返回 int，你返回的是 {type(s).__name__}")
+    true(n * 4 <= s <= n * 4 * 1.05, f"{n} 个 fp32 参数至少要 {n * 4} 字节（再加一点文件格式的开销），你量出 {s}")
+
+@check("int8 模型也要量对（它的 parameters() 是空的）")
+def _():
+    model = make_mlp().eval()
+    q = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+    s_fp32, s_int8 = model_size_bytes(model), model_size_bytes(q)
+    true(s_int8 > 0, "量化模型量出来是 0：它的权重不是 nn.Parameter，parameters() 里什么都没有。要量 state_dict 存下来的字节数")
+    true(s_fp32 / 4.5 < s_int8 < s_fp32 / 3, f"int8 版应该比 fp32 版（{s_fp32} 字节）小 3～4.5 倍，你量出 {s_int8}")
+--- hints
+- `buf = io.BytesIO()`，然后 `torch.save(model.state_dict(), buf)`。
+- 最后 `return buf.getbuffer().nbytes`。
+
+@@ item d21-11
+type: code
+title: 量化体检报告
+level: 2
+cards: 动态量化的账：大小、精度、速度; int8 量化：1 个字节存一个权重
+targets: quantize_report
+ref: day21
+--- context
+要不要上线量化模型，不能凭感觉。团队里常见的做法是每次压缩都出一份小报告：小了几倍、输出差了多少、预测变了多少。数字摆出来，才好拍板。
+--- prompt
+写 `quantize_report(model, x)`：
+
+- 用 `torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)` 得到量化模型 `q`（原模型不能被改）
+- 两个模型都 `eval()`，在 `torch.inference_mode()` 里对同一个 `x` 各跑一遍：原模型的输出叫 `a`，量化模型的叫 `b`
+- 返回一个字典，有 4 个 key（后三个都是 Python float）：
+
+1. `"model"`：量化模型 `q`
+2. `"size_ratio"`：`model_size_bytes(model) / model_size_bytes(q)`（`model_size_bytes` 已经准备好了）
+3. `"max_diff"`：`(a - b).abs().max()`
+4. `"agree"`：argmax 相同的比例（0～1）
+--- starter
+def quantize_report(model, x):
+    """动态 int8 量化 model，返回 {"model", "size_ratio", "max_diff", "agree"}。"""
+    raise todo()
+--- solution
+def quantize_report(model, x):
+    model.eval()
+    q = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+    q.eval()
+    with torch.inference_mode():
+        a, b = model(x), q(x)
+    return {
+        "model": q,
+        "size_ratio": model_size_bytes(model) / model_size_bytes(q),
+        "max_diff": (a - b).abs().max().item(),
+        "agree": (a.argmax(dim=1) == b.argmax(dim=1)).float().mean().item(),
+    }
+--- tests
+def _case():
+    model = make_mlp().eval()
+    x = torch.randn(128, 256)
+    return model, x
+
+@check("原模型没有被改")
+def _():
+    model, x = _case()
+    with torch.inference_mode():
+        before = model(x)
+    quantize_report(model, x)
+    true(type(model[0]) is nn.Linear and type(model[2]) is nn.Linear,
+         "原模型里的 Linear 被换掉了 —— 不要用 inplace=True，quantize_dynamic 默认返回一个新模型")
+    with torch.inference_mode():
+        eq(model(x), before, tol=0, msg="原模型的输出变了")
+
+@check("返回的模型是 int8 的")
+def _():
+    model, x = _case()
+    r = quantize_report(model, x)
+    true(isinstance(r, dict), f"要返回一个字典，你返回的是 {type(r).__name__}")
+    q = r.get("model")
+    true(isinstance(q, nn.Module), "r['model'] 应该是量化后的模型")
+    true(not any(type(m) is nn.Linear for m in q.modules()),
+         f"量化模型里还有普通的 nn.Linear：{[type(m).__name__ for m in q.modules()]}")
+
+@check("大小比、最大误差、一致率都算对了")
+def _():
+    model, x = _case()
+    r = quantize_report(model, x)
+    q = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+    with torch.inference_mode():
+        a, b = model(x), q(x)
+    for k in ("size_ratio", "max_diff", "agree"):
+        true(isinstance(r.get(k), float), f"r[{k!r}] 要是 Python float，你的是 {type(r.get(k)).__name__}（张量用 .item() 转）")
+    ratio = model_size_bytes(model) / model_size_bytes(q)
+    true(close(r["size_ratio"], ratio, 1e-6), f"size_ratio 应该约是 {ratio:.2f}（原模型字节数 / 量化模型字节数），你的是 {r['size_ratio']:.3f}")
+    diff = (a - b).abs().max().item()
+    true(close(r["max_diff"], diff, 1e-6), f"max_diff 应该是 {diff:.4f}，你的是 {r['max_diff']:.4f}")
+    agree = (a.argmax(1) == b.argmax(1)).float().mean().item()
+    true(close(r["agree"], agree, 1e-6), f"agree 应该是 {agree:.4f}（argmax 相同的比例），你的是 {r['agree']:.4f}")
+--- hints
+- 先 `q = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)`，再在 `with torch.inference_mode():` 里算 `a, b = model(x), q(x)`。
+- 一致率：`(a.argmax(dim=1) == b.argmax(dim=1)).float().mean().item()`；最大误差也要 `.item()` 变成 Python float。
+
+@@ item d21-12
+type: predict
+title: fp16 和 bf16，谁会溢出
+level: 1
+cards: fp16 和 bf16 推理
+--- context
+把模型转成半精度，是上线省显存最快的办法。转之前要知道 fp16 和 bf16 的区别：选错了，线上会冒出 inf 和 NaN，而且只在某些输入上出现，很难查。
+--- prompt
+这段代码会打印什么？每个 print 占一行。
+--- code
+x = torch.tensor([1000.0, 70000.0])
+print(torch.isinf(x.half()).tolist())
+print(torch.isinf(x.bfloat16()).tolist())
+print(x.element_size(), x.half().element_size(), x.bfloat16().element_size())
+--- explain
+- fp16 最大只能表示 65504。70000 超过了，变成 `inf`；1000 没问题。所以是 `[False, True]`。
+- bf16 的范围和 fp32 一样大（最大约 3.4e38），两个数都不会溢出：`[False, False]`。它的代价是精度低：70000 存进去，其实变成了 70144。
+- 每个数占几个字节：fp32 是 4，fp16 和 bf16 都是 2。
+--- hints
+- fp16 能表示的最大的数是多少？
+- bf16 也只用 2 个字节，却有和 fp32 一样大的范围。它牺牲了什么？
+
+@@ item d21-13
+type: code
+title: 闭卷：导出 batch 可变的 ONNX
+level: 2
+exam: yes
+cards: 动态 batch 维：说清楚哪一维会变; 导出成 ONNX，再用 onnxruntime 对拍
+targets: export_onnx_dynamic
+ref: day21
+timeout: 120
+--- context
+导出是今天最重要的一步，面试里也常要你当场写出来。不看卡片，从空白写出一个能上线的导出函数。
+--- prompt
+从空白写出 `export_onnx_dynamic(model, example, path)`：
+
+- 导出前切到推理模式
+- 用 `torch.onnx.export` 导出（`dynamo=True`，`verbose=False`），示例输入是 `example`
+- 输入名 `"x"`，输出名 `"logits"`；第 0 维（batch）可变，名字叫 `"batch"`（forward 的参数名是 `x`）
+- 写到 `path`，返回 `path`
+--- starter
+def export_onnx_dynamic(model, example, path):
+    raise todo()
+--- solution
+def export_onnx_dynamic(model, example, path):
+    model.eval()
+    prog = torch.onnx.export(model, (example,), dynamo=True, verbose=False,
+                             input_names=["x"], output_names=["logits"],
+                             dynamic_shapes={"x": {0: "batch"}})
+    prog.save(path)
+    return path
+--- tests
+import os, tempfile
+
+_got = {}
+
+def _export():
+    """导出一次，用 batch = 1、5、64 各跑一次，把结果记下来（临时文件夹马上删掉）。"""
+    if not _got:
+        net = trained_net()
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+            path = os.path.join(folder, "net.onnx")
+            export_onnx_dynamic(net, torch.randn(2, FEATURES), path)
+            sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+            name = sess.get_inputs()[0].name
+            facts = {"net": net, "inputs": [(i.name, i.shape) for i in sess.get_inputs()],
+                     "outputs": [o.name for o in sess.get_outputs()], "runs": {}}
+            for b in (1, 5, 64):
+                x = torch.randn(b, FEATURES)
+                try:
+                    facts["runs"][b] = (x, sess.run(None, {name: x.numpy()})[0])
+                except Exception as e:
+                    facts["runs"][b] = (x, e)
+            del sess
+        _got.update(facts)
+    return _got
+
+@check("输入叫 x，输出叫 logits")
+def _():
+    f = _export()
+    true(f["inputs"][0][0] == "x", f"输入名是 {f['inputs'][0][0]!r}，应该是 'x'（input_names）")
+    true(f["outputs"] == ["logits"], f"输出名是 {f['outputs']}，应该是 ['logits']（output_names）")
+
+@check("batch 维是可变的")
+def _():
+    shape = _export()["inputs"][0][1]
+    true(isinstance(shape[0], str),
+         f"文件里输入的形状是 {shape}：batch 维被写死了。加上 dynamic_shapes={{'x': {{0: 'batch'}}}}")
+
+@check("batch = 1、5、64 都能跑，结果和 PyTorch 一样")
+def _():
+    f = _export()
+    net = f["net"].eval()
+    for b, (x, got) in f["runs"].items():
+        if isinstance(got, Exception):
+            true(False, f"batch = {b} 跑不了：{' '.join(str(got).strip().splitlines()[:2])[:200]}")
+        with torch.inference_mode():
+            want = net(x)
+        eq(torch.from_numpy(got), want, tol=1e-4, msg=f"batch = {b} 时 ONNX 和 PyTorch 对不上")
+--- hints
+- 一共 4 步：eval、export、save、return。
+- export 要用到的关键字参数：`dynamo`、`verbose`、`input_names`、`output_names`、`dynamic_shapes`。
+
+@@ item d21-14
+type: code
+title: 闭卷：verify_export
+level: 2
+exam: yes
+cards: 导出成 ONNX，再用 onnxruntime 对拍; 动态 batch 维：说清楚哪一维会变; 上线前的推理检查单
+targets: verify_export
+ref: day21
+timeout: 120
+--- context
+导出之后的对拍，是「敢不敢上线」的依据。不看卡片，从空白写出这个每次发布都要跑的检查函数。
+--- prompt
+从空白写出 `verify_export(model, path, example, batch_sizes=(1, 4, 16), tol=1e-4)`：
+
+- 传进来的模型可能在 train 模式，先切到推理模式
+- 用 onnxruntime（CPU）打开 `path`，输入名从文件里读
+- 对每个 batch 大小 b，用 `torch.randn(b, *example.shape[1:])` 造输入，PyTorch（不建计算图）和 onnxruntime 各跑一遍，算最大绝对误差
+- 最大的误差超过 `tol` 就 `raise AssertionError`，否则返回它（Python float）
+--- starter
+import numpy as np
+import onnxruntime as ort
+
+def verify_export(model, path, example, batch_sizes=(1, 4, 16), tol=1e-4):
+    raise todo()
+--- solution
+import numpy as np
+import onnxruntime as ort
+
+def verify_export(model, path, example, batch_sizes=(1, 4, 16), tol=1e-4):
+    model.eval()
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    name = sess.get_inputs()[0].name
+    worst = 0.0
+    for b in batch_sizes:
+        x = torch.randn(b, *example.shape[1:])
+        with torch.inference_mode():
+            want = model(x).numpy()
+        got = sess.run(None, {name: x.numpy()})[0]
+        worst = max(worst, float(np.abs(got - want).max()))
+    if worst > tol:
+        raise AssertionError(f"ONNX 和 PyTorch 的最大误差 {worst:.2e} 超过了容差 {tol}")
+    return worst
+--- tests
+_cache = {}
+
+def _net_and_file():
+    """只导出一次（batch 维可变）；每项检查拿一份新的模型副本。"""
+    if not _cache:
+        net = trained_net().eval()
+        _cache["net"] = net
+        _cache["data"] = onnx_bytes(net, torch.randn(2, FEATURES))
+    return copy.deepcopy(_cache["net"]), _cache["data"]
+
+@check("导出正确时，返回一个很小的误差")
+def _():
+    net, data = _net_and_file()
+    with onnx_file(data) as path:
+        d = verify_export(net, path, torch.randn(2, FEATURES))
+    true(isinstance(d, float), f"要返回一个 Python float，你返回的是 {type(d).__name__}（用 float(...) 转一下）")
+    true(0 <= d < 1e-4, f"导出是正确的，误差应该在 1e-4 以内，你返回了 {d}")
+
+@check("模型还在 train 模式，也能正确对拍")
+def _():
+    net, data = _net_and_file()
+    net.train()
+    try:
+        with onnx_file(data) as path:
+            verify_export(net, path, torch.randn(2, FEATURES))
+    except AssertionError as e:
+        true(False, f"导出没问题，你的函数却说误差太大（{e}）。传进来的模型在 train 模式，PyTorch 这边的 Dropout 还开着 —— 先 model.eval()")
+
+@check("权重对不上时报错；放宽 tol 就不报")
+def _():
+    net, data = _net_and_file()
+    with torch.no_grad():
+        net.fc2.bias += 0.5                   # 模拟「导出的是旧的 checkpoint」
+    with onnx_file(data) as path:
+        raised = False
+        try:
+            verify_export(net, path, torch.randn(2, FEATURES))
+        except AssertionError:
+            raised = True
+        true(raised, "模型和文件的输出差了 0.5，verify_export 应该 raise AssertionError，却正常返回了")
+        d = verify_export(net, path, torch.randn(2, FEATURES), tol=1.0)
+    true(0.4 < d < 0.6, f"tol=1.0 时应该正常返回误差（约 0.5），你返回了 {d}")
+
+@check("batch_sizes 里的每个大小都试了")
+def _():
+    net, data = _net_and_file()
+
+    class Spy(nn.Module):                     # 记下 PyTorch 这边跑过哪些 batch 大小
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+            self.seen = []
+
+        def forward(self, x):
+            self.seen.append(x.shape[0])
+            return self.inner(x)
+
+    spy = Spy(net)
+    with onnx_file(data) as path:
+        verify_export(spy, path, torch.randn(2, FEATURES), batch_sizes=(1, 3, 7))
+    true(sorted(set(spy.seen)) == [1, 3, 7], f"PyTorch 这边跑过的 batch 大小是 {spy.seen}，应该把 1、3、7 都试一遍")
+--- hints
+- 顺序：eval → 建 session、读输入名 → 循环每个 batch 大小，两边各跑一次，记下最大误差 → 和 tol 比。
+- PyTorch 那边放在 `with torch.inference_mode():` 里再 `.numpy()`；误差用 `float(np.abs(got - want).max())`。

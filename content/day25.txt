@@ -1,0 +1,1183 @@
+@@ day 25
+title: 运维二：上线后的监控
+part: 上线后的运维
+hours: 3–4 小时
+--- goal
+学完今天，你知道模型上线后该看哪些数；能手写 PSI 和 KS 发现输入漂移，在标签回来之前用预测分布发现问题；能写出不乱响的报警规则，用影子流量和金丝雀安全地换模型，并算出每 1000 个请求的成本。
+--- checklist
+- 先清空复习区（昨天看过答案的题从空白重做）
+- 读完 8 张知识卡片，每段代码都改一改再运行
+- 练习区全部通过
+- 闭卷区：不看卡片写出 psi 和滚动窗口报警
+
+@@ concept
+title: 上线后要看的几个数
+--- body
+模型上线之后，每天都有人问：「它还好吗？」回答这个问题，要看两类数。
+
+**服务健不健康**（和普通的网站后台一样）：
+
+- **延迟**（latency）：一个请求从进来到返回用了多久。看分位数 p50 / p95 / p99（第 22 天学过），不要只看平均值：平均值会被少数特别慢的请求拉高，又把它们藏了起来。
+- **错误率**：失败的请求占多少。5xx（服务端出错）和超时都算；4xx（用户传了坏数据）通常单独看。
+- **吞吐量**（throughput）：每秒处理多少个请求（req/s）。进来的比处理完的多，队列就会越排越长。
+- **饱和度**：GPU 利用率、显存、排队的请求数。GPU 一直 100%、队列还在涨，说明容量不够了。
+- **成本**：每 1000 个请求花多少钱（今天最后一张卡片）。
+
+**模型对不对**：上面这些全是绿的，模型也可能在悄悄变差。比如来了一批新用户，输入的数据和训练时不一样了，服务照样按时返回，只是答案错了。真实标签（这笔贷款到底有没有违约、这笔交易是不是欺诈）往往要几天甚至几周才回来，所以要先盯住**输入的分布**和**预测的分布**（后面几张卡片）。
+
+下面用 10 秒的请求日志，算出面板上的几个数。
+--- code
+latency_ms = torch.tensor([21., 19, 25, 22, 480, 20, 23, 18, 2000, 24, 22, 19])
+status = torch.tensor([200, 200, 200, 200, 200, 200, 200, 200, 504, 200, 500, 200])
+seconds = 10                                         # 这 12 个请求是 10 秒内进来的
+gpu_util = torch.tensor([0.62, 0.71, 0.68, 0.66])    # 每 2.5 秒采一次
+
+print("吞吐量:", len(latency_ms) / seconds, "req/s")
+print("错误率:", round((status >= 500).float().mean().item(), 3))
+print("平均延迟:", round(latency_ms.mean().item(), 1), "ms   <- 被两个慢请求拉高了")
+q = torch.quantile(latency_ms, torch.tensor([0.5, 0.95]))
+print("p50, p95:", [round(v, 1) for v in q.tolist()], "ms")
+print("GPU 利用率:", round(gpu_util.mean().item(), 3))
+
+@@ concept
+title: PSI：输入的分布变了多少
+--- body
+**漂移**（drift）：线上数据的分布，慢慢变得和训练数据不一样。比如训练时用户的平均年龄是 35 岁，一次推广之后来了一大批 20 岁的用户。模型没见过这样的数据，预测就可能变差，而服务本身一个错都不报。
+
+PSI（Population Stability Index，群体稳定性指数）是最常用的漂移指标，在金融风控里用了几十年。一次看一个特征（输入的一列）：
+
+1. **用训练数据定分箱边界**：取训练数据的 10%、20%、…、90% 分位数，一共 9 个边界，切出 10 个箱。这样每个箱里正好有 10% 的训练数据。
+2. 数一数：训练数据在每个箱里占多少（e，expected），线上数据在每个箱里占多少（a，actual）。
+3. PSI = Σ (a − e) × ln(a / e)，对 10 个箱求和。两边一样时每一项都是 0；差得越多，PSI 越大。
+
+几个细节：
+
+- 边界**只能来自训练数据**，而且要和模型一起存下来，线上数据用同一套边界去数。如果用线上数据自己的分位数分箱，每个箱永远是 10%，PSI 永远接近 0（今天有一道改错题就是它）。
+- 线上的值超出训练时的范围，也要算进最两边的箱。`torch.bucketize(x, edges)` 正好这样做：比第一个边界小的进 0 号箱，比最后一个边界大的进 9 号箱。
+- `torch.bincount(idx, minlength=10)` 数每个箱有几个。一定要写 minlength：否则最后几个箱是空的时，结果会变短。
+- 某个箱里线上一个数据都没有，a = 0，ln(0) 是负无穷。所以先把比例夹到一个很小的数：`clamp_min(1e-4)`。
+- 常用的经验阈值：PSI < 0.1 基本没变；0.1 到 0.25 有变化，要留意；> 0.25 变化很大，要查原因。
+--- code
+torch.manual_seed(0)
+train = torch.randn(5000)                                          # 训练时的一个特征
+edges = torch.quantile(train, torch.linspace(0, 1, 11))[1:-1]      # 9 个边界 -> 10 个箱
+print("边界:", [round(v, 2) for v in edges.tolist()])
+
+def shares(x):
+    return torch.bincount(torch.bucketize(x, edges), minlength=10) / len(x)
+
+e = shares(train).clamp_min(1e-4)
+print("训练数据每个箱:", [round(v, 3) for v in e.tolist()])
+
+for name, live in [("没变", torch.randn(2000)),
+                   ("均值 +0.3", torch.randn(2000) + 0.3),
+                   ("均值 +1.0", torch.randn(2000) + 1.0)]:
+    a = shares(live).clamp_min(1e-4)
+    psi = ((a - e) * torch.log(a / e)).sum().item()
+    print(f"{name:8s} PSI = {psi:.3f}")
+
+@@ concept
+title: KS 统计量：两条累积曲线的最大距离
+--- body
+PSI 要先分箱，箱怎么分会影响结果。KS 统计量（Kolmogorov–Smirnov）不用分箱。
+
+先认识**经验累积分布**（ECDF）：F(x) = 数据里「≤ x」的值占多少。比如数据是 [1, 2, 3, 4]：F(0) = 0，F(2) = 2/4 = 0.5，F(10) = 1。x 从小往大走，F 从 0 一格一格涨到 1，画出来是一条台阶线。
+
+两份数据各有一条台阶线。**KS 统计量 = 两条线在竖直方向上的最大距离**：
+
+- 0 表示两份数据的分布一模一样；1 表示完全分开（一份的所有值都比另一份的小）。
+- 最大距离一定出现在某个数据点上，所以只要在「两份数据合在一起的所有值」上各算一次就够了。
+
+用 PyTorch 算 F：先 `torch.sort` 排好序，再 `torch.searchsorted(排好序的 a, points, right=True)`。它返回 a 里有几个值 ≤ points（right=True 把相等的也数进去），除以 len(a) 就是 F(points)。
+
+PSI 和 KS 怎么选：两个都常用。PSI 有行业里惯用的阈值；KS 不用分箱，结果总在 0 到 1 之间，好理解。scipy 的 `ks_2samp` 还会给一个 p 值，但线上数据量很大时，一点点差别都会「显著」，所以监控里一般直接给 KS 的值设阈值。今天不用 scipy，自己写。
+--- code
+a = torch.tensor([1., 2., 3., 4.])
+b = torch.tensor([3., 4., 5., 6.])
+points = torch.cat([a, b]).sort().values          # 排序只是为了打印好看
+Fa = torch.searchsorted(a, points, right=True) / len(a)     # a、b 已经排好序
+Fb = torch.searchsorted(b, points, right=True) / len(b)
+print("x   :", points.tolist())
+print("F_a :", Fa.tolist())
+print("F_b :", Fb.tolist())
+print("KS  :", (Fa - Fb).abs().max().item())
+
+torch.manual_seed(0)
+train = torch.randn(3000).sort().values
+live = (torch.randn(1000) + 0.5).sort().values
+pts = torch.cat([train, live])
+d = (torch.searchsorted(train, pts, right=True) / len(train)
+     - torch.searchsorted(live, pts, right=True) / len(live)).abs().max()
+print("均值偏移 0.5 时的 KS:", round(d.item(), 3))
+
+@@ concept
+title: 预测漂移：标签没回来，先看预测
+--- body
+监控模型最直接的办法，是算线上的准确率。可是真实标签（label）常常要等很久：贷款要几个月后才知道会不会违约，欺诈要等用户申诉。等标签回来，损失已经造成了。
+
+**预测漂移**（prediction drift）：不看标签，只看模型**输出**的分布有没有变。模型的每个预测我们马上就知道，所以它是实时的。
+
+- 分类模型：看每个类别被预测的比例。上线第一周预测为「欺诈」的是 2%，今天是 9%：要么欺诈真的变多了，要么输入变了、模型开始乱判。两种情况都值得有人去看。
+- 也可以看平均置信度（softmax 最大值的平均）有没有明显下降。
+
+类别本身就是「箱」，不用再分箱：
+
+- 比例：`torch.bincount(pred, minlength=num_classes) / len(pred)`。一定要写 minlength：今天某个类一次都没出现时，bincount 返回的结果会变短，和训练时对不上。
+- 然后套 PSI 的公式：Σ (a − e) × ln(a / e)，同样先 `clamp_min(eps)`。
+
+输入漂移和预测漂移互相补充：输入变了，预测不一定变（模型可能不在乎那个特征）；预测变了，一定值得查。
+--- code
+ref_pred = torch.repeat_interleave(torch.arange(3), torch.tensor([700, 250, 50]))    # 上线第一周的预测
+live_pred = torch.repeat_interleave(torch.arange(3), torch.tensor([450, 250, 300]))  # 今天的预测
+print("ref_pred 的开头:", ref_pred[:5].tolist(), " 长度", len(ref_pred))
+
+e = torch.bincount(ref_pred, minlength=3) / len(ref_pred)
+a = torch.bincount(live_pred, minlength=3) / len(live_pred)
+print("第一周:", [round(v, 3) for v in e.tolist()])
+print("今天:  ", [round(v, 3) for v in a.tolist()])
+a, e = a.clamp_min(1e-4), e.clamp_min(1e-4)
+print("预测的 PSI:", round(((a - e) * torch.log(a / e)).sum().item(), 3))
+
+only_0_and_1 = torch.tensor([0, 1, 1, 0])
+print("不写 minlength:", torch.bincount(only_0_and_1).tolist())
+print("写了 minlength:", torch.bincount(only_0_and_1, minlength=3).tolist())
+
+@@ concept
+title: 报警规则：滚动窗口 + 最少样本数
+--- body
+报警要做到两件事：出事时**快**响，没出事时**别**响。半夜被没意义的报警叫醒几次之后，大家就开始无视报警了。
+
+**滚动窗口**（rolling window）：只看最近一段时间（比如最近 5 分钟）的请求。
+
+- 不能用「从上线到现在」的累计错误率：服务跑了一周，错误率 0.5%；刚刚 5 分钟错误率 30%，累计值只从 0.5% 变成 0.6%，谁也发现不了。
+- 窗口太短，数字跳得厉害；太长，出事后要很久才响。几分钟是常见的选择。
+
+**最少样本数**（minimum count）：窗口里的请求太少，错误率没有意义。凌晨 3 点，1 分钟里只有 2 个请求，1 个失败，错误率 50%，但这很可能只是某个用户传了坏数据。所以规则写成：**请求数 ≥ min_count，并且错误率 > 阈值**，才报警。
+
+实现：用 `collections.deque`（两头都能快速进出的队列）按时间顺序存 (时间, 是不是错误)。新请求从右边 `append` 进来；每次检查时，先把左边太旧的（时间 ≤ now − window_s）`popleft` 扔掉，剩下的就是窗口里的。扔掉旧请求还有一个好处：服务连着跑几个月，内存也不会一直涨。
+
+真实的系统（比如 Prometheus 的报警规则）还常加一条「连续 N 分钟都超过阈值才报」，以及「报过之后一段时间内不重复报」。思路一样。
+--- code
+from collections import deque
+
+window_s, threshold, min_count = 60, 0.05, 20
+events = deque()                                        # (t 秒, 是不是错误)，旧的在左边
+
+def check(now):
+    while events and events[0][0] <= now - window_s:   # 太旧的，从左边扔掉
+        events.popleft()
+    n = len(events)
+    errors = sum(1 for _, is_error in events if is_error)
+    rate = errors / n if n else 0.0
+    return n, round(rate, 3), n >= min_count and rate > threshold
+
+events.extend([(3, True), (41, False)])                 # 凌晨：1 分钟里只有 2 个请求
+print("凌晨 3 点 (请求数, 错误率, 报警):", check(now=50))
+
+for t in range(100, 160):                               # 白天：每秒 1 个请求，每 5 个失败 1 个
+    events.append((t, t % 5 == 0))
+print("白天出事 (请求数, 错误率, 报警):", check(now=160))
+print("deque 里还剩:", len(events), "个请求（凌晨那 2 个已经扔掉了）")
+
+@@ concept
+title: 影子流量：新模型先陪跑
+--- body
+新模型在离线测试集上更好，不代表上线后也更好：线上的数据、流量、各种奇怪的输入，测试集里不一定有。
+
+**影子流量**（shadow traffic，也叫 shadow mode）：每个线上请求，同时发一份给新模型（影子），但**用户拿到的永远是旧模型（prod）的答案**。影子的结果只记下来，拿去和 prod 比。
+
+- 对用户零风险：影子答错了、变慢了、崩了，用户都感觉不到。
+- 能拿到真实流量上的数：两个模型的**分歧率**（disagreement rate，预测不一样的比例），影子的延迟和出错次数。
+- 分歧率高不一定是坏事（也许新模型改对了），但它告诉你「换上新模型会改变多少用户的结果」，还能把分歧的样本挑出来给人看。
+
+两条铁律：
+
+1. 影子出错，必须被 `try/except` 接住、记一笔，然后照常返回 prod 的答案。**绝不能**因为影子让用户看到错误。
+2. prod 自己出错，要照常报错（这是正常的错误处理），不能被影子的 try/except 顺手吞掉。所以 try 只包住影子的那一行。
+
+真实系统里，影子通常在后台线程或者另一个服务里异步地跑，这样也不会拖慢响应。今天的练习为了简单，同步调用。
+--- code
+torch.manual_seed(0)
+prod = nn.Linear(4, 3)
+shadow = nn.Linear(4, 3)
+shadow.load_state_dict(prod.state_dict())
+with torch.no_grad():
+    shadow.weight.add_(0.05 * torch.randn(3, 4))     # 「新模型」：和 prod 有点不一样
+
+x = torch.randn(1000, 4)                             # 1000 个线上请求
+with torch.inference_mode():
+    p = prod(x).argmax(dim=-1)                       # 用户拿到的
+    s = shadow(x).argmax(dim=-1)                     # 只记下来
+print("预测不一样的行数:", int((p != s).sum()))
+print("分歧率:", round((p != s).float().mean().item(), 3))
+
+def broken(x):
+    raise RuntimeError("CUDA out of memory（模拟）")
+
+try:
+    broken(x)
+except Exception as e:
+    print("影子出错，记一笔:", type(e).__name__, "-> 用户照样拿到 prod 的答案，shape", tuple(p.shape))
+
+@@ concept
+title: 金丝雀和 A/B：样本不够别下结论
+--- body
+**金丝雀发布**（canary release）：新版本先只接一小部分真实流量（比如 5%），其余还走旧版本（叫基线，baseline）。比较两边的错误率和延迟：没问题就逐步加到 100%，有问题就回滚。名字来自矿工带进矿井的金丝雀：它先出事，人就来得及撤。
+
+**A/B 测试**和它很像，目的不同：两个版本各分一部分用户，跑够事先定好的时间，比较业务指标（点击率、转化率），决定哪个更好。
+
+两者都会撞上同一个问题：**样本太少，差别可能只是运气。**一个真实错误率为 p 的服务，看 n 个请求算出来的错误率会上下晃，晃动的大小叫**标准误差**（standard error，SE）：
+
+SE = sqrt(p × (1 − p) / n)
+
+p = 2%、n = 50 时，SE ≈ 2 个百分点：一个真实错误率 2% 的模型，看起来是 4% 一点也不奇怪。n 变成 100 倍，SE 只缩小到 1/10（因为有根号）。
+
+所以决策规则分三档：
+
+1. 任何一边的请求数 < min_n（事先定好）：**wait**，继续收集，不下结论。
+2. 金丝雀的错误率比基线高出 z 倍以上的标准误差（常用 z = 2）：**rollback**。两边合起来的标准误差是 se = sqrt(p_b(1 − p_b)/n_b + p_c(1 − p_c)/n_c)，b 是基线，c 是金丝雀。
+3. 否则：**promote**（继续放量）。
+
+下面的代码模拟 2000 次金丝雀：新旧模型**完全一样**，真实错误率都是 2%。每次只看 n 个请求，有多少次金丝雀「看起来」错误率 ≥ 4%？
+--- code
+torch.manual_seed(0)
+p = 0.02
+for n in [50, 500, 5000]:
+    errors = torch.binomial(torch.full((2000,), float(n)), torch.full((2000,), p))  # 2000 次金丝雀各有几个失败
+    looks_bad = (errors / n >= 0.04).float().mean().item()
+    se = math.sqrt(p * (1 - p) / n)
+    print(f"n={n:5d}  SE={se:.4f}  看起来 >= 4% 的比例: {looks_bad:.3f}")
+
+@@ concept
+title: 每 1000 个请求花多少钱
+--- body
+老板会问：「这个模型一个月花多少钱？值不值？」工程师要能算出**每 1000 个请求的成本**（cost per 1k requests）。
+
+GPU 按小时收钱，不管它忙不忙。所以：
+
+- 每小时实际处理的请求数 = 满载时每秒的吞吐量 × 3600 × 平均利用率
+- 每个请求的成本 = GPU 每小时的价格 ÷ 每小时处理的请求数
+- 每 1000 个请求的成本 = 每个请求的成本 × 1000
+
+两个杠杆：
+
+- **吞吐量**：批处理（第 22 天）、int8 / fp16（第 21 天）能让同一张卡每秒处理更多请求，成本按比例下降。
+- **利用率**：流量白天高、夜里低。按高峰准备的 GPU，夜里大多在空转，钱照样付。平均利用率 25%，成本就是满载时的 4 倍。自动扩缩容（按流量增减机器）就是为了提高利用率。
+
+生成式模型常说「每 1000 个 token 的成本」，算法一样，把请求数换成 token 数。
+
+下面的价格是假设的，只用来演示怎么算。
+--- code
+price = 2.00                                         # 假设：一张 GPU 每小时 2 美元
+for name, rps, util in [("batch=1,  利用率 100%", 40, 1.0),
+                        ("batch=1,  利用率 25%", 40, 0.25),
+                        ("batch=16, 利用率 25%", 400, 0.25)]:
+    per_hour = rps * 3600 * util                     # 每小时实际处理的请求数
+    cost = price / per_hour * 1000
+    print(f"{name}   每 1000 个请求 ${cost:.4f}")
+
+@@ item d25-01
+type: predict
+title: 从请求日志算面板上的数
+level: 1
+cards: 上线后要看的几个数
+--- context
+监控面板上的每个数，都是从一行行请求日志算出来的。自己算一遍，才知道「平均延迟 125 ms」这种数为什么会骗人。
+--- prompt
+10 个请求，5 秒内进来。写出这段代码打印的 4 行。
+--- code
+latency_ms = [12, 15, 11, 240, 14, 13, 16, 12, 15, 900]
+status = [200, 200, 200, 500, 200, 200, 200, 200, 200, 504]
+seconds = 5
+
+print(len(latency_ms) / seconds)                        # 吞吐量 req/s
+print(sum(s >= 500 for s in status) / len(status))      # 错误率
+print(sum(latency_ms) / len(latency_ms))                # 平均延迟
+print(sorted(latency_ms)[len(latency_ms) // 2])         # 排好序后，正中间那个
+--- explain
+吞吐量：10 / 5 = 2.0。状态码 ≥ 500 的有两个，500（服务出错）和 504（超时），错误率 2 / 10 = 0.2。延迟加起来是 1248，平均 124.8 ms。排好序是 [11, 12, 12, 13, 14, 15, 15, 16, 240, 900]，从 0 数第 10 // 2 = 5 个是 15。
+
+平均值 124.8 ms 没有描述任何一个请求：8 个请求都在 16 ms 以内，另外 2 个慢得多。所以面板上要看分位数（第 22 天的 p50 / p95 / p99），不能只看平均值。
+--- hints
+- 状态码 ≥ 500 的有几个？504 也算。
+- `sorted(...)[5]`：先排序，再从 0 开始数到第 5 个。
+
+@@ item d25-02
+type: choice
+title: 延迟面板怎么读
+level: 2
+cards: 上线后要看的几个数
+--- context
+出事时，值班的人往往只有几分钟看面板、做决定。能从几条曲线的组合里读出原因，就不会在错误的方向（比如回滚一个没问题的模型）上浪费时间。
+--- prompt
+晚上 8 点起的监控面板：
+
+- 进来的请求：每秒 200 个 → 320 个
+- 处理完的请求：一直停在每秒 250 个左右
+- p50 延迟：25 ms → 160 ms；p99 延迟：80 ms → 2000 ms
+- 错误率：0.1% → 4%，新增的几乎全是 504（超时；服务的超时设的是 2 秒）
+- GPU 利用率：100%；排队的请求数：一直在涨
+
+最可能的原因和第一步动作是？
+--- options
+- 新模型的输出变差了：马上回滚到上一个版本
+- 容量不够：进来的比处理得了的多，请求在队列里越排越久，排得最久的超时了。先扩容（加副本）或限流
+- 输入数据漂移了：模型遇到了没见过的数据，所以算得更慢
+- 网络抖动：p50 也变慢了，说明是网络问题，等它自己恢复
+answer: 2
+--- explain
+关键是两个数对不上：每秒进来 320 个，只处理得了 250 个，每秒多出 70 个排进队列，队列只会越来越长。GPU 已经 100%，说明卡算不过来了。排队的时间加在每个请求上，所以 p50 和 p99 都变慢；排得最久的等满 2 秒，变成 504。
+
+新增的错误几乎全是超时，不是 500，说明模型本身没有崩。回滚解决不了问题：旧模型一样算不过来。第一步是加副本，或者限流（多出来的请求马上返回 429「太忙了」，而不是让所有人都等到超时）。漂移会让预测变差，但一般不会让同一个模型算得更慢。
+--- hints
+- 比较「进来的」和「处理完的」：每秒差多少？多出来的请求去了哪里？
+- 新增的错误是 504 而不是 500：是模型报错了，还是请求等得太久了？
+
+@@ item d25-03
+type: choice
+title: 指标全绿，用户却在投诉
+level: 1
+cards: 上线后要看的几个数; 预测漂移：标签没回来，先看预测; PSI：输入的分布变了多少
+--- context
+服务监控和模型监控是两回事。服务健康只说明「有回答」，不说明「回答是对的」。很多模型上线后出的事，服务指标自始至终都是绿的。
+--- prompt
+一个信用卡欺诈检测模型上线三个月了。监控面板上：p95 延迟 40 ms（和上线时一样），错误率 0.1%，吞吐量正常，GPU 利用率 60%。但风控团队说，最近被漏掉的欺诈明显变多了。真实标签（哪笔交易是欺诈）要等用户申诉，通常 3 到 6 周后才回来。
+
+现在最该先加的监控是？
+--- options
+- 把 GPU 利用率的报警阈值从 90% 降到 70%
+- 监控输入特征和预测结果的分布：今天的数据和训练数据比变了多少（比如每个特征的 PSI、预测为「欺诈」的比例）
+- 把 p95 延迟换成 p99 延迟
+- 把错误率报警的窗口从 5 分钟改成 1 分钟
+answer: 2
+--- explain
+另外三个选项都在调「服务健康」的监控，而服务确实是健康的：它按时回答了每一个请求。问题是答案错了。
+
+准确率要等标签，几周后才算得出来。输入分布和预测分布现在就有：比如新的欺诈手法让某几个特征的分布变了（这些特征的 PSI 变大），或者预测为「欺诈」的比例掉了下去。它们不能直接证明模型错了，但能在标签回来之前几周就提醒你去查。
+--- hints
+- 延迟、错误率、GPU 都正常，说明服务在按时回答。那问题出在哪里？
+- 标签要几周后才有。现在手上有哪些数据，和「模型对不对」有关？
+
+@@ item d25-04
+type: code
+title: 手写 PSI
+level: 2
+cards: PSI：输入的分布变了多少
+targets: psi
+ref: day25
+--- context
+PSI 是业界监控输入漂移最常用的指标。风控、推荐系统里，几乎每个模型都有一张「每个特征每天的 PSI」表。面试里也常让你手写。
+--- prompt
+写 `psi(ref, live, bins=10, eps=1e-4)`，返回一个 Python float。`ref` 是训练时的一个特征（一维 float 张量），`live` 是线上的同一个特征（一维 float 张量，长度可以和 ref 不同）。
+
+1. 分箱边界只用 `ref` 定：`torch.quantile(ref, torch.linspace(0, 1, bins + 1))[1:-1]`（去掉头尾，剩 bins − 1 个边界）。
+2. `torch.bucketize(x, edges)` 得到每个值在第几个箱（0 到 bins − 1）；`torch.bincount(..., minlength=bins)` 数个数，再除以长度，得到比例 e（ref 的）和 a（live 的）。
+3. 两个比例都 `clamp_min(eps)`，然后 PSI = Σ (a − e) × ln(a / e)。
+--- starter
+def psi(ref, live, bins=10, eps=1e-4):
+    """ref: 训练时的一个特征 (N,)；live: 线上的同一个特征 (M,)。返回 PSI（Python float）。"""
+    edges = ...      # 1. bins - 1 个边界，只用 ref 定
+    e = ...          # 2. ref 在每个箱里的比例，长度 bins
+    a = ...          #    live 在每个箱里的比例，长度 bins
+    raise todo()     # 3. clamp_min(eps)，套公式，返回 float
+--- solution
+def psi(ref, live, bins=10, eps=1e-4):
+    edges = torch.quantile(ref, torch.linspace(0, 1, bins + 1))[1:-1]     # 边界只来自训练数据
+    e = torch.bincount(torch.bucketize(ref, edges), minlength=bins) / len(ref)
+    a = torch.bincount(torch.bucketize(live, edges), minlength=bins) / len(live)
+    e, a = e.clamp_min(eps), a.clamp_min(eps)                            # 空箱不会变成 log(0)
+    return float(((a - e) * torch.log(a / e)).sum())
+--- tests
+@check("没漂移：PSI 很小，而且算得对")
+def _():
+    seed(1)
+    ref, live = torch.randn(2000), torch.randn(1000)
+    p = psi(ref, live)
+    true(isinstance(p, float), f"要返回 Python float（用 float(...) 或 .item()），你返回的是 {type(p).__name__}")
+    eq(p, _psi_ref(ref, live), tol=1e-4, msg="和参考答案不一样：检查分箱边界、bincount 的 minlength 和公式")
+    true(p < 0.05, f"同一个分布，PSI 应该很小，你的是 {p:.4f}")
+
+@check("均值偏移 1 个标准差：PSI 远大于 0.25")
+def _():
+    seed(2)
+    ref, live = torch.randn(2000), torch.randn(1000) + 1.0
+    p = psi(ref, live)
+    eq(p, _psi_ref(ref, live), tol=1e-4, msg="和参考答案不一样")
+    true(p > 0.25, f"PSI 只有 {p:.4f}：整体偏移了 1 个标准差，应该远大于 0.25")
+
+@check("分布变宽（标准差翻倍）也能发现")
+def _():
+    seed(3)
+    ref, live = torch.randn(2000), 2 * torch.randn(1000)
+    p = psi(ref, live)
+    eq(p, _psi_ref(ref, live), tol=1e-4,
+       msg="和参考答案不一样。边界要用 ref 的分位数，不能用 live 的：用 live 自己的分位数，live 的每个箱永远是 10%")
+    true(p > 0.25, f"PSI 只有 {p:.4f}：标准差翻倍，应该大于 0.25")
+
+@check("线上的值全都比训练时的最小值还小：进 0 号箱，结果不是 inf")
+def _():
+    seed(4)
+    ref = torch.randn(2000)
+    live = ref.min() - 1 - torch.rand(500)
+    p = psi(ref, live)
+    true(math.isfinite(p), f"PSI 是 {p}：有的箱里 live 一个都没有，log(0) 变成了无穷。先 clamp_min(eps) 再取 log")
+    eq(p, _psi_ref(ref, live), tol=1e-3,
+       msg="和参考答案不一样。bincount 要写 minlength=bins：live 全在 0 号箱时，不写它结果只有 1 个元素")
+
+@check("bins 参数有用")
+def _():
+    seed(5)
+    ref, live = torch.randn(2000), torch.randn(1000) + 0.3
+    eq(psi(ref, live, bins=5), _psi_ref(ref, live, bins=5), tol=1e-4, msg="bins=5 时算得不对：边界个数和 minlength 都要用 bins")
+--- hints
+- 边界：`torch.quantile(ref, torch.linspace(0, 1, bins + 1))` 给出 bins + 1 个分位数（包括最小值和最大值），`[1:-1]` 去掉头尾。
+- 比例：`torch.bincount(torch.bucketize(x, edges), minlength=bins) / len(x)`，ref 和 live 都用**同一个** edges。
+- 最后：`e, a = e.clamp_min(eps), a.clamp_min(eps)`，`return float(((a - e) * torch.log(a / e)).sum())`。
+
+@@ item d25-05
+type: fix
+title: PSI 永远是 0：分箱用了当天的数据
+level: 2
+cards: PSI：输入的分布变了多少
+targets: fit_reference, daily_psi
+ref: day25
+--- context
+真实事故：漂移监控跑了半年，PSI 每天都在 0.01 以下，从没报过警，直到模型效果明显变差才发现分箱写错了。这种 bug 不报错，只会让监控「永远正常」。
+--- prompt
+训练时跑一次 `fit_reference`：定好分箱边界，记下训练数据在每个箱里的比例，和模型一起存下来。上线后每天跑一次 `daily_psi`，比较今天的数据和训练时的数据。
+
+这个监控上线半年，PSI 每天都接近 0，哪怕今天的数据明显变了。找出 bug 并修好：`daily_psi(fit_reference(train), today)` 要和第 4 题的 `psi(train, today)` 算得一样。
+--- starter
+def fit_reference(train_values, bins=10):
+    """训练时跑一次：定好分箱边界，记下训练数据在每个箱里的比例。"""
+    edges = torch.quantile(train_values, torch.linspace(0, 1, bins + 1))[1:-1]
+    shares = torch.bincount(torch.bucketize(train_values, edges), minlength=bins) / len(train_values)
+    return {"edges": edges, "shares": shares}
+
+
+def daily_psi(reference, today_values, eps=1e-4):
+    """每天跑一次：今天的数据和训练时比，变了多少。"""
+    bins = len(reference["shares"])
+    edges = torch.quantile(today_values, torch.linspace(0, 1, bins + 1))[1:-1]
+    a = torch.bincount(torch.bucketize(today_values, edges), minlength=bins) / len(today_values)
+    e = reference["shares"]
+    a, e = a.clamp_min(eps), e.clamp_min(eps)
+    return float(((a - e) * torch.log(a / e)).sum())
+--- solution
+def fit_reference(train_values, bins=10):
+    edges = torch.quantile(train_values, torch.linspace(0, 1, bins + 1))[1:-1]
+    shares = torch.bincount(torch.bucketize(train_values, edges), minlength=bins) / len(train_values)
+    return {"edges": edges, "shares": shares}
+
+
+def daily_psi(reference, today_values, eps=1e-4):
+    edges, e = reference["edges"], reference["shares"]       # 边界用训练时存下的那一套
+    a = torch.bincount(torch.bucketize(today_values, edges), minlength=len(e)) / len(today_values)
+    a, e = a.clamp_min(eps), e.clamp_min(eps)
+    return float(((a - e) * torch.log(a / e)).sum())
+--- tests
+@check("今天的数据整体偏移了：PSI 要报出来")
+def _():
+    seed(1)
+    train, today = torch.randn(3000), torch.randn(1000) + 1.0
+    p = daily_psi(fit_reference(train), today)
+    true(p > 0.25, f"PSI 只有 {p:.4f}。今天的数据用今天自己的分位数分箱，每个箱永远正好 10%，"
+         "和训练时一模一样。要用 reference['edges']")
+    eq(p, _psi_ref(train, today), tol=1e-4, msg="PSI 变大了，但数值和参考答案不一样")
+
+@check("今天的数据变宽了（标准差翻倍）：也要报出来")
+def _():
+    seed(2)
+    train, today = torch.randn(3000), 2 * torch.randn(1000)
+    p = daily_psi(fit_reference(train), today)
+    true(p > 0.25, f"PSI 只有 {p:.4f}：分布明显变宽了，监控却说没变")
+    eq(p, _psi_ref(train, today), tol=1e-4, msg="PSI 变大了，但数值和参考答案不一样")
+
+@check("和 psi(train, today) 算得一样")
+def _():
+    seed(3)
+    train = torch.randn(3000)
+    reference = fit_reference(train)
+    for shift, scale in [(0.0, 1.0), (0.3, 1.0), (0.0, 1.5), (-0.5, 0.7)]:
+        today = torch.randn(1000) * scale + shift
+        eq(daily_psi(reference, today), _psi_ref(train, today), tol=1e-4,
+           msg=f"today = randn * {scale} + {shift} 时不一样。没变化时 PSI 也不是正好 0，而是一个小数")
+--- hints
+- 看 `daily_psi` 里的 edges 是用什么数据算出来的。今天的数据用今天的 10% 分位数去切，每个箱会占多少？
+- `fit_reference` 已经把训练时的边界存在 `reference["edges"]` 里了，今天的数据要用它来分箱。
+- 改一行就够：`edges = reference["edges"]`。
+
+@@ item d25-06
+type: predict
+title: KS 统计量的几个小例子
+level: 1
+cards: KS 统计量：两条累积曲线的最大距离
+ref: day25
+--- context
+写监控代码之前，先能在纸上算出几个小例子的答案。这样代码的结果一不对，你马上就能发现。
+--- prompt
+`ks_statistic(a, b)` 就是卡片里的算法：两条经验累积曲线的最大竖直距离。写出这段代码打印的 4 行。
+--- code
+t = torch.tensor
+a = t([1., 2., 3., 4.])
+print(ks_statistic(a, t([3., 4., 5., 6.])))
+print(ks_statistic(a, t([11., 12., 13., 14.])))
+print(ks_statistic(a, t([4., 3., 2., 1.])))
+print(round(ks_statistic(a, t([1., 2., 3., 4., 100., 200.])), 3))
+--- explain
+第 1 行：在 x = 2 处，a 的 F = 2/4 = 0.5，b 的 F = 0（b 最小是 3），差 0.5；在 x = 4 处，1 − 2/4 = 0.5。没有更大的差，所以是 0.5。
+
+第 2 行：a 的值全比 b 的小。x = 4 时 a 的 F 已经是 1，b 的还是 0，差 1.0（完全分开）。
+
+第 3 行：同样的 4 个数，只是顺序不同。累积分布只看「≤ x 的有几个」，和顺序无关，所以是 0.0。
+
+第 4 行：b 多了两个很大的值。x = 4 时 a 的 F = 1，b 的 F = 4/6，差 1/3 ≈ 0.333。
+--- hints
+- 对每个 x，数 a 里有几个 ≤ x，除以 len(a)；b 也一样。找差得最多的那个 x。
+- 第 4 行 b 有 6 个数，其中 4 个 ≤ 4。
+
+@@ item d25-07
+type: code
+title: 手写 KS 统计量（不用 scipy）
+level: 2
+cards: KS 统计量：两条累积曲线的最大距离
+targets: ks_statistic
+ref: day25
+--- context
+KS 统计量不用分箱，结果总在 0 到 1 之间，监控连续特征很好用。线上服务的镜像里常常没有 scipy，面试也爱问「KS 怎么算」，自己写一遍就不怕了。
+--- prompt
+写 `ks_statistic(a, b)`，返回 Python float。a、b 是一维 float 张量，长度可以不同，顺序是乱的。不许 import scipy。
+
+1. 各自排好序：`torch.sort(a).values`。
+2. 要看的位置：两份数据合在一起，`torch.cat([a, b])`。
+3. 在这些位置上算两条累积曲线：`torch.searchsorted(排好序的 a, 位置, right=True) / len(a)`，b 也一样。
+4. 返回两条曲线之差的绝对值的最大值。
+--- starter
+def ks_statistic(a, b):
+    """两份一维数据的 KS 统计量：两条经验累积曲线的最大竖直距离，在 0 到 1 之间。"""
+    raise todo()
+--- solution
+def ks_statistic(a, b):
+    a = torch.sort(a).values                   # searchsorted 要求排好序
+    b = torch.sort(b).values
+    points = torch.cat([a, b])                 # 最大距离一定出现在某个数据点上
+    cdf_a = torch.searchsorted(a, points, right=True) / len(a)    # a 里 <= 每个位置的比例
+    cdf_b = torch.searchsorted(b, points, right=True) / len(b)
+    return float((cdf_a - cdf_b).abs().max())
+--- tests
+@check("和逐点暴力计算的结果一样")
+def _():
+    seed(1)
+    a, b = torch.randn(300), torch.randn(200) * 1.3 - 0.3
+    got = ks_statistic(a, b)
+    true(isinstance(got, float), f"要返回 Python float，你返回的是 {type(got).__name__}")
+    eq(got, _ks_slow(a, b), tol=1e-6,
+       msg="和暴力计算的不一样。要在 a、b 合在一起的所有值上算两条累积曲线；searchsorted 前要先排序")
+
+@check("一模一样是 0，完全分开是 1")
+def _():
+    seed(2)
+    a = torch.randn(100)
+    got = ks_statistic(a, a.clone())
+    true(close(got, 0.0, 1e-9), f"两份一样的数据，KS 应该是 0，你的是 {got}")
+    got = ks_statistic(a, a + 100)
+    true(close(got, 1.0, 1e-9), f"b 的每个值都比 a 的大，KS 应该是 1，你的是 {got}")
+
+@check("有重复的值也对")
+def _():
+    seed(3)
+    a = torch.randint(0, 5, (200,)).float()
+    b = torch.randint(1, 6, (150,)).float()
+    eq(ks_statistic(a, b), _ks_slow(a, b), tol=1e-6,
+       msg="有很多相等的值时算错了。F(x) 要数「≤ x 的有几个」，相等的值要一起数进去：用 searchsorted，不要用排序后的位置 i / n")
+
+@check("顺序打乱、长度不同都不影响")
+def _():
+    seed(4)
+    a, b = torch.randn(250) + 0.4, torch.randn(80)
+    want = _ks_slow(a, b)
+    got = ks_statistic(a[torch.randperm(250)], b[torch.randperm(80)])
+    eq(got, want, tol=1e-6, msg="打乱顺序后结果变了：排序了吗？两条曲线要各自除以自己的长度")
+--- hints
+- 累积曲线 F(x) = 「≤ x 的有几个」÷ 总数。`torch.searchsorted(sorted_a, points, right=True)` 一次算出所有位置上的「几个」。
+- 位置用 `torch.cat([a, b])`；a、b 排序后再传给 searchsorted。
+- 最后：`float((cdf_a - cdf_b).abs().max())`。
+
+@@ item d25-08
+type: code
+title: 预测漂移：每个类别的比例和 PSI
+level: 2
+cards: 预测漂移：标签没回来，先看预测; PSI：输入的分布变了多少
+targets: class_shares, prediction_psi
+ref: day25
+--- context
+标签要几周后才回来，但模型的每个预测我们马上就知道。「预测为某一类的比例」突然变了，常常是最早的报警信号。
+--- prompt
+写两个函数：
+
+- `class_shares(pred, num_classes)`：pred 是一维 long 张量，每个元素是预测的类别（0 到 num_classes − 1）。返回长度为 num_classes 的 float 张量：每个类别占的比例。某个类一次都没出现，它的比例就是 0，长度不能变短。
+- `prediction_psi(ref_pred, live_pred, num_classes, eps=1e-4)`：e 是 ref_pred 的比例，a 是 live_pred 的比例；两个都 `clamp_min(eps)`，再算 Σ (a − e) × ln(a / e)，返回 Python float。
+--- starter
+def class_shares(pred, num_classes):
+    """每个类别被预测的比例，长度 num_classes。"""
+    raise todo()
+
+
+def prediction_psi(ref_pred, live_pred, num_classes, eps=1e-4):
+    """上线初期的预测 vs 今天的预测：PSI（float）。"""
+    raise todo()
+--- solution
+def class_shares(pred, num_classes):
+    return torch.bincount(pred, minlength=num_classes) / len(pred)     # minlength：没出现的类也占一个位置
+
+
+def prediction_psi(ref_pred, live_pred, num_classes, eps=1e-4):
+    e = class_shares(ref_pred, num_classes).clamp_min(eps)
+    a = class_shares(live_pred, num_classes).clamp_min(eps)
+    return float(((a - e) * torch.log(a / e)).sum())
+--- tests
+def _preds(counts):
+    return torch.repeat_interleave(torch.arange(len(counts)), torch.tensor(counts))
+
+@check("每个类别的比例")
+def _():
+    got = class_shares(torch.tensor([0, 0, 1, 2, 2, 2]), 3)
+    true(torch.is_tensor(got), f"要返回张量，你返回的是 {type(got).__name__}")
+    eq(got, torch.tensor([2 / 6, 1 / 6, 3 / 6]), tol=1e-6, msg="比例 = 每个类出现的次数 / 总数")
+
+@check("没出现的类比例是 0，长度不变")
+def _():
+    got = class_shares(torch.tensor([0, 0, 1]), 4)
+    eq(got, torch.tensor([2 / 3, 1 / 3, 0.0, 0.0]), tol=1e-6,
+       msg="类别 2、3 一次都没出现，也要占位置：torch.bincount 要写 minlength=num_classes")
+
+@check("预测的分布变了：PSI 算得对")
+def _():
+    ref_pred, live_pred = _preds([700, 250, 50]), _preds([450, 250, 300])
+    got = prediction_psi(ref_pred, live_pred, 3)
+    true(isinstance(got, float), f"要返回 Python float，你返回的是 {type(got).__name__}")
+    eq(got, _prediction_psi_ref(ref_pred, live_pred, 3), tol=1e-5, msg="公式是 Σ (a - e) * ln(a / e)，e 来自 ref_pred")
+    true(close(prediction_psi(ref_pred, ref_pred.flip(0), 3), 0.0, 1e-9), "同样的预测（只是顺序不同），PSI 应该是 0")
+
+@check("今天有个类一次都没出现：结果仍是有限的数")
+def _():
+    ref_pred, live_pred = _preds([700, 250, 50]), _preds([600, 400])
+    got = prediction_psi(ref_pred, live_pred, 3)
+    true(math.isfinite(got), f"PSI 是 {got}：类别 2 今天的比例是 0，log(0) 是负无穷。先 clamp_min(eps)")
+    eq(got, _prediction_psi_ref(ref_pred, live_pred, 3), tol=1e-5,
+       msg="不对。live_pred 里没有类别 2，class_shares 的长度要仍然是 3")
+--- hints
+- 比例：`torch.bincount(pred, minlength=num_classes) / len(pred)`。
+- `prediction_psi` 里直接调用你的 `class_shares`，然后和第 4 题一样：clamp_min、套公式、`float(...)`。
+
+@@ item d25-09
+type: code
+title: 滚动窗口报警，带最少样本数
+level: 2
+cards: 报警规则：滚动窗口 + 最少样本数
+targets: ErrorRateAlert
+ref: day25
+--- context
+报警规则写不好，要么出了事没人知道，要么半夜被没意义的报警叫醒。「滚动窗口 + 最少样本数」是几乎所有报警系统（比如 Prometheus）的基本写法。
+--- prompt
+补完 `ErrorRateAlert`：
+
+- `record(t, is_error)`：记下一个请求。t 是时间（秒，越来越大），is_error 是 True / False。存进 `self.events`。
+- `firing(now)`：只看最近 window_s 秒内的请求，也就是 now − window_s < t ≤ now 的那些。先把更旧的从 `self.events` 左边 `popleft` 扔掉，这样内存不会一直涨。窗口里的请求数 ≥ min_count，**并且**错误率 > threshold，才返回 True；否则返回 False（窗口里一个请求都没有时也是 False）。
+--- starter
+from collections import deque
+
+class ErrorRateAlert:
+    def __init__(self, window_s=300, threshold=0.05, min_count=50):
+        self.window_s = window_s
+        self.threshold = threshold
+        self.min_count = min_count
+        self.events = deque()          # (t, is_error)，旧的在左边
+
+    def record(self, t, is_error):
+        raise todo()
+
+    def firing(self, now):
+        raise todo()
+--- solution
+from collections import deque
+
+class ErrorRateAlert:
+    def __init__(self, window_s=300, threshold=0.05, min_count=50):
+        self.window_s = window_s
+        self.threshold = threshold
+        self.min_count = min_count
+        self.events = deque()
+
+    def record(self, t, is_error):
+        self.events.append((t, bool(is_error)))
+
+    def firing(self, now):
+        while self.events and self.events[0][0] <= now - self.window_s:   # 窗口外的，从左边扔掉
+            self.events.popleft()
+        n = len(self.events)
+        if n == 0 or n < self.min_count:                                 # 样本太少，不下结论
+            return False
+        errors = sum(1 for _, is_error in self.events if is_error)
+        return errors / n > self.threshold
+--- tests
+@check("请求太少不报；请求够了、错误率高才报")
+def _():
+    alert = ErrorRateAlert(window_s=60, threshold=0.05, min_count=20)
+    true(not alert.firing(0), "窗口里一个请求都没有，应该返回 False（小心除以 0）")
+    alert.record(1, True)
+    true(not alert.firing(2), "窗口里只有 1 个请求（错误率 100%），但少于 min_count=20，不该报警")
+    for t in range(2, 21):
+        alert.record(t, t in (5, 9))
+    true(alert.firing(21), "窗口里有 20 个请求、3 个错误（15% > 5%），应该返回 True")
+
+@check("错误率没超过阈值不报，超过了才报")
+def _():
+    alert = ErrorRateAlert(window_s=300, threshold=0.05, min_count=50)
+    for t in range(100):
+        alert.record(t, t % 50 == 0)
+    true(not alert.firing(100), "100 个请求、2 个错误（2%），没超过 5%，不该报警")
+    for t in range(100, 110):
+        alert.record(t, True)
+    true(alert.firing(110), "110 个请求、12 个错误（约 10.9%），超过 5%，应该报警")
+
+@check("只看窗口里的：旧的错误不算")
+def _():
+    alert = ErrorRateAlert(window_s=60, threshold=0.05, min_count=20)
+    for t in range(50):
+        alert.record(t, True)
+    true(alert.firing(50), "前 50 秒的请求全失败了，这时应该报警")
+    for t in range(100, 200):
+        alert.record(t, False)
+    true(not alert.firing(200), "现在的窗口是 (140, 200]，里面全是成功的请求，不该报警。你是不是把所有历史都算进去了？")
+
+@check("窗口外的请求要从 events 里扔掉（内存不会一直涨）")
+def _():
+    alert = ErrorRateAlert(window_s=60, threshold=0.05, min_count=20)
+    for t in range(5000):
+        alert.record(t, t % 10 == 0)
+        alert.firing(t)
+    true(len(alert.events) <= 61,
+         f"跑了 5000 秒，events 里还存着 {len(alert.events)} 个请求：窗口外的要 popleft 扔掉")
+    true(alert.firing(4999), "最近 60 秒有 60 个请求、6 个错误（10%），应该报警")
+--- hints
+- `record` 只有一行：`self.events.append((t, bool(is_error)))`。
+- `firing` 开头：`while self.events and self.events[0][0] <= now - self.window_s: self.events.popleft()`。
+- 然后 `n = len(self.events)`；`n == 0` 或 `n < self.min_count` 就返回 False；否则数错误的个数，返回 `errors / n > self.threshold`。
+
+@@ item d25-10
+type: code
+title: 影子流量：用户只拿 prod 的答案
+level: 2
+cards: 影子流量：新模型先陪跑
+targets: serve_with_shadow, disagreement_rate
+ref: day25
+--- context
+新模型上线前先当「影子」：看它在真实流量上和旧模型有多少分歧、会不会崩，而用户完全不受影响。推荐、搜索、风控模型换代时，很多团队都先走这一步。
+--- prompt
+写两个函数。`stats` 由调用方创建：`{"rows": 0, "disagree": 0, "shadow_errors": 0}`。
+
+`serve_with_shadow(x, prod, shadow, stats)`，整个过程放在 `torch.inference_mode()` 里：
+
+1. 用 prod 算出每行的预测类别 `prod(x).argmax(dim=-1)`，最后返回它：这是用户拿到的答案。
+2. 用 shadow 也算一遍。shadow 出任何错（`Exception`），就 `stats["shadow_errors"] += 1`，照常返回 prod 的答案。
+3. shadow 没出错：`stats["rows"]` 加上这次的行数，`stats["disagree"]` 加上两个模型预测不一样的行数。
+4. prod 自己出错：不要接住，让它照常抛出去。
+
+`disagreement_rate(stats)`：返回 disagree / rows；rows 为 0（还没比过）时返回 None。
+--- starter
+def serve_with_shadow(x, prod, shadow, stats):
+    """返回 prod 的预测（给用户）；shadow 只拿来比较，出错也不能影响用户。"""
+    raise todo()
+
+
+def disagreement_rate(stats):
+    raise todo()
+--- solution
+def serve_with_shadow(x, prod, shadow, stats):
+    with torch.inference_mode():
+        pred = prod(x).argmax(dim=-1)          # 用户拿到的答案：只来自 prod。prod 出错就照常抛出
+        try:
+            other = shadow(x).argmax(dim=-1)   # try 只包住影子
+        except Exception:
+            stats["shadow_errors"] += 1        # 记一笔，但不影响用户
+        else:
+            stats["rows"] += len(x)
+            stats["disagree"] += int((pred != other).sum())
+    return pred
+
+
+def disagreement_rate(stats):
+    if stats["rows"] == 0:
+        return None
+    return stats["disagree"] / stats["rows"]
+--- tests
+class _Broken(nn.Module):
+    def forward(self, x):
+        raise RuntimeError("CUDA out of memory（模拟）")
+
+def _models():
+    torch.manual_seed(1)
+    prod, shadow = nn.Linear(4, 3), nn.Linear(4, 3)
+    shadow.load_state_dict(prod.state_dict())
+    with torch.no_grad():
+        shadow.weight.add_(0.5 * torch.randn(3, 4))
+    return prod, shadow
+
+def _stats():
+    return {"rows": 0, "disagree": 0, "shadow_errors": 0}
+
+@check("返回给用户的是 prod 的答案")
+def _():
+    prod, shadow = _models()
+    x = torch.randn(64, 4)
+    got = serve_with_shadow(x, prod, shadow, _stats())
+    want = prod(x).argmax(dim=-1)
+    true(not torch.equal(want, shadow(x).argmax(dim=-1)), "（题目自检）两个模型应该有分歧")
+    true(torch.is_tensor(got) and torch.equal(got, want), "返回的应该是 prod(x).argmax(dim=-1)：用户只能拿到 prod 的答案")
+
+@check("分歧的行数数得对，多次调用会累加")
+def _():
+    prod, shadow = _models()
+    stats = _stats()
+    rows, disagree = 0, 0
+    for n in (64, 36):
+        x = torch.randn(n, 4)
+        serve_with_shadow(x, prod, shadow, stats)
+        rows += n
+        disagree += int((prod(x).argmax(-1) != shadow(x).argmax(-1)).sum())
+    true(stats["rows"] == rows, f"stats['rows'] 是 {stats['rows']}，应该是 {rows}（两次调用的行数加起来）")
+    true(stats["disagree"] == disagree, f"stats['disagree'] 是 {stats['disagree']}，应该是 {disagree}")
+    true(stats["shadow_errors"] == 0, "影子没出错，shadow_errors 应该还是 0")
+
+@check("影子崩了：用户照样拿到答案，记一次 shadow_errors")
+def _():
+    prod, _ = _models()
+    stats = _stats()
+    x = torch.randn(8, 4)
+    try:
+        got = serve_with_shadow(x, prod, _Broken(), stats)
+    except NotImplementedError:
+        raise
+    except RuntimeError:
+        true(False, "影子出错，错误传到了用户那里：用 try/except 把影子的那一行包起来")
+    true(torch.equal(got, prod(x).argmax(dim=-1)), "影子出错时，也要返回 prod 的答案")
+    true(stats["shadow_errors"] == 1, f"stats['shadow_errors'] 是 {stats['shadow_errors']}，应该是 1")
+    true(stats["rows"] == 0 and stats["disagree"] == 0, "影子没算出结果，这次不能算进 rows / disagree")
+
+@check("prod 出错要照常抛出，不能吞掉")
+def _():
+    _, shadow = _models()
+    try:
+        serve_with_shadow(torch.randn(8, 4), _Broken(), shadow, _stats())
+    except NotImplementedError:
+        raise
+    except RuntimeError:
+        return
+    true(False, "prod 出错了，你的函数却没有抛出这个错误：try/except 只包住影子的那一行")
+
+@check("disagreement_rate：有数据时是比例，没数据时是 None")
+def _():
+    true(disagreement_rate({"rows": 0, "disagree": 0, "shadow_errors": 3}) is None,
+         "还没比过任何一行（rows 为 0），应该返回 None，而不是除以 0")
+    r = disagreement_rate({"rows": 200, "disagree": 30, "shadow_errors": 0})
+    true(r is not None and close(r, 0.15, 1e-9), f"200 行里 30 行不一样，分歧率应该是 0.15，你返回的是 {r!r}")
+--- hints
+- 先算 `pred = prod(x).argmax(dim=-1)`，放在 try 的**外面**：prod 出错要照常抛出。
+- 影子：`try: other = shadow(x).argmax(dim=-1)`，`except Exception: stats["shadow_errors"] += 1`，`else:` 里更新 rows 和 disagree。
+- 不一样的行数：`int((pred != other).sum())`。最后 `return pred`。
+
+@@ item d25-11
+type: choice
+title: 金丝雀只跑了 50 个请求
+level: 1
+cards: 金丝雀和 A/B：样本不够别下结论
+--- context
+自动发布系统每天都要回答「新版本能不能放量」。样本太少时下结论，要么把好版本错杀，要么把坏版本放出去。
+--- prompt
+新模型做金丝雀，接 5% 的流量，跑了 10 分钟。
+
+- 基线（旧模型）：20000 个请求，错误率 2.0%
+- 金丝雀（新模型）：50 个请求，2 个失败，错误率 4.0%
+
+发布系统现在应该怎么做？
+--- options
+- 马上回滚：错误率翻倍了
+- 马上全量发布：只多了 1 个失败，差别很小
+- 先不下结论，继续收集：50 个请求时，光是运气造成的晃动就有大约 2 个百分点，分不出 2% 和 4%
+- 把两边都换成新模型再比较
+answer: 3
+--- explain
+错误率 2% 的服务，看 50 个请求，标准误差是 sqrt(0.02 × 0.98 / 50) ≈ 0.02，也就是 2 个百分点。卡片里的模拟显示：新旧模型**完全一样**时，只看 50 个请求，大约 26% 的金丝雀会「看起来」有 4% 或更高的错误率。所以这里既不能说新模型更差（回滚），也不能说它没问题（全量）：样本数还没到 min_n，就 wait。等到几千个请求，标准误差降到零点几个百分点，才分得清。
+--- hints
+- 用卡片里的公式算一下：p = 2%、n = 50 时，SE 是多少个百分点？
+- 2% 和 4% 差 2 个百分点。这个差别比 SE 大很多吗？
+
+@@ item d25-12
+type: fix
+title: 金丝雀第 7 个请求失败就回滚了
+level: 2
+cards: 金丝雀和 A/B：样本不够别下结论
+targets: canary_decision
+ref: day25
+--- context
+真实事故：自动发布系统看到金丝雀的 7 个请求里有 1 个失败（14%），马上回滚，而新版本其实没有任何问题。只比较两个错误率大小的规则，会被运气耍得团团转。
+--- prompt
+下面的 `canary_decision` 只比较两个错误率谁大。按卡片里的三档规则改好它，返回 `"wait"`、`"rollback"`、`"promote"` 之一：
+
+1. `base_n < min_n` 或 `canary_n < min_n`：返回 "wait"。（先判断这一条，这时连除法都不用做。）
+2. 否则算 p_base、p_canary，以及 se = sqrt(p_base(1 − p_base)/base_n + p_canary(1 − p_canary)/canary_n)。p_canary − p_base > z × se 时，返回 "rollback"。
+3. 其他情况：返回 "promote"。
+--- starter
+def canary_decision(base_errors, base_n, canary_errors, canary_n, min_n=1000, z=2.0):
+    p_base = base_errors / base_n
+    p_canary = canary_errors / canary_n
+    if p_canary > p_base:              # 金丝雀的错误率比基线高，就回滚
+        return "rollback"
+    return "promote"
+--- solution
+def canary_decision(base_errors, base_n, canary_errors, canary_n, min_n=1000, z=2.0):
+    if base_n < min_n or canary_n < min_n:
+        return "wait"                                       # 样本不够，不下结论
+    p_base = base_errors / base_n
+    p_canary = canary_errors / canary_n
+    se = math.sqrt(p_base * (1 - p_base) / base_n + p_canary * (1 - p_canary) / canary_n)
+    if p_canary - p_base > z * se:                          # 差得比噪声大得多，才算真的更差
+        return "rollback"
+    return "promote"
+--- tests
+@check("样本不够：wait，哪怕看起来很糟")
+def _():
+    got = canary_decision(40, 20000, 1, 7)
+    true(got == "wait", f"金丝雀只有 7 个请求，应该返回 'wait'，你返回的是 {got!r}：1 个失败就是 14%，这只是运气")
+    got = canary_decision(3, 500, 30, 5000)
+    true(got == "wait", f"基线只有 500 个请求（少于 min_n=1000），也应该 'wait'，你返回的是 {got!r}")
+    got = canary_decision(20, 2000, 20, 2000)
+    true(got == "promote", f"两边都有 2000 个请求、错误率一样，应该 'promote'，你返回的是 {got!r}")
+
+@check("差一点点、在噪声范围内：promote；差得多：rollback")
+def _():
+    got = canary_decision(20, 2000, 26, 2000)
+    true(got == "promote", f"1.0% 对 1.3%，差 0.3 个百分点，而 2 × se 约是 0.67 个百分点：应该 'promote'，你返回的是 {got!r}")
+    got = canary_decision(20, 2000, 36, 2000)
+    true(got == "rollback", f"1.0% 对 1.8%，差 0.8 个百分点，超过 2 × se（约 0.74）：应该 'rollback'，你返回的是 {got!r}")
+
+@check("明显更差 rollback，更好 promote")
+def _():
+    got = canary_decision(100, 10000, 150, 10000)
+    true(got == "rollback", f"1.0% 对 1.5%，每边 10000 个请求：应该 'rollback'，你返回的是 {got!r}")
+    got = canary_decision(40, 2000, 10, 2000)
+    true(got == "promote", f"金丝雀的错误率更低（0.5% 对 2.0%）：应该 'promote'，你返回的是 {got!r}")
+
+@check("min_n 和 z 参数有用")
+def _():
+    got = canary_decision(20, 2000, 60, 2000, min_n=5000)
+    true(got == "wait", f"min_n=5000 时两边都不够，应该 'wait'，你返回的是 {got!r}")
+    a, b = canary_decision(20, 2000, 32, 2000), canary_decision(20, 2000, 32, 2000, z=1.0)
+    true((a, b) == ("promote", "rollback"),
+         f"1.0% 对 1.6%：z=2 时应该 'promote'，z=1 时门槛变低，应该 'rollback'。你返回的是 {a!r}、{b!r}")
+--- hints
+- 函数第一件事：`if base_n < min_n or canary_n < min_n: return "wait"`。
+- 标准误差：`se = math.sqrt(p_base * (1 - p_base) / base_n + p_canary * (1 - p_canary) / canary_n)`。
+- 把 `if p_canary > p_base:` 改成 `if p_canary - p_base > z * se:`。
+
+@@ item d25-13
+type: fill
+title: 每 1000 个请求的成本
+level: 1
+cards: 每 1000 个请求花多少钱
+targets: cost_per_1k
+ref: day25
+--- context
+「这个模型一个月花多少钱」是每个上线的模型都会被问到的问题。能把 GPU 价格和吞吐量换算成每 1000 个请求的成本，才能判断批处理、量化、自动扩缩容这些优化值不值得做。
+--- prompt
+把空填上：GPU 每小时 `gpu_dollars_per_hour` 美元；满载时每秒处理 `requests_per_second` 个请求；平均利用率 `utilization`（0 到 1）。返回每 1000 个请求的成本（美元）。
+--- template
+def cost_per_1k(gpu_dollars_per_hour, requests_per_second, utilization=1.0):
+    requests_per_hour = requests_per_second * [[3600]] * [[utilization]]     # 一小时实际处理多少个请求
+    dollars_per_request = [[gpu_dollars_per_hour]] / requests_per_hour
+    return dollars_per_request * [[1000]]
+--- tests
+@check("满载：每小时 2 美元，每秒 50 个请求")
+def _():
+    got = cost_per_1k(2.0, 50)
+    true(close(got, 2.0 / (50 * 3600) * 1000, 1e-12), f"应该约是 0.01111 美元，你算出 {got}")
+
+@check("利用率 25%：成本是满载时的 4 倍")
+def _():
+    got = cost_per_1k(2.0, 50, utilization=0.25)
+    true(close(got, 0.0444444444, 1e-9), f"应该约是 0.04444 美元，你算出 {got}：一小时里只有 25% 的时间在干活，但 GPU 照样收一小时的钱")
+
+@check("吞吐量提高 10 倍：成本降到 1/10")
+def _():
+    slow, fast = cost_per_1k(1.2, 40, 0.5), cost_per_1k(1.2, 400, 0.5)
+    true(close(slow, 1.2 / (40 * 3600 * 0.5) * 1000, 1e-12), f"每小时 1.2 美元、每秒 40 个、利用率 50%：应该约是 0.01667，你算出 {slow}")
+    true(close(fast * 10, slow, 1e-12), f"每秒 400 个时应该是 {slow / 10}，你算出 {fast}")
+--- hints
+- 一小时有几秒？再乘上利用率，就是一小时实际处理的请求数。
+- 每个请求的成本 = 每小时的价格 ÷ 每小时处理的请求数；每 1000 个就再乘 1000。
+
+@@ item d25-14
+type: code
+title: 闭卷：手写 PSI
+level: 2
+exam: yes
+cards: PSI：输入的分布变了多少
+targets: psi
+ref: day25
+--- context
+PSI 是今天最重要的一个函数：面试里问「怎么发现数据漂移」，几乎都会落到它上面。不看卡片，从空白写出来。
+--- prompt
+不看卡片，写出 `psi(ref, live, bins=10, eps=1e-4)`，返回 Python float：分箱边界只用 ref 的分位数定（bins − 1 个），ref 和 live 都用这套边界数出每个箱的比例（长度都是 bins），两边都 clamp_min(eps)，PSI = Σ (a − e) × ln(a / e)。
+
+检查和第 4 题一样。
+--- starter
+def psi(ref, live, bins=10, eps=1e-4):
+    raise todo()
+--- solution
+def psi(ref, live, bins=10, eps=1e-4):
+    edges = torch.quantile(ref, torch.linspace(0, 1, bins + 1))[1:-1]
+    e = torch.bincount(torch.bucketize(ref, edges), minlength=bins) / len(ref)
+    a = torch.bincount(torch.bucketize(live, edges), minlength=bins) / len(live)
+    e, a = e.clamp_min(eps), a.clamp_min(eps)
+    return float(((a - e) * torch.log(a / e)).sum())
+--- tests
+@check("没漂移：PSI 很小，而且算得对")
+def _():
+    seed(1)
+    ref, live = torch.randn(2000), torch.randn(1000)
+    p = psi(ref, live)
+    true(isinstance(p, float), f"要返回 Python float（用 float(...) 或 .item()），你返回的是 {type(p).__name__}")
+    eq(p, _psi_ref(ref, live), tol=1e-4, msg="和参考答案不一样：检查分箱边界、bincount 的 minlength 和公式")
+    true(p < 0.05, f"同一个分布，PSI 应该很小，你的是 {p:.4f}")
+
+@check("均值偏移 1 个标准差：PSI 远大于 0.25")
+def _():
+    seed(2)
+    ref, live = torch.randn(2000), torch.randn(1000) + 1.0
+    p = psi(ref, live)
+    eq(p, _psi_ref(ref, live), tol=1e-4, msg="和参考答案不一样")
+    true(p > 0.25, f"PSI 只有 {p:.4f}：整体偏移了 1 个标准差，应该远大于 0.25")
+
+@check("分布变宽（标准差翻倍）也能发现")
+def _():
+    seed(3)
+    ref, live = torch.randn(2000), 2 * torch.randn(1000)
+    p = psi(ref, live)
+    eq(p, _psi_ref(ref, live), tol=1e-4,
+       msg="和参考答案不一样。边界要用 ref 的分位数，不能用 live 的：用 live 自己的分位数，live 的每个箱永远是 10%")
+    true(p > 0.25, f"PSI 只有 {p:.4f}：标准差翻倍，应该大于 0.25")
+
+@check("线上的值全都比训练时的最小值还小：进 0 号箱，结果不是 inf")
+def _():
+    seed(4)
+    ref = torch.randn(2000)
+    live = ref.min() - 1 - torch.rand(500)
+    p = psi(ref, live)
+    true(math.isfinite(p), f"PSI 是 {p}：有的箱里 live 一个都没有，log(0) 变成了无穷。先 clamp_min(eps) 再取 log")
+    eq(p, _psi_ref(ref, live), tol=1e-3,
+       msg="和参考答案不一样。bincount 要写 minlength=bins：live 全在 0 号箱时，不写它结果只有 1 个元素")
+
+@check("bins 参数有用")
+def _():
+    seed(5)
+    ref, live = torch.randn(2000), torch.randn(1000) + 0.3
+    eq(psi(ref, live, bins=5), _psi_ref(ref, live, bins=5), tol=1e-4, msg="bins=5 时算得不对：边界个数和 minlength 都要用 bins")
+--- hints
+- 三步：边界（只用 ref）→ 两边的比例（同一套边界）→ clamp_min 后套公式。
+- 分位数、bucketize、bincount(minlength=bins)。
+
+@@ item d25-15
+type: code
+title: 闭卷：滚动窗口报警
+level: 2
+exam: yes
+cards: 报警规则：滚动窗口 + 最少样本数
+targets: ErrorRateAlert
+ref: day25
+--- context
+报警规则是上线后每天都在用的东西。「只看最近的窗口」「样本够了才下结论」「旧数据要扔掉」这三点，不看卡片也要写得出来。
+--- prompt
+不看卡片，写出 `ErrorRateAlert(window_s=300, threshold=0.05, min_count=50)`：
+
+- `self.events` 是一个 deque，存 (t, is_error)；
+- `record(t, is_error)` 记下一个请求；
+- `firing(now)` 先从左边扔掉 t ≤ now − window_s 的请求，然后：窗口里的请求数 ≥ min_count 并且错误率 > threshold 时返回 True，否则返回 False（没有请求时也是 False）。
+
+检查和第 9 题一样。
+--- starter
+from collections import deque
+
+class ErrorRateAlert:
+    def __init__(self, window_s=300, threshold=0.05, min_count=50):
+        raise todo()
+
+    def record(self, t, is_error):
+        raise todo()
+
+    def firing(self, now):
+        raise todo()
+--- solution
+from collections import deque
+
+class ErrorRateAlert:
+    def __init__(self, window_s=300, threshold=0.05, min_count=50):
+        self.window_s = window_s
+        self.threshold = threshold
+        self.min_count = min_count
+        self.events = deque()
+
+    def record(self, t, is_error):
+        self.events.append((t, bool(is_error)))
+
+    def firing(self, now):
+        while self.events and self.events[0][0] <= now - self.window_s:
+            self.events.popleft()
+        n = len(self.events)
+        if n == 0 or n < self.min_count:
+            return False
+        errors = sum(1 for _, is_error in self.events if is_error)
+        return errors / n > self.threshold
+--- tests
+@check("请求太少不报；请求够了、错误率高才报")
+def _():
+    alert = ErrorRateAlert(window_s=60, threshold=0.05, min_count=20)
+    true(not alert.firing(0), "窗口里一个请求都没有，应该返回 False（小心除以 0）")
+    alert.record(1, True)
+    true(not alert.firing(2), "窗口里只有 1 个请求（错误率 100%），但少于 min_count=20，不该报警")
+    for t in range(2, 21):
+        alert.record(t, t in (5, 9))
+    true(alert.firing(21), "窗口里有 20 个请求、3 个错误（15% > 5%），应该返回 True")
+
+@check("错误率没超过阈值不报，超过了才报")
+def _():
+    alert = ErrorRateAlert(window_s=300, threshold=0.05, min_count=50)
+    for t in range(100):
+        alert.record(t, t % 50 == 0)
+    true(not alert.firing(100), "100 个请求、2 个错误（2%），没超过 5%，不该报警")
+    for t in range(100, 110):
+        alert.record(t, True)
+    true(alert.firing(110), "110 个请求、12 个错误（约 10.9%），超过 5%，应该报警")
+
+@check("只看窗口里的：旧的错误不算")
+def _():
+    alert = ErrorRateAlert(window_s=60, threshold=0.05, min_count=20)
+    for t in range(50):
+        alert.record(t, True)
+    true(alert.firing(50), "前 50 秒的请求全失败了，这时应该报警")
+    for t in range(100, 200):
+        alert.record(t, False)
+    true(not alert.firing(200), "现在的窗口是 (140, 200]，里面全是成功的请求，不该报警。你是不是把所有历史都算进去了？")
+
+@check("窗口外的请求要从 events 里扔掉（内存不会一直涨）")
+def _():
+    alert = ErrorRateAlert(window_s=60, threshold=0.05, min_count=20)
+    for t in range(5000):
+        alert.record(t, t % 10 == 0)
+        alert.firing(t)
+    true(len(alert.events) <= 61,
+         f"跑了 5000 秒，events 里还存着 {len(alert.events)} 个请求：窗口外的要 popleft 扔掉")
+    true(alert.firing(4999), "最近 60 秒有 60 个请求、6 个错误（10%），应该报警")
+--- hints
+- 窗口：`while` 循环 + `popleft`，条件是最左边的 t ≤ now − window_s。
+- 先判断「请求数够不够」，再算错误率。

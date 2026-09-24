@@ -1,18 +1,14 @@
-# imports of the drill file (the checks use them)
-import sys, os
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+"""Day 4 reference module: the nanoGPT pieces (causal mask, attention, CausalSelfAttention, MLP, Block, GPT,
+parameter count, greedy generation, and the fixed versions of the two find-the-bug exercises).
 
-"""Day 04 参考答案 —— 这份就是你 Day 5/10/13 要反复复用的那个 Block。"""
+Loaded as hidden setup by the day-4 exercises (the names an exercise asks for are removed again before the
+learner's code runs). Later days may reuse Block / GPT from here, so keep the names and behaviour stable.
+"""
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-DICTATION_DONE = True
 
 
 def causal_bias(T, device=None):
@@ -85,7 +81,7 @@ class GPT(nn.Module):
         self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
         self.apply(self._init)
-        self.lm_head.weight = self.wte.weight     # tying 必须放在 init 之后
+        self.lm_head.weight = self.wte.weight     # weight tying: one shared Parameter object
 
     @staticmethod
     def _init(m):

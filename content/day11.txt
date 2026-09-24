@@ -3,72 +3,337 @@ title: 音频的 shape 语言
 part: 音频
 hours: 3–4 小时
 --- goal
-TODO: 一句话写今天学完能做什么。
+学完今天，你能把一段波形一步步变成模型能吃的 log-mel 张量：每一步的 shape 都能心算出来，也说得清每一步为什么要做、丢掉了什么。
 --- checklist
-- 先清空复习区
-- 读完知识卡片并改动运行
-- 练习区全部通过
+- 先清空复习区（之前看过答案的题，从空白重做）
+- 8 张知识卡片都运行一遍，每张至少改一个数字再跑
+- 合上卡片，在纸上写出 1 秒 16kHz 音频从波形到 log-mel 每一步的 shape
+- 练习区全部通过，最后做闭卷题
+
+@@ concept
+title: 波形和采样率：一秒有多少个数
+--- body
+一段音频在电脑里就是一串数字，叫 **波形**（waveform）。每个数记录某一瞬间声音的振动位置，范围大约在 -1 到 1 之间。
+
+**采样率**（sample rate，简写 sr）= 每秒记录多少个数。16kHz 就是每秒 16000 个数。
+
+- 采样点数 = 秒数 × sr，取整。16kHz 下 2 秒 → 32000 个点
+- 秒数 = 采样点数 ÷ sr。48000 个点 @16kHz → 3.0 秒
+- 一条单声道音频的 shape 是 `(T,)`，一个 batch 是 `(B, T)`
+
+常见采样率：语音识别常用 16kHz；TTS 和音频 codec 常用 22.05kHz 或 24kHz；音乐 CD 是 44.1kHz。
+
+模型一般不直接看每个采样点，而是把波形切成一帧一帧（frame）。相邻两帧的起点差多少个点，叫 **hop**（步长）。所以：
+
+- 每秒多少帧（帧率）= sr ÷ hop
+- 16kHz、hop=160 → 每秒 100 帧（Whisper 就是这么设的）
+
+帧率就像 LLM 里「一个 token 大约几个字」：它决定了一段音频变成多长的序列，也就决定了模型要算多久。
+--- code
+sr = 16000
+seconds = 2.5
+T = int(seconds * sr)
+wav = torch.zeros(T)                  # 2.5 秒的静音
+print("shape:", tuple(wav.shape))
+print("时长:", wav.numel() / sr, "秒")
+
+for sr_, hop in [(16000, 160), (22050, 256), (24000, 300)]:
+    print(f"sr={sr_}, hop={hop}: 每秒 {sr_ / hop:.1f} 帧")
+
+@@ concept
+title: 峰值归一化：把音量拉齐
+--- body
+不同录音的音量差很多：有人贴着麦克风说话，**峰值**（绝对值最大的那个采样点）接近 1；有人离得远，峰值只有 0.05。喂给模型之前，常见做法是先把音量拉到同一个水平。
+
+**峰值归一化**（peak normalization）：整条波形乘同一个数，让峰值正好等于目标值，比如 0.95。
+
+- 峰值 = `wav.abs().max()`（要取绝对值，负数也算）
+- 结果 = `wav * (target / peak)`
+- 所有点乘同一个数，波形的「形状」不变，只是音量变了
+- 目标用 0.95 而不是 1.0，是留一点余量：后面的处理如果把数值推过 1，就会削波（clipping），听起来是爆音
+
+坑：全是 0 的静音片段，峰值是 0。`0.95 / 0` 是 inf，`0 * inf` 是 nan。数据集里混进一条静音文件，就能让训练出现 nan。所以峰值为 0 时要原样返回。
+--- code
+wav = torch.tensor([0.05, -0.2, 0.1])
+peak = wav.abs().max()
+print("峰值:", round(peak.item(), 3))
+out = wav * (0.95 / peak)
+print("归一化后:", [round(v, 4) for v in out.tolist()])
+print("新峰值:", round(out.abs().max().item(), 4))
+
+silence = torch.zeros(3)
+print("静音也直接除:", (silence * (0.95 / silence.abs().max())).tolist())
+
+@@ concept
+title: 分帧：用 unfold 把波形切成一段一段
+--- body
+声音一直在变，但在 20～60 毫秒这么短的时间里，可以看成基本不变。所以处理音频的第一步通常是 **分帧**：一个长度为 `size` 的窗口在波形上滑动，每次往前挪 `step` 个点（这个 step 就是 hop）。
+
+`wav.unfold(0, size, step)` 一步做完：在第 0 维上，每隔 `step` 个点取一段长度为 `size` 的片段，排成一个新维度。
+
+- 输入 `(T,)` → 输出 `(帧数, size)`
+- 第 i 帧是 `wav[i*step : i*step + size]`
+- 帧数 = `(T - size) // step + 1`，最后凑不满一帧的尾巴丢掉
+- 返回的是 view（视图）：不复制数据，所以很快；写 Python 循环一帧帧切，长音频上会慢很多
+
+例子：T=8、size=3、step=2 → (8 - 3) // 2 + 1 = 3 帧，起点是 0、2、4，最后的 7 被丢掉。
+
+记住这个帧数公式：它就是下一张卡里 STFT 在 `center=False` 时的帧数。
+--- code
+wav = torch.arange(8.)
+frames = wav.unfold(0, 3, 2)
+print(frames)
+print("帧数公式:", (8 - 3) // 2 + 1)
+
+big = torch.randn(16000).unfold(0, 400, 160)   # 16kHz: 25 毫秒一帧, 10 毫秒一跳
+print(tuple(big.shape), "=", (16000 - 400) // 160 + 1, "帧")
+
+@@ concept
+title: STFT：频点数和帧数
+--- body
+分帧之后，对每一帧做一次 FFT（快速傅里叶变换），就知道这一帧里「每个频率有多强」。所有帧排在一起，就是 **STFT**（短时傅里叶变换）。`torch.stft` 一步做完分帧、加窗、FFT。
+
+三个参数：
+
+- `n_fft`：每帧多少个点，比如 1024
+- `hop_length`：相邻两帧差多少个点，比如 256
+- `window`：每帧先乘一个窗函数，把帧的两头压到 0，常用 `torch.hann_window(n_fft)`
+
+输出 shape 是 `(频点数, 帧数)`；输入带 batch 时是 `(B, 频点数, 帧数)`。
+
+- **频点数** = `n_fft // 2 + 1`。每个频点宽 `sr / n_fft` Hz，第 k 个频点对应 `k * sr / n_fft` Hz
+- **帧数，center=True**（默认）：两头各补 `n_fft // 2` 个点再分帧，帧数 = `T // hop + 1`
+- **帧数，center=False**：不补，和 unfold 一样，帧数 = `(T - n_fft) // hop + 1`
+
+例子：T=16000、n_fft=512、hop=128 → 频点数 257，center=True 时 126 帧，center=False 时 122 帧。注意 center=True 时帧数和 n_fft 无关，只看 hop。
+
+要加 `return_complex=True`，输出是复数张量（`complex64`）。每个复数的模 `.abs()` 就是这个频率有多强，得到 **幅度谱**（magnitude spectrogram），它是普通的实数张量。
+--- code
+sr = 16000
+t = torch.arange(sr) / sr                      # 1 秒的时间轴
+tone = torch.sin(2 * math.pi * 1000 * t)       # 1000 Hz 的纯音
+n_fft, hop = 512, 128
+spec = torch.stft(tone, n_fft, hop, window=torch.hann_window(n_fft), return_complex=True)
+print("复数谱:", tuple(spec.shape), spec.dtype)
+mag = spec.abs()
+print("幅度谱:", tuple(mag.shape), mag.dtype)
+print("第 60 帧最强的频点:", mag[:, 60].argmax().item(), " 理论值 1000 * 512 / 16000 =", 1000 * n_fft / sr)
+
+nc = torch.stft(tone, n_fft, hop, window=torch.hann_window(n_fft), return_complex=True, center=False)
+print("center=False:", tuple(nc.shape))
+
+@@ concept
+title: 幅度和相位：幅度谱丢掉了什么
+--- body
+STFT 输出的每个格子是一个复数 `a + bi`。把它想成平面上的一支箭头：
+
+- **幅度**（magnitude）= 箭头的长度 = `z.abs()` = √(a² + b²)。表示这个频率有多强，永远 ≥ 0
+- **相位**（phase）= 箭头的角度 = `z.angle()`。表示这个频率的波在这一帧里「从哪里开始」
+- `z.real` 只是实部 a，既不是幅度也不是相位，还可能是负数。想要幅度却写成 `.real`，是很常见的 bug
+
+幅度 + 相位 = 完整信息。`torch.polar(幅度, 相位)` 能把复数拼回来，再用 `torch.istft`（STFT 的逆运算）变回波形，误差几乎为 0。
+
+可是 mel 谱、log-mel 都只从幅度算出来，相位被扔掉了。下面的实验把相位全设成 0 再重建：相对误差大约是 1.0，也就是误差和原信号本身一样大，波形面目全非。所以 TTS 模型预测出 mel 谱之后，还需要一个 **vocoder**（声码器）把相位「猜」回来，才能得到能播放的波形（Day 12 会用到）。
+--- code
+torch.manual_seed(1)
+wav = torch.randn(4096)
+win = torch.hann_window(512)
+spec = torch.stft(wav, 512, 128, window=win, return_complex=True)
+mag, phase = spec.abs(), spec.angle()
+print("spec:", tuple(spec.shape), spec.dtype)
+
+z = torch.tensor(-3 + 4j)
+print("一个格子 -3+4j: real =", z.real.item(), " abs =", z.abs().item())
+
+def rel_err(x):
+    return (((x - wav) ** 2).mean() / (wav ** 2).mean()).item()
+
+full = torch.istft(torch.polar(mag, phase), 512, 128, window=win, length=4096)
+print(f"幅度 + 相位重建, 相对误差: {rel_err(full):.1e}")
+
+no_phase = torch.istft(mag.to(torch.complex64), 512, 128, window=win, length=4096)
+print(f"只用幅度 (相位全 0) 重建, 相对误差: {rel_err(no_phase):.2f}")
+
+@@ concept
+title: mel 刻度和 mel 滤波器组
+--- body
+人耳对低频的变化很敏感：100 Hz 和 200 Hz 听起来差很多；7900 Hz 和 8000 Hz 却几乎听不出区别。**mel 刻度** 把 Hz 换成「听起来的距离」：
+
+`mel = 2595 * log10(1 + f / 700)`
+
+- 0 Hz → 0 mel，1000 Hz → 大约 1000 mel
+- 100→200 Hz 差 133 mel；7900→8000 Hz 只差 13 mel
+- 低频被「拉开」，高频被「挤紧」
+
+**mel 滤波器组**（mel filterbank）是一个矩阵 `fb`，shape `(n_mels, n_freq)`，比如 `(80, 513)`。每一行是一个三角形的滤波器。80 个三角形在 mel 刻度上等间距排开，换回 Hz 看：低频的三角形又窄又密，高频的又宽又稀。
+
+把 513 个频点压成 80 个 mel 频带，只要一次矩阵乘法：
+
+- `fb @ mag`：`(80, 513) @ (513, 63)` → `(80, 63)`
+- mag 带 batch 时：`(80, 513) @ (B, 513, 63)` → `(B, 80, 63)`，`@` 会自动广播
+
+实际项目里 fb 用现成函数生成（`torchaudio.functional.melscale_fbanks` 或 `librosa.filters.mel`）。下面手写一个，看清它长什么样。
+--- code
+def hz_to_mel(f):
+    return 2595 * math.log10(1 + f / 700)
+
+for f in [100, 200, 1000, 7900, 8000]:
+    print(f, "Hz ->", round(hz_to_mel(f)), "mel")
+
+sr, n_fft, n_mels = 16000, 1024, 80
+edges_mel = torch.linspace(0, hz_to_mel(sr / 2), n_mels + 2)   # mel 上等间距
+edges_hz = 700 * (10 ** (edges_mel / 2595) - 1)                # 换回 Hz
+freqs = torch.linspace(0, sr / 2, n_fft // 2 + 1)              # 513 个频点各自的 Hz
+fb = torch.zeros(n_mels, freqs.numel())
+for i in range(n_mels):
+    lo, mid, hi = edges_hz[i], edges_hz[i + 1], edges_hz[i + 2]
+    rise = (freqs - lo) / (mid - lo)
+    fall = (hi - freqs) / (hi - mid)
+    fb[i] = torch.clamp(torch.minimum(rise, fall), min=0)      # 三角形
+
+print("fb:", tuple(fb.shape))
+print("第 0 个滤波器盖住几个频点:", (fb[0] > 0).sum().item())
+print("第 79 个滤波器盖住几个频点:", (fb[79] > 0).sum().item())
+mag = torch.rand(2, 513, 63)
+print("fb @ mag:", tuple((fb @ mag).shape))
+
+@@ concept
+title: log-mel：取 log，再加 eps
+--- body
+mel 谱里的数值跨度很大：安静处可能是 0.001，响的地方可能是 1000，差了一百万倍。直接喂给神经网络，大数会压倒一切。而且人耳对响度的感觉本来就接近对数：能量翻 10 倍，听起来只是「响了一档」。
+
+所以几乎所有语音模型都用 **log-mel**：对 mel 取 log。取完 log，一百万倍的差距只剩 13.8。
+
+坑：完全静音的地方 mel = 0，`log(0) = -inf`。一个 -inf 进了网络，loss 就变成 nan。所以要加一个很小的数 **eps**：
+
+`log_mel = log(fb @ mag + eps)`，常用 eps = 1e-5。
+
+加了 eps，完全静音 = log(1e-5) ≈ -11.5。这就是 log-mel 的「静音地板」。后面补 padding 时用的 -11.5 就是从这里来的。
+
+完整链路：波形 `(T,)` → 幅度谱 `(n_freq, 帧数)` → `fb @` → mel `(n_mels, 帧数)` → `log(· + eps)` → log-mel `(n_mels, 帧数)`。
+--- code
+mel = torch.tensor([0.0, 0.001, 1.0, 1000.0])
+print("不加 eps:", [round(v, 2) for v in torch.log(mel).tolist()])
+print("加 eps  :", [round(v, 2) for v in torch.log(mel + 1e-5).tolist()])
+print("静音地板 log(1e-5) =", round(math.log(1e-5), 2))
+print("最大 / 最小 (线性):", 1000.0 / 0.001)
+print("最大 - 最小 (log)  :", round(math.log(1000.0) - math.log(0.001), 1))
+
+@@ concept
+title: 进模型之前：通道维、padding 和 mask
+--- body
+**mel 谱就是一张单通道的图**：高 = n_mels，宽 = 帧数。图像模型要的输入是 `(B, C, H, W)`，所以 `(B, n_mels, 帧数)` 只要在第 1 维加一个通道维：`mel.unsqueeze(1)` → `(B, 1, n_mels, 帧数)`。然后 Day 8 用过的 `nn.Conv2d` 原样能用。
+
+**变长**：一个 batch 里的音频长短不一，帧数各不相同，但张量必须是规整的长方体。做法和文本的 padding 一样：
+
+- 找出最长的帧数 Tmax，建一个 `(B, n_mels, Tmax)` 的张量，全部先填成 pad 值
+- 把每条 mel 拷到左边，右边剩下的就是 padding
+- pad 值用 -11.5（log-mel 的静音地板），而不是 0：log-mel 里的 0 表示能量为 1，是「有声音」
+- 再做一个 **mask**，shape `(B, Tmax)`：真实帧是 1，padding 帧是 0。之后算 loss、做 attention 时靠它忽略 padding
+
+`F.pad(x, (左, 右), value=v)` 能在最后一维的两边补值；`arange < lengths` 能一次做出整个 mask。
+
+下面的代码用 0.5 秒、n_fft=512、hop=128、n_mels=64 走一遍整条 shape 链。
+--- code
+wav = torch.randn(8000)                         # 0.5 秒, 16kHz
+mag = torch.stft(wav, 512, 128, window=torch.hann_window(512), return_complex=True).abs()
+fb = torch.rand(64, 257)                        # 假的滤波器组, 只看 shape
+log_mel = torch.log(fb @ mag + 1e-5)
+x = log_mel.unsqueeze(0).unsqueeze(0)           # 加 batch 维和通道维
+print(tuple(wav.shape), "->", tuple(mag.shape), "->", tuple(log_mel.shape), "->", tuple(x.shape))
+print("Conv2d 输出:", tuple(nn.Conv2d(1, 8, 3, padding=1)(x).shape))
+
+short = torch.zeros(2, 3)                       # 一条 3 帧的 mel (n_mels=2)
+print(F.pad(short, (0, 5 - 3), value=-11.5))    # 右边补 2 帧
+lengths = torch.tensor([3, 5])
+print((torch.arange(5)[None, :] < lengths[:, None]).long())
 
 @@ item d11-01
 type: code
 title: 采样率算术
-level: 2
-targets: n_samples, duration
+level: 1
+cards: 波形和采样率：一秒有多少个数
+targets: n_samples, duration, AUDIO_FACTS
 ref: day11
 --- context
-TODO
+采样率决定了一段音频会变成多长的序列。准备数据、定模型输入长度、估推理耗时，都要先做这笔算术；面试也常让你当场算「10 秒音频有多少帧」。
 --- prompt
-01  采样率的算术 —— 音频版的"一个 token 是多少字"
+写两个函数，再填一个字典：
+
+- `n_samples(seconds, sr)`：时长（秒）→ 采样点数，结果取整（`int`）。例：`n_samples(0.5, 24000) == 12000`
+- `duration(n, sr)`：采样点数 → 时长（秒）。例：`duration(16000, 16000) == 1.0`
+- `AUDIO_FACTS`：把 4 个 `None` 换成整数，心算就行。「每秒多少帧」= sr ÷ hop，向下取整
 --- starter
 def n_samples(seconds, sr):
-    """时长 -> 采样点数（取整）。"""
-    # --- TODO 01 ---
+    """时长（秒）-> 采样点数（取整）。"""
     raise todo()
 
+
 def duration(n, sr):
-    """采样点数 -> 秒。"""
-    # --- TODO 01b ---
+    """采样点数 -> 时长（秒）。"""
     raise todo()
+
+
+AUDIO_FACTS = {
+    "16kHz 下 1 秒有多少个采样点": None,
+    "24kHz 下 2.5 秒有多少个采样点": None,
+    "hop=256 @16kHz 时每秒多少帧": None,
+    "hop=320 @24kHz 时每秒多少帧": None,
+}
 --- solution
 def n_samples(seconds, sr):
     return int(seconds * sr)
 
+
 def duration(n, sr):
     return n / sr
+
+
+AUDIO_FACTS = {
+    "16kHz 下 1 秒有多少个采样点": 16000,
+    "24kHz 下 2.5 秒有多少个采样点": 60000,
+    "hop=256 @16kHz 时每秒多少帧": 62,      # 16000 / 256 = 62.5 -> 62
+    "hop=320 @24kHz 时每秒多少帧": 75,
+}
 --- tests
 @check("采样率算术")
 def t01():
-    true(n_samples(1.0, 16000) == 16000)
-    true(n_samples(0.5, 24000) == 12000)
-    true(close(duration(16000, 16000), 1.0))
+    true(n_samples(1.0, 16000) == 16000, "n_samples(1.0, 16000) 应为 16000")
+    true(n_samples(0.5, 24000) == 12000, "n_samples(0.5, 24000) 应为 12000")
+    true(close(duration(16000, 16000), 1.0), "duration(16000, 16000) 应为 1.0 秒")
     want = {
         "16kHz 下 1 秒有多少个采样点": 16000,
         "24kHz 下 2.5 秒有多少个采样点": 60000,
         "hop=256 @16kHz 时每秒多少帧": 62,      # 16000/256 = 62.5 -> 取整 62
         "hop=320 @24kHz 时每秒多少帧": 75,
     }
-    wrong = [f"{k}: 你填 {v}, 应为 {want[k]}" for k, v in AUDIO_FACTS.items()
-             if v is None or int(v) != want[k]]
-    true(not wrong, "\n       " + "\n       ".join(wrong))
+    wrong = [f"{k}: 你填 {AUDIO_FACTS.get(k)}, 应为 {v}" for k, v in want.items()
+             if AUDIO_FACTS.get(k) is None or int(AUDIO_FACTS[k]) != v]
+    true(not wrong, "AUDIO_FACTS 这几项不对:\n" + "\n".join(wrong))
 --- hints
-- TODO
+- 采样率就是「每秒多少个点」。秒数 × 每秒点数 = 点数；反过来，点数 ÷ 每秒点数 = 秒数。
+- `n_samples` 返回 `int(seconds * sr)`，`duration` 返回 `n / sr`。
+- 帧率：16000 / 256 = 62.5，向下取整是 62；24000 / 320 正好是 75。
 
 @@ item d11-02
 type: code
 title: STFT 帧数公式
 level: 2
+cards: 分帧：用 unfold 把波形切成一段一段; STFT：频点数和帧数
 targets: n_frames
 ref: day11
 --- context
-TODO
+模型看到的序列长度就是 STFT 的帧数。帧数算错一帧，mel 和文字、和音频 token 的对齐就会错位，拼接时还可能报 shape 不匹配。
 --- prompt
-02  STFT 的帧数公式
+写 `n_frames(n_sample, n_fft, hop_length, center=True)`，返回 `torch.stft` 会产生的帧数（int）。不许调用 `torch.stft`，用公式算。
+
+- `center=True`：先在波形两头各补 `n_fft // 2` 个点，再分帧
+- `center=False`：不补。第一帧从第 0 个点开始，每帧 `n_fft` 个点，最后凑不满一帧的尾巴丢掉
+
+检查会拿你的结果和真正的 `torch.stft(...).shape[-1]` 对比（`n_fft` 都是偶数）。
 --- starter
 def n_frames(n_sample, n_fft, hop_length, center=True):
-    """center=True（默认）时前后各补 n_fft//2，帧数 = n_sample // hop + 1
-    center=False 时帧数 = (n_sample - n_fft) // hop + 1
-    """
-    # --- TODO 02 ---
+    """返回 torch.stft 的帧数。"""
     raise todo()
 --- solution
 def n_frames(n_sample, n_fft, hop_length, center=True):
@@ -82,30 +347,36 @@ def t02():
         real = torch.stft(torch.zeros(n), nf, hop, window=torch.hann_window(nf),
                           return_complex=True, center=True).shape[-1]
         true(n_frames(n, nf, hop, True) == real,
-             f"center=True: 你算 {n_frames(n, nf, hop, True)}, 实际 {real}")
+             f"center=True, n={n}, n_fft={nf}, hop={hop}: 你算 {n_frames(n, nf, hop, True)}, 实际 {real}")
         real2 = torch.stft(torch.zeros(n), nf, hop, window=torch.hann_window(nf),
                            return_complex=True, center=False).shape[-1]
         true(n_frames(n, nf, hop, False) == real2,
-             f"center=False: 你算 {n_frames(n, nf, hop, False)}, 实际 {real2}")
+             f"center=False, n={n}, n_fft={nf}, hop={hop}: 你算 {n_frames(n, nf, hop, False)}, 实际 {real2}")
 --- hints
-- TODO
+- center=False 和 unfold 一模一样：帧的起点是 0、hop、2·hop……最后一帧必须完整放得下。
+- center=False：`(n_sample - n_fft) // hop_length + 1`。center=True 时长度变成 `n_sample + n_fft`，代进同一个公式再化简。
+- center=True 化简后是 `n_sample // hop_length + 1`。
 
 @@ item d11-03
 type: code
 title: STFT 幅度谱
 level: 2
+cards: STFT：频点数和帧数; 幅度和相位：幅度谱丢掉了什么
 targets: stft_mag
 ref: day11
 --- context
-TODO
+几乎所有语音模型的第一步都是「波形 → 幅度谱」。这个函数要能处理单条音频和整个 batch，窗口还要和输入在同一个 device 上，否则一上 GPU 就报错。
 --- prompt
-03  STFT：从波形到复数谱
+写 `stft_mag(wav, n_fft=1024, hop_length=256)`：
+
+- 输入 `wav`：`(T,)` 或 `(B, T)`
+- 用 `torch.stft`，窗口是 `torch.hann_window(n_fft)`（放在 `wav.device` 上），`center=True`，`return_complex=True`
+- 返回幅度（实数、非负）：`(n_fft//2 + 1, 帧数)` 或 `(B, n_fft//2 + 1, 帧数)`
+
+例：16000 个点 → `(513, 63)`；`(2, 16000)` → `(2, 513, 63)`。
 --- starter
 def stft_mag(wav, n_fft=1024, hop_length=256):
-    """wav: (T,) 或 (B, T) -> 幅度谱 (…, n_fft//2 + 1, frames)
-    用 torch.hann_window，center=True，return_complex=True，最后取 abs()。
-    """
-    # --- TODO 03 ---
+    """wav: (T,) 或 (B, T) -> 幅度谱 (..., n_fft//2 + 1, 帧数)"""
     raise todo()
 --- solution
 def stft_mag(wav, n_fft=1024, hop_length=256):
@@ -119,8 +390,8 @@ def t03():
     w = torch.randn(16000)
     m = stft_mag(w)
     shape_is(m, (513, 63), "1024//2+1 = 513 个频点, 16000//256+1 = 63 帧")
-    true((m >= 0).all(), "幅度谱不可能是负的（忘了取 abs？）")
-    true(not m.is_complex(), "应该是实数张量")
+    true(not m.is_complex(), "应该返回实数张量 —— 复数谱要取 .abs()")
+    true((m >= 0).all(), "幅度不可能是负的（是不是用了 .real 而不是 .abs()？）")
     shape_is(stft_mag(torch.randn(2, 16000)), (2, 513, 63), "batch 维要能带着走")
     # 一个纯音的能量应该集中在一个频点上
     t = torch.arange(16000).float() / 16000
@@ -128,63 +399,73 @@ def t03():
     peak = stft_mag(tone)[:, 30].argmax().item()
     true(abs(peak - 1000 * 1024 / 16000) < 2, f"1000Hz 纯音的峰值频点应该在 64 附近, 实际 {peak}")
 --- hints
-- TODO
+- `torch.stft(wav, n_fft, hop_length, window=..., center=True, return_complex=True)` 返回复数张量，batch 维它自己会处理。
+- 幅度是复数的模：`.abs()`，不是 `.real`。
+- 窗口：`torch.hann_window(n_fft, device=wav.device)`。
 
 @@ item d11-04
 type: code
 title: mel 刻度换算
-level: 2
+level: 1
+cards: mel 刻度和 mel 滤波器组
 targets: hz_to_mel, mel_to_hz
 ref: day11
 --- context
-TODO
+mel 刻度让频率轴更接近人耳的感觉，所以语音模型几乎都用 mel 谱。搭 mel 滤波器组、设置 `f_min` / `f_max`、看频谱图时，都要在 Hz 和 mel 之间来回换算。
 --- prompt
-04  mel 滤波器组
+写两个函数，输入输出都是 Python 数字（用 `math` 就行）：
+
+- `hz_to_mel(f)`：`2595 * log10(1 + f / 700)`
+- `mel_to_hz(m)`：它的逆函数，满足 `mel_to_hz(hz_to_mel(f)) ≈ f`
 --- starter
 def hz_to_mel(f):
-    """2595 * log10(1 + f / 700)"""
-    # --- TODO 04 ---
+    """Hz -> mel"""
     raise todo()
 
+
 def mel_to_hz(m):
-    """hz_to_mel 的逆函数。"""
-    # --- TODO 04b ---
+    """mel -> Hz（hz_to_mel 的逆函数）"""
     raise todo()
 --- solution
 def hz_to_mel(f):
     return 2595.0 * math.log10(1.0 + f / 700.0)
+
 
 def mel_to_hz(m):
     return 700.0 * (10 ** (m / 2595.0) - 1.0)
 --- tests
 @check("mel 刻度换算")
 def t04():
-    true(close(hz_to_mel(0), 0.0))
-    true(close(hz_to_mel(700), 2595 * math.log10(2), 1e-3))
+    true(close(hz_to_mel(0), 0.0), f"hz_to_mel(0) 应为 0, 实际 {hz_to_mel(0)}")
+    true(close(hz_to_mel(700), 2595 * math.log10(2), 1e-3), "hz_to_mel(700) 应为 2595 * log10(2) ≈ 781.2")
     for f in [100.0, 1000.0, 8000.0]:
-        true(close(mel_to_hz(hz_to_mel(f)), f, 1e-2), f"{f}Hz 往返对不上")
-    # mel 刻度在低频更"拉伸"
+        true(close(mel_to_hz(hz_to_mel(f)), f, 1e-2), f"{f}Hz 换成 mel 再换回来, 对不上 —— mel_to_hz 不是 hz_to_mel 的逆")
+    # mel 刻度在低频更「拉伸」
     true(hz_to_mel(200) - hz_to_mel(100) > hz_to_mel(8100) - hz_to_mel(8000),
          "低频 100Hz 的差在 mel 上应该比高频同样的 100Hz 差更大 —— 这就是 mel 的意义")
 --- hints
-- TODO
+- `math.log10(x)` 就是以 10 为底的 log。
+- 求逆：从 `m = 2595 * log10(1 + f/700)` 解出 f。先两边除以 2595，再两边做「10 的几次方」。
+- `mel_to_hz(m) = 700 * (10 ** (m / 2595) - 1)`。
 
 @@ item d11-05
 type: code
 title: log-mel
-level: 2
+level: 1
+cards: log-mel：取 log，再加 eps; mel 刻度和 mel 滤波器组
 targets: to_log_mel
 ref: day11
 --- context
-TODO
+log-mel 是 Whisper 等语音模型的标准输入。取 log 把巨大的音量差压小；eps 防止静音处出现 log(0) = -inf，否则一条静音样本就能让整次训练变 nan。
 --- prompt
-05  log-mel：为什么要取 log
+写 `to_log_mel(mag, fb, eps=1e-5)`：
+
+- `mag`：幅度谱，`(n_freq, 帧数)` 或 `(B, n_freq, 帧数)`
+- `fb`：mel 滤波器组，`(n_mels, n_freq)`
+- 返回 `log(fb @ mag + eps)`，shape 是 `(n_mels, 帧数)` 或 `(B, n_mels, 帧数)`
 --- starter
 def to_log_mel(mag, fb, eps=1e-5):
-    """mag: (…, n_freq, frames)   fb: (n_mels, n_freq) 的滤波器矩阵
-    -> log(fb @ mag + eps)，形状 (…, n_mels, frames)
-    """
-    # --- TODO 05 ---
+    """mag: (..., n_freq, 帧数), fb: (n_mels, n_freq) -> (..., n_mels, 帧数)"""
     raise todo()
 --- solution
 def to_log_mel(mag, fb, eps=1e-5):
@@ -199,28 +480,37 @@ def t05():
     eq(lm, (fb @ mag + 1e-5).log(), tol=1e-4)
     # batch 维
     shape_is(to_log_mel(torch.rand(4, 513, 63), fb), (4, 80, 63), "batch 维要能带着走")
+    # 静音: 必须加 eps
+    true(torch.isfinite(to_log_mel(torch.zeros(513, 2), fb)).all(),
+         "全 0（静音）的输入得到了 -inf —— log 里面要加 eps")
     # log 的意义: 把动态范围压下来
     loud, quiet = torch.full((513, 1), 100.0), torch.full((513, 1), 0.1)
     ratio_lin = (fb @ loud).mean() / (fb @ quiet).mean()
     ratio_log = to_log_mel(loud, fb).mean() / to_log_mel(quiet, fb).mean()
     true(abs(ratio_log) < abs(ratio_lin) / 10, "取 log 之后动态范围应该被大幅压缩")
 --- hints
-- TODO
+- `fb @ mag`：`(80, 513) @ (513, 63)` → `(80, 63)`。mag 带 batch 时，`@` 会自动广播。
+- 一行就够：`torch.log(fb @ mag + eps)`。
 
 @@ item d11-06
 type: code
 title: 峰值归一化
-level: 2
+level: 1
+cards: 峰值归一化：把音量拉齐
 targets: peak_normalize
 ref: day11
 --- context
-TODO
+不同录音的音量差很多，训练前常把音量拉齐。数据集里总会混进几条全静音的文件，归一化时没处理除以 0，就会产生 nan，悄悄污染整次训练。
 --- prompt
-06  波形归一化
+写 `peak_normalize(wav, target=0.95)`：
+
+- 整条波形乘同一个数，让绝对值最大的那个采样点正好等于 `target`
+- 全零输入原样返回，不能出现 nan
+
+例：`[0.1, -0.4, 0.2]` 的峰值是 0.4，乘 0.95 / 0.4 后变成 `[0.2375, -0.95, 0.475]`。
 --- starter
 def peak_normalize(wav, target=0.95):
-    """把波形按峰值缩放到 target。全零输入要原样返回，不能除以 0。"""
-    # --- TODO 06 ---
+    """把波形按峰值缩放到 target；全零输入原样返回。"""
     raise todo()
 --- solution
 def peak_normalize(wav, target=0.95):
@@ -233,29 +523,35 @@ def peak_normalize(wav, target=0.95):
 def t06():
     w = torch.tensor([0.1, -0.4, 0.2])
     o = peak_normalize(w)
-    true(close(o.abs().max().item(), 0.95), f"峰值应为 0.95, 实际 {o.abs().max().item():.4f}")
-    eq(o / o[0], w / w[0], msg="波形形状不能变，只能整体缩放")
+    true(close(o.abs().max().item(), 0.95), f"峰值应为 0.95, 实际 {o.abs().max().item():.4f}（峰值要看绝对值）")
+    eq(o / o[0], w / w[0], msg="波形的形状不能变，只能整体乘同一个数")
     z = torch.zeros(5)
     eq(peak_normalize(z), z, msg="全零输入不能除以 0 变成 nan")
 --- hints
-- TODO
+- 峰值是 `wav.abs().max()`。要取绝对值：-0.4 比 0.2 更「响」。
+- 先判断 `if peak == 0: return wav`，否则返回 `wav * (target / peak)`。
 
 @@ item d11-07
 type: code
 title: 分帧 unfold
-level: 2
+level: 1
+cards: 分帧：用 unfold 把波形切成一段一段
 targets: frame
 ref: day11
 --- context
-TODO
+分帧是 STFT、按帧算音量、语音活动检测的第一步。`unfold` 一行完成、不复制数据；用 Python 循环一帧一帧切，长音频上会慢很多。
 --- prompt
-07  分帧 —— unfold 的第一次登场
+写 `frame(wav, frame_len, hop)`：
+
+- `wav`：`(T,)`
+- 返回 `(帧数, frame_len)`，第 i 帧是 `wav[i*hop : i*hop + frame_len]`
+- 最后凑不满一帧的尾巴丢掉
+- 用 `tensor.unfold`，不要写循环
+
+例：`frame(torch.arange(10.), 4, 2)` 有 4 帧，第 1 帧是 `[2, 3, 4, 5]`。
 --- starter
 def frame(wav, frame_len, hop):
-    """wav: (T,) -> (n_frames, frame_len)，相邻帧起点相差 hop，不足的尾巴丢弃。
-    用 tensor.unfold，不许写循环。
-    """
-    # --- TODO 07 ---
+    """(T,) -> (帧数, frame_len)"""
     raise todo()
 --- solution
 def frame(wav, frame_len, hop):
@@ -265,21 +561,23 @@ def frame(wav, frame_len, hop):
 def t07():
     w = torch.arange(10).float()
     f = frame(w, 4, 2)
-    shape_is(f, (4, 4))
-    eq(f[0], torch.tensor([0., 1., 2., 3.]))
-    eq(f[1], torch.tensor([2., 3., 4., 5.]))
-    eq(f[3], torch.tensor([6., 7., 8., 9.]))
+    shape_is(f, (4, 4), "10 个点, 帧长 4, hop 2 -> (10 - 4) // 2 + 1 = 4 帧")
+    eq(f[0], torch.tensor([0., 1., 2., 3.]), msg="第 0 帧应该是 wav[0:4]")
+    eq(f[1], torch.tensor([2., 3., 4., 5.]), msg="第 1 帧应该从 hop=2 开始")
+    eq(f[3], torch.tensor([6., 7., 8., 9.]), msg="最后一帧应该是 wav[6:10]")
 --- hints
-- TODO
+- `x.unfold(dim, size, step)`：在第 dim 维上，每隔 step 取一段长度为 size 的片段。
+- `wav.unfold(0, frame_len, hop)`。
 
 @@ item d11-08
 type: choice
 title: 幅度谱丢掉了什么
 level: 2
+cards: 幅度和相位：幅度谱丢掉了什么
 --- context
-TODO
+mel 谱只保留了幅度。明白丢掉的是什么，才明白为什么 TTS 除了预测 mel 的模型，还要一个 vocoder；面试问「mel 谱为什么不能直接播放」，答的就是这个。
 --- prompt
-把一段波形做 STFT，只保留幅度（把相位全设成 0），再用 istft 变回波形。和原波形比，结果会怎样？
+把一段波形做 STFT，只保留幅度（相位全部设成 0），再用 `torch.istft` 变回波形。和原波形比，结果会怎样？
 --- options
 - 几乎一样：相位只影响音色的细节
 - 面目全非：相对误差很大，因为相位决定了各个频率分量怎么叠加
@@ -287,26 +585,27 @@ TODO
 - 程序报错：没有相位就不能做 istft
 answer: 2
 --- explain
-幅度谱只记录「每个频率有多强」，不记录「每个频率从哪里开始」。丢掉相位再重建，相对误差通常远大于 0.5。所以 TTS 模型预测出 mel 谱之后，还需要一个 vocoder（比如 Griffin-Lim 或神经网络声码器）把相位「猜」回来。
+幅度只记录「每个频率有多强」，相位记录「每个频率的波从哪里开始」。相位全设成 0，各个频率分量叠加的方式就全乱了。知识卡片里的实验：相对误差大约是 1.0，误差和原信号本身一样大。istft 不会自己算相位，给它什么就用什么，所以也不会报错。这就是 TTS 需要 vocoder（声码器）的原因：模型预测出 mel 谱后，要靠 vocoder（Griffin-Lim 或神经网络）把相位「猜」回来。
 --- hints
-- 想一想：两个同频率、相位差半个周期的正弦波相加会发生什么。
+- 两个频率相同、但相位差半个周期的正弦波加在一起，会发生什么？（会互相抵消。）
+- 到卡片「幅度和相位」里运行那个实验，看最后一行的相对误差。
 
 @@ item d11-09
 type: code
 title: mel -> conv 输入
-level: 2
+level: 1
+cards: 进模型之前：通道维、padding 和 mask
 targets: mel_to_image
 ref: day11
 --- context
-TODO
+很多音频模型（声音分类、语音增强、扩散式 TTS）直接把 mel 谱当成图片，用图像里的 Conv2d / UNet 处理。关键一步就是补上通道维。
 --- prompt
-09  mel 谱就是单通道图像
+写 `mel_to_image(mel)`：`(B, n_mels, 帧数)` → `(B, 1, n_mels, 帧数)`，也就是在第 1 维插入一个长度为 1 的通道维。
+
+检查会把结果直接喂给 `nn.Conv2d(1, 16, 3, 1, 1)`。
 --- starter
 def mel_to_image(mel):
-    """mel: (B, n_mels, frames) -> (B, 1, n_mels, frames)
-    加一个通道维，之后就能直接喂给 Day 8 写的那些 Conv2d。
-    """
-    # --- TODO 09 ---
+    """(B, n_mels, 帧数) -> (B, 1, n_mels, 帧数)"""
     raise todo()
 --- solution
 def mel_to_image(mel):
@@ -316,30 +615,34 @@ def mel_to_image(mel):
 def t09():
     m = torch.randn(4, 80, 100)
     x = mel_to_image(m)
-    shape_is(x, (4, 1, 80, 100))
+    shape_is(x, (4, 1, 80, 100), "通道维要加在第 1 维（batch 后面）")
     conv = nn.Conv2d(1, 16, 3, 1, 1)          # Day 8 的积木原样能用
     shape_is(conv(x), (4, 16, 80, 100))
 --- hints
-- TODO
+- `unsqueeze(dim)` 在第 dim 维插入一个长度为 1 的维度。
+- `mel.unsqueeze(1)`。
 
 @@ item d11-10
 type: code
 title: 变长 mel 的 padding
 level: 2
+cards: 进模型之前：通道维、padding 和 mask; log-mel：取 log，再加 eps
 targets: pad_mels
 ref: day11
 --- context
-TODO
+真实数据里每条音频的长度都不一样。把它们拼成一个 batch，再告诉模型哪些帧是补出来的，是每个语音训练脚本都有的一步；mask 错了，模型会去学 padding。
 --- prompt
-10  变长音频的 padding 与 mask
+写 `pad_mels(mels, pad_value=-11.5)`：
+
+- `mels`：一个 list，每个元素是 `(n_mels, T_i)`，各条的 `T_i` 不一样
+- 返回 `(batch, mask)`
+- `batch`：`(B, n_mels, Tmax)`，每条 mel 靠左放，右边空出来的位置填 `pad_value`
+- `mask`：`(B, Tmax)`，真实帧为 1，padding 帧为 0（用 long 类型）
+
+例：帧数 3、5、1 的三条 mel → `batch` 是 `(3, n_mels, 5)`，mask 第一行是 `[1, 1, 1, 0, 0]`。
 --- starter
 def pad_mels(mels, pad_value=-11.5):
-    """mels: list of (n_mels, T_i)，T 不等长。
-    返回 (batch, mask)：
-      batch: (B, n_mels, Tmax)，右侧补 pad_value（log-mel 的静音大约是 -11.5）
-      mask : (B, Tmax)，有效帧 1，pad 帧 0
-    """
-    # --- TODO 10 ---
+    """mels: list of (n_mels, T_i) -> batch (B, n_mels, Tmax), mask (B, Tmax)"""
     raise todo()
 --- solution
 def pad_mels(mels, pad_value=-11.5):
@@ -358,25 +661,32 @@ def pad_mels(mels, pad_value=-11.5):
 def t10():
     ms = [torch.ones(4, 3), torch.ones(4, 5) * 2, torch.ones(4, 1) * 3]
     b, mask = pad_mels(ms, pad_value=-11.5)
-    shape_is(b, (3, 4, 5))
-    shape_is(mask, (3, 5))
-    eq(b[0, :, :3], torch.ones(4, 3))
-    eq(b[0, :, 3:], torch.full((4, 2), -11.5))
-    eq(mask, torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1], [1, 0, 0, 0, 0]]))
+    shape_is(b, (3, 4, 5), "batch 应为 (B, n_mels, Tmax)")
+    shape_is(mask, (3, 5), "mask 应为 (B, Tmax)")
+    eq(b[0, :, :3], torch.ones(4, 3), msg="真实帧要原样拷到左边")
+    eq(b[0, :, 3:], torch.full((4, 2), -11.5), msg="右边的 padding 要填 pad_value")
+    eq(mask, torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1], [1, 0, 0, 0, 0]]), msg="mask: 真实帧 1, padding 帧 0")
 --- hints
-- TODO
+- 先算 `Tmax = max(m.size(1) for m in mels)`，再用 `torch.full((B, n_mels, Tmax), pad_value)` 建好底板。
+- mask 先建 `torch.zeros(B, Tmax, dtype=torch.long)`；循环每条：`batch[i, :, :T] = m`，`mask[i, :T] = 1`。
+- 另一种写法：每条用 `F.pad(m, (0, Tmax - T), value=pad_value)` 补齐，再 `torch.stack`。
 
 @@ item d11-11
 type: code
 title: 音频张量 shape 账
 level: 2
+cards: STFT：频点数和帧数; mel 刻度和 mel 滤波器组; 进模型之前：通道维、padding 和 mask
 targets: AUDIO_SHAPES
 ref: day11
 --- context
-TODO
+音频代码里的 bug 大多是 shape 错位。能不跑代码、心算出每一步的 shape，读论文、debug、面试都会快得多。
 --- prompt
-11  三个张量的 shape 账
-1 秒 16kHz 单声道，n_fft=1024，hop=256，n_mels=80
+一段 1 秒、16kHz 的单声道音频，`n_fft=1024`，`hop=256`（center=True），`n_mels=80`。
+
+把 `AUDIO_SHAPES` 里每个 `None` 换成对应张量的 shape，写成 tuple，比如 `(3, 4)`。
+
+- 「喂进 Conv2d 前」指 batch 大小为 1、加好通道维之后的 4 维张量
+- 只有一个维度的 tuple 要带逗号：`(16000,)`
 --- starter
 AUDIO_SHAPES = {
     "waveform":       None,
@@ -403,22 +713,27 @@ def t11():
         "log-mel": (80, 63),
         "喂进 Conv2d 前": (1, 1, 80, 63),
     }
-    wrong = [f"{k!r}: 你填 {v}, 应为 {want[k]}" for k, v in AUDIO_SHAPES.items()
-             if v is None or tuple(v) != want[k]]
-    true(not wrong, "\n       " + "\n       ".join(wrong))
+    wrong = [f"{k!r}: 你填 {AUDIO_SHAPES.get(k)}, 应为 {v}" for k, v in want.items()
+             if AUDIO_SHAPES.get(k) is None or tuple(AUDIO_SHAPES[k]) != v]
+    true(not wrong, "这几项不对:\n" + "\n".join(wrong))
 --- hints
-- TODO
+- 频点数 = n_fft // 2 + 1；帧数（center=True）= T // hop + 1。
+- 幅度谱是复数谱逐个取 abs，shape 不变；log-mel 把频点数那一维换成 n_mels。
+- Conv2d 要 `(B, C, H, W)`：这里 B = 1，C = 1。
 
 @@ item d11-12
 type: fix
 title: 找 bug: log_mel_buggy
 level: 2
+cards: 幅度和相位：幅度谱丢掉了什么; log-mel：取 log，再加 eps
 targets: log_mel_buggy
 ref: day11
 --- context
-TODO
+这是真实音频代码里最常见的两个 bug：把复数的实部当成幅度，以及 log 忘了加 eps。它们不一定报错，只会让训练在某一步突然变成 nan。
 --- prompt
-12  找 bug —— 这个 mel 提取有 3 处错
+`log_mel_buggy(wav, fb)` 想算 log-mel，可它的输出里有 nan，数值也和正确做法（先 d11-03 的 `stft_mag`，再 d11-05 的 `to_log_mel`，eps = 1e-5）对不上。
+
+有两行写错了。改好它们，让输出和正确做法一致（容差 1e-4）。函数名和参数不要改。
 --- starter
 def log_mel_buggy(wav, fb, n_fft=1024, hop=256):
     spec = torch.stft(wav, n_fft, hop, window=torch.hann_window(n_fft), return_complex=True)
@@ -428,9 +743,9 @@ def log_mel_buggy(wav, fb, n_fft=1024, hop=256):
 --- solution
 def log_mel_buggy(wav, fb, n_fft=1024, hop=256):
     spec = torch.stft(wav, n_fft, hop, window=torch.hann_window(n_fft), return_complex=True)
-    mag = spec.abs()                    # 修 1+3: real -> abs，保证非负
+    mag = spec.abs()                    # 幅度是复数的模, 一定 >= 0; .real 可能是负数
     mel = fb @ mag
-    return torch.log(mel + 1e-5)        # 修 2: 加 eps
+    return torch.log(mel + 1e-5)        # 加 eps, 防止 log(0) = -inf
 --- tests
 @check("找 bug: log_mel_buggy")
 def t12():
@@ -440,9 +755,196 @@ def t12():
     got = log_mel_buggy(w, fb)
     want = to_log_mel(stft_mag(w), fb)
     shape_is(got, want.shape)
-    true(torch.isfinite(got).all(), "出现了 -inf/nan —— log 里面要加 eps")
+    true(torch.isfinite(got).all(),
+         "输出里有 nan 或 -inf：log 的输入出现了负数或 0 —— 幅度要用 .abs()，log 里要加 eps")
     eq(got, want, tol=1e-4,
-       msg="三处: 要取 abs() 而不是 real（幅度是复数的模）；log 要加 eps 防止 log(0)；"
-           "取完 abs 才能保证非负")
+       msg="数值对不上。检查两处：幅度要用 .abs()（复数的模），不是 .real；log 里要加 eps = 1e-5")
 --- hints
-- TODO
+- 幅度是复数的「模」。`.real` 只是实部，可能是负数，而 log(负数) = nan。
+- 就算幅度都非负，静音处 mel = 0，log(0) = -inf。
+- 改成 `mag = spec.abs()` 和 `return torch.log(mel + 1e-5)`。
+
+@@ item d11-13
+type: predict
+title: Whisper 的 STFT 设置
+level: 2
+cards: STFT：频点数和帧数
+--- context
+Whisper 用 16kHz、n_fft=400（25 毫秒一帧）、hop=160（10 毫秒一跳）。看到这组参数就能说出 STFT 的 shape 和 dtype，是读语音模型代码的基本功。
+--- prompt
+这段代码会打印什么？（三行）
+--- code
+wav = torch.zeros(16000)                   # 1 秒, 16kHz
+spec = torch.stft(wav, n_fft=400, hop_length=160,
+                  window=torch.hann_window(400), return_complex=True)
+print(tuple(spec.shape))
+print(spec.dtype)
+print(spec.abs().dtype)
+--- explain
+频点数 = 400 // 2 + 1 = 201。帧数（默认 center=True）= 16000 // 160 + 1 = 101。所以是 `(201, 101)`。
+
+STFT 的输出是复数，dtype 是 `torch.complex64`；取 `.abs()` 之后变成实数 `torch.float32`。Whisper 就是在这样的谱上再做 mel 和 log，得到它的输入。
+--- hints
+- 频点数只看 n_fft；帧数（center=True）只看 T 和 hop。
+- `.abs()` 把每个复数变成它的模，模是实数。
+
+@@ item d11-14
+type: choice
+title: n_fft 加倍，shape 怎么变
+level: 2
+cards: STFT：频点数和帧数
+--- context
+调 n_fft 是在「频率分得多细」和「时间分得多细」之间做取舍。先知道它改变的是哪一维，改配置时才不会把下游的 shape 弄坏。
+--- prompt
+1 秒 16kHz 的音频，`hop=256`，`center=True`。`n_fft=1024` 时幅度谱是 `(513, 63)`。
+
+把 `n_fft` 改成 2048（hop 不变），幅度谱的 shape 变成多少？
+--- options
+- (513, 126)
+- (1025, 32)
+- (1025, 63)
+- (1025, 55)
+answer: 3
+--- explain
+频点数 = 2048 // 2 + 1 = 1025：n_fft 越大，频率分得越细（每个频点 16000 / 2048 ≈ 7.8 Hz）。
+
+帧数在 center=True 时 = 16000 // 256 + 1 = 63，只由 hop 决定，和 n_fft 无关。(1025, 55) 是 center=False 的答案：(16000 - 2048) // 256 + 1 = 55。
+
+代价是：每帧现在覆盖 2048 个点（128 毫秒），时间上更模糊。
+--- hints
+- 分开想：哪一维只和 n_fft 有关？哪一维只和 hop 有关？
+- center=True 时，帧数 = T // hop + 1。
+
+@@ item d11-15
+type: predict
+title: 静音的 log-mel
+level: 2
+cards: log-mel：取 log，再加 eps
+--- context
+静音在音频数据里到处都是：开头、结尾、padding。知道静音经过 log-mel 会变成什么数，才能选对 padding 值，也能一眼认出日志里的 -inf 是从哪来的。
+--- prompt
+这段代码会打印什么？（三行）
+--- code
+mag = torch.zeros(513, 10)                 # 10 帧完全静音
+fb = torch.rand(80, 513)
+log_mel = torch.log(fb @ mag + 1e-5)
+print(tuple(log_mel.shape))
+print(round(log_mel.min().item(), 1), round(log_mel.max().item(), 1))
+print(torch.isinf(torch.log(fb @ mag)).all().item())
+--- explain
+`fb @ mag`：`(80, 513) @ (513, 10)` → `(80, 10)`。
+
+mag 全是 0，所以不管 fb 是什么，mel 全是 0。加上 eps 后每个格子都是 log(1e-5) ≈ -11.5，最小值和最大值都是 -11.5。这就是 log-mel 的「静音地板」，也是 `pad_mels` 默认用 -11.5 补齐的原因。
+
+不加 eps 时每个格子都是 log(0) = -inf，所以最后一行是 `True`。
+--- hints
+- fb 是随机的，但 mag 全是 0。乘出来是多少？
+- log(1e-5) = -5 × ln(10) ≈ -11.5。
+
+@@ item d11-16
+type: choice
+title: 采样率对不上
+level: 2
+cards: 波形和采样率：一秒有多少个数; STFT：频点数和帧数; mel 刻度和 mel 滤波器组
+--- context
+线上的音频来自各种设备：手机录音常是 48kHz，电话是 8kHz，音乐是 44.1kHz。采样率不一致不会报错，模型只会悄悄变差，这是语音服务里很常见的事故。
+--- prompt
+一个模型用 16kHz 音频的 log-mel 训练（n_fft=1024，hop=256，mel 滤波器按 sr=16000 生成）。上线后有人上传了 44.1kHz 的文件，代码没有重采样，直接算 log-mel 喂给模型。会发生什么？
+--- options
+- 报错：shape 对不上，模型根本跑不起来
+- 不报错，但每帧只覆盖约 5.8 毫秒（训练时是 16 毫秒），每个频点代表的 Hz 也变了。模型看到的像是被放慢、音调变低的声音，效果悄悄变差
+- 没有影响：mel 谱和采样率无关
+- 效果更好：采样率越高，信息越多
+answer: 2
+--- explain
+log-mel 的 shape 是 `(80, 帧数)`，帧数本来就随音频长度变，所以不会报错。
+
+但 hop=256 在 44.1kHz 下只有 256 / 44100 ≈ 5.8 毫秒。同样 3 秒的音频变成 517 帧（16kHz 时是 188 帧），同一个音拉长了，像放慢了。
+
+第 k 个频点代表 k × sr / n_fft Hz：第 64 个频点在 16kHz 下是 1000 Hz，在 44.1kHz 下是 2756 Hz。模型却还当它是 1000 Hz，mel 滤波器全都对错了位置。
+
+正确做法：读音频时检查采样率，不一致就先重采样到 16kHz（比如 `torchaudio.functional.resample`）。
+--- hints
+- log-mel 的哪一维会随音频长度变化？它变了会报错吗？
+- 算一下：hop=256 在 16kHz 和 44.1kHz 下各是多少毫秒？第 64 个频点各代表多少 Hz？
+
+@@ item d11-17
+type: code
+title: 闭卷：STFT 幅度谱
+level: 2
+exam: yes
+cards: STFT：频点数和帧数
+targets: stft_mag
+ref: day11
+--- context
+「波形 → 幅度谱」是所有音频模型的第一步。闭卷再写一遍，确认你记住了 torch.stft 的参数和取幅度的方法。
+--- prompt
+写 `stft_mag(wav, n_fft=1024, hop_length=256)`：
+
+- 输入 `(T,)` 或 `(B, T)`
+- Hann 窗（和 wav 在同一个 device 上），`center=True`
+- 返回实数、非负的幅度谱：`(n_fft//2 + 1, 帧数)` 或 `(B, n_fft//2 + 1, 帧数)`
+--- starter
+def stft_mag(wav, n_fft=1024, hop_length=256):
+    raise todo()
+--- solution
+def stft_mag(wav, n_fft=1024, hop_length=256):
+    win = torch.hann_window(n_fft, device=wav.device)
+    return torch.stft(wav, n_fft, hop_length, window=win,
+                      center=True, return_complex=True).abs()
+--- tests
+@check("STFT 幅度谱")
+def t03():
+    seed(0)
+    w = torch.randn(16000)
+    m = stft_mag(w)
+    shape_is(m, (513, 63), "1024//2+1 = 513 个频点, 16000//256+1 = 63 帧")
+    true(not m.is_complex(), "应该返回实数张量 —— 复数谱要取 .abs()")
+    true((m >= 0).all(), "幅度不可能是负的（是不是用了 .real 而不是 .abs()？）")
+    shape_is(stft_mag(torch.randn(2, 16000)), (2, 513, 63), "batch 维要能带着走")
+    # 一个纯音的能量应该集中在一个频点上
+    t = torch.arange(16000).float() / 16000
+    tone = torch.sin(2 * math.pi * 1000 * t)
+    peak = stft_mag(tone)[:, 30].argmax().item()
+    true(abs(peak - 1000 * 1024 / 16000) < 2, f"1000Hz 纯音的峰值频点应该在 64 附近, 实际 {peak}")
+
+@@ item d11-18
+type: code
+title: 闭卷：变长 mel 的 padding
+level: 2
+exam: yes
+cards: 进模型之前：通道维、padding 和 mask
+targets: pad_mels
+ref: day11
+--- context
+把长短不一的样本拼成 batch 并给出 mask，是每个音频训练脚本都有的一步。闭卷写一遍，确认 shape 和 mask 的约定都记住了。
+--- prompt
+写 `pad_mels(mels, pad_value=-11.5)`：
+
+- `mels`：list，每个元素 `(n_mels, T_i)`，长度不一
+- 返回 `(batch, mask)`：`batch` 是 `(B, n_mels, Tmax)`，每条靠左放，右边填 `pad_value`；`mask` 是 `(B, Tmax)`，真实帧 1、padding 帧 0（long 类型）
+--- starter
+def pad_mels(mels, pad_value=-11.5):
+    raise todo()
+--- solution
+def pad_mels(mels, pad_value=-11.5):
+    B = len(mels)
+    n_mels = mels[0].size(0)
+    Tmax = max(m.size(1) for m in mels)
+    batch = torch.full((B, n_mels, Tmax), pad_value)
+    mask = torch.zeros(B, Tmax, dtype=torch.long)
+    for i, m in enumerate(mels):
+        T = m.size(1)
+        batch[i, :, :T] = m
+        mask[i, :T] = 1
+    return batch, mask
+--- tests
+@check("变长 mel 的 padding")
+def t10():
+    ms = [torch.ones(4, 3), torch.ones(4, 5) * 2, torch.ones(4, 1) * 3]
+    b, mask = pad_mels(ms, pad_value=-11.5)
+    shape_is(b, (3, 4, 5), "batch 应为 (B, n_mels, Tmax)")
+    shape_is(mask, (3, 5), "mask 应为 (B, Tmax)")
+    eq(b[0, :, :3], torch.ones(4, 3), msg="真实帧要原样拷到左边")
+    eq(b[0, :, 3:], torch.full((4, 2), -11.5), msg="右边的 padding 要填 pad_value")
+    eq(mask, torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1], [1, 0, 0, 0, 0]]), msg="mask: 真实帧 1, padding 帧 0")

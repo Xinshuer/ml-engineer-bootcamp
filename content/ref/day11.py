@@ -1,11 +1,4 @@
-# imports of the drill file (the checks use them)
-import sys, os
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-"""Day 11 参考答案。"""
+"""Day 11 reference module: the shape language of audio (hidden setup for the exercises)."""
 import math
 
 import torch
@@ -90,6 +83,6 @@ def pad_mels(mels, pad_value=-11.5):
 
 def log_mel_buggy(wav, fb, n_fft=1024, hop=256):
     spec = torch.stft(wav, n_fft, hop, window=torch.hann_window(n_fft), return_complex=True)
-    mag = spec.abs()                    # 修 1+3: real -> abs，保证非负
+    mag = spec.abs()
     mel = fb @ mag
-    return torch.log(mel + 1e-5)        # 修 2: 加 eps
+    return torch.log(mel + 1e-5)

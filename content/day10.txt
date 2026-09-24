@@ -3,34 +3,350 @@ title: DiT + Flow Matching：文生图其实就是你写过的 Transformer
 part: 图像生成
 hours: 3–4 小时
 --- goal
-TODO: 一句话写今天学完能做什么。
+学完今天，你能把图片切成 patch token，用 adaLN-Zero 把时间条件注入 Transformer block，拼出一个 mini DiT，并用 rectified flow 写出它的训练 loss 和欧拉采样循环。
 --- checklist
-- 先清空复习区
-- 读完知识卡片并改动运行
-- 练习区全部通过
+- 先清空复习区（之前看过答案的题，从空白重做）
+- 读完 8 张知识卡片，每段代码至少改一个数再运行一次
+- 练习区全部通过，DiTBlock 和 MiniDiT 是今天最重要的两题
+- 最后做闭卷区：DiTBlock 和 flow_loss 各从空白写一遍
+
+@@ concept
+title: patchify：把图片切成 token
+--- body
+Transformer 吃的是一串 token，形状 (B, N, D)。图片的形状是 (B, C, H, W)。DiT（Diffusion Transformer）的做法：把图片切成 p×p 的小方块（patch），每个方块拉平成一个向量，一个方块就是一个 token。
+
+以 (B, C, H, W) = (2, 3, 8, 8)、p = 2 为例：
+
+- 竖着 8/2 = 4 块，横着 4 块，一共 N = 4×4 = 16 个 patch
+- 每个 patch 有 C×p×p = 3×2×2 = 12 个数
+- 结果是 (2, 16, 12)
+
+只用 reshape 和 permute 三步就能切好：
+
+1. `x.reshape(B, C, nh, p, nw, p)`：把 H 拆成 (nh, p)，W 拆成 (nw, p)。nh = H/p 表示「第几行方块」，后面那个 p 表示「方块里的第几行像素」
+2. `permute(0, 2, 4, 1, 3, 5)`，变成 (B, nh, nw, C, p, p)：「哪一块」的两个维度放前面，「块里的内容」放后面
+3. `reshape(B, nh*nw, C*p*p)`：前面两维合成 N，后面三维合成一个向量
+
+patch 按行优先排列：token 0 是左上角那块，token 1 是它右边那块，token nw 是第二行的第一块。每块内部先按通道 C，再按块里的行、块里的列展开。
+
+为什么不能直接 `x.reshape(B, N, C*p*p)`？内存里的数是按「一整行像素接着一整行」排的。直接 reshape 会把一行里连续的几个像素塞进同一个 token，得到的不是方块。下面的代码里能看到。
+
+unpatchify 是反过来：先 reshape 回 (B, nh, nw, C, p, p)，再 permute 回 (B, C, nh, p, nw, p)，最后 reshape 成 (B, C, H, W)。
+--- code
+x = torch.arange(16.).reshape(1, 1, 4, 4)     # 1 张图，1 个通道，4×4 像素
+print(x[0, 0])
+
+B, C, H, W = x.shape
+p = 2
+nh, nw = H // p, W // p                        # 竖着 2 块，横着 2 块
+t = x.reshape(B, C, nh, p, nw, p)              # 把 H 拆成 (nh, p)，W 拆成 (nw, p)
+t = t.permute(0, 2, 4, 1, 3, 5)                # (B, nh, nw, C, p, p)
+tok = t.reshape(B, nh * nw, C * p * p)
+print(tok.shape)                               # 4 个 patch，每个 1*2*2 = 4 个数
+print(tok[0])                                  # 第 0 行是左上角那块：0 1 4 5
+
+wrong = x.reshape(B, nh * nw, C * p * p)       # 错误做法：不 permute，直接 reshape
+print(wrong[0, 0])                             # 0 1 2 3：是一整行像素，不是方块
+
+@@ concept
+title: 二维位置编码：告诉模型每块在哪
+--- body
+attention 本身不知道 token 的顺序：把输入的 token 打乱，输出也只是跟着同样打乱（练习区有一道题让你亲眼看到）。所以要给每个 token 加上一个「位置向量」，模型才分得清左上角和右下角。
+
+先看一维的正弦编码，和第 8 天的时间嵌入是同一个思路：用一组不同频率的 sin/cos 来表示一个数。
+
+- 选 d/2 个频率：`freqs = 1 / 10000 ** (arange(0, d, 2) / d)`
+- 位置 pos 的编码：`cat([sin(pos * freqs), cos(pos * freqs)])`，长度 d
+
+图片上的位置是两个数：（行，列）。DiT 的二维做法很简单：一半维度编码行号，另一半编码列号，拼起来。
+
+- `row = pe_1d(dim/2, 行号)`，`col = pe_1d(dim/2, 列号)`
+- 位置（i, j）的编码 = `cat([row[i], col[j]])`，长度 dim
+- token 按行优先排：第 k 个 token 在第 `k // w` 行、第 `k % w` 列
+
+例子：4×4 的网格、dim = 64。token 0 在 (0, 0)，token 3 在 (0, 3)，token 12 在 (3, 0)。token 0 和 3 同一行，所以前 32 维一样；token 0 和 12 同一列，所以后 32 维一样。
+
+这张表是固定的，不需要训练。在模型里用 `register_buffer` 存起来，它会跟着 `.to(device)` 一起走，但不会被优化器更新。
+--- code
+def pe_1d(d, pos):
+    freqs = 1.0 / (10000 ** (torch.arange(0, d, 2).float() / d))   # d/2 个频率
+    a = pos.float()[:, None] * freqs[None]                          # (len(pos), d/2)
+    return torch.cat([a.sin(), a.cos()], dim=-1)                    # (len(pos), d)
+
+print(pe_1d(4, torch.arange(3)))       # 3 个位置，每个 4 维；位置 0 是 [0, 0, 1, 1]
+
+h, w, dim = 2, 3, 8
+row = pe_1d(dim // 2, torch.arange(h))    # (2, 4)：每行一个
+col = pe_1d(dim // 2, torch.arange(w))    # (3, 4)：每列一个
+k = torch.arange(h * w)
+print("row:", k // w)                     # 每个 token 在第几行
+print("col:", k % w)                      # 每个 token 在第几列
+table = torch.stack([torch.cat([row[i // w], col[i % w]]) for i in range(h * w)])
+print(table.shape)                                  # (6, 8)
+print(torch.equal(table[0, :4], table[2, :4]))      # True：token 0 和 2 同在第 0 行
+print(torch.equal(table[0, 4:], table[3, 4:]))      # True：token 0 和 3 同在第 0 列
+
+@@ concept
+title: modulate：用条件缩放和平移
+--- body
+扩散模型每一步都必须知道「现在是什么时刻、噪声有多大」（时间 t）；按类别或文字出图时，还要知道类别或文字。这些信息先被变成一个条件向量 c，形状 (B, D)。问题是：怎么把 c 注入到每个 token 里？
+
+第 8 天的 UNet 用的是 FiLM：`h * (1 + scale) + shift`，scale 和 shift 由条件算出来。DiT 用同一个公式，只是放在 LayerNorm 之后，所以叫 adaLN（adaptive LayerNorm，自适应的层归一化）：
+
+`modulate(x, shift, scale) = x * (1 + scale) + shift`
+
+形状要对齐：x 是 (B, N, D)，有 N 个 token；shift 和 scale 是 (B, D)，每张图一组。要先 `unsqueeze(1)` 变成 (B, 1, D)，才能广播到这张图的所有 token 上。同一张图的 N 个 token 用同一组参数。
+
+为什么写 `1 + scale`，而不是 `scale`？这样 scale = 0、shift = 0 时，modulate 什么都不做（恒等）。网络刚开始时输出都在 0 附近，从「不改动」开始学，比从「全部乘 0」开始稳得多。
+
+为什么 LayerNorm 要写 `elementwise_affine=False`？普通 LayerNorm 自带可学习的 γ（缩放）和 β（平移）。adaLN 的 scale 和 shift 已经在做这件事，而且会随条件变化，所以 LayerNorm 自己那一份就关掉，免得重复。
+--- code
+x = torch.randn(2, 3, 4)          # 2 张图，每张 3 个 token，每个 4 维
+shift = torch.zeros(2, 4)
+scale = torch.zeros(2, 4)
+print(scale.shape, scale.unsqueeze(1).shape)
+
+y = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+print(torch.equal(y, x))          # True：全是 0 时是恒等
+
+scale[0] = 1.0                    # 只给第 0 张图 scale = 1
+y = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+print(torch.equal(y[0], 2 * x[0]), torch.equal(y[1], x[1]))   # True True：第 0 张图放大 2 倍，第 1 张不变
+
+@@ concept
+title: adaLN-Zero：gate 和零初始化
+--- body
+DiT 的每个 block 有两条残差分支：attention 和 MLP。每条分支要 3 组参数：shift、scale、gate。一共 6 组，都从条件 c 算出来：
+
+`SiLU → Linear(D, 6D)`，得到 (B, 6D)，再用 `chunk(6, dim=-1)` 切成 6 个 (B, D)，顺序是 shift_msa、scale_msa、gate_msa、shift_mlp、scale_mlp、gate_mlp（msa 是 multi-head self-attention 的缩写）。
+
+gate 乘在分支的输出上：`x = x + gate * attn(...)`。gate = 0 时，这条分支完全不起作用。
+
+adaLN-Zero 里的「Zero」：这个 Linear 的 weight 和 bias 都初始化为 0。于是训练刚开始时，6 组参数全是 0：
+
+- shift = scale = 0，modulate 是恒等
+- gate = 0，两条分支都被关掉
+- 整个 block 就是恒等映射：输出 = 输入
+
+为什么要这样？几十个 block 叠在一起时，如果每层一开始都随机改一点，信号会被越改越乱。从恒等出发，每层先「什么都不做」，训练再慢慢把 gate 打开。DiT 论文比较了几种注入条件的方式，adaLN-Zero 效果最好。
+
+零初始化不等于学不动：gate 的梯度来自分支的输出，不是 0，所以第一次更新之后 gate 就不再是 0 了。下面的代码能看到 gate 那一组确实有梯度。
+--- code
+D = 4
+lin = nn.Linear(D, 6 * D)
+nn.init.zeros_(lin.weight)
+nn.init.zeros_(lin.bias)
+
+c = torch.randn(2, D)                                 # 2 张图的条件向量
+groups = lin(F.silu(c)).chunk(6, dim=-1)
+print(len(groups), groups[0].shape)                   # 6 组，每组 (2, 4)
+print(all(bool((g == 0).all()) for g in groups))      # True：一开始全是 0
+
+x = torch.randn(2, 3, D)
+branch = nn.Linear(D, D)                              # 随便拿一个层当分支
+gate = groups[2]                                      # gate_msa
+y = x + gate.unsqueeze(1) * branch(x)
+print(torch.equal(y, x))                              # True：恒等映射
+
+y.pow(2).sum().backward()
+print(lin.weight.grad[2 * D:3 * D].abs().sum() > 0)   # tensor(True)：gate 那一组有梯度
+
+@@ concept
+title: DiTBlock：第 4 天的 Block 换个条件注入
+--- body
+先回忆第 4 天的 pre-LN Block：
+
+```
+x = x + attn(ln1(x))
+x = x + mlp(ln2(x))
+```
+
+DiTBlock 只改了三处：
+
+1. LayerNorm 不带 γ/β（`elementwise_affine=False`），后面接 modulate
+2. 每条分支的输出乘上 gate
+3. attention 不加 causal mask：图片的每一块都能看到所有其他块，没有「未来」一说
+
+```
+s1, sc1, g1, s2, sc2, g2 = modulation(c)
+x = x + g1.unsqueeze(1) * attn(modulate(norm1(x), s1, sc1))
+x = x + g2.unsqueeze(1) * mlp(modulate(norm2(x), s2, sc2))
+```
+
+MLP 和第 4 天一样：`Linear(D, 4D) → GELU → Linear(4D, D)`。x 的形状进来是 (B, N, D)，出去还是 (B, N, D)；c 是 (B, D)。
+
+练习区已经给你准备好了 `SelfAttention(dim, n_head)`，就是下面代码里这个类，直接用即可。它和第 4 天的 CausalSelfAttention 只差两点：没有 causal mask，所以也不需要 block_size 和那个下三角 buffer。它用的 `F.scaled_dot_product_attention` 和第 4 天手写的 softmax(QKᵀ/√d)·V 算的是同一个东西。
+--- code
+class SelfAttention(nn.Module):
+    def __init__(self, dim, n_head):
+        super().__init__()
+        self.n_head = n_head
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        hd = C // self.n_head
+        q, k, v = self.qkv(x).split(C, dim=-1)
+        q, k, v = (t.view(B, T, self.n_head, hd).transpose(1, 2) for t in (q, k, v))
+        o = F.scaled_dot_product_attention(q, k, v)     # 没有 is_causal=True：每个 token 看所有 token
+        return self.proj(o.transpose(1, 2).reshape(B, T, C))
+
+
+torch.manual_seed(0)
+attn = SelfAttention(8, 2)
+x = torch.randn(1, 4, 8)          # 4 个 token
+x2 = x.clone()
+x2[0, 3] += 1.0                   # 只改最后一个 token
+with torch.no_grad():
+    diff = (attn(x)[0, 0] - attn(x2)[0, 0]).abs().max()
+print(f"{diff.item():.4f}")       # 不是 0：第 0 个 token 也「看到」了最后一个
+
+@@ concept
+title: Rectified flow：从噪声到数据走直线
+--- body
+第 8 天的 DDPM：按 beta 调度一步步加噪，模型预测噪声 ε，公式里有 alpha、alpha_bar 一大串，原版采样要 1000 步。
+
+Flow matching 换了个思路。这里用最简单的一种，叫 rectified flow：
+
+- 取一份噪声 x0 ~ N(0, I) 和一张真图 x1
+- 在两者之间连一条直线：`x_t = (1 - t) * x0 + t * x1`，t 从 0 走到 1
+- t = 0 是纯噪声，t = 1 是干净数据。注意这和 DDPM 相反（DDPM 里 t 越大越吵）。有些论文和库（比如 Stable Diffusion 3）又把 t = 1 定为噪声，读别人代码时先看清约定
+- 沿这条直线走的速度（x_t 对 t 求导）：`v = x1 - x0`。它不随 t 变化，因为直线上的速度是恒定的
+
+模型学的就是这个速度：输入 (x_t, t)，输出一个和 x_t 同形状的 v。训练一步只有四件事：
+
+1. 每个样本随机抽一个 t ~ U(0, 1)：`torch.rand(B)`
+2. 抽和数据同形状的噪声：`torch.randn_like(x1)`
+3. 算出 x_t
+4. loss = MSE(model(x_t, t), x1 - x0)
+
+形状细节：t 是 (B,)，图片是 (B, C, H, W)。要把 t reshape 成 (B, 1, 1, 1)，才能让每个样本用自己的 t。通用写法：`t.reshape(-1, *([1] * (x.dim() - 1)))`，不管数据有几维都对。
+
+一个好用的检验：如果模型永远输出 0，loss 就等于目标 v 的方差。数据也是标准正态时，Var(x1 - x0) = 1 + 1 = 2，所以 loss ≈ 2。
+--- code
+torch.manual_seed(0)
+x0 = torch.randn(3)                         # 噪声
+x1 = torch.tensor([2.0, -1.0, 0.5])         # 「数据」
+for t in [0.0, 0.5, 1.0]:
+    print(t, (1 - t) * x0 + t * x1)         # t=0 是噪声，t=1 是数据
+print("v:    ", x1 - x0)
+
+h = 1e-3                                    # 数值求导：x_t 在 t=0.3 附近的变化率
+xa = (1 - 0.3) * x0 + 0.3 * x1
+xb = (1 - 0.3 - h) * x0 + (0.3 + h) * x1
+print("dx/dt:", (xb - xa) / h)              # 和 v 几乎一样
+
+img = torch.randn(4, 3, 8, 8)               # 一个 batch 的图片
+t = torch.rand(4)                           # 每张图一个 t
+print(t.reshape(-1, *([1] * (img.dim() - 1))).shape)   # (4, 1, 1, 1)
+
+data, noise = torch.randn(100000), torch.randn(100000)
+print(((data - noise) ** 2).mean())         # ≈ 2：永远输出 0 的模型的 loss
+
+@@ concept
+title: 欧拉采样：沿着速度一步步走
+--- body
+训练好的模型能告诉你：在位置 x、时刻 t，速度是 v(x, t)。采样就是从纯噪声出发，沿着速度一小步一小步走到 t = 1。最简单的走法叫欧拉法（Euler method）：
+
+```
+x = 纯噪声;  dt = 1 / steps
+for i in range(steps):
+    t = i * dt
+    x = x + v(x, t) * dt
+```
+
+几个要点：
+
+- 时间从 t = 0 开始，最后一步用的是 t = 1 - dt，走完正好到 t = 1
+- 给模型的 t 要做成 (B,) 的张量：`torch.full((B,), i * dt)`，batch 里每个样本一个
+- 采样不需要梯度，函数上加 `@torch.no_grad()`，省显存也更快
+
+检验积分写对没有，有个好办法：用一个「速度恒为 5」的假模型。从 x 出发走完 1 个单位时间，结果必须是 x + 5，而且不管 steps 是 4 还是 100 都一样。如果 dt 写错了（比如写成 `1 / (steps - 1)`），结果就会随步数变化。
+
+步数和路径的关系：速度不变（路径是直线）时，欧拉法一步都不会走偏；路径越弯，每一步的误差越大，需要的步数越多。下面代码里「速度 = x」就是一条弯路径，从 1 出发，真正的终点是 e ≈ 2.718，1 步只能走到 2.0。rectified flow 学出来的路径大体是直的（不完全直：很多条噪声到数据的直线会交叉，模型学到的是它们的平均速度），所以常常 20–50 步就够了，而 DDPM 原版要 1000 步。
+--- code
+def euler(v, x, steps):
+    dt = 1.0 / steps
+    for i in range(steps):
+        x = x + v(x, i * dt) * dt
+    return x
+
+const5 = lambda x, t: torch.full_like(x, 5.0)     # 速度恒为 5
+x0 = torch.tensor([1.0, -2.0])
+print(euler(const5, x0, 4), euler(const5, x0, 100))   # 都是 x0 + 5
+
+curved = lambda x, t: x                           # 速度 = x 本身：弯的路径
+for n in [1, 4, 100]:
+    print(n, round(euler(curved, torch.tensor([1.0]), n).item(), 4))   # 真值 e ≈ 2.7183
+
+@@ concept
+title: MiniDiT：把零件拼成模型
+ref: day8, day10
+--- body
+MiniDiT 的输入是带噪的图 x (B, C, H, W) 和时间 t (B,)，输出和 x 同形状的速度。以 in_ch = 4、img = 8、patch = 2、dim = 64、B = 2 为例，一步步看形状：
+
+1. `patchify(x, 2)`：(2, 4, 8, 8) → (2, 16, 16)。16 个 patch，每个 2×2×4 = 16 个数
+2. `Linear(16, 64)`：每个 token 变成 64 维，(2, 16, 64)
+3. 加上二维位置编码 `pos_embed_2d(64, 4, 4)`，形状 (16, 64)，自动广播到整个 batch
+4. 时间条件：`c = t_mlp(timestep_embedding(t, 64))`，形状 (2, 64)。timestep_embedding 就是第 8 天写的正弦时间嵌入，t_mlp 是 `Linear(64, 64) → SiLU → Linear(64, 64)`
+5. n_layer 个 DiTBlock：`h = block(h, c)`，形状一直是 (2, 16, 64)
+6. 输出层：LayerNorm（不带 γ/β）→ modulate → `Linear(64, 16)`，得到 (2, 16, 16)。这里的 shift、scale 只要 2 组：`Linear(64, 128)(silu(c))` 再 `chunk(2)`
+7. `unpatchify`：(2, 16, 16) → (2, 4, 8, 8)
+
+零初始化：输出层里算 shift/scale 的那个 Linear 和最后那个 `Linear(64, 16)`，weight 和 bias 都设为 0。于是没训练时，整个网络对任何输入都输出 0。这是 DiT 论文的做法，不是 bug：训练从「预测速度为 0」开始，梯度从一个干净的起点长出来。
+
+怎么确认时间条件真的接上了？零初始化时输出全是 0，看不出来。先给所有参数加一点随机扰动（模拟训练了几步），再比较 t = 0 和 t = 1 的输出，两者应该不同。
+
+下面的代码直接调用了今天练习要写的 patchify、pos_embed_2d、DiTBlock、unpatchify（后台已经准备好参考实现）和第 8 天的 timestep_embedding，只看形状。
+--- code
+torch.manual_seed(0)
+B, C, H, p, dim = 2, 4, 8, 2, 64
+x = torch.randn(B, C, H, H)
+t = torch.rand(B)
+
+tok = patchify(x, p)
+print("patchify:   ", tuple(tok.shape))
+h = nn.Linear(p * p * C, dim)(tok) + pos_embed_2d(dim, H // p, H // p)
+print("embed + pos:", tuple(h.shape))
+t_mlp = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
+c = t_mlp(timestep_embedding(t, dim))
+print("condition c:", tuple(c.shape))
+h = DiTBlock(dim, 4)(h, c)
+print("DiTBlock:   ", tuple(h.shape))
+out = unpatchify(nn.Linear(dim, p * p * C)(h), p, H, H, C)
+print("output:     ", tuple(out.shape))
 
 @@ item d10-01
 type: code
 title: patchify / unpatchify 往返
 level: 2
+cards: patchify：把图片切成 token
 targets: patchify, unpatchify
 ref: day8, day10
 --- context
-TODO
+ViT、DiT 这类模型都要先把图片（或 latent）切成 patch，才能交给 Transformer。patch 大小决定 token 数，也就决定了 attention 的计算量。展平顺序写错不会报错，但模型看到的「方块」是乱的。
 --- prompt
-01  patchify：把图片切成 token
+写两个函数：
+
+`patchify(x, p)`
+- 输入 x 的形状是 (B, C, H, W)，H 和 W 都能被 p 整除
+- 返回 (B, N, C*p*p)，其中 N = (H/p) × (W/p)
+- patch 按行优先排列：先从左到右，再从上到下
+- 每个 patch 内部按「先通道 C，再块里的行，再块里的列」展平，也就是先 permute 到 (B, nh, nw, C, p, p) 再合并
+
+`unpatchify(tok, p, H, W, C)`
+- patchify 的逆操作：(B, N, C*p*p) → (B, C, H, W)
+
+检查：(2, 3, 8, 8) 用 p = 2 切成 (2, 16, 12)，拼回去必须和原图完全一样；每个 token 必须真的是一个方块，顺序是行优先。
 --- starter
 def patchify(x, p):
-    """x: (B, C, H, W)，H 和 W 都能被 p 整除。
-    -> (B, N, p*p*C)，N = (H/p) * (W/p)，patch 按行优先排列。
-    每个 patch 内部的展平顺序: 先 C，再 ph，再 pw（即 reshape 后 permute 到 (B, nh, nw, C, ph, pw) 再 flatten）。
-    """
-    # --- TODO 01 ---
+    """x: (B, C, H, W) -> (B, N, C*p*p)，N = (H/p) * (W/p)，patch 按行优先排列。"""
     raise todo()
 
+
 def unpatchify(tok, p, H, W, C):
-    """patchify 的逆操作。"""
-    # --- TODO 01b ---
+    """patchify 的逆操作：(B, N, C*p*p) -> (B, C, H, W)。"""
     raise todo()
 --- solution
 def patchify(x, p):
@@ -40,42 +356,74 @@ def patchify(x, p):
     x = x.permute(0, 2, 4, 1, 3, 5)            # (B, nh, nw, C, p, p)
     return x.reshape(B, nh * nw, C * p * p)
 
+
 def unpatchify(tok, p, H, W, C):
     B = tok.size(0)
     nh, nw = H // p, W // p
-    x = tok.reshape(B, nh, nw, C, p, p).permute(0, 3, 1, 4, 2, 5)
+    x = tok.reshape(B, nh, nw, C, p, p).permute(0, 3, 1, 4, 2, 5)   # (B, C, nh, p, nw, p)
     return x.reshape(B, C, H, W)
 --- tests
 @check("patchify / unpatchify 往返")
 def t01():
     x = torch.randn(2, 3, 8, 8)
     tok = patchify(x, 2)
-    shape_is(tok, (2, 16, 12), "8/2=4, 4*4=16 个 patch，每个 2*2*3=12 维")
-    eq(unpatchify(tok, 2, 8, 8, 3), x, msg="往返必须完全还原")
-    # 256x256 的图用 patch=16 -> 256 个 token，正好是 DiT 的常用配置
+    shape_is(tok, (2, 16, 12), "8/2=4，4×4=16 个 patch，每个 3×2×2=12 个数")
+    eq(unpatchify(tok, 2, 8, 8, 3), x, msg="切开再拼回去，必须和原图完全一样")
+    # 256×256 的图先被 VAE 压成 (4, 32, 32) 的 latent，p=2 切出 256 个 token，正是 DiT-XL/2 的配置
     shape_is(patchify(torch.randn(1, 4, 32, 32), 2), (1, 256, 16))
+
+
+@check("每个 token 是一个方块，按行优先排列")
+def t01b():
+    x = torch.arange(32.).reshape(1, 2, 4, 4)      # 2 个通道，每个 4×4
+    tok = patchify(x, 2)
+    eq(tok[0, 0], torch.tensor([0., 1., 4., 5., 16., 17., 20., 21.]),
+       msg="token 0 应该是左上角 2×2 的方块：先放通道 0 的 4 个数，再放通道 1 的。"
+           "如果开头是 0, 1, 2, 3，说明你没 permute 就直接 reshape 了")
+    eq(tok[0, 1], torch.tensor([2., 3., 6., 7., 18., 19., 22., 23.]),
+       msg="token 1 应该是右上角那块（行优先：先从左到右）")
 --- hints
-- TODO
+- 先把 H 拆成 (nh, p)、W 拆成 (nw, p)：`x.reshape(B, C, nh, p, nw, p)`，其中 nh = H // p。
+- 再 `permute(0, 2, 4, 1, 3, 5)` 得到 (B, nh, nw, C, p, p)，最后 `reshape(B, nh * nw, C * p * p)`。
+- unpatchify 倒着来：`tok.reshape(B, nh, nw, C, p, p).permute(0, 3, 1, 4, 2, 5).reshape(B, C, H, W)`。
 
 @@ item d10-02
 type: code
 title: 二维位置编码
 level: 2
+cards: 二维位置编码：告诉模型每块在哪
 targets: pos_embed_2d
 ref: day8, day10
 --- context
-TODO
+attention 分不清 token 的顺序，不加位置信息，模型就不知道一个 patch 在左上角还是右下角。DiT 用的是固定的二维正弦编码：一张算出来的表，不用训练，存成 buffer 放进模型。
 --- prompt
-02  二维正弦位置编码
+写 `pos_embed_2d(dim, h, w)`，返回形状 (h*w, dim) 的位置编码表。token 按行优先排列：第 k 个 token 在第 `k // w` 行、第 `k % w` 列。
+
+做法：
+
+1. 先写一维编码 `_pe_1d(d, pos)`：pos 是整数位置组成的一维张量，长度 L，返回 (L, d)。`freqs = 1 / 10000 ** (arange(0, d, 2) / d)`，`a = pos * freqs`（外积，形状 (L, d/2)），结果是 `cat([sin(a), cos(a)], dim=-1)`
+2. 行编码 `row = _pe_1d(dim // 2, arange(h))`，列编码 `col = _pe_1d(dim // 2, arange(w))`
+3. 位置（i, j）的编码 = `cat([row[i], col[j]])`：前一半只和行有关，后一半只和列有关
+
+dim 是 4 的倍数，所以 dim/2 也是偶数。
+
+检查：(64, 4, 4) 得到 (16, 64)；相邻的 token 编码不同；同一行的 token 前 32 维相同，同一列的 token 后 32 维相同。
 --- starter
+def _pe_1d(d, pos):
+    """pos: 整数位置 (L,) -> (L, d)。"""
+    raise todo()
+
+
 def pos_embed_2d(dim, h, w):
-    """返回 (h*w, dim)。做法: 高和宽各用 dim/2 维的一维正弦编码，然后拼起来。
-    一维部分用: freqs = 1 / 10000 ** (arange(0, d, 2) / d)，emb = cat([sin(pos*freqs), cos(pos*freqs)])
-    token 顺序行优先。
-    """
-    # --- TODO 02 ---
+    """-> (h*w, dim)。前 dim/2 维编码行号，后 dim/2 维编码列号；token 按行优先排列。"""
     raise todo()
 --- solution
+def _pe_1d(d, pos):
+    freqs = 1.0 / (10000 ** (torch.arange(0, d, 2).float() / d))
+    a = pos.float()[:, None] * freqs[None]         # (L, d/2)
+    return torch.cat([a.sin(), a.cos()], dim=-1)   # (L, d)
+
+
 def pos_embed_2d(dim, h, w):
     half = dim // 2
     row = _pe_1d(half, torch.arange(h))         # (h, half)
@@ -88,30 +436,36 @@ def pos_embed_2d(dim, h, w):
 def t02():
     pe = pos_embed_2d(64, 4, 4)
     shape_is(pe, (16, 64))
-    true(not torch.allclose(pe[0], pe[1]), "同一行相邻的两个 token 编码必须不同")
-    true(not torch.allclose(pe[0], pe[4]), "同一列相邻的两个 token 编码必须不同")
+    true(not torch.allclose(pe[0], pe[1]), "同一行里相邻的两个 token（0 和 1），编码必须不同")
+    true(not torch.allclose(pe[0], pe[4]), "同一列里相邻的两个 token（0 和 4），编码必须不同")
     # 前一半只依赖行，后一半只依赖列
-    eq(pe[0, :32], pe[3, :32], msg="前一半应该只编码行坐标，token 0 和 3 同在第 0 行")
-    eq(pe[0, 32:], pe[12, 32:], msg="后一半应该只编码列坐标，token 0 和 12 同在第 0 列")
+    eq(pe[0, :32], pe[3, :32], msg="前一半应该只编码行号：token 0 和 3 都在第 0 行")
+    eq(pe[0, 32:], pe[12, 32:], msg="后一半应该只编码列号：token 0 和 12 都在第 0 列")
 --- hints
-- TODO
+- 一维部分：`a = pos.float()[:, None] * freqs[None]` 的形状是 (L, d/2)，sin 和 cos 拼起来正好 d 维。
+- 最直白的拼法是循环：第 k 个 token 用 `torch.cat([row[k // w], col[k % w]])`，最后 `torch.stack` 起来。
+- 不用循环的写法：`row[:, None, :].expand(h, w, half)` 和 `col[None, :, :].expand(h, w, half)` 在最后一维 cat，得到 (h, w, dim)，再 `reshape(h * w, dim)`。
 
 @@ item d10-03
 type: code
 title: modulate
-level: 2
+level: 1
+cards: modulate：用条件缩放和平移
 targets: modulate
 ref: day8, day10
 --- context
-TODO
+条件（时间 t、类别、文字）怎么影响每一层，是生成模型的核心设计。DiT、SD3、Flux 这类模型都用这一行把条件注入进去：用条件算出的 shift/scale 调整归一化之后的特征。
 --- prompt
-03  modulate：adaLN 的核心一行
+写 `modulate(x, shift, scale)`：
+
+- x 的形状是 (B, N, D)；shift 和 scale 的形状是 (B, D)
+- 返回 `x * (1 + scale) + shift`，同一张图的 N 个 token 用同一组 shift/scale
+- 注意 `1 +`：scale 和 shift 都是 0 时，必须原样返回 x
+
+检查：全 0 时是恒等；shift = 1 时整体加 1；scale = 1 时整体乘 2。
 --- starter
 def modulate(x, shift, scale):
-    """x: (B, N, D)   shift/scale: (B, D)
-    返回 x * (1 + scale) + shift。注意 1+ 这个偏移，它让 scale=0 时是恒等。
-    """
-    # --- TODO 03 ---
+    """x: (B, N, D)   shift, scale: (B, D)   ->  x * (1 + scale) + shift"""
     raise todo()
 --- solution
 def modulate(x, shift, scale):
@@ -121,33 +475,38 @@ def modulate(x, shift, scale):
 def t03():
     x = torch.randn(2, 5, 8)
     z = torch.zeros(2, 8)
-    eq(modulate(x, z, z), x, msg="shift=scale=0 时必须是恒等")
-    eq(modulate(x, torch.ones(2, 8), z), x + 1)
-    eq(modulate(x, z, torch.ones(2, 8)), x * 2)
+    eq(modulate(x, z, z), x, msg="shift 和 scale 都是 0 时，必须原样返回 x")
+    eq(modulate(x, torch.ones(2, 8), z), x + 1, msg="shift = 1 时应该是 x + 1")
+    eq(modulate(x, z, torch.ones(2, 8)), x * 2, msg="scale = 1 时应该是 x * (1 + 1) = 2x")
 --- hints
-- TODO
+- shift 和 scale 少了 N 那一维，直接和 (B, N, D) 的 x 运算会广播出错。
+- 用 `scale.unsqueeze(1)` 把 (B, D) 变成 (B, 1, D)，shift 也一样，一行就能写完。
 
 @@ item d10-04
 type: code
 title: adaLN-Zero 调制参数
-level: 2
+level: 1
+cards: adaLN-Zero：gate 和零初始化; modulate：用条件缩放和平移
 targets: AdaLNModulation
 ref: day8, day10
 --- context
-TODO
+零初始化让很深的网络一开始每层都是恒等映射，训练更稳。「新加的层先零初始化」是实际工作里很常见的技巧：LoRA 的 B 矩阵、ControlNet 的零卷积，都是同一个思路。
 --- prompt
-04  adaLN-Zero 的调制参数
+写一个 nn.Module：`AdaLNModulation(dim)`。
+
+- `__init__`：建一个 `nn.SiLU()` 和一个 `nn.Linear(dim, 6 * dim)`；这个 Linear 的 weight 和 bias 都用 `nn.init.zeros_` 初始化为 0
+- `forward(c)`：c 的形状是 (B, dim)。先 SiLU，再 Linear，得到 (B, 6*dim)；切成 6 个 (B, dim) 返回（tuple 即可）。顺序是 shift_msa、scale_msa、gate_msa、shift_mlp、scale_mlp、gate_mlp
+
+检查：返回 6 个张量，每个 (B, dim)，而且刚建好时全是 0。
 --- starter
 class AdaLNModulation(nn.Module):
-    """把条件向量 c (B, D) 变成 6 组调制参数:
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
-    结构: SiLU -> Linear(D, 6D)，且这个 Linear 的**权重和 bias 都初始化为 0**
-    （这就是 "adaLN-Zero" 的 Zero：训练一开始整个 block 是恒等映射）
-    """
+    """c (B, dim) -> 6 个 (B, dim)：shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp"""
 
     def __init__(self, dim):
         super().__init__()
-        # --- TODO 04 ---
+        raise todo()
+
+    def forward(self, c):
         raise todo()
 --- solution
 class AdaLNModulation(nn.Module):
@@ -155,7 +514,7 @@ class AdaLNModulation(nn.Module):
         super().__init__()
         self.act = nn.SiLU()
         self.lin = nn.Linear(dim, 6 * dim)
-        nn.init.zeros_(self.lin.weight)      # Zero 的来历
+        nn.init.zeros_(self.lin.weight)      # adaLN-Zero 的「Zero」
         nn.init.zeros_(self.lin.bias)
 
     def forward(self, c):
@@ -165,38 +524,52 @@ class AdaLNModulation(nn.Module):
 def t04():
     m = AdaLNModulation(16)
     out = m(torch.randn(3, 16))
-    true(isinstance(out, (tuple, list)) and len(out) == 6, "应该返回 6 个张量")
+    true(isinstance(out, (tuple, list)) and len(out) == 6, "应该返回 6 个张量（tuple 或 list）")
     for i, o in enumerate(out):
-        shape_is(o, (3, 16), f"第 {i} 个")
+        shape_is(o, (3, 16), f"第 {i} 组参数的形状应该是 (B, dim)")
     for o in out:
-        eq(o, torch.zeros(3, 16), msg="零初始化：一开始 6 个参数全应该是 0")
+        eq(o, torch.zeros(3, 16), msg="零初始化：刚建好时 6 组参数都应该是 0。weight 和 bias 都置 0 了吗？")
 --- hints
-- TODO
+- `nn.init.zeros_(self.lin.weight)` 和 `nn.init.zeros_(self.lin.bias)` 两行都要有：漏了 bias，输出就不是 0。
+- 切分用 `.chunk(6, dim=-1)`，它直接返回一个 tuple。
 
 @@ item d10-05
 type: code
 title: DiTBlock
 level: 2
+cards: DiTBlock：第 4 天的 Block 换个条件注入; adaLN-Zero：gate 和零初始化; modulate：用条件缩放和平移
 targets: DiTBlock
 ref: day8, day10
 --- context
-TODO
+这就是「文生图模型 = 你写过的 Transformer」的证据：DiTBlock 和第 4 天的 Block 只差 modulate 和 gate，再去掉 causal mask。SD3、Flux 这类模型的主干，就是这种 block 一层层叠起来的。
 --- prompt
-05  DiTBlock —— 把 Day 4 的 Block 换个条件注入方式
+写 `DiTBlock(dim, n_head)`，`forward(x, c)`：x 是 (B, N, dim)，c 是 (B, dim)，返回 (B, N, dim)。
+
+在 `__init__` 里建这些层（属性名照写，检查会用到 `modulation`）：
+
+- `norm1`、`norm2`：`nn.LayerNorm(dim, elementwise_affine=False)`
+- `attn`：`SelfAttention(dim, n_head)`（已经提供）
+- `mlp`：`Linear(dim, 4*dim) → GELU → Linear(4*dim, dim)`
+- `modulation`：`AdaLNModulation(dim)`（上一题的类，已经提供）
+
+forward：
+
+```
+s1, sc1, g1, s2, sc2, g2 = modulation(c)
+x = x + g1 * attn(modulate(norm1(x), s1, sc1))
+x = x + g2 * mlp(modulate(norm2(x), s2, sc2))
+```
+
+gate 的形状是 (B, dim)，乘之前要变成 (B, 1, dim)。`modulate` 也已经提供。
+
+检查：刚建好的 block 必须是恒等映射（输出 = 输入）；把 modulation 的参数改成非零之后，输出必须真的变了。
 --- starter
 class DiTBlock(nn.Module):
-    """结构:
-        s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp = modulation(c)
-        x = x + g_msa.unsqueeze(1) * attn(modulate(norm1(x), s_msa, sc_msa))
-        x = x + g_mlp.unsqueeze(1) * mlp( modulate(norm2(x), s_mlp, sc_mlp))
-    norm1/norm2 是 LayerNorm(dim, elementwise_affine=False)（缩放交给 adaLN 了）。
-    mlp: Linear(dim, 4dim) -> GELU -> Linear(4dim, dim)
-    对比 Day 4:  x = x + attn(ln1(x))  —— 多的只有 modulate 和 gate 两处。
-    """
-
     def __init__(self, dim, n_head):
         super().__init__()
-        # --- TODO 05 ---
+        raise todo()
+
+    def forward(self, x, c):
         raise todo()
 --- solution
 class DiTBlock(nn.Module):
@@ -221,42 +594,50 @@ def t05():
     x, c = torch.randn(2, 9, 32), torch.randn(2, 32)
     shape_is(b(x, c), (2, 9, 32))
     eq(b(x, c), x, tol=1e-5,
-       msg="零初始化的 gate 让整个 block 一开始就是恒等映射。不相等说明 gate 没接上，"
+       msg="零初始化的 gate 应该让整个 block 一开始就是恒等映射。不相等说明 gate 没接上，"
            "或者 modulation 的 Linear 没有零初始化")
-    # 训练起来之后（人为给 gate 一个非零值）就不再是恒等了
+    # 训练起来之后（人为给 modulation 非零参数），block 就不再是恒等了
     with torch.no_grad():
         for p in b.modulation.parameters():
             p.normal_(0, 0.3)
-    true(not torch.allclose(b(x, c), x, atol=1e-4), "gate 非零后应该真的改变 x")
+    true(not torch.allclose(b(x, c), x, atol=1e-4), "gate 不是 0 之后，block 应该真的改变 x")
 --- hints
-- TODO
+- mlp 可以写成 `nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))`。
+- 恒等检查没过？看看两条分支是不是都乘了 gate，以及 gate 有没有 `unsqueeze(1)`。
+- 对照第 4 天：`x = x + attn(ln1(x))` 变成 `x = x + g1.unsqueeze(1) * self.attn(modulate(self.norm1(x), s1, sc1))`，mlp 那一行同理。
 
 @@ item d10-06
 type: code
 title: Rectified Flow 插值与目标
-level: 2
+level: 1
+cards: Rectified flow：从噪声到数据走直线
 targets: flow_interpolate, flow_target
 ref: day8, day10
 --- context
-TODO
+这两行就是 flow matching 训练数据的全部构造。对比第 8 天 DDPM 要的 beta 调度、alphas_cumprod 和 extract，这么简单、不容易写错，是 SD3、Flux 等新模型改用 flow 的原因之一。
 --- prompt
-06  Rectified Flow：训练数据的构造
+写两个函数：
+
+- `flow_interpolate(x0_noise, x1_data, t)`：返回 `x_t = (1 - t) * noise + t * data`。x0_noise 和 x1_data 的形状是 (B, C, H, W)；t 的形状是 (B,)，取值在 [0, 1]，每个样本一个 t
+- `flow_target(x0_noise, x1_data)`：返回速度目标 `v = data - noise`
+
+让 t 能按样本广播到任意维数的数据上（不要假设一定是 4 维）。
+
+检查：t = 0 返回噪声，t = 1 返回数据，t = 0.5 是两者的平均；x_t 对 t 的数值导数等于 flow_target；batch 里每个样本用的是自己的 t。
 --- starter
 def flow_interpolate(x0_noise, x1_data, t):
-    """x_t = (1 - t) * noise + t * data
-    x0_noise / x1_data: (B, C, H, W)   t: (B,) 取值 [0, 1] 的浮点。
-    """
-    # --- TODO 06 ---
+    """x_t = (1 - t) * noise + t * data。x: (B, C, H, W)，t: (B,)"""
     raise todo()
 
+
 def flow_target(x0_noise, x1_data):
-    """速度场的目标: v = data - noise（这是一条直线，从噪声直接指向数据）。"""
-    # --- TODO 06b ---
+    """速度目标 v = data - noise：一条从噪声直接指向数据的直线。"""
     raise todo()
 --- solution
 def flow_interpolate(x0_noise, x1_data, t):
-    tt = t.reshape(-1, *([1] * (x0_noise.dim() - 1)))
+    tt = t.reshape(-1, *([1] * (x0_noise.dim() - 1)))    # (B,) -> (B, 1, 1, 1)
     return (1 - tt) * x0_noise + tt * x1_data
+
 
 def flow_target(x0_noise, x1_data):
     return x1_data - x0_noise
@@ -266,34 +647,52 @@ def t06():
     n, d = torch.randn(4, 1, 4, 4), torch.randn(4, 1, 4, 4)
     eq(flow_interpolate(n, d, torch.zeros(4)), n, msg="t=0 应该是纯噪声")
     eq(flow_interpolate(n, d, torch.ones(4)), d, msg="t=1 应该是干净数据")
-    eq(flow_interpolate(n, d, torch.full((4,), 0.5)), (n + d) / 2)
-    eq(flow_target(n, d), d - n)
-    # 关键性质: 沿 t 求导恒等于目标速度
+    eq(flow_interpolate(n, d, torch.full((4,), 0.5)), (n + d) / 2, msg="t=0.5 应该是噪声和数据的平均")
+    eq(flow_target(n, d), d - n, msg="目标速度是 data - noise，方向别写反")
+    # 关键性质：x_t 对 t 的导数处处等于目标速度
     t1, t2 = torch.full((4,), 0.3), torch.full((4,), 0.3001)
     num = (flow_interpolate(n, d, t2) - flow_interpolate(n, d, t1)) / 0.0001
     eq(num, flow_target(n, d), tol=1e-2, msg="x_t 对 t 的导数应该正好是目标速度")
+
+
+@check("每个样本用自己的 t")
+def t06b():
+    n, d = torch.randn(4, 1, 4, 4), torch.randn(4, 1, 4, 4)
+    t = torch.tensor([0.0, 0.25, 0.5, 1.0])
+    xt = flow_interpolate(n, d, t)
+    shape_is(xt, (4, 1, 4, 4))
+    for i in range(4):
+        eq(xt[i], (1 - t[i]) * n[i] + t[i] * d[i],
+           msg=f"第 {i} 个样本应该用 t[{i}] = {t[i].item()}。t 是 (B,)，要先 reshape 成 (B, 1, 1, 1) 再乘；"
+               "直接乘的话它会沿最后一维（图片的宽）广播：不报错，但算错了")
 --- hints
-- TODO
+- t 是 (B,)，直接和 (B, C, H, W) 相乘，会沿最后一维广播，不报错但算错。先把它 reshape 成 (B, 1, 1, 1)。
+- 不管几维都对的写法：`tt = t.reshape(-1, *([1] * (x0_noise.dim() - 1)))`。
+- flow_target 只有一行：`return x1_data - x0_noise`。
 
 @@ item d10-07
 type: code
 title: Flow 训练目标
 level: 2
+cards: Rectified flow：从噪声到数据走直线
 targets: flow_loss
 ref: day8, day10
 --- context
-TODO
+训练生成模型时，loss 函数定义了模型要学什么。flow 的训练步只有几行，结构和第 8 天的 ddpm_loss 一模一样，只是把「预测噪声」换成了「预测速度」。面试里常让你当场写出来。
 --- prompt
-07  Flow 的训练目标：5 行
+写 `flow_loss(model, x1_data)`，返回一个标量 loss：
+
+1. 每个样本随机抽一个 t ~ U(0, 1)，形状 (B,)
+2. 抽和数据同形状的标准正态噪声
+3. 用 `flow_interpolate` 算出 x_t（上一题的函数，已经提供；`flow_target` 也有）
+4. 返回 `F.mse_loss(model(x_t, t), data - noise)`
+
+`model(x, t)` 返回和 x 同形状的张量。随机数要和数据在同一个 device 上。
+
+检查：用一个永远输出 0 的模型、4096 个标准正态的「数据」，loss 应该 ≈ 2（为什么是 2，见卡片）。
 --- starter
 def flow_loss(model, x1_data):
-    """1) t ~ U(0,1)，每个样本一个
-       2) noise ~ N(0, I)
-       3) x_t = 插值
-       4) 返回 mse(model(x_t, t), data - noise)
-    model(x, t) -> 和 x 同形状。
-    """
-    # --- TODO 07 ---
+    """t ~ U(0,1) 每个样本一个；noise ~ N(0, I)；x_t = 插值；返回 mse(model(x_t, t), data - noise)。"""
     raise todo()
 --- solution
 def flow_loss(model, x1_data):
@@ -311,33 +710,38 @@ def t07():
         def forward(self, x, t):
             return torch.zeros_like(x)
 
-    # data 也是标准正态时，v = data - noise 的方差是 2
+    # data 也是标准正态时，v = data - noise 的方差是 1 + 1 = 2
     l = flow_loss(Zero(), torch.randn(4096, 1, 4, 4))
+    true(l.dim() == 0, "loss 应该是一个标量（0 维张量）：F.mse_loss 默认就会求平均")
     true(abs(l.item() - 2.0) < 0.15,
-         f"永远输出 0 的模型，loss 应该 ≈ Var(data - noise) = 2，实际 {l.item():.3f}")
-    true(l.dim() == 0)
+         f"永远输出 0 的模型，loss 应该 ≈ Var(data - noise) = 2，实际是 {l.item():.3f}")
 --- hints
-- TODO
+- `t = torch.rand(B, device=x1_data.device)`，`noise = torch.randn_like(x1_data)`。
+- 目标是 `flow_target(noise, x1_data)`，也就是 data - noise，注意参数的顺序：先噪声，后数据。
+- loss ≈ 1 而不是 2？说明你的目标只用了 data 或只用了 noise，而不是两者之差。
 
 @@ item d10-08
 type: code
 title: 欧拉采样
 level: 2
+cards: 欧拉采样：沿着速度一步步走
 targets: flow_sample
 ref: day8, day10
 --- context
-TODO
+采样是模型上线后真正在跑的代码，步数直接决定出一张图要多久（SD3 默认 28 步）。时间从哪开始、dt 是多少，是采样代码里最容易出 bug、又不会报错的地方。
 --- prompt
-08  欧拉采样
+写 `flow_sample(model, shape, steps=20, device="cpu")`：
+
+- 从纯噪声出发（t = 0）：函数里第一个随机数就是 `x = torch.randn(shape, device=device)`
+- `dt = 1 / steps`，循环 steps 次：第 i 步的时间 `t = i * dt`，做成形状 (B,) 的张量（B = shape[0]），然后 `x = x + model(x, t) * dt`
+- 返回最后的 x（此时 t = 1）
+- 函数上已经加了 `@torch.no_grad()`
+
+检查：速度恒为 5 的模型，4 步和 100 步的结果必须一样，而且正好是初始噪声 + 5；模型被调用 steps 次，收到的 t 依次是 0, dt, 2dt, …。检查会先设随机种子再调用，所以别在 `torch.randn(shape)` 之前再用别的随机数。
 --- starter
 @torch.no_grad()
 def flow_sample(model, shape, steps=20, device="cpu"):
-    """从 t=0 的纯噪声出发，用欧拉法积分到 t=1:
-        dt = 1 / steps
-        for i in range(steps):  t = i * dt;  x = x + model(x, t_batch) * dt
-    返回最终的 x。
-    """
-    # --- TODO 08 ---
+    """从 t=0 的纯噪声出发，用欧拉法积分到 t=1，返回最后的 x。"""
     raise todo()
 --- solution
 @torch.no_grad()
@@ -352,8 +756,8 @@ def flow_sample(model, shape, steps=20, device="cpu"):
 @check("欧拉采样")
 def t08():
     class ConstV(nn.Module):
-        """速度场恒等于 5：从 x 出发积分 1 个单位时间，结果必须是 x + 5，
-        而且和步数无关（这是检验积分写对没有的最好办法）。"""
+        """速度恒为 5：从 x 出发积分 1 个单位时间，结果必须是 x + 5，
+        而且和步数无关（这是检验积分有没有写对的好办法）。"""
         def forward(self, x, t):
             return torch.full_like(x, 5.0)
 
@@ -362,69 +766,91 @@ def t08():
     a = flow_sample(m, (2, 1, 3, 3), steps=4)
     torch.manual_seed(0)
     b = flow_sample(m, (2, 1, 3, 3), steps=100)
-    eq(a, b, tol=1e-4, msg="常速度场下，结果不该随步数变化 —— 你的 dt 算错了")
+    eq(a, b, tol=1e-4, msg="速度恒定时，结果不该随步数变化：你的 dt 或循环次数错了")
     torch.manual_seed(0)
     x0 = torch.randn(2, 1, 3, 3)
-    eq(a, x0 + 5.0, tol=1e-4, msg="积分了 1 个单位时间，位移应该正好是速度 × 1")
+    eq(a, x0 + 5.0, tol=1e-4, msg="积分了 1 个单位时间，位移应该正好是 速度 × 1 = 5")
+
+
+@check("传给模型的 t")
+def t08b():
+    class Rec(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ts = []
+
+        def forward(self, x, t):
+            self.ts.append(torch.as_tensor(t).clone())
+            return torch.zeros_like(x)
+
+    r = Rec()
+    flow_sample(r, (3, 1, 2, 2), steps=4)
+    true(len(r.ts) == 4, f"steps=4 应该调用模型 4 次，实际调用了 {len(r.ts)} 次")
+    shape_is(r.ts[0], (3,), "t 要做成形状 (B,) 的张量，batch 里每个样本一个")
+    eq(torch.stack([t[0] for t in r.ts]), torch.tensor([0.0, 0.25, 0.5, 0.75]),
+       msg="4 步的时间应该依次是 0, 0.25, 0.5, 0.75：从 t=0（纯噪声）开始，最后一步是 1 - dt")
 --- hints
-- TODO
+- 每一步的时间张量：`t = torch.full((shape[0],), i * dt, device=device)`。
+- 结果随步数变了？检查 dt 是不是 `1.0 / steps`，循环是不是正好 steps 次。
+- 和「噪声 + 5」对不上？确认函数一开始就是 `torch.randn(shape, device=device)`，前面没有别的随机调用。
 
 @@ item d10-09
-type: code
+type: self
 title: 代码量对比（自评）
-level: 2
-targets: LOC
-ref: day8, day10
+level: 1
+cards: Rectified flow：从噪声到数据走直线; 欧拉采样：沿着速度一步步走
 --- context
-TODO
+代码越短，越不容易写错，也越好调试。亲手数一次行数，你就能体会为什么新的文生图模型（SD3、Flux）从 DDPM 换成了 flow matching。
 --- prompt
-09  Flow 和 DDPM 的代码量对比（自评）
-数一下你写的行数（不含空行和注释）:
---- starter
-LOC = {
-    "DDPM 的 q_sample + p_sample_step": None,
-    "Flow 的 flow_interpolate + 欧拉一步": None,
-}
---- solution
-LOC = {
-    "DDPM 的 q_sample + p_sample_step": 9,
-    "Flow 的 flow_interpolate + 欧拉一步": 3,
-}
---- tests
-@check("代码量对比（自评）")
-def t09():
-    true(all(v is not None for v in LOC.values()), "还没填。数完再填，这一题是让你有个体感")
-    true(LOC["Flow 的 flow_interpolate + 欧拉一步"] < LOC["DDPM 的 q_sample + p_sample_step"],
-         "Flow 那边应该明显更短 —— 这就是它现在成为主流的一大原因")
+这一题不写代码，只数行数（不算空行和注释）：
+
+1. 第 8 天你写的 `q_sample` 和 `p_sample_step`，两个函数体一共几行
+2. 今天的 `flow_interpolate` 函数体，加上欧拉采样里更新 x 的那一行（`x = x + model(x, t) * dt`），一共几行
+
+数完之后，对照下面的清单诚实地打勾。
+--- checklist
+- 我数出了 DDPM 这边的行数（参考答案是 2 + 7 = 9 行）
+- 我数出了 flow 这边的行数（参考答案是 2 + 1 = 3 行），明显更短
+- 我能说出 flow 少掉了什么：没有 beta 调度、没有 alphas_cumprod 和 extract、更新公式里没有那串系数、最后一步也不用特殊处理
 --- hints
-- TODO
+- q_sample 在第 8 天的 d8-04，p_sample_step 在 d8-11；回去看你自己写的版本。
+- p_sample_step 里的行：取三个系数、算均值、处理 noise、t = 0 时不加噪声……每一行都是 flow 不需要的。
 
 @@ item d10-10
 type: code
 title: MiniDiT 前向
-level: 2
+level: 3
+cards: MiniDiT：把零件拼成模型; patchify：把图片切成 token; 二维位置编码：告诉模型每块在哪
 targets: MiniDiT
 ref: day8, day10
 --- context
-TODO
+这一题把今天的零件拼成一个能训练的模型，结构和 DiT 论文一致，只是小得多。输出层零初始化、条件有没有真的接上，这两件事在真实项目里都需要专门写测试确认。
 --- prompt
-10  完整的 mini DiT
+写 `MiniDiT(in_ch=4, img=8, patch=2, dim=64, n_layer=2, n_head=4)`，`forward(x, t)`：x 是 (B, in_ch, img, img)，t 是 (B,)，返回和 x 同形状的张量（预测的速度）。
+
+结构：
+
+1. `patchify(x, patch)` → `nn.Linear(patch*patch*in_ch, dim)` → 加上 `pos_embed_2d(dim, img // patch, img // patch)`（用 `register_buffer` 存起来）
+2. 条件 `c = t_mlp(timestep_embedding(t, dim))`，t_mlp 是 `Linear(dim, dim) → SiLU → Linear(dim, dim)`
+3. n_layer 个 `DiTBlock(dim, n_head)`，放在 `nn.ModuleList` 里，依次 `h = block(h, c)`
+4. 输出层：`LayerNorm(dim, elementwise_affine=False)` → `modulate(·, shift, scale)` → `Linear(dim, patch*patch*in_ch)` → `unpatchify`。其中 `shift, scale = Linear(dim, 2*dim)(F.silu(c)).chunk(2, dim=-1)`
+5. 输出层的两个 Linear（算 shift/scale 的那个、最后那个）的 weight 和 bias 全部零初始化
+
+可以直接用：`patchify`、`unpatchify`、`pos_embed_2d`、`modulate`、`DiTBlock`（今天的参考实现），`timestep_embedding`（第 8 天）。
+
+检查：输出形状对；没训练时输出全是 0；参数加了扰动之后，t = 0 和 t = 1 的输出必须不同。
 --- starter
 class MiniDiT(nn.Module):
-    """结构:
-        x -> patchify(p) -> Linear(p*p*C, dim) -> + pos_embed_2d
-        c = t_embed(t) + (可选的 class 嵌入)     这里只做 t
-        n_layer 个 DiTBlock(x, c)
-        LayerNorm(no affine) -> modulate(最后一组 shift/scale) -> Linear(dim, p*p*C) -> unpatchify
-    forward(x, t) -> 和 x 同形状
-    t_embed: 复用 Day 8 的 timestep_embedding(t, dim) 再过一个两层 MLP。
-    最后那个 Linear(dim, p*p*C) 和输出侧的 modulate 层都要**零初始化**（DiT 论文的做法：
-    训练开始时整个网络输出恒为 0，梯度从一个干净的起点长出来）。
+    """x (B, in_ch, img, img), t (B,) -> 和 x 同形状。
+    patchify -> Linear -> + pos -> n_layer 个 DiTBlock(h, c) -> LayerNorm -> modulate -> Linear -> unpatchify
+    c = t_mlp(timestep_embedding(t, dim))；输出层的两个 Linear 零初始化。
     """
 
     def __init__(self, in_ch=4, img=8, patch=2, dim=64, n_layer=2, n_head=4):
         super().__init__()
-        # --- TODO 10 ---
+        raise todo()
+
+    def forward(self, x, t):
         raise todo()
 --- solution
 class MiniDiT(nn.Module):
@@ -433,7 +859,6 @@ class MiniDiT(nn.Module):
         self.in_ch, self.img, self.patch, self.dim = in_ch, img, patch, dim
         pdim = patch * patch * in_ch
         self.embed = nn.Linear(pdim, dim)
-        n = (img // patch) ** 2
         self.register_buffer("pos", pos_embed_2d(dim, img // patch, img // patch))
         self.t_mlp = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.blocks = nn.ModuleList([DiTBlock(dim, n_head) for _ in range(n_layer)])
@@ -446,12 +871,12 @@ class MiniDiT(nn.Module):
         nn.init.zeros_(self.head.bias)
 
     def forward(self, x, t):
-        h = self.embed(patchify(x, self.patch)) + self.pos
-        c = self.t_mlp(timestep_embedding(t, self.dim))
+        h = self.embed(patchify(x, self.patch)) + self.pos        # (B, N, dim)
+        c = self.t_mlp(timestep_embedding(t, self.dim))           # (B, dim)
         for b in self.blocks:
             h = b(h, c)
         shift, scale = self.mod_out(F.silu(c)).chunk(2, dim=-1)
-        h = self.head(modulate(self.norm_out(h), shift, scale))
+        h = self.head(modulate(self.norm_out(h), shift, scale))   # (B, N, patch*patch*in_ch)
         return unpatchify(h, self.patch, self.img, self.img, self.in_ch)
 --- tests
 @check("MiniDiT 前向")
@@ -462,40 +887,54 @@ def t10():
     t = torch.rand(2)
     shape_is(m(x, t), (2, 4, 8, 8))
     eq(m(x, t), torch.zeros(2, 4, 8, 8),
-       msg="零初始化的输出层让训练前的输出恒为 0 —— 这是对的，不是 bug")
-    # 给所有参数加一点扰动，模拟"训练了几步之后"，再检查时间条件有没有真的接进去
+       msg="输出层零初始化后，训练前的输出应该全是 0（这是对的，不是 bug）。"
+           "两个输出 Linear 的 weight 和 bias 都置 0 了吗？")
+    # 给所有参数加一点扰动，模拟「训练了几步之后」，再检查时间条件有没有真的接进去
     with torch.no_grad():
         for p in m.parameters():
             p.add_(torch.randn_like(p) * 0.1)
     o1, o2 = m(x, torch.zeros(2)), m(x, torch.ones(2))
-    true(not torch.allclose(o1, o2, atol=1e-5), "换了 t 输出没变 —— 时间条件没接上")
+    true(not torch.allclose(o1, o2, atol=1e-5), "换了 t，输出却没变：时间条件没接上")
 --- hints
-- TODO
+- 在 `__init__` 里把 in_ch、img、patch、dim 存到 self 上，forward 里还要用。
+- 位置编码：`self.register_buffer("pos", pos_embed_2d(dim, img // patch, img // patch))`，forward 里直接 `+ self.pos`，(N, dim) 会自动广播到 (B, N, dim)。
+- forward 的结尾：`shift, scale = self.mod_out(F.silu(c)).chunk(2, dim=-1)`，然后 `self.head(modulate(self.norm_out(h), shift, scale))`，再 unpatchify。
 
 @@ item d10-11
 type: self
 title: 复用检验（自评）
 level: 1
+cards: DiTBlock：第 4 天的 Block 换个条件注入
 --- context
-TODO
+面试常问「DiT 和 GPT 的 Transformer 有什么不同」。答案是：几乎一样。亲手对比一次，你就能把第 4 天学的东西直接搬到图像、视频甚至音频模型上。
 --- prompt
-11  复用检验：DiT 里的 attention 和 Day 4 的是不是同一段代码
-打开 drills/day04.py 里你写的 CausalSelfAttention，和本文件顶部给出的 SelfAttention 对比。
-确认两段代码的差别只有: (a) is_causal / mask，(b) 没有 block_size buffer。
-确认之后把下面改成 True。
+这一题不写代码。打开第 4 天你写的 `CausalSelfAttention`（d4-03），和知识卡片「DiTBlock：第 4 天的 Block 换个条件注入」里的 `SelfAttention` 并排放着，逐行对比：qkv 投影、切成多个头、算 attention、合并头、输出投影。
+
+确认之后，对照清单打勾。「文生图模型 = 你写过的 Transformer」是今天唯一真正重要的事。
 --- checklist
-- TODO: 从 prompt 里的 [ ] 清单搬过来
+- qkv 投影、切头（view + transpose）、合并头、proj 输出投影：两边一模一样
+- 差别 (a)：SelfAttention 没有 causal mask（没有 masked_fill，也没有 is_causal=True），每个 patch 能看到所有 patch
+- 差别 (b)：SelfAttention 没有 block_size 参数，也没有那个下三角 buffer
+- 我能用一句话说出：文生图模型的主干就是我写过的 Transformer，只是条件注入换成了 adaLN
+--- hints
+- 如果第 4 天你手写的是 softmax(QKᵀ/√d)·V，而今天用的是 `F.scaled_dot_product_attention`：这两者算的是同一个东西，第 4 天的 d4-02 就对拍过。
+- 除了 attention，再对比一下 Block：第 4 天是 `x + attn(ln1(x))`，今天是 `x + g1 * attn(modulate(norm1(x), s1, sc1))`。
 
 @@ item d10-12
 type: fix
 title: 找 bug: DiTBlockBuggy
 level: 2
+cards: adaLN-Zero：gate 和零初始化; DiTBlock：第 4 天的 Block 换个条件注入; modulate：用条件缩放和平移
 targets: DiTBlockBuggy
 ref: day8, day10
 --- context
-TODO
+这 4 处错都不会报错，形状也都对，模型照样能训练，只是更不稳定、效果更差。这正是真实项目里最难发现的那种 bug，只能靠读代码和针对性的测试抓出来。
 --- prompt
-12  找 bug —— 这个 DiTBlock 有 4 处错
+`DiTBlockBuggy` 本来应该和 DiTBlock 做完全一样的事，但里面有 4 处错。代码能跑、不报错，输出形状也对。
+
+找到这 4 处错并改好（类名不要改，`modulation` 保持 `nn.Sequential(SiLU, Linear)` 的写法即可）。
+
+检查：刚建好的 block 必须是恒等映射（输出 = 输入）；两个 LayerNorm 都不能带可学习的 γ/β。
 --- starter
 class DiTBlockBuggy(nn.Module):
     def __init__(self, dim, n_head):
@@ -521,12 +960,12 @@ class DiTBlockBuggy(nn.Module):
         self.attn = SelfAttention(dim, n_head)
         self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
         self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
-        nn.init.zeros_(self.modulation[1].weight)                  # 修 1
+        nn.init.zeros_(self.modulation[1].weight)                  # 修 1：weight 和 bias 都零初始化
         nn.init.zeros_(self.modulation[1].bias)
 
     def forward(self, x, c):
         s1, sc1, g1, s2, sc2, g2 = self.modulation(c).chunk(6, dim=-1)
-        # 修 2: 补上 gate；修 3: scale 要写成 (1 + scale)
+        # 修 2：attn 这一路补上 gate；修 3：scale 要写成 (1 + scale)
         x = x + g1.unsqueeze(1) * self.attn(
             self.norm1(x) * (1 + sc1.unsqueeze(1)) + s1.unsqueeze(1))
         x = x + g2.unsqueeze(1) * self.mlp(
@@ -539,10 +978,214 @@ def t12():
     b = DiTBlockBuggy(32, 4)
     x, c = torch.randn(2, 9, 32), torch.randn(2, 32)
     eq(b(x, c), x, tol=1e-5,
-       msg="其中三处: modulation 的 Linear 要零初始化；attn 那一路漏了 gate；"
-           "attn 那一路的 scale 要写成 (1 + scale)")
+       msg="刚建好的 block 应该是恒等映射。这里藏着三处错：modulation 的 Linear 要零初始化（weight 和 bias）；"
+           "attn 那一路漏了 gate；attn 那一路的 scale 要写成 (1 + scale)")
     ln = [m for m in b.modules() if isinstance(m, nn.LayerNorm)]
     true(all(m.elementwise_affine is False for m in ln),
-         "第四处: adaLN 已经负责缩放了，两个 LayerNorm 都应该 elementwise_affine=False")
+         "第四处：adaLN 已经负责缩放和平移了，两个 LayerNorm 都应该写 elementwise_affine=False")
 --- hints
-- TODO
+- 刚建好的 DiT block 应该是恒等映射。什么能保证这一点？modulation 的 Linear 怎么初始化，以及每条分支上的 gate。
+- 把两条分支并排对比：attn 那一路比 mlp 那一路少了什么？scale 的写法一样吗？
+- 第四处在 `__init__` 最上面：adaLN 已经负责缩放和平移，LayerNorm 自带的 γ/β 应该关掉。
+
+@@ item d10-13
+type: predict
+title: patch 大小和 token 数
+level: 1
+cards: patchify：把图片切成 token
+ref: day8, day10
+--- context
+token 数 N 决定 attention 的计算量（和 N² 成正比）。DiT 论文里 patch 从 8 缩到 2，token 多了 16 倍，计算量大很多，图也好很多。选模型配置时，这是最常见的权衡。
+--- prompt
+读下面的代码，写出它打印的三行。`patchify` 就是 d10-01 里你写的那个函数。每行打印：p、tokens 的形状、N²（attention 要算的 token 对数）。
+--- code
+x = torch.randn(1, 4, 32, 32)       # 一张 256×256 图片经过 VAE 之后的 latent
+for p in [2, 4, 8]:
+    tok = patchify(x, p)
+    print(p, tuple(tok.shape), tok.shape[1] ** 2)
+--- explain
+N = (32 / p)²，每个 token 有 4·p·p 个数。p = 2：N = 16² = 256，每个 token 16 个数，N² = 65536。p = 4：N = 64，每个 64 个数，N² = 4096。p = 8：N = 16，每个 256 个数，N² = 256。
+
+p 每减半，token 数 ×4，attention 要算的配对数 ×16。每个 token 的长度反而变短了：总的数字个数始终是 4×32×32 = 4096，patchify 只是换一种切法，不丢任何信息。
+--- hints
+- N = (H / p) × (W / p)，每个 token 的长度是 C × p × p。
+- 三行的 N × (每个 token 的长度) 都应该等于 4 × 32 × 32 = 4096，可以用来验算。
+
+@@ item d10-14
+type: predict
+title: 没有位置编码，attention 分不清顺序
+level: 2
+cards: 二维位置编码：告诉模型每块在哪; DiTBlock：第 4 天的 Block 换个条件注入
+ref: day8, day10
+--- context
+self-attention 对 token 的排列是「等变」的：打乱输入，输出只是跟着打乱。这是面试常考的性质，也是 Transformer 必须额外加位置编码的原因。
+--- prompt
+读下面的代码，写出它打印的两行（每行是 True 或 False）。`SelfAttention` 是卡片里那个不带 mask 的 attention，`pos_embed_2d` 是 d10-02 的函数。`perm` 是把 9 个 token 打乱的一种顺序。
+--- code
+torch.manual_seed(0)
+attn = SelfAttention(16, 4)
+x = torch.randn(1, 9, 16)              # 3×3 = 9 个 patch
+pe = pos_embed_2d(16, 3, 3)            # (9, 16)
+perm = torch.tensor([8, 3, 5, 0, 1, 7, 2, 6, 4])
+with torch.no_grad():
+    a = attn(x)[:, perm]               # 先算，再打乱
+    b = attn(x[:, perm])               # 先打乱，再算
+    print(torch.allclose(a, b, atol=1e-5))
+    a = attn(x + pe)[:, perm]          # 加上位置编码再比一次
+    b = attn(x[:, perm] + pe)          # 位置表本身不跟着打乱
+    print(torch.allclose(a, b, atol=1e-5))
+--- explain
+第一行 True：attention 里每个 token 都和所有 token 算相似度，再加权求和。求和不在乎顺序，所以「先打乱再算」和「先算再打乱」结果一样。模型根本分不清一个 patch 原来在左上角还是右下角。
+
+第二行 False：位置编码是按位置固定的，第 k 个位置永远加 pe[k]。token 换了位置，它加上的位置向量也变了，输出就不再只是简单地跟着打乱。这正是 pos_embed_2d 的作用：让同样的内容放在不同位置时，模型看到的东西不一样。
+--- hints
+- attention 的输出 = softmax(相似度) 加权求和 V。打乱 token 的顺序，每个 token 的「邻居集合」变了吗？
+- 第二次比较时，内容跟着 perm 搬家了，但 pe 没有，每个 token 加上的位置向量变了。
+
+@@ item d10-15
+type: choice
+title: 为什么要零初始化
+level: 1
+cards: adaLN-Zero：gate 和零初始化
+answer: 1
+--- context
+「新加的层零初始化，让网络从恒等映射开始训练」这个技巧在 DiT、LoRA、ControlNet 里都出现过。能说清它的作用和它「不会」造成什么，是面试里的加分项。
+--- prompt
+DiT 把 adaLN 调制层的 Linear（weight 和 bias）初始化为 0。训练刚开始时，这带来的直接效果是什么？
+--- options
+- 每个 DiTBlock 都是恒等映射：gate = 0 关掉了两条分支，输出等于输入
+- 这一层的参数永远学不动，因为参数是 0，梯度也是 0
+- 模型一开始就能画出干净的图
+- 可以省掉 LayerNorm 的计算
+--- explain
+零初始化后 6 组参数全是 0：shift = scale = 0 让 modulate 变成恒等，gate = 0 让 attention 和 MLP 两条分支都不起作用，于是 x = x + 0 = x。
+
+选项 2 错：参数是 0 不等于梯度是 0。gate 的梯度来自分支的输出，第一次更新后 gate 就不再是 0。选项 3 错：没训练的 MiniDiT 输出的速度全是 0，采样出来就是原封不动的噪声。选项 4 错：LayerNorm 照样要算，只是关掉了它自己的 γ/β。
+--- hints
+- 6 组参数全是 0 时，把 gate = 0 代入 `x = x + gate * attn(...)` 看看。
+- 「参数是 0」和「梯度是 0」是两回事：梯度取决于这个参数乘的是什么。
+
+@@ item d10-16
+type: predict
+title: 走直线，1 步就到
+level: 2
+cards: 欧拉采样：沿着速度一步步走; Rectified flow：从噪声到数据走直线
+ref: day8, day10
+--- context
+采样步数就是推理延迟。明白「路径越直，需要的步数越少」，就明白了为什么 rectified flow 以及那些少步数的蒸馏模型（比如 1–4 步出图的 FLUX.1 schnell）能把出图时间压下来。
+--- prompt
+下面的速度场，是「只有一个数据点 d = 3」时的理想速度：在时刻 t、位置 x，它总是指向 d，大小正好让你在剩下的时间 1 - t 里走到 d。起点是 -1。写出打印的三行。
+--- code
+d = torch.tensor([3.0])
+v = lambda x, t: (d - x) / (1 - t)
+
+for steps in [1, 2, 4]:
+    x = torch.tensor([-1.0])           # 起点（「噪声」）
+    dt = 1.0 / steps
+    for i in range(steps):
+        x = x + v(x, i * dt) * dt
+    print(steps, x.item())
+--- explain
+三行都是 3.0。第一步 t = 0：v = (3 - (-1)) / 1 = 4。走 dt 之后，x 正好落在从 -1 到 3 的直线上，之后每一步都还在这条直线上，速度一直是 4。速度不变，欧拉法就没有误差，所以 1 步、2 步、4 步都正好走到 3.0。比如 2 步：-1 → 1 → 3。
+
+真实模型面对很多数据点，学到的是平均速度，路径有些弯，所以还需要 20–50 步。卡片里「速度 = x」那条弯路径，1 步只能走到 2.0，离真值 e ≈ 2.718 差很远。
+--- hints
+- 先算 steps = 1：只有一步，t = 0，dt = 1。
+- 再算 steps = 2 的第一步：t = 0 时 v 是多少？走半步之后 x 是多少？这时 v 又是多少？
+
+@@ item d10-17
+type: code
+title: 闭卷：DiTBlock
+level: 3
+exam: yes
+cards: DiTBlock：第 4 天的 Block 换个条件注入; adaLN-Zero：gate 和零初始化
+targets: DiTBlock
+ref: day8, day10
+--- context
+DiTBlock 是今天最重要的一段代码：第 4 天的 pre-LN Block 加上 adaLN-Zero。能从空白写出来，你就能读懂 SD3、Flux 这类模型的主干。
+--- prompt
+闭卷，从空白写 `DiTBlock(dim, n_head)`，`forward(x, c)`：x 是 (B, N, dim)，c 是 (B, dim)，返回 (B, N, dim)。
+
+- 可以用已经提供的 `SelfAttention(dim, n_head)`、`AdaLNModulation(dim)`（返回 6 组 (B, dim) 参数：shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp）和 `modulate(x, shift, scale)`
+- 调制模块的属性名必须是 `modulation`
+- MLP 是 `Linear(dim, 4*dim) → GELU → Linear(4*dim, dim)`
+
+检查：刚建好的 block 必须是恒等映射；modulation 的参数变成非零后，输出必须改变。
+--- starter
+class DiTBlock(nn.Module):
+    def __init__(self, dim, n_head):
+        super().__init__()
+        raise todo()
+
+    def forward(self, x, c):
+        raise todo()
+--- solution
+class DiTBlock(nn.Module):
+    def __init__(self, dim, n_head):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.attn = SelfAttention(dim, n_head)
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+        self.modulation = AdaLNModulation(dim)
+
+    def forward(self, x, c):
+        s1, sc1, g1, s2, sc2, g2 = self.modulation(c)
+        x = x + g1.unsqueeze(1) * self.attn(modulate(self.norm1(x), s1, sc1))
+        x = x + g2.unsqueeze(1) * self.mlp(modulate(self.norm2(x), s2, sc2))
+        return x
+--- tests
+@check("DiTBlock")
+def t05():
+    seed(0)
+    b = DiTBlock(32, 4)
+    x, c = torch.randn(2, 9, 32), torch.randn(2, 32)
+    shape_is(b(x, c), (2, 9, 32))
+    eq(b(x, c), x, tol=1e-5,
+       msg="零初始化的 gate 应该让整个 block 一开始就是恒等映射。不相等说明 gate 没接上，"
+           "或者 modulation 的 Linear 没有零初始化")
+    with torch.no_grad():
+        for p in b.modulation.parameters():
+            p.normal_(0, 0.3)
+    true(not torch.allclose(b(x, c), x, atol=1e-4), "gate 不是 0 之后，block 应该真的改变 x")
+
+@@ item d10-18
+type: code
+title: 闭卷：flow_loss
+level: 2
+exam: yes
+cards: Rectified flow：从噪声到数据走直线
+targets: flow_loss
+ref: day8, day10
+--- context
+「写出 flow matching 的训练 loss」是生成模型面试的常见题。约定、形状、目标的方向，三样都要对。
+--- prompt
+闭卷，从空白写 `flow_loss(model, x1_data)`，返回一个标量 loss。约定：t = 0 是纯噪声，t = 1 是数据；每个样本一个 t ~ U(0, 1)；模型预测速度；用 MSE。
+
+插值自己写，不要调用 `flow_interpolate` / `flow_target`。`model(x, t)` 返回和 x 同形状的张量，t 的形状是 (B,)。
+
+检查：永远输出 0 的模型，在标准正态数据上 loss ≈ 2。
+--- starter
+def flow_loss(model, x1_data):
+    raise todo()
+--- solution
+def flow_loss(model, x1_data):
+    B = x1_data.size(0)
+    t = torch.rand(B, device=x1_data.device)
+    noise = torch.randn_like(x1_data)
+    tt = t.reshape(-1, *([1] * (x1_data.dim() - 1)))
+    xt = (1 - tt) * noise + tt * x1_data
+    return F.mse_loss(model(xt, t), x1_data - noise)
+--- tests
+@check("Flow 训练目标")
+def t07():
+    seed(1)
+
+    class Zero(nn.Module):
+        def forward(self, x, t):
+            return torch.zeros_like(x)
+
+    l = flow_loss(Zero(), torch.randn(4096, 1, 4, 4))
+    true(l.dim() == 0, "loss 应该是一个标量（0 维张量）：F.mse_loss 默认就会求平均")
+    true(abs(l.item() - 2.0) < 0.15,
+         f"永远输出 0 的模型，loss 应该 ≈ Var(data - noise) = 2，实际是 {l.item():.3f}")

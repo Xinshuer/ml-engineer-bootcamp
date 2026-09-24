@@ -1,0 +1,1086 @@
+@@ day 5
+title: From GPT-2 to Llama
+part: LLMs
+hours: 3–4 hours
+--- goal
+Swap yesterday's GPT-2 parts one by one for Llama's (RMSNorm, RoPE, SwiGLU, GQA). Then write what generation needs: a KV cache and sampling (temperature, top-k, top-p, repetition penalty). By the end you can prove that token-by-token output with a cache equals running the whole sequence at once.
+--- checklist
+- Clear the review queue first (redo from scratch any item whose answer you looked at)
+- Read all 8 knowledge cards; change each example and run it again
+- Pass every practice item, especially "RoPE relative position" and "KV cache vs the full forward pass"
+- Write apply_rope and incremental_attention closed-book
+- Without notes, list what Llama changed compared with GPT-2 and why (a common interview question)
+
+@@ concept
+title: From GPT-2 to Llama: what changed
+--- body
+Yesterday (day 4) you wrote a GPT-2 style Transformer by hand. Llama (Meta's family of open models) has the same skeleton: token embedding → many blocks → a final norm → lm_head. Each block still does "norm, then attention, add the residual; norm, then FFN, add the residual".
+
+What changes are the parts. Today you swap them one at a time:
+
+1. LayerNorm → **RMSNorm**: no mean subtraction, just divide by the root mean square. Half the parameters.
+2. The learned position embedding (GPT-2's `wpe`) → **RoPE**: nothing is added to the input. Instead, every attention layer "rotates" q and k by position.
+3. The GELU MLP → **SwiGLU**: one extra "gate" matrix and a slightly narrower hidden layer, so the parameter count stays about the same.
+4. No bias in the Linear layers.
+5. Multi-head attention (MHA) → **GQA**: several q heads share one k/v head. Used since Llama 2 70B and in Llama 3.
+
+The second half of the day is about generation (inference): the **KV cache** (don't recompute old tokens while generating) and **sampling** (temperature, top-k, top-p, repetition penalty). GPT-2 uses these too, and interviews often ask about them together with Llama.
+
+The example uses Llama-7B's width C = 4096 and counts the parameters before and after some of these changes.
+--- code
+C = 4096   # the width of every Llama-7B layer
+print(f"one norm layer     LayerNorm: {2 * C:,}   RMSNorm: {C:,}")
+print(f"one FFN (no bias)  GPT-2 MLP (C->4C->C): {2 * C * 4 * C:,}")
+print(f"                   SwiGLU (3 x C x 11008): {3 * C * 11008:,}")
+print(f"positions          GPT-2 wpe (1024 positions): {1024 * C:,}   RoPE: 0")
+
+@@ concept
+title: RMSNorm: no mean, just the root mean square
+--- body
+LayerNorm does three things to each token's vector (length C): subtract the mean, divide by the standard deviation, then multiply by a weight and add a bias. It has 2C parameters.
+
+RMSNorm (Root Mean Square Norm) is simpler:
+```
+rms = sqrt(mean(x²) + eps)
+y   = x / rms * weight
+```
+- It does not subtract the mean. There is no "centring" step.
+- It only has a weight (shape (C,), starts as all ones) and no bias: C parameters.
+- With the weight at all ones, the output's mean square mean(y²) ≈ 1.
+- eps is a tiny number (for example 1e-6) that prevents division by 0.
+
+Why switch: one step less, half the parameters, about the same quality. Llama, Mistral and Qwen all use it.
+
+Two tools for the code: `torch.rsqrt(a)` is 1 / sqrt(a). `x.pow(2).mean(-1, keepdim=True)` averages over the last dimension (C) and keeps it: (B, T, C) becomes (B, T, 1), which broadcasts against (B, T, C).
+
+PyTorch has shipped `nn.RMSNorm` since version 2.4. Interviews and today's exercises want you to write it yourself.
+--- code
+x = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+ms = x.pow(2).mean(-1, keepdim=True)          # (1+4+9+16)/4 = 7.5
+y = x * torch.rsqrt(ms + 1e-6)
+print("mean(x^2) =", ms.item())
+print("RMSNorm  :", y)
+print("mean(y^2) =", round(y.pow(2).mean().item(), 4))
+print("LayerNorm:", F.layer_norm(x, (4,)), " <- mean removed: some values are negative")
+with torch.no_grad():
+    print("built-in nn.RMSNorm:", nn.RMSNorm(4, eps=1e-6)(x))
+
+@@ concept
+title: RoPE: rotate q and k by position
+--- body
+GPT-2 adds "the vector for position t" to the token embedding. RoPE (Rotary Position Embedding) adds nothing. Instead, in every attention layer it **rotates** q and k by an angle that depends on the position. v is not rotated.
+
+How the rotation works:
+- A vector of length hd (head_dim, the width of one head) is seen as hd/2 pairs of numbers. Each pair is a point in a plane.
+- Pair i has its own angular speed ω_i = 1 / θ^(2i / hd). θ is usually 10000, and i = 0, 1, …, hd/2 − 1.
+- At position t, pair i is turned by t · ω_i radians.
+
+With hd = 8, ω = [1, 0.1, 0.01, 0.001]. Pair 0 turns 1 radian per position (fast); the last pair turns only 0.001 radians (slow). Fast pairs tell neighbouring positions apart; slow pairs can express long distances. Llama 3 raises θ to 500000 so the slow pairs turn even more slowly, which helps with longer texts.
+
+All the angles form one table of shape (max_seq_len, hd/2): angle[t, i] = t · ω_i. It is computed once when the model is built; its cos and sin are stored and every layer looks them up. At position 0 every angle is 0: cos = 1 and sin = 0, so nothing turns.
+
+Two tools: `torch.arange(0, hd, 2)` is [0, 2, 4, …], exactly the 2i in the formula. `torch.outer(a, b)` (the outer product) multiplies every element of a with every element of b and gives a (len(a), len(b)) table.
+
+Turning a point (a, b) by φ radians:
+```
+a' = a · cos φ − b · sin φ
+b' = a · sin φ + b · cos φ
+```
+
+RoPE has two important properties:
+- **Lengths do not change**: a rotation never makes q or k longer or shorter.
+- **The dot product depends only on the distance**: q at position m was turned by m·ω, k at position n by n·ω. The dot product of two vectors depends only on their lengths and the angle between them, and after both rotations that angle has changed by exactly (n − m)·ω. So the attention score q·k depends only on the distance n − m: q at 3 with k at 5 gives the same score as q at 20 with k at 22. The model learns "how many positions apart", not "at which position".
+--- code
+print("2i =", torch.arange(0, 8, 2))
+w = 1.0 / (10000.0 ** (torch.arange(0, 8, 2).float() / 8))
+print("angular speeds ω for hd=8:", w)
+print("an outer product:\n", torch.outer(torch.arange(3).float(), torch.tensor([1.0, 0.1])))
+
+def rot2(v, phi):                      # turn a point (a, b) by phi radians
+    c, s = math.cos(phi), math.sin(phi)
+    return torch.stack([v[0] * c - v[1] * s, v[0] * s + v[1] * c])
+
+q, k = torch.tensor([1.0, 2.0]), torch.tensor([0.5, -1.0])
+w0 = 0.3                               # the angular speed of this pair
+print("q at 3,  k at 5 :", round((rot2(q, 3 * w0) @ rot2(k, 5 * w0)).item(), 4))
+print("q at 20, k at 22:", round((rot2(q, 20 * w0) @ rot2(k, 22 * w0)).item(), 4), " <- same distance, same dot product")
+print("q at 3,  k at 9 :", round((rot2(q, 3 * w0) @ rot2(k, 9 * w0)).item(), 4), " <- other distance, other dot product")
+
+@@ concept
+title: Writing RoPE: pairs, interleaving, complex numbers
+--- body
+Before writing RoPE code you must decide which two dimensions form a "pair". There are two conventions:
+- **Neighbouring pairs** (Meta's original Llama code, and today's exercises): (x0, x1), (x2, x3), …. `x[..., 0::2]` takes all even dimensions (the first number a of each pair); `x[..., 1::2]` takes all odd dimensions (the second number b).
+- **Half-and-half pairs** (HuggingFace's `rotate_half`): the first half is paired with the second half. With hd = 8 the pairs are (x0, x4), (x1, x5), ….
+
+Both are correct. But the weights were trained (or converted) for one of them. Using the wrong one **raises no error**; the model just produces garbage.
+
+With neighbouring pairs, after computing the new a' and b' you must **interleave** them back: a'0, b'0, a'1, b'1, …. `torch.stack([a', b'], dim=-1)` gives (…, hd/2, 2), and `.flatten(-2)` merges the last two dimensions into (…, hd). A plain `torch.cat([a', b'], dim=-1)` gives a'0, a'1, …, b'0, b'1, …, which is the wrong order.
+
+How the shapes fit: x is (B, nh, T, hd), so `x[..., 0::2]` is (B, nh, T, hd/2). cos and sin are (T, hd/2), the same as its last two dimensions, so they broadcast. No loop needed.
+
+**The complex-number form** (what Meta's original code does): see a pair (a, b) as the complex number a + bi. Multiplying by e^(iφ) = cos φ + i·sin φ turns it by φ radians, because multiplying complex numbers adds their angles and multiplies their lengths.
+- `torch.view_as_complex(t)`: the last dimension of t must be 2; (…, hd/2, 2) becomes a complex tensor (…, hd/2). So first `reshape(*x.shape[:-1], -1, 2)`.
+- `torch.polar(r, φ)`: the complex number with length r and angle φ. With r = 1 everywhere it is e^(iφ).
+- `torch.view_as_real(z)`: complex (…, hd/2) back to (…, hd/2, 2); then `.flatten(-2)`.
+- Complex tensors only support types such as float32/float64, so start with `x.float()` and finish with `.type_as(x)` to return x's original dtype.
+--- code
+x = torch.arange(8.0)
+a, b = x[0::2], x[1::2]
+print("even dims a:", a, " odd dims b:", b)
+print("stack + flatten:", torch.stack([a, b], dim=-1).flatten(-2), " <- interleaved: original order")
+print("cat            :", torch.cat([a, b], dim=-1), " <- order is scrambled")
+
+z = torch.view_as_complex(torch.tensor([3.0, 4.0]))           # 3 + 4i
+turn = torch.polar(torch.tensor(1.0), torch.tensor(math.pi / 2))   # e^(i·90°)
+print("complex:", z)
+print("turned by 90°:", torch.view_as_real(z * turn).round(decimals=4), " <- (3, 4) becomes (-4, 3); length still 5")
+
+@@ concept
+title: SwiGLU: an FFN with a gate
+--- body
+GPT-2's FFN (feed-forward layer): C → 4C → C with GELU in the middle. Two matrices with 2 · C · 4C = 8C² parameters (not counting biases).
+
+Llama's SwiGLU uses three Linear layers without bias:
+```
+w1: C -> H     w3: C -> H     w2: H -> C
+out = w2( silu(w1(x)) * w3(x) )
+```
+- `silu(z) = z · sigmoid(z)` (also called Swish); in PyTorch it is `F.silu`.
+- `w3(x)` acts as a "gate": it is multiplied element by element with `silu(w1(x))` and decides how much of each hidden unit gets through.
+- The three matrices have 3 · C · H parameters. To match GPT-2's 8C², take H = (2/3) · 4C = 8C/3, so that 3 · C · H = 8C².
+
+8C/3 is usually not a whole number, nor a size the hardware likes. Llama first rounds it down with `int(...)`, then rounds **up** to a multiple of multiple_of (for example 256). For C = 4096: 8 × 4096 / 3 = 10922.67 → 10922 → up to a multiple of 256 = 11008 (43 × 256). That is Llama-7B's FFN width.
+
+Rounding h up to a multiple of m with integers: `((h + m - 1) // m) * m` (`//` is integer division).
+--- code
+z = torch.tensor([-2.0, 0.0, 2.0])
+print("F.silu        :", F.silu(z))
+print("z * sigmoid(z):", z * torch.sigmoid(z))
+print("8C/3, C=4096  :", 2 * (4 * 4096) / 3, "-> int:", int(2 * (4 * 4096) / 3))
+m = 256
+for h in (10922, 11008, 11009):
+    print(h, "rounded up to a multiple of 256 ->", ((h + m - 1) // m) * m)
+
+@@ concept
+title: GQA: several q heads share one k/v head
+--- body
+Ordinary multi-head attention (MHA): with n_head q heads there are also n_head k heads and n_head v heads. During generation the k and v of every layer are stored (the KV cache, next card), and that is where most of the memory goes.
+
+GQA (Grouped-Query Attention): k and v only have n_kv_head heads (for example 8). Each group of n_rep = n_head / n_kv_head q heads shares one k/v head. The KV cache becomes n_rep times smaller. Example: Llama 2 70B has 64 q heads and 8 kv heads, so n_rep = 8 and the cache is 8 times smaller. The extreme case n_kv_head = 1 is called MQA (Multi-Query Attention).
+
+Before attention, the head dimension of k and v is "copied" up to n_head heads. After that it is exactly ordinary attention. This function is usually called `repeat_kv`.
+
+The order matters: q heads 0 to n_rep − 1 belong to group 0, so the copied kv heads must be ordered 0,0,…,1,1,… (each one repeated back to back), not 0,1,0,1,….
+
+Three steps:
+1. `x[:, :, None]`: insert a new dimension of length 1 after the head dimension. (B, n_kv, T, hd) → (B, n_kv, 1, T, hd).
+2. `.expand(B, n_kv, n_rep, T, hd)`: "stretch" that length-1 dimension to n_rep. expand copies no memory; it just lets the same data be seen n_rep times.
+3. `.reshape(B, n_kv * n_rep, T, hd)`: merge the (n_kv, n_rep) dimensions into one.
+--- code
+x = torch.tensor([1.0, 2.0]).view(1, 2, 1, 1)     # (B=1, n_kv_head=2, T=1, hd=1)
+x5 = x[:, :, None]
+print("after inserting a dim:", tuple(x5.shape))
+e = x5.expand(1, 2, 2, 1, 1)                        # n_rep = 2
+print("after expand:", tuple(e.shape))
+print("merged into 4 heads:", e.reshape(1, 4, 1, 1).flatten().tolist(), " <- each kv head twice, back to back")
+
+@@ concept
+title: KV cache: compute only the newest token
+--- body
+Text is generated one token at a time: feed the sequence to the model, take the logits at the last position, sample the next token, append it, and repeat.
+
+Without a cache, step t recomputes k and v for every earlier token. But the previous step already computed them, and they cannot change (with causal attention, old positions cannot see the new token, so their results do not depend on it).
+
+**KV cache**: every layer stores the k and v it has already computed. From then on, each step feeds only the one new token:
+1. Compute q, k, v for the new token only; the time dimension has length 1: (B, nh, 1, hd).
+2. Apply RoPE to q and k using the token's **position t in the whole sequence**, not 0.
+3. Append the new k and v to the cache along the time dimension (dim=-2): `torch.cat([old, new], dim=-2)`.
+4. Run attention with this one q over all k and v in the cache.
+
+Step 4 needs **no causal mask**. A causal mask stops a position from seeing the positions after it. Here the only q is the newest position, and every k in the cache is before it (or is itself), so it may see all of them anyway.
+
+How to prove it is right (this is also how it is tested at work): the output of feeding one token at a time must equal, position by position, the output of feeding the whole sequence at once (with a causal mask). If they differ, the position index is wrong nine times out of ten. How much memory a KV cache takes is worked out on day 23.
+--- code
+torch.manual_seed(0)
+q, k, v = torch.randn(1, 1, 5, 4), torch.randn(1, 1, 5, 4), torch.randn(1, 1, 5, 4)
+full = F.scaled_dot_product_attention(q, k, v, is_causal=True)   # all 5 positions at once
+last = F.scaled_dot_product_attention(q[:, :, -1:], k, v)         # only the last q, no mask
+print("last position of the full pass:", full[0, 0, -1])
+print("one step (no mask)            :", last[0, 0, 0])
+print("equal:", torch.allclose(full[:, :, -1:], last, atol=1e-6))
+
+cache_k = torch.zeros(1, 2, 0, 4)                 # empty cache: time length 0
+for t in range(3):
+    cache_k = torch.cat([cache_k, torch.randn(1, 2, 1, 4)], dim=-2)
+    print(f"after step {t}, cache shape:", tuple(cache_k.shape))
+
+@@ concept
+title: Sampling: temperature, top-k, top-p, repetition penalty
+--- body
+At the last position the model outputs logits (the raw score for every word, before softmax), shape (B, V), where V is the vocabulary size. The usual way to pick the next token:
+1. **Repetition penalty** (optional): lower the scores of tokens that have already appeared.
+2. **Temperature**: logits / T. T < 1 makes the distribution sharper (more certain); T > 1 makes it flatter (more random). T = 0 is the convention for "greedy": keep only the largest (argmax). You cannot actually divide by 0.
+3. **top-k**: keep the k largest scores and set the rest to -inf. After softmax, -inf has probability 0.
+4. **top-p** (nucleus sampling): sort by probability, largest first, and add them up. Stop when the running total **first reaches ≥ p**; keep that token too and drop everything after it. Always keep at least 1.
+5. Softmax gives probabilities; `torch.multinomial` draws one token.
+
+A top-p example: probabilities [0.5, 0.3, 0.15, 0.05], p = 0.7. Running total: 0.5, 0.8. The total first reaches ≥ 0.7 at the 2nd token, so the first 2 are kept. A handy rule: if the running total **before** a token (not counting itself) is already ≥ p, drop that token.
+
+The top-p code sorts first: `s, idx = logits.sort(dim=-1, descending=True)`; s holds the sorted values and idx their original positions. Decide what to drop in sorted order, then use `scatter` with idx to put the decision back in the original order.
+
+**Repetition penalty** (the `repetition_penalty` parameter of HuggingFace `generate`): penalty > 1. For every token that has appeared: if its logit > 0, divide by penalty; if ≤ 0, multiply by penalty. Both make it smaller. If you only divided, a negative logit would grow (−2 / 2 = −1) and become more likely.
+
+Reading and writing by index in one go: `logits.gather(1, ids)` reads the scores at ids; `logits.scatter(1, ids, new_values)` writes them back and returns a new tensor.
+--- code
+logits = torch.tensor([1.0, 2.0, 3.0, 4.0])
+for T in (0.5, 1.0, 2.0):
+    print(f"T={T}: probabilities", (logits / T).softmax(-1))
+print("the 2 largest:", logits.topk(2).values)
+
+probs = torch.tensor([0.5, 0.3, 0.15, 0.05])
+print("running total             :", probs.cumsum(-1))
+print("total before each (w/o it):", probs.cumsum(-1) - probs)
+
+ids = torch.tensor([3, 0])
+print("gather:", logits.gather(0, ids))
+print("scatter:", logits.scatter(0, ids, torch.tensor([-1.0, -1.0])))
+
+@@ item d5-01
+type: code
+title: RMSNorm
+level: 1
+cards: RMSNorm: no mean, just the root mean square
+targets: RMSNorm
+ref: day5
+--- context
+Every layer of Llama, Mistral and Qwen uses RMSNorm instead of LayerNorm. You will meet it when reading open-source model code and in hand-written interview questions.
+--- prompt
+Write `RMSNorm(nn.Module)`:
+- `__init__(self, dim, eps=1e-6)`: store `eps` and create one learnable parameter `self.weight` (an `nn.Parameter`) of shape `(dim,)`, starting as all ones. No bias.
+- `forward(self, x)`: x has shape (..., dim). Over the last dimension compute `y = x / sqrt(mean(x²) + eps) * weight` and return y with the same shape.
+
+Do not subtract the mean; that is exactly the difference from LayerNorm.
+--- starter
+class RMSNorm(nn.Module):
+    """y = x / sqrt(mean(x^2) + eps) * weight
+    Only one learnable parameter, weight, of shape (dim,), starting as all ones. No bias, no mean subtraction.
+    """
+
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        raise todo()
+
+    def forward(self, x):
+        raise todo()
+--- solution
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+--- tests
+@check("parameters = dim, output mean square ≈ 1, mean not removed")
+def t01():
+    seed(0)
+    m = RMSNorm(8)
+    true(params(m) == 8, f"there should be 8 parameters (only the weight). LayerNorm has 16; the bias is the half you save. Yours: {params(m)}")
+    x = torch.randn(2, 5, 8) * 7 + 3
+    y = m(x)
+    eq(y.pow(2).mean(-1), torch.ones(2, 5), tol=1e-3,
+       msg="the mean square mean(y²) over the last dimension should be ≈ 1. Check that you average over the last dimension (-1) with keepdim=True")
+    # the key difference from LayerNorm: the mean is not subtracted
+    true(abs(y.mean().item()) > 1e-3, "the output mean is almost 0: did you subtract the mean? RMSNorm does not")
+--- hints
+- There is one parameter: `self.weight = nn.Parameter(torch.ones(dim))`. Don't forget `self.eps = eps`.
+- The mean square: `x.pow(2).mean(-1, keepdim=True)`, shape (..., 1), which broadcasts against x. `torch.rsqrt(a)` is 1 / sqrt(a).
+- `forward` is one line: `return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight`
+
+@@ item d5-02
+type: code
+title: The RoPE frequency table
+level: 2
+cards: RoPE: rotate q and k by position
+targets: precompute_freqs
+ref: day5
+--- context
+RoPE's cos/sin table is computed once when the model is built, and every layer reads it at every step. If the table is wrong (say, a wrong exponent), the model still runs; the position information is just scrambled. That kind of bug is very hard to spot.
+--- prompt
+Write `precompute_freqs(head_dim, max_seq_len, theta=10000.0)` that returns `(cos, sin)`, both of shape `(max_seq_len, head_dim // 2)`.
+- The angular speed of pair i: `ω_i = 1 / theta ** (2i / head_dim)`, for i = 0, 1, …, head_dim/2 − 1.
+- The angle of pair i at position t is `t * ω_i`.
+- Return the cos and sin of this table of angles.
+
+Example: with head_dim = 8, ω = [1, 0.1, 0.01, 0.001], so cos[3, 0] = cos(3) and sin[5, 0] = sin(5). No Python loops.
+--- starter
+def precompute_freqs(head_dim, max_seq_len, theta=10000.0):
+    """Returns (cos, sin), both of shape (max_seq_len, head_dim // 2).
+    angular speed of pair i = 1 / theta ** (2i / head_dim), i = 0, 1, ..., head_dim/2 - 1
+    angle at position t = t * angular speed
+    """
+    raise todo()
+--- solution
+def precompute_freqs(head_dim, max_seq_len, theta=10000.0):
+    inv = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    ang = torch.outer(torch.arange(max_seq_len).float(), inv)   # (T, hd/2)
+    return ang.cos(), ang.sin()
+--- tests
+@check("shapes, no turn at position 0, pair 0 has speed 1, high dims turn slower")
+def t02():
+    cos, sin = precompute_freqs(8, 16)
+    shape_is(cos, (16, 4), "cos should be (max_seq_len, head_dim // 2)")
+    shape_is(sin, (16, 4), "sin should be (max_seq_len, head_dim // 2)")
+    eq(cos[0], torch.ones(4), msg="every angle at position 0 is 0, so cos should be all ones")
+    eq(sin[0], torch.zeros(4), msg="every angle at position 0 is 0, so sin should be all zeros")
+    # pair 0 has angular speed 1, so its angle at position t is just t
+    eq(cos[3, 0], torch.tensor(math.cos(3.0)), msg="pair 0 has speed 1, so its angle at position 3 is 3: cos[3, 0] = cos(3)")
+    eq(sin[5, 0], torch.tensor(math.sin(5.0)), msg="pair 0 has speed 1, so its angle at position 5 is 5: sin[5, 0] = sin(5)")
+    # the last pair turns slowest
+    true(abs(sin[1, -1].item()) < abs(sin[1, 0].item()), "the last pair should turn slowest: check that the exponent is 2i / head_dim and not upside down")
+--- hints
+- `torch.arange(0, head_dim, 2)` is exactly [0, 2, 4, …], the 2i in the formula. Add `.float()` so the division and power work on decimals, not integers.
+- Take the outer product of the positions `torch.arange(max_seq_len).float()` and ω: `torch.outer(positions, ω)` gives the (T, hd/2) table of angles.
+- `inv = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))`, `ang = torch.outer(torch.arange(max_seq_len).float(), inv)`, then return `ang.cos(), ang.sin()`.
+
+@@ item d5-03
+type: code
+title: Apply RoPE (neighbouring pairs)
+level: 2
+cards: RoPE: rotate q and k by position; Writing RoPE: pairs, interleaving, complex numbers
+targets: apply_rope
+ref: day5
+--- context
+This is what every Llama attention layer does to q and k. Done right, the attention score depends only on how far apart two tokens are, which is why almost every new model uses RoPE.
+--- prompt
+Write `apply_rope(x, cos, sin)`:
+- x: (B, nh, T, hd). cos, sin: (T, hd/2), from `precompute_freqs` (provided). Return a tensor with the same shape as x.
+- Neighbouring dimensions form a pair: (x0, x1), (x2, x3), …. Pair i, (a, b) = (x[2i], x[2i+1]), is rotated like this:
+```
+out[..., 2i]   = a * cos[i] - b * sin[i]
+out[..., 2i+1] = a * sin[i] + b * cos[i]
+```
+- Use slicing to do it all at once; no Python loops.
+
+Besides the shape, "no turn at position 0" and "length unchanged", the grader checks RoPE's most important property: the dot product of q at position 3 and k at position 5 equals that of q at 20 and k at 22.
+--- starter
+def apply_rope(x, cos, sin):
+    """x: (B, nh, T, hd)   cos/sin: (T, hd//2)  ->  (B, nh, T, hd)
+    Pairs are **neighbouring dimensions**: (x0,x1), (x2,x3), ...
+        out[..., 2i]   = x[2i]*cos[i] - x[2i+1]*sin[i]
+        out[..., 2i+1] = x[2i]*sin[i] + x[2i+1]*cos[i]
+    """
+    raise todo()
+--- solution
+def apply_rope(x, cos, sin):
+    x1, x2 = x[..., 0::2], x[..., 1::2]        # neighbouring pairs
+    o1 = x1 * cos - x2 * sin
+    o2 = x1 * sin + x2 * cos
+    return torch.stack([o1, o2], dim=-1).flatten(-2)   # interleave back
+--- tests
+@check("same shape, no turn at position 0, length unchanged")
+def t03():
+    seed(1)
+    x = torch.randn(2, 3, 6, 8)
+    cos, sin = precompute_freqs(8, 6)
+    y = apply_rope(x, cos, sin)
+    shape_is(y, x.shape, "the output should have the same shape as x")
+    eq(y[:, :, 0], x[:, :, 0], msg="the angle at position 0 is 0, so the output there should equal the input. If only the order is off, check whether you used cat instead of interleaving")
+    # a rotation keeps the length
+    eq(y.norm(dim=-1), x.norm(dim=-1), tol=1e-4, msg="a rotation does not change a vector's length. If it changed, a sign or a cos/sin in the formula is wrong")
+
+@check("relative position: the dot product depends only on the distance")
+def t04():
+    seed(2)
+    cos, sin = precompute_freqs(16, 64)
+    q = torch.randn(1, 1, 1, 16)
+    k = torch.randn(1, 1, 1, 16)
+
+    def dot_at(m, n):
+        qm = apply_rope(q, cos[m:m + 1], sin[m:m + 1])
+        kn = apply_rope(k, cos[n:n + 1], sin[n:n + 1])
+        return (qm * kn).sum()
+
+    eq(dot_at(3, 5), dot_at(20, 22), tol=1e-4,
+       msg="the dot product of q at 3 and k at 5 should equal that of q at 20 and k at 22 (distance 2 in both). "
+           "If not, the rotation formula is wrong")
+    true(not torch.allclose(dot_at(3, 5), dot_at(3, 9), atol=1e-4), "different distances (2 and 6) give the same dot product: your function does not seem to rotate at all")
+--- hints
+- `a, b = x[..., 0::2], x[..., 1::2]`: both are (B, nh, T, hd/2) and broadcast directly against the (T, hd/2) cos and sin.
+- Compute `o1 = a * cos - b * sin` and `o2 = a * sin + b * cos`, then interleave them back: `torch.stack([o1, o2], dim=-1).flatten(-2)`.
+- Don't use `torch.cat([o1, o2], dim=-1)`: it puts all of o1 first and all of o2 after, so even position 0 no longer matches the input.
+
+@@ item d5-04
+type: code
+title: Complex-number RoPE, checked against the real version
+level: 2
+cards: Writing RoPE: pairs, interleaving, complex numbers
+targets: apply_rope_complex
+ref: day5
+--- context
+Meta's original Llama code writes RoPE with complex numbers: a pair is one complex number, and multiplying by e^(iφ) rotates it. When you read that code, or move weights between the two implementations, first make sure both forms give the same result.
+--- prompt
+Write `apply_rope_complex(x, freqs)`:
+- x: (B, nh, T, hd). freqs: (T, hd/2) holds the **angles** themselves, not cos/sin.
+- Use `torch.view_as_complex`, `torch.polar` and `torch.view_as_real`.
+- The result must equal `apply_rope(x, freqs.cos(), freqs.sin())` (`apply_rope` is provided; the grader compares against it).
+- Return shape (B, nh, T, hd), with the same dtype as x.
+--- starter
+def apply_rope_complex(x, freqs):
+    """x: (B, nh, T, hd)   freqs: (T, hd//2) **angles** (not cos/sin)
+    Use torch.view_as_complex / torch.polar / torch.view_as_real; the result must equal apply_rope.
+    """
+    raise todo()
+--- solution
+def apply_rope_complex(x, freqs):
+    xc = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    fc = torch.polar(torch.ones_like(freqs), freqs)
+    return torch.view_as_real(xc * fc).flatten(-2).type_as(x)
+--- tests
+@check("same result as the real-number apply_rope")
+def t05():
+    seed(3)
+    x = torch.randn(2, 2, 5, 8)
+    hd, T = 8, 5
+    inv = 1.0 / (10000.0 ** (torch.arange(0, hd, 2).float() / hd))
+    ang = torch.outer(torch.arange(T).float(), inv)      # (T, hd//2)
+    eq(apply_rope_complex(x, ang), apply_rope(x, ang.cos(), ang.sin()), tol=1e-5,
+       msg="does not match the real version. Check that complex numbers are built from neighbouring dimensions (reshape to (..., hd/2, 2)) and that you flatten(-2) at the end")
+--- hints
+- First split the last dimension into pairs: `x.float().reshape(*x.shape[:-1], -1, 2)` has shape (B, nh, T, hd/2, 2); `torch.view_as_complex` turns it into complex (B, nh, T, hd/2).
+- `torch.polar(torch.ones_like(freqs), freqs)` is e^(i·freqs), shape (T, hd/2), and multiplies directly with the complex tensor above.
+- After multiplying, `torch.view_as_real(...)` gives (…, hd/2, 2), `.flatten(-2)` gives (…, hd), and `.type_as(x)` finishes it.
+
+@@ item d5-05
+type: code
+title: SwiGLU and its hidden size
+level: 2
+cards: SwiGLU: an FFN with a gate
+targets: swiglu_hidden, SwiGLU
+ref: day5
+--- context
+The FFN of Llama, Mistral and Qwen is SwiGLU. A common interview question: "Why is Llama-7B's FFN 11008 wide and not 4 × 4096?" Because three matrices should have about as many parameters as the original two.
+--- prompt
+Write two things:
+1. `swiglu_hidden(n_embd, multiple_of=256)`: compute `int(2 * (4 * n_embd) / 3)` (2/3 of 4C), then round it **up** to a multiple of `multiple_of`. `swiglu_hidden(4096, 256)` should be 11008 and `swiglu_hidden(64, 8)` should be 176.
+2. `SwiGLU(nn.Module)`: `__init__(self, n_embd, hidden)` creates three `nn.Linear` layers without bias, named as in Llama: `w1` (C → H), `w3` (C → H), `w2` (H → C). `forward(x)` returns `w2(silu(w1(x)) * w3(x))`. Input (B, T, C), output (B, T, C).
+--- starter
+def swiglu_hidden(n_embd, multiple_of=256):
+    """Llama's hidden size: take 2/3 of 4*C (= 8C/3), then round up to a multiple of multiple_of."""
+    raise todo()
+
+class SwiGLU(nn.Module):
+    """Three Linear layers without bias:
+        w1: C -> H     w3: C -> H     w2: H -> C
+    forward: w2(silu(w1(x)) * w3(x))
+    """
+
+    def __init__(self, n_embd, hidden):
+        super().__init__()
+        raise todo()
+
+    def forward(self, x):
+        raise todo()
+--- solution
+def swiglu_hidden(n_embd, multiple_of=256):
+    h = int(2 * (4 * n_embd) / 3)
+    return multiple_of * ((h + multiple_of - 1) // multiple_of)
+
+class SwiGLU(nn.Module):
+    def __init__(self, n_embd, hidden):
+        super().__init__()
+        self.w1 = nn.Linear(n_embd, hidden, bias=False)
+        self.w3 = nn.Linear(n_embd, hidden, bias=False)
+        self.w2 = nn.Linear(hidden, n_embd, bias=False)
+
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+--- tests
+@check("hidden sizes 11008 / 176, output shape, 3·C·H parameters")
+def t06():
+    true(swiglu_hidden(4096, 256) == 11008, f"Llama-7B's FFN width is 11008; you computed {swiglu_hidden(4096, 256)}. Did you round down?")
+    true(swiglu_hidden(64, 8) == 176, f"swiglu_hidden(64, 8) should be 176 (170 rounded up to a multiple of 8); you computed {swiglu_hidden(64, 8)}")
+    m = SwiGLU(16, 32)
+    shape_is(m(torch.randn(2, 5, 16)), (2, 5, 16), "the output should have the input's shape (B, T, C)")
+    true(params(m) == 16 * 32 * 3, f"there should be three Linear layers without bias, {16 * 32 * 3} parameters in total; yours has {params(m)}")
+--- hints
+- Rounding h up to a multiple of m: `m * ((h + m - 1) // m)`. Example: h = 170, m = 8 → 8 × 22 = 176.
+- Write each layer as `nn.Linear(in, out, bias=False)`; the parameter count should be exactly 3 × C × H.
+- `forward` is one line: `return self.w2(F.silu(self.w1(x)) * self.w3(x))`.
+
+@@ item d5-06
+type: code
+title: repeat_kv for GQA
+level: 2
+cards: GQA: several q heads share one k/v head
+targets: repeat_kv
+ref: day5
+--- context
+Models with GQA (Llama 3, Mistral and others) copy the k and v heads up to the number of q heads before attention. Getting the order wrong raises no error, but every q head is paired with another group's k/v and the output is garbage.
+--- prompt
+Write `repeat_kv(x, n_rep)`:
+- x: (B, n_kv_head, T, hd); return (B, n_kv_head * n_rep, T, hd).
+- Repeat each kv head n_rep times **back to back**: with n_kv_head = 2 and n_rep = 3 the head order is 0,0,0,1,1,1, not 0,1,0,1,0,1.
+- With n_rep = 1, return x unchanged.
+- Use `expand` + `reshape`, not a loop with `torch.cat`.
+--- starter
+def repeat_kv(x, n_rep):
+    """x: (B, n_kv_head, T, hd)  ->  (B, n_kv_head*n_rep, T, hd)
+    Each kv head is repeated n_rep times back to back (heads 0,0,1,1, not 0,1,0,1).
+    No torch.cat in a loop (use expand + reshape).
+    """
+    raise todo()
+--- solution
+def repeat_kv(x, n_rep):
+    if n_rep == 1:
+        return x
+    B, nkv, T, hd = x.shape
+    return x[:, :, None].expand(B, nkv, n_rep, T, hd).reshape(B, nkv * n_rep, T, hd)
+--- tests
+@check("shape, back-to-back order, n_rep = 1")
+def t07():
+    x = torch.arange(2 * 2 * 3 * 4, dtype=torch.float).reshape(2, 2, 3, 4)
+    y = repeat_kv(x, 3)
+    shape_is(y, (2, 6, 3, 4), "should be (B, n_kv_head * n_rep, T, hd)")
+    eq(y[:, 0], x[:, 0], msg="output head 0 should be kv head 0")
+    eq(y[:, 1], x[:, 0], msg="repeats must be back to back: the head order should be 0,0,0,1,1,1. Yours looks like 0,1,0,1,… (that is what x.repeat does)")
+    eq(y[:, 3], x[:, 1], msg="output head 3 should be kv head 1")
+    eq(repeat_kv(x, 1), x, msg="with n_rep = 1 the input should come back unchanged")
+--- hints
+- `x[:, :, None]` inserts a length-1 dimension after the head dimension: (B, n_kv_head, 1, T, hd).
+- `.expand(B, n_kv_head, n_rep, T, hd)` stretches it to n_rep; then `.reshape(B, n_kv_head * n_rep, T, hd)`.
+- `x.repeat(1, n_rep, 1, 1)` gives the order 0,1,0,1,…, exactly the wrong order the task warns about.
+
+@@ item d5-07
+type: code
+title: A KVCache class
+level: 1
+cards: KV cache: compute only the newest token
+targets: KVCache
+ref: day5
+--- context
+Without a KV cache, every generation step recomputes all earlier tokens; with one, each step computes only the new token. HuggingFace generate, vLLM and llama.cpp all have this structure.
+--- prompt
+Write a `KVCache` class (a plain Python class, not an nn.Module):
+- `__init__()`: the cache starts empty.
+- `update(k, v)`: k and v have shape (B, nh, T_new, hd). Append them to the cache along the **time dimension** (dim=-2) and return the complete `(k_all, v_all)`. On the first call the cache is empty, so just store them.
+- `length`: a property (used as `c.length`, no brackets) that returns how many time steps are cached. 0 when empty.
+- `reset()`: empty the cache.
+--- starter
+class KVCache:
+    """Usage:
+        c = KVCache()
+        k_all, v_all = c.update(k_new, v_new)   # all (B, nh, T_new, hd)
+    Each call appends the new k/v after the cached ones along the time dimension and returns the full k/v.
+    c.length is the number of cached time steps. c.reset() empties the cache.
+    """
+
+    def __init__(self):
+        raise todo()
+
+    @property
+    def length(self):
+        raise todo()
+
+    def update(self, k, v):
+        raise todo()
+
+    def reset(self):
+        raise todo()
+--- solution
+class KVCache:
+    def __init__(self):
+        self.k = None
+        self.v = None
+
+    @property
+    def length(self):
+        return 0 if self.k is None else self.k.size(-2)
+
+    def update(self, k, v):
+        self.k = k if self.k is None else torch.cat([self.k, k], dim=-2)
+        self.v = v if self.v is None else torch.cat([self.v, v], dim=-2)
+        return self.k, self.v
+
+    def reset(self):
+        self.k = self.v = None
+--- tests
+@check("two updates are joined; length and reset work")
+def t08():
+    c = KVCache()
+    true(c.length == 0, "a new cache should have c.length == 0. Note that length is a property (@property), not a method")
+    k1, v1 = torch.randn(1, 2, 3, 4), torch.randn(1, 2, 3, 4)
+    K, V = c.update(k1, v1)
+    shape_is(K, (1, 2, 3, 4), "after the first update there should be exactly these 3 steps")
+    true(c.length == 3, f"3 steps are stored, so c.length should be 3; yours is {c.length}")
+    k2, v2 = torch.randn(1, 2, 1, 4), torch.randn(1, 2, 1, 4)
+    K, V = c.update(k2, v2)
+    shape_is(K, (1, 2, 4, 4), "3 steps plus 1 step should be 4 steps: concatenate along the time dimension dim=-2")
+    eq(K[:, :, :3], k1, msg="the old cache was overwritten: the new k must be appended after the old one")
+    eq(K[:, :, 3:], k2, msg="the last step should be the k you just passed in")
+    eq(V[:, :, 3:], v2, msg="v must be appended just like k")
+    true(c.length == 4, f"c.length should be 4; yours is {c.length}")
+    c.reset()
+    true(c.length == 0, "after reset() c.length should be 0 again")
+--- hints
+- Use `self.k = None` and `self.v = None` for "empty". In `update`: if it is None, just store it; otherwise `torch.cat([self.k, k], dim=-2)`.
+- Put `@property` above `length` and write `return 0 if self.k is None else self.k.size(-2)`.
+- `reset` sets k and v back to None. `update` ends with `return self.k, self.v`.
+
+@@ item d5-08
+type: code
+title: One attention step needs no mask
+level: 1
+cards: KV cache: compute only the newest token
+targets: attn_step
+ref: day5
+--- context
+When generating with a KV cache, each step has only one new q, which attends to all k and v in the cache. Explaining why no causal mask is needed here separates "memorised it" from "understood it" in interviews.
+--- prompt
+Write `attn_step(q, k_all, v_all)`:
+- q: (B, nh, 1, hd), just the current step. k_all, v_all: (B, nh, T, hd), the whole history (including the current step).
+- Return (B, nh, 1, hd): ordinary scaled dot-product attention, `softmax(q · kᵀ / sqrt(hd)) · v`, **with no mask**.
+- Write it yourself; don't call `F.scaled_dot_product_attention` (the grader uses it to check your answer).
+--- starter
+def attn_step(q, k_all, v_all):
+    """q: (B, nh, 1, hd) only the current step; k_all/v_all: (B, nh, T, hd) the whole history.
+    q is a single position and it is the newest one, so **no causal mask is needed** (think about why).
+    Returns (B, nh, 1, hd).
+    """
+    raise todo()
+--- solution
+def attn_step(q, k_all, v_all):
+    # q is the newest position in the sequence; it may see the whole history, so no mask is needed
+    att = (q @ k_all.transpose(-2, -1) / math.sqrt(q.size(-1))).softmax(-1)
+    return att @ v_all
+--- tests
+@check("matches SDPA without a mask")
+def t09():
+    seed(4)
+    q = torch.randn(1, 2, 1, 4)
+    k, v = torch.randn(1, 2, 5, 4), torch.randn(1, 2, 5, 4)
+    eq(attn_step(q, k, v), F.scaled_dot_product_attention(q, k, v, is_causal=False),
+       msg="does not match standard attention. Check that you divide by sqrt(hd) (q's last dimension) and take the softmax over the last dimension")
+--- hints
+- Scores: `q @ k_all.transpose(-2, -1)` has shape (B, nh, 1, T); divide by `math.sqrt(q.size(-1))`.
+- `.softmax(-1)` over the last dimension, then `@ v_all` gives (B, nh, 1, hd).
+- Why no mask: the only q is the newest position; every k in the cache is before it or is itself, so it may see all of them.
+
+@@ item d5-09
+type: code
+title: Token by token = the whole sequence at once
+level: 3
+cards: KV cache: compute only the newest token; RoPE: rotate q and k by position
+targets: incremental_attention
+ref: day5
+--- context
+A broken KV cache usually does not raise an error; the generated text just slowly gets worse. The standard test at work is this exercise: the output computed one token at a time must equal the output of the whole sequence computed at once.
+--- prompt
+Provided (hidden reference code): `precompute_freqs`, `apply_rope`, `KVCache`, `attn_step`, and `_full_attention`, which computes the whole sequence at once:
+```python
+def _full_attention(x, wq, wk, wv, cos, sin):
+    B, T, C = x.shape
+    nh, hd = 2, C // 2
+    q = (x @ wq).view(B, T, nh, hd).transpose(1, 2)
+    k = (x @ wk).view(B, T, nh, hd).transpose(1, 2)
+    v = (x @ wv).view(B, T, nh, hd).transpose(1, 2)
+    q, k = apply_rope(q, cos[:T], sin[:T]), apply_rope(k, cos[:T], sin[:T])
+    return F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(B, T, C)
+```
+Write `incremental_attention(x, wq, wk, wv, cos, sin)` that returns the same (B, T, C), but **feeds one token at a time**:
+- x: (B, T, C). wq, wk, wv: (C, C). 2 heads, hd = C // 2. cos, sin: (max_len, hd/2).
+- For t = 0, 1, …, T − 1: compute this step's q, k, v from `x[:, t:t+1]` only (shape (B, 2, 1, hd)), apply RoPE, put k and v into a `KVCache`, compute this step's output with `attn_step`, and turn it back into (B, 1, C).
+- Finally join the outputs of all steps along the time dimension.
+--- starter
+def incremental_attention(x, wq, wk, wv, cos, sin):
+    """Feed one token at a time and reproduce _full_attention's output with KVCache + attn_step.
+    Returns (B, T, C). Note: step t must use cos[t:t+1] / sin[t:t+1] for RoPE, not cos[0:1].
+    """
+    raise todo()
+--- solution
+def incremental_attention(x, wq, wk, wv, cos, sin):
+    B, T, C = x.shape
+    nh, hd = 2, C // 2
+    cache = KVCache()
+    outs = []
+    for t in range(T):
+        xt = x[:, t:t + 1]
+        q = (xt @ wq).view(B, 1, nh, hd).transpose(1, 2)
+        k = (xt @ wk).view(B, 1, nh, hd).transpose(1, 2)
+        v = (xt @ wv).view(B, 1, nh, hd).transpose(1, 2)
+        q = apply_rope(q, cos[t:t + 1], sin[t:t + 1])    # the key point: use position t's angles
+        k = apply_rope(k, cos[t:t + 1], sin[t:t + 1])
+        K, V = cache.update(k, v)
+        o = attn_step(q, K, V)
+        outs.append(o.transpose(1, 2).reshape(B, 1, C))
+    return torch.cat(outs, dim=1)
+--- tests
+@check("token-by-token output equals the full forward pass")
+def t10():
+    seed(5)
+    B, T, C = 1, 7, 8
+    x = torch.randn(B, T, C)
+    wq, wk, wv = (torch.randn(C, C) * 0.3 for _ in range(3))
+    cos, sin = precompute_freqs(C // 2, 32)
+    eq(incremental_attention(x, wq, wk, wv, cos, sin),
+       _full_attention(x, wq, wk, wv, cos, sin), tol=1e-4,
+       msg="the token-by-token output does not match the full forward pass. Nine times out of ten the position index is wrong (every step used position 0's cos/sin)")
+--- hints
+- Step t must use `cos[t:t+1]` and `sin[t:t+1]` for RoPE, its position in the whole sequence, not `cos[0:1]`.
+- Copy the shapes from `_full_attention` with T replaced by 1: `q = (xt @ wq).view(B, 1, nh, hd).transpose(1, 2)`, and the same for k and v.
+- Create `cache = KVCache()` before the loop; each step does `K, V = cache.update(k, v)` and `o = attn_step(q, K, V)`, appends `o.transpose(1, 2).reshape(B, 1, C)` to a list, and at the end `torch.cat(outs, dim=1)`.
+
+@@ item d5-10
+type: code
+title: temperature / top-k / top-p
+level: 3
+cards: Sampling: temperature, top-k, top-p, repetition penalty
+targets: apply_temperature, top_k_filter, top_p_filter
+ref: day5
+--- context
+The same model can go from dull to nonsense just by changing temperature, top-k and top-p. Almost every LLM API has these three parameters, and interviews often ask you to write top-p by hand.
+--- prompt
+Write three functions. The input logits have shape (..., V); each returns new logits of the same shape, with removed positions set to `float("-inf")`:
+1. `apply_temperature(logits, t)`: return `logits / t`. When t == 0 you cannot divide; use greedy instead: keep the maximum, set everything else to -inf.
+2. `top_k_filter(logits, k)`: keep the k largest, set the rest to -inf.
+3. `top_p_filter(logits, p)`: sort by softmax probability, largest first. Keep tokens until the running total **first reaches ≥ p** (keep that token too) and set everything after it to -inf. Always keep at least 1. Return the logits in their **original order**.
+
+Example: probabilities [0.5, 0.3, 0.15, 0.05] with p = 0.7 → keep the first 2 (0.5 + 0.3 = 0.8 is the first total ≥ 0.7).
+--- starter
+def apply_temperature(logits, t):
+    """Smaller t = more certain. t may be 0: then it becomes argmax (everything but the maximum is -inf)."""
+    raise todo()
+
+def top_k_filter(logits, k):
+    """Keep the k largest, set the rest to -inf. logits: (..., V)"""
+    raise todo()
+
+def top_p_filter(logits, p):
+    """Nucleus sampling. Sort by probability, largest first; the token where the running total **first reaches >= p**
+    is kept too, everything after it becomes -inf. Keep at least 1.
+    """
+    raise todo()
+--- solution
+def apply_temperature(logits, t):
+    if t == 0:
+        return logits.masked_fill(logits < logits.max(-1, keepdim=True).values, float("-inf"))
+    return logits / t
+
+def top_k_filter(logits, k):
+    kth = logits.topk(k, dim=-1).values[..., -1:]
+    return logits.masked_fill(logits < kth, float("-inf"))
+
+def top_p_filter(logits, p):
+    s, idx = logits.sort(dim=-1, descending=True)
+    probs = s.softmax(-1)
+    cum = probs.cumsum(-1)
+    remove = (cum - probs) >= p          # the total *before* this token is already enough -> drop it
+    remove[..., 0] = False               # keep at least one
+    mask = torch.zeros_like(remove).scatter(-1, idx, remove)
+    return logits.masked_fill(mask, float("-inf"))
+--- tests
+@check("temperature, greedy at t = 0, top-k, top-p")
+def t11():
+    lg = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    eq(apply_temperature(lg, 2.0), lg / 2, msg="with t = 2 the result should be logits / 2")
+    z = apply_temperature(lg, 0.0)
+    true(torch.isinf(z[0, :3]).all() and z[0, 3] == 4.0, "t = 0 should become greedy: keep the maximum 4.0 and set all others to -inf")
+
+    f = top_k_filter(lg, 2)
+    true(torch.isinf(f[0, :2]).all(), "top-k = 2 should keep only the 2 largest (3.0 and 4.0); 1.0 and 2.0 should be -inf")
+    eq(f[0, 2:], lg[0, 2:], msg="the values you keep must not change")
+
+    probs = torch.tensor([[0.5, 0.3, 0.15, 0.05]])
+    lgp = probs.log()
+    g = top_p_filter(lgp, 0.7)
+    kept = (~torch.isinf(g)).sum().item()
+    true(kept == 2, f"0.5 + 0.3 = 0.8 is the first total ≥ 0.7, so 2 tokens should be kept; you kept {kept}")
+    true(top_p_filter(lgp, 0.01).isinf().sum().item() == 3, "even with a tiny p at least 1 token (the most likely one) must be kept")
+--- hints
+- t = 0: `logits.max(-1, keepdim=True).values` is each row's maximum; `logits.masked_fill(logits < maximum, float("-inf"))`. top-k is similar: `logits.topk(k, dim=-1).values[..., -1:]` is the k-th largest value; drop everything smaller.
+- top-p: `s, idx = logits.sort(dim=-1, descending=True)`, `probs = s.softmax(-1)`. The total before a token is `probs.cumsum(-1) - probs`; drop the token when that is ≥ p.
+- Once you have the boolean tensor `remove` in sorted order, set `remove[..., 0] = False`, put it back in the original order with `torch.zeros_like(remove).scatter(-1, idx, remove)`, then `masked_fill`.
+
+@@ item d5-11
+type: code
+title: Repetition penalty
+level: 2
+cards: Sampling: temperature, top-k, top-p, repetition penalty
+targets: repetition_penalty
+ref: day5
+--- context
+Small models like to repeat themselves, producing the same sentence again and again. The repetition penalty (the repetition_penalty parameter of HuggingFace generate) fights this by lowering the scores of tokens that have already appeared.
+--- prompt
+Write `repetition_penalty(logits, prev_ids, penalty=1.2)`:
+- logits: (B, V). prev_ids: (B, T), the token ids each row has already generated (dtype long).
+- For each token that appears in a row: if its logit > 0, divide by penalty; otherwise multiply by penalty. Both make it smaller. Tokens that have not appeared stay the same.
+- Return a new tensor. No Python loop over the batch.
+
+Example: logits [2, −2, 1], tokens 0 and 1 have appeared, penalty = 2 → [1, −4, 1].
+--- starter
+def repetition_penalty(logits, prev_ids, penalty=1.2):
+    """logits: (B, V)   prev_ids: (B, T) tokens generated so far.
+    For tokens that appeared: positive logits are divided by penalty, negative ones multiplied (both become less likely).
+    No python loop over the batch.
+    """
+    raise todo()
+--- solution
+def repetition_penalty(logits, prev_ids, penalty=1.2):
+    s = logits.gather(1, prev_ids)
+    s = torch.where(s > 0, s / penalty, s * penalty)
+    return logits.scatter(1, prev_ids, s)
+--- tests
+@check("positive divided, negative multiplied, unseen unchanged")
+def t12():
+    lg = torch.tensor([[2.0, -2.0, 1.0]])
+    prev = torch.tensor([[0, 1]])
+    out = repetition_penalty(lg, prev, 2.0)
+    eq(out, torch.tensor([[1.0, -4.0, 1.0]]),
+       msg="should be [1, -4, 1]: divide the positive one, multiply the negative one, and leave the unseen token (index 2) alone")
+--- hints
+- `logits.gather(1, prev_ids)` reads the scores of the tokens that appeared, shape (B, T).
+- `torch.where(s > 0, s / penalty, s * penalty)` handles positive and negative values separately.
+- `logits.scatter(1, prev_ids, new_scores)` writes them back in place of the old ones and returns a new tensor.
+
+@@ item d5-12
+type: fix
+title: Fix the bug: RoPE with the wrong pairing
+level: 2
+cards: Writing RoPE: pairs, interleaving, complex numbers
+targets: apply_rope_buggy
+ref: day5
+--- context
+RoPE has two pairing conventions. Move weights from one implementation to the other without adjusting them and the model raises no error; it just outputs garbage. This really happens when people port models.
+--- prompt
+`apply_rope_buggy` below should give exactly the same result as `apply_rope` (neighbouring pairs, provided). But it was written with HuggingFace's "half-and-half" convention: with hd = 8, x0 is paired with x4, x1 with x5, and so on.
+
+Change it to neighbouring pairs (x0 with x1, x2 with x3, …) so its output equals `apply_rope(x, cos, sin)`. Keep the function name and arguments. There are two places to fix.
+--- starter
+def apply_rope_buggy(x, cos, sin):
+    hd = x.size(-1)
+    x1 = x[..., :hd // 2]
+    x2 = x[..., hd // 2:]
+    o1 = x1 * cos - x2 * sin
+    o2 = x1 * sin + x2 * cos
+    return torch.cat([o1, o2], dim=-1)
+--- solution
+def apply_rope_buggy(x, cos, sin):
+    x1, x2 = x[..., 0::2], x[..., 1::2]              # fix 1: half-and-half -> neighbouring pairs
+    o1 = x1 * cos - x2 * sin
+    o2 = x1 * sin + x2 * cos
+    return torch.stack([o1, o2], dim=-1).flatten(-2)  # fix 2: cat -> interleave with stack + flatten
+--- tests
+@check("matches apply_rope with neighbouring pairs")
+def t13():
+    seed(6)
+    x = torch.randn(1, 2, 5, 8)
+    cos, sin = precompute_freqs(8, 5)
+    eq(apply_rope_buggy(x, cos, sin), apply_rope(x, cos, sin), tol=1e-5,
+       msg="two places: take the pairs from neighbouring dimensions (0-1, 2-3, ...), not the two halves; "
+           "and interleave them back (stack + flatten) instead of cat")
+--- hints
+- The first fix is where the pairs are taken: `x[..., :hd // 2]` and `x[..., hd // 2:]` are the two halves. Neighbouring pairs need the even and the odd dimensions.
+- The second fix is where they are put back: `torch.cat` puts all of o1 first. Neighbouring pairs must be interleaved: `torch.stack([o1, o2], dim=-1).flatten(-2)`.
+
+@@ item d5-13
+type: choice
+title: What Llama changed compared with GPT-2
+level: 1
+cards: From GPT-2 to Llama: what changed
+answer: 1,3,4
+--- context
+"How is Llama different from GPT-2?" is a very common question in LLM job interviews. Naming every change and its reason without hesitating shows you have really read the code.
+--- prompt
+Which of these did Llama change compared with GPT-2? (Pick all that apply.)
+--- options
+- LayerNorm was replaced by RMSNorm
+- The causal mask was removed, so every token sees the whole sentence
+- The learned position embedding was replaced by RoPE, which rotates q and k in every attention layer
+- The FFN changed from a GELU MLP to SwiGLU
+--- explain
+Llama is still a decoder that can only look back: the causal mask is still there, which is what makes token-by-token generation possible. The other three are real changes. The full list has two more: no bias in the Linear layers, and GQA (several q heads share one k/v head) in Llama 2 70B and Llama 3.
+--- hints
+- Think: does Llama generate text the same way GPT-2 does? If so, does it still need a causal mask?
+- Check the options one by one against the list of five changes on the first card.
+
+@@ item d5-14
+type: predict
+title: Head order with repeat vs expand
+level: 2
+cards: GQA: several q heads share one k/v head
+--- context
+A wrong head order in GQA raises no error; it just pairs q heads with the wrong k/v. Seeing the difference between `repeat` and `expand + reshape` at a glance helps you catch this bug in other people's code.
+--- prompt
+What does this code print? x has 2 kv heads with the values 10 and 20; each should be copied 3 times.
+--- code
+x = torch.tensor([10, 20]).view(1, 2, 1, 1)
+good = x[:, :, None].expand(1, 2, 3, 1, 1).reshape(1, 6, 1, 1)
+bad = x.repeat(1, 3, 1, 1)
+print(good.flatten().tolist())
+print(bad.flatten().tolist())
+--- explain
+`expand + reshape` repeats each head 3 times back to back: 10, 10, 10, 20, 20, 20. `x.repeat(1, 3, 1, 1)` treats the whole head dimension as one block and copies the block 3 times: 10, 20, 10, 20, 10, 20. In GQA, q heads 0, 1 and 2 belong to group 0, so you need the first one. `torch.repeat_interleave(x, 3, dim=1)` also gives the first one.
+--- hints
+- After `expand` the shape is (1, 2, 3, 1, 1): the kv-head dimension comes before the repeat dimension. reshape reads the numbers with the last dimension changing fastest.
+- `x.repeat(1, 3, 1, 1)` copies dimension 1 as one block 3 times, like writing the list [10, 20] three times in a row.
+
+@@ item d5-15
+type: choice
+title: Why one attention step needs no mask
+level: 2
+cards: KV cache: compute only the newest token
+answer: 2
+--- context
+Interviewers like to dig into the details of the KV cache. If you can explain why a single step needs no mask, you can also explain why feeding several tokens at once needs one again.
+--- prompt
+When generating with a KV cache, each step's attention has just one q (the newest token), which attends to all k and v in the cache without a causal mask. Why is that correct?
+--- options
+- RoPE has already encoded the positions, so a mask is not needed
+- The only q is the newest position; every k and v in the cache is before it (or is itself), so it may see all of them anyway
+- Softmax automatically gives the future positions a weight of 0
+- It is not exactly correct, but the error is small enough to ignore
+--- explain
+A causal mask stops position t from seeing positions after t. In a single step there is no "after": the cache holds only the past and the present. So the single-step output equals the last position of the full (masked) forward pass exactly, not approximately. RoPE only encodes positions and does not stop anyone from looking ahead; softmax does not zero out any position by itself either. Note: if you feed several new tokens at once (for example the whole prompt in one go), those q's still need a causal mask among themselves.
+--- hints
+- What exactly does a causal mask block? In a single step, does any of that exist?
+- Look at the example on the KV cache card: is the last position of the full pass roughly equal to the one-step output without a mask, or exactly equal?
+
+@@ item d5-16
+type: predict
+title: How many tokens does top-p keep?
+level: 2
+cards: Sampling: temperature, top-k, top-p, repetition penalty
+ref: day5
+--- context
+top-p is one of the sampling parameters tuned most often in production. Knowing roughly how many candidates a given p keeps makes tuning, and debugging "too dull / too random" output, much faster.
+--- prompt
+`top_p_filter` is the reference answer of exercise d5-10 (the token where the running total first reaches ≥ p is kept too). What does this code print? Each line is "p, number kept".
+--- code
+probs = torch.tensor([0.5, 0.3, 0.15, 0.05])
+logits = probs.log()
+for p in (0.3, 0.6, 0.85, 0.99):
+    kept = (~top_p_filter(logits, p).isinf()).sum().item()
+    print(p, kept)
+--- explain
+Adding up the probabilities from largest to smallest: 0.5, 0.8, 0.95, 1.0. p = 0.3: the 1st token (0.5) already reaches ≥ 0.3, so 1 is kept. p = 0.6: only the 2nd (0.8) reaches ≥ 0.6, so 2 are kept. p = 0.85: the 3rd (0.95), so 3 are kept. p = 0.99: it takes the 4th (1.0), so all are kept. The larger p is, the more candidates remain and the more random the output.
+--- hints
+- First write down the running totals from largest to smallest: 0.5, 0.8, 0.95, 1.0.
+- For each p, find the first total that is ≥ p. That token and every token before it are kept.
+
+@@ item d5-17
+type: code
+title: Closed book: apply RoPE
+level: 2
+exam: yes
+cards: RoPE: rotate q and k by position; Writing RoPE: pairs, interleaving, complex numbers
+targets: apply_rope
+ref: day5
+--- context
+RoPE is today's most important part and a regular in hand-written interview questions. Writing it without notes shows you really remember the two details: the pairing and the interleaving.
+--- prompt
+Without notes, write `apply_rope(x, cos, sin)`:
+- x: (B, nh, T, hd). cos, sin: (T, hd/2) (`precompute_freqs` is provided). Return a tensor with the same shape as x.
+- Neighbouring dimensions form a pair: pair i, (a, b) = (x[2i], x[2i+1]), becomes (a·cos[i] − b·sin[i], a·sin[i] + b·cos[i]) in the same two places.
+- No Python loops.
+
+The checks are the same as in exercise d5-03: shape, no turn at position 0, length unchanged, dot product depends only on the distance.
+--- starter
+def apply_rope(x, cos, sin):
+    raise todo()
+--- solution
+def apply_rope(x, cos, sin):
+    x1, x2 = x[..., 0::2], x[..., 1::2]        # neighbouring pairs
+    o1 = x1 * cos - x2 * sin
+    o2 = x1 * sin + x2 * cos
+    return torch.stack([o1, o2], dim=-1).flatten(-2)   # interleave back
+--- tests
+@check("same shape, no turn at position 0, length unchanged")
+def t03():
+    seed(1)
+    x = torch.randn(2, 3, 6, 8)
+    cos, sin = precompute_freqs(8, 6)
+    y = apply_rope(x, cos, sin)
+    shape_is(y, x.shape, "the output should have the same shape as x")
+    eq(y[:, :, 0], x[:, :, 0], msg="the angle at position 0 is 0, so the output there should equal the input. If only the order is off, check whether you used cat instead of interleaving")
+    # a rotation keeps the length
+    eq(y.norm(dim=-1), x.norm(dim=-1), tol=1e-4, msg="a rotation does not change a vector's length. If it changed, a sign or a cos/sin in the formula is wrong")
+
+@check("relative position: the dot product depends only on the distance")
+def t04():
+    seed(2)
+    cos, sin = precompute_freqs(16, 64)
+    q = torch.randn(1, 1, 1, 16)
+    k = torch.randn(1, 1, 1, 16)
+
+    def dot_at(m, n):
+        qm = apply_rope(q, cos[m:m + 1], sin[m:m + 1])
+        kn = apply_rope(k, cos[n:n + 1], sin[n:n + 1])
+        return (qm * kn).sum()
+
+    eq(dot_at(3, 5), dot_at(20, 22), tol=1e-4,
+       msg="the dot product of q at 3 and k at 5 should equal that of q at 20 and k at 22 (distance 2 in both). "
+           "If not, the rotation formula is wrong")
+    true(not torch.allclose(dot_at(3, 5), dot_at(3, 9), atol=1e-4), "different distances (2 and 6) give the same dot product: your function does not seem to rotate at all")
+--- hints
+- Even and odd dimensions: `x[..., 0::2]` and `x[..., 1::2]`.
+- Interleave back: `torch.stack([o1, o2], dim=-1).flatten(-2)`.
+
+@@ item d5-18
+type: code
+title: Closed book: token by token = the whole sequence at once
+level: 3
+exam: yes
+cards: KV cache: compute only the newest token; RoPE: rotate q and k by position
+targets: incremental_attention
+ref: day5
+--- context
+The KV cache is at the heart of every inference engine, and proving it equals the full forward pass is today's most important result. Writing it closed-book confirms you remember the easiest thing to get wrong: the position index.
+--- prompt
+Without notes, write `incremental_attention(x, wq, wk, wv, cos, sin)`. Provided: `apply_rope`, `KVCache`, `attn_step`, and this reference that computes the whole sequence at once:
+```python
+def _full_attention(x, wq, wk, wv, cos, sin):
+    B, T, C = x.shape
+    nh, hd = 2, C // 2
+    q = (x @ wq).view(B, T, nh, hd).transpose(1, 2)
+    k = (x @ wk).view(B, T, nh, hd).transpose(1, 2)
+    v = (x @ wv).view(B, T, nh, hd).transpose(1, 2)
+    q, k = apply_rope(q, cos[:T], sin[:T]), apply_rope(k, cos[:T], sin[:T])
+    return F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(B, T, C)
+```
+Your function must return the same (B, T, C) but feed one token at a time: each step uses only `x[:, t:t+1]`, puts k and v into a `KVCache`, computes the step's output with `attn_step`, and at the end the outputs are joined along the time dimension.
+--- starter
+def incremental_attention(x, wq, wk, wv, cos, sin):
+    raise todo()
+--- solution
+def incremental_attention(x, wq, wk, wv, cos, sin):
+    B, T, C = x.shape
+    nh, hd = 2, C // 2
+    cache = KVCache()
+    outs = []
+    for t in range(T):
+        xt = x[:, t:t + 1]
+        q = (xt @ wq).view(B, 1, nh, hd).transpose(1, 2)
+        k = (xt @ wk).view(B, 1, nh, hd).transpose(1, 2)
+        v = (xt @ wv).view(B, 1, nh, hd).transpose(1, 2)
+        q = apply_rope(q, cos[t:t + 1], sin[t:t + 1])    # the key point: use position t's angles
+        k = apply_rope(k, cos[t:t + 1], sin[t:t + 1])
+        K, V = cache.update(k, v)
+        o = attn_step(q, K, V)
+        outs.append(o.transpose(1, 2).reshape(B, 1, C))
+    return torch.cat(outs, dim=1)
+--- tests
+@check("token-by-token output equals the full forward pass")
+def t10():
+    seed(5)
+    B, T, C = 1, 7, 8
+    x = torch.randn(B, T, C)
+    wq, wk, wv = (torch.randn(C, C) * 0.3 for _ in range(3))
+    cos, sin = precompute_freqs(C // 2, 32)
+    eq(incremental_attention(x, wq, wk, wv, cos, sin),
+       _full_attention(x, wq, wk, wv, cos, sin), tol=1e-4,
+       msg="the token-by-token output does not match the full forward pass. Nine times out of ten the position index is wrong (every step used position 0's cos/sin)")
+--- hints
+- Step t uses `cos[t:t+1]` and `sin[t:t+1]` for RoPE.
+- Each step's output is `o.transpose(1, 2).reshape(B, 1, C)`; at the end, `torch.cat(outs, dim=1)`.

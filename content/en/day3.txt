@@ -1,0 +1,1037 @@
+@@ day 3
+title: What happens to text before the model sees it
+part: LLMs
+hours: 3–4 hours
+--- goal
+After today you can turn raw text into training batches a model can eat: turn text into token ids with a character tokenizer and with BPE, read a big corpus with memmap, cut x and y (shifted by one) with get_batch, and pad sentences of different lengths with an attention mask and position ids. You can also tell at a glance whether a loss looks normal by comparing it with ln(V).
+--- checklist
+- Clear the review queue first (redo from a blank page any item where you looked at the answer)
+- Read the 8 cards; press Run on every example, change one number, run it again
+- Pass every practice item, d3-01 to d3-15
+- Close the cards and write get_batch and pad_batch from a blank page in the closed-book tab
+
+@@ concept
+title: Character tokenizer: text to numbers and back
+--- body
+A model only understands numbers, not text. A tokenizer does two jobs: it cuts text into small pieces (each piece is a token), and it turns each token into an integer, the token id.
+
+The simplest way is one character per token:
+
+1. Take every character that appears in the corpus, remove duplicates and sort them: `sorted(set(text))`. Sorting means you get the same table every time.
+2. Give each character a number. Build two dicts: `stoi` (string to int, character → id) and `itos` (int to string, id → character).
+3. `encode`: string → list of ids. `decode`: list of ids → string.
+
+The vocabulary size `vocab_size` (often written V) is the number of different characters. "hello world" below has 8 different characters (the space counts), so V = 8. The Shakespeare corpus used by nanoGPT has 65 different characters, so V = 65.
+
+The most basic rule for any tokenizer is the round trip: `decode(encode(s)) == s`.
+
+A small trap: the ids a model gives back are often numbers inside a tensor. You cannot look up a tensor as a dict key (you get a KeyError), so convert with `int(i)` in decode.
+--- code
+text = "hello world"
+chars = sorted(set(text))
+stoi = {c: i for i, c in enumerate(chars)}
+itos = {i: c for c, i in stoi.items()}
+print("vocab:", chars)
+print("V =", len(chars))
+ids = [stoi[c] for c in "hello"]
+print("encode('hello') ->", ids)
+print("decode ->", "".join(itos[i] for i in ids))
+t = torch.tensor(ids)
+print("decode from a tensor ->", "".join(itos[int(i)] for i in t))
+
+@@ concept
+title: BPE and compression ratio
+ref: day3
+--- body
+A character tokenizer is too fine-grained: one sentence needs many tokens, so the model has to process long sequences. The GPT models use BPE (Byte Pair Encoding). It starts from the smallest units (GPT-2 starts from the 256 possible bytes) and repeats three steps:
+
+1. Count how often each pair of neighbouring tokens appears.
+2. Merge the most frequent pair into one new token, for example `"t","h"` → `"th"`, and add it to the vocabulary.
+3. Go back to step 1 with the merged sequence.
+
+GPT-2 did 50,000 merges: 256 bytes + 50,000 merged tokens + 1 special token `<|endoftext|>` gives a vocabulary of 50,257.
+
+A merge scans from left to right. Once a position has been merged, both of its tokens are skipped; they cannot take part in another merge in this round. So merging `("a","a")` in `["a","a","a"]` gives `["aa", "a"]`, not two `"aa"`. But when you count pairs, overlaps do count: `("a","a")` appears twice in `["a","a","a"]` (positions 0-1 and 1-2).
+
+### Compression ratio
+
+Compression ratio = number of characters ÷ number of tokens, which is how many characters one token holds on average. A bigger number means the tokenizer is more "economical" on that text. A character tokenizer has a ratio of exactly 1; every merge removes tokens and raises the ratio.
+
+Why the token count matters: APIs charge per token, the context window is measured in tokens, and training and generation time grow with the number of tokens.
+
+Why Chinese is often more "expensive": byte-level BPE like GPT-2's starts from UTF-8 bytes. An English letter is 1 byte; a common Chinese character is 3 bytes ("你" is 228, 189, 160). The merges were learned mostly from English text, so many Chinese characters were never merged, and one character often takes more than one token.
+
+In the code below, `merge_pair` is the function you write yourself in d3-02; here the reference version shows what it does.
+--- code
+from collections import Counter
+
+text = "the cat and the hat"
+tokens = list(text)
+print("start:", len(tokens), "tokens")
+for step in range(4):
+    counts = Counter(zip(tokens, tokens[1:]))      # count neighbouring pairs
+    best = max(counts, key=counts.get)             # the most frequent pair
+    tokens = merge_pair(tokens, best)
+    print(f"merge {best} (seen {counts[best]} times) -> {len(tokens)} tokens, compression ratio {len(text) / len(tokens):.2f}")
+print(tokens)
+print("UTF-8 bytes of '你':", list("你".encode("utf-8")))
+
+@@ concept
+title: get_batch: y is x shifted by one
+--- body
+A language model's job is "predict the next token". For training, the whole corpus is one long row of token ids (a 1D tensor `data`). Each step cuts batch_size random pieces out of it (called B), each block_size long (the context length, called T):
+
+- `x = data[i : i+T]` is the input.
+- `y = data[i+1 : i+1+T]` is the answer: x moved one place to the right.
+
+So `y[t]` is exactly the token that comes after `x[t]`. One x of length T gives the model T "guess the next one" questions at once: see the first token, guess the second; see the first two, guess the third; and so on.
+
+How large can the start i be? The last element of y is `data[i+T]`, and it must exist, so `i + T <= len(data) - 1`, which means the largest i is `len(data) - T - 1`. `torch.randint(high, (B,))` gives integers from 0 to high-1 (high itself is excluded), so you write `torch.randint(len(data) - T, (B,))`. Stack the B pieces with `torch.stack` and x and y both have shape `(B, T)`.
+
+To make the random starts reproducible, create `g = torch.Generator().manual_seed(0)` and pass `generator=g` to `torch.randint`: same seed, same starts.
+
+The dtype must be int64 (`torch.long`): the embedding layer (the lookup table that turns an id into a vector) and the labels of `cross_entropy` only accept integers.
+
+Three common mistakes:
+
+- y is not shifted (y equals x): no error at all. The model can answer by copying its input, the loss quickly drops close to 0, and the generated text is garbage.
+- The upper bound for the start is `len(data)`: near the end the slices get shorter and `torch.stack` fails. It only fails sometimes, which makes it hard to track down.
+- Converting to float: the embedding layer raises an error.
+--- code
+data = torch.arange(10, 20)          # pretend these are 10 token ids
+T = 4
+i = 3
+x = data[i:i + T]
+y = data[i + 1:i + 1 + T]
+print("x =", x.tolist())
+print("y =", y.tolist())
+for t in range(T):
+    print(f"sees {x[:t + 1].tolist()} -> should guess {y[t].item()}")
+print("largest start i:", len(data) - T - 1)
+g = torch.Generator().manual_seed(0)
+print("random starts:", torch.randint(len(data) - T, (5,), generator=g).tolist())
+g = torch.Generator().manual_seed(0)
+print("same seed again:", torch.randint(len(data) - T, (5,), generator=g).tolist())
+
+@@ concept
+title: Big corpora: a uint16 .bin file and np.memmap
+--- body
+A real corpus is tens of GB and does not fit in memory. nanoGPT handles it in two steps:
+
+1. During preprocessing, write all token ids once into a binary file: `np.asarray(ids, dtype=np.uint16).tofile(path)`. The file holds only the numbers, with no header.
+2. During training, open it with `np.memmap(path, dtype=np.uint16, mode="r")`. A memmap (memory map) behaves like a numpy array, but the data stays on disk: the operating system reads only the part you slice.
+
+Why uint16: it holds integers from 0 to 65535 and takes only 2 bytes each. GPT-2's vocabulary of 50,257 fits. That is 4 times less disk than int64 (8 bytes). 1000 tokens take 2000 bytes.
+
+Points to remember:
+
+- A `.bin` file does not store its dtype. You must read it with the same dtype you wrote it with, or every number comes out wrong (the code below reads it once with uint8 on purpose).
+- `mode="r"` is read-only, so a bug in the training code cannot damage the corpus.
+- A vocabulary larger than 65,536 (for example a 100k tokenizer) does not fit in uint16; use uint32. Numbers too big for uint16 raise no error; they quietly turn into other numbers.
+- Before feeding the model, turn a slice into an int64 tensor: `torch.from_numpy(m[i:i+T].astype(np.int64))`.
+--- code
+import os, tempfile
+import numpy as np
+
+with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+    path = os.path.join(d, "train.bin")
+    np.asarray([5, 50256, 7, 8], dtype=np.uint16).tofile(path)
+    print("file size:", os.path.getsize(path), "bytes")      # 4 tokens × 2 bytes
+    m = np.memmap(path, dtype=np.uint16, mode="r")
+    print(type(m).__name__, m.dtype, len(m), m.tolist())
+    x = torch.from_numpy(m[1:3].astype(np.int64))
+    print(x, x.dtype)
+    wrong = np.memmap(path, dtype=np.uint8, mode="r")
+    print("read as uint8:", wrong.tolist())
+    del m, wrong                                          # close the file so the temp folder can be deleted
+
+@@ concept
+title: Bigram counts and the ln(V) baseline
+--- body
+A bigram model is the simplest language model: it looks only at the current token to guess the next one. All its "parameters" are one V×V table of counts C: `C[i, j]` is how often j comes right after i. Divide each row by its sum and you get "the probability that j follows i".
+
+A sequence of N tokens has N-1 neighbouring pairs. You can count them without a Python loop:
+
+1. Turn each pair (i, j) into one number: `i * V + j`. It lies between 0 and V*V-1, and different pairs always give different numbers.
+2. `torch.bincount(flat, minlength=V * V)` counts how often each number appears. `minlength` makes the result exactly V*V long (it does not get shorter when the largest pairs never appear).
+3. `.reshape(V, V)` turns it back into a table.
+
+### The ln(V) baseline
+
+A model that has learned nothing gives each of the V tokens the same probability 1/V. Cross-entropy is "minus the log of the probability of the right answer", so its loss is -ln(1/V) = ln(V).
+
+- V = 65 (Shakespeare characters): ln 65 ≈ 4.17
+- V = 50257 (GPT-2): ln 50257 ≈ 10.82
+
+How to use it: right after initialisation the loss should be close to ln(V). If it is still close to ln(V) after a long training run, the model has learned nothing, and the code most likely has a bug (for example a missing `optimizer.step()`, or a learning rate of 0).
+--- code
+ids = torch.tensor([0, 1, 0, 1, 2])
+V = 3
+flat = ids[:-1] * V + ids[1:]            # each pair (i, j) becomes i*V + j
+print("pair codes:", flat.tolist())
+counts = torch.bincount(flat, minlength=V * V)
+print("how often each code appears:", counts.tolist())
+print(counts.reshape(V, V))
+
+logits = torch.zeros(4, 65)              # 4 positions, 65 tokens, all scores equal = uniform guessing
+y = torch.tensor([3, 10, 0, 64])
+print("loss of pure guessing:", round(F.cross_entropy(logits, y).item(), 4), "  ln(65) =", round(math.log(65), 4))
+
+@@ concept
+title: Padding, attention mask and position ids
+--- body
+Sentences in a batch have different lengths, but a tensor must be a neat rectangle. The fix is padding: add `pad_id` on the right of the shorter sentences until they are as long as the longest one, Tmax.
+
+After padding you hand over three things, all of shape `(B, Tmax)` and dtype int64:
+
+- `ids`: the padded token ids.
+- `attention mask`: 1 for a real token, 0 for a padded position. Attention uses it to ignore the padding.
+- `position ids`: where each token sits in its own sentence, counting from 0 and counting only real tokens. Padded positions get 0 (they are masked out anyway).
+
+Why you cannot skip them: without a mask, real tokens "look at" the padding and their results get polluted. The same sentence then gives different outputs in a batch with a lot of padding and in a batch with little.
+
+The code below uses two loop-free tricks: `torch.arange(Tmax) < lengths[:, None]` builds the whole mask in one comparison, and `(mask.cumsum(-1) - 1) * mask` computes the position ids from the mask. In the exercise, filling it sentence by sentence with a for loop is completely fine.
+--- code
+seqs = [[4, 5], [6, 7, 8, 9]]
+B, Tmax = len(seqs), max(len(s) for s in seqs)
+ids = torch.full((B, Tmax), 0, dtype=torch.long)     # fill everything with pad_id = 0 first
+ids[0, :2] = torch.tensor(seqs[0])                    # the first 2 positions of sentence 0
+ids[1, :4] = torch.tensor(seqs[1])
+print(ids)
+lengths = torch.tensor([len(s) for s in seqs])
+mask = (torch.arange(Tmax) < lengths[:, None]).long()
+print(mask)
+pos = (mask.cumsum(-1) - 1) * mask
+print(pos)
+
+@@ concept
+title: Turning the mask into a -inf additive bias
+--- body
+Attention first computes scores of shape `(B, nh, T, T)` (nh is the number of heads), then takes a softmax over the last dimension to get weights. To give padded positions a weight of 0, add -inf to their scores before the softmax:
+
+- exp(-inf) = 0, so after the softmax that position's weight is exactly 0. The other weights are rescaled and still add up to 1.
+- Real positions get + 0, so their scores do not change.
+
+So the bias is 0.0 at real positions and -inf at padded ones. Its shape is `(B, 1, 1, T)`: the first dimension is one row per sentence; the two 1s let it broadcast over every head and every query position; the last T is "the position being looked at" (the key).
+
+How to write it: `torch.zeros(B, 1, 1, T).masked_fill(mask[:, None, None, :] == 0, float("-inf"))`. `masked_fill(cond, v)` puts v wherever cond is True; `mask[:, None, None, :]` inserts two dimensions of size 1 in the middle.
+
+Trap: do not write `(1 - mask) * float("-inf")`. At real positions that computes `0 * -inf`, and floating point defines the result as nan (not a number). Once a nan enters the softmax, the whole row becomes nan.
+--- code
+mask = torch.tensor([[1, 1, 0]])                      # the 3rd position is padding
+bias = torch.zeros(1, 1, 1, 3).masked_fill(mask[:, None, None, :] == 0, float("-inf"))
+print(bias)
+scores = torch.tensor([[[[2.0, 1.0, 5.0]]]])
+print("without bias:", scores.softmax(-1))
+print("with bias:   ", (scores + bias).softmax(-1))
+
+@@ concept
+title: Every shape in one training step
+--- body
+Take GPT-2 small as the example: B = 8 (batch size), T = 256 (block_size), V = 50257 (vocabulary size), C = 768 (the width of each token vector). The tensors of one training step, in order:
+
+1. `x`, `y`: `(B, T)` = `(8, 256)`, int64.
+2. `tok_emb = wte(x)`: `wte = nn.Embedding(V, C)` is a table with V rows and C columns; each id looks up one row, so a dimension C is added at the end: `(8, 256, 768)`.
+3. `pos = torch.arange(T)` is `(T,)`; `pos_emb = wpe(pos)` is `(T, C)` = `(256, 768)`. `tok_emb + pos_emb` broadcasts and stays `(B, T, C)`.
+4. Every Transformer block keeps the shape: `(8, 256, 768)` in and out.
+5. `logits = lm_head(hidden)`: `lm_head = nn.Linear(C, V)` changes only the last dimension, giving `(8, 256, 50257)`: at every position, one score for each of the V tokens.
+6. `F.cross_entropy` wants logits of shape `(N, V)` and labels of shape `(N,)`, so `logits.view(-1, V)` is `(2048, 50257)` and `y.view(-1)` is `(2048,)`, with N = B*T = 2048.
+7. `loss` is a scalar (a tensor holding one number); its shape is the empty tuple `()`.
+
+The logits are the largest tensor of the step: 8 × 256 × 50257 ≈ 103 million numbers, about 412 MB in fp32.
+
+The code below runs the same step with tiny numbers and prints every shape.
+--- code
+torch.manual_seed(0)
+B, T, V, C = 2, 5, 11, 8
+wte = nn.Embedding(V, C)
+wpe = nn.Embedding(T, C)
+lm_head = nn.Linear(C, V, bias=False)
+x = torch.randint(0, V, (B, T))
+y = torch.randint(0, V, (B, T))
+tok_emb = wte(x)
+pos_emb = wpe(torch.arange(T))
+h = tok_emb + pos_emb                 # (B, T, C) + (T, C) broadcasts
+logits = lm_head(h)
+loss = F.cross_entropy(logits.view(-1, V), y.view(-1))
+for name, t in [("x", x), ("tok_emb", tok_emb), ("pos_emb", pos_emb), ("h", h), ("logits", logits),
+                ("logits.view(-1, V)", logits.view(-1, V)), ("y.view(-1)", y.view(-1)), ("loss", loss)]:
+    print(f"{name:20s} {tuple(t.shape)}")
+print("loss right after init =", round(loss.item(), 3), "  ln(V) =", round(math.log(V), 3))
+
+@@ item d3-01
+type: code
+title: CharTokenizer round trip
+level: 1
+cards: Character tokenizer: text to numbers and back
+targets: CharTokenizer
+ref: day3
+--- context
+Every language model starts with a tokenizer. A character tokenizer is about 20 lines, yet it has the full encode / decode interface. nanoGPT uses exactly this one for Shakespeare, and interviewers often ask you to write one on the spot.
+--- prompt
+Write a class `CharTokenizer`:
+
+- `CharTokenizer(text)`: build the vocabulary with `sorted(set(text))` (sorted, so you get the same table every time).
+- `tok.vocab_size`: the vocabulary size, the number of different characters in text.
+- `tok.encode(s)`: string → `list[int]`, each character replaced by its id.
+- `tok.decode(ids)`: list of ids → string. ids can be a list of Python ints or a 1D tensor.
+
+Rules: `decode(encode(s)) == s`; every id is between 0 and `vocab_size - 1`; the same character always gets the same id.
+
+Example: `CharTokenizer("hello world")` has `vocab_size` 8; the space sorts first and gets id 0; `encode("hello")` is `[3, 2, 4, 4, 5]`.
+--- starter
+class CharTokenizer:
+    """Usage:
+        tok = CharTokenizer("hello world")
+        tok.vocab_size      -> number of distinct characters
+        tok.encode("hell")  -> [int, int, int, int]
+        tok.decode([...])   -> "hell"
+    """
+
+    def __init__(self, text):
+        raise todo()
+
+    def encode(self, s):
+        raise todo()
+
+    def decode(self, ids):
+        raise todo()
+--- solution
+class CharTokenizer:
+    def __init__(self, text):
+        chars = sorted(set(text))
+        self.itos = {i: c for i, c in enumerate(chars)}
+        self.stoi = {c: i for i, c in self.itos.items()}
+        self.vocab_size = len(chars)
+
+    def encode(self, s):
+        return [self.stoi[c] for c in s]
+
+    def decode(self, ids):
+        return "".join(self.itos[int(i)] for i in ids)
+--- tests
+@check("CharTokenizer round trip")
+def t01():
+    txt = "the quick brown fox jumps over the lazy dog"
+    tok = CharTokenizer(txt)
+    true(tok.vocab_size == len(set(txt)), f"wrong vocab_size: yours is {tok.vocab_size}, the text has {len(set(txt))} distinct characters")
+    ids = tok.encode("quick fox")
+    true(isinstance(ids, list) and all(isinstance(i, int) for i in ids), "encode must return a list of Python ints")
+    true(tok.decode(ids) == "quick fox", f"the round trip fails: decode(encode('quick fox')) gives {tok.decode(ids)!r}")
+    same = tok.encode("the the")
+    true(same[0] == same[4] and same[1] == same[5], "the same character must always get the same id")
+    true(tok.encode(" ") == [0] and tok.decode([tok.vocab_size - 1]) == "z",
+         "the vocabulary must be sorted: the space is smallest (id 0) and 'z' is largest; build it with sorted(set(text))")
+    true(min(ids) >= 0 and max(ids) < tok.vocab_size, "an id is out of range: ids must be between 0 and vocab_size-1")
+    try:
+        back = tok.decode(torch.tensor(ids))
+    except KeyError:
+        back = None
+    true(back == "quick fox", "decode must also accept a tensor: a number inside a tensor cannot be used as a dict key; convert it with int(i)")
+--- hints
+- In `__init__`, build two dicts: `stoi` (character → id) and `itos` (id → character). `enumerate(sorted(set(text)))` gives you both the number and the character.
+- encode is a list comprehension: `[self.stoi[c] for c in s]`. decode joins the characters back with `"".join(...)`.
+- In decode, write `self.itos[int(i)]`: `int()` lets numbers from a tensor work as dict keys.
+
+@@ item d3-02
+type: code
+title: BPE: count pairs and merge
+level: 2
+cards: BPE and compression ratio
+targets: pair_counts, merge_pair
+ref: day3
+--- context
+The tokenizers of GPT and Llama are trained with BPE, and its core is just two steps: count neighbouring pairs, merge the most frequent one. Write it once and you will know where the odd tokens in a vocabulary (like " the" with its leading space) come from.
+--- prompt
+Write the two functions of one BPE round.
+
+1. `pair_counts(tokens)`: tokens is a `list[str]`. Return a dict whose keys are tuples of two neighbouring tokens and whose values are how often they appear. Overlapping pairs count too.
+2. `merge_pair(tokens, pair)`: replace every place where `pair` appears as two neighbours with one new token (the two strings added together) and return the new list. Scan from left to right; a position that has been merged cannot take part in another merge in this round.
+
+Examples:
+
+```
+pair_counts(["a","b","a","b","c"])      -> {("a","b"): 2, ("b","a"): 1, ("b","c"): 1}
+merge_pair(["a","b","a","b"], ("a","b")) -> ["ab", "ab"]
+merge_pair(["a","a","a"], ("a","a"))     -> ["aa", "a"]
+```
+--- starter
+def pair_counts(tokens):
+    """tokens: list[str]. Count every pair of neighbouring tokens.
+    ["a","b","a","b","c"] -> {("a","b"): 2, ("b","a"): 1, ("b","c"): 1}
+    """
+    raise todo()
+
+def merge_pair(tokens, pair):
+    """Merge every occurrence of pair (two neighbours) into one token (string concatenation).
+    Scan left to right; merged positions do not take part in another merge.
+    (["a","b","a","b"], ("a","b")) -> ["ab", "ab"]
+    """
+    raise todo()
+--- solution
+def pair_counts(tokens):
+    c = {}
+    for a, b in zip(tokens, tokens[1:]):
+        c[(a, b)] = c.get((a, b), 0) + 1
+    return c
+
+def merge_pair(tokens, pair):
+    out, i = [], 0
+    while i < len(tokens):
+        if i + 1 < len(tokens) and (tokens[i], tokens[i + 1]) == pair:
+            out.append(tokens[i] + tokens[i + 1])
+            i += 2                      # skip both, so overlapping pairs are not merged twice
+        else:
+            out.append(tokens[i])
+            i += 1
+    return out
+--- tests
+@check("BPE: count pairs and merge")
+def t02():
+    t = list("abababc")
+    c = pair_counts(t)
+    true(c.get(("a", "b")) == 3, f"('a','b') appears 3 times in 'abababc'; you counted {c.get(('a','b'))}")
+    true(c.get(("b", "a")) == 2, f"('b','a') appears 2 times in 'abababc'; you counted {c.get(('b','a'))}")
+    true(max(c, key=c.get) == ("a", "b"), "the most frequent pair should be ('a','b')")
+    true(merge_pair(t, ("a", "b")) == ["ab", "ab", "ab", "c"],
+         f"merge_pair(list('abababc'), ('a','b')) should be ['ab', 'ab', 'ab', 'c']; yours is {merge_pair(t, ('a','b'))}")
+    # overlap: merging ("a","a") in "aaa" can make only one "aa", and one "a" is left
+    got = merge_pair(list("aaa"), ("a", "a"))
+    true(got == ["aa", "a"], f"overlapping pairs go wrong: merging ('a','a') in 'aaa' should give ['aa', 'a']; yours is {got}. After a merge, skip two positions")
+--- hints
+- `zip(tokens, tokens[1:])` gives you every neighbouring pair at once. Count with `d[k] = d.get(k, 0) + 1`.
+- For merge, use `while i < len(tokens)` with an index i, not a for loop: after a merge you must jump two positions.
+- The test is `i + 1 < len(tokens) and (tokens[i], tokens[i + 1]) == pair`. If it holds, append `tokens[i] + tokens[i + 1]` and do `i += 2`; otherwise append `tokens[i]` and do `i += 1`.
+
+@@ item d3-03
+type: code
+title: Compression ratio
+level: 1
+cards: BPE and compression ratio
+targets: compression_ratio
+ref: day3
+--- context
+APIs charge per token and context windows are measured in tokens. The compression ratio (how many characters one token holds on average) tells you how economical a tokenizer is on a given text, and it explains why the same meaning often costs more tokens in Chinese than in English.
+--- prompt
+Write `compression_ratio(text, encode_fn)`:
+
+- `encode_fn` is the encode function of any tokenizer: it takes a string and returns a list of token ids.
+- Return number of characters ÷ number of tokens (a float).
+
+Example: a tokenizer that makes one token out of every two characters turns "abcdefgh" (8 characters) into 4 tokens, so the ratio is 2.0. With one token per character, the ratio is 1.0.
+--- starter
+def compression_ratio(text, encode_fn):
+    """Return characters / tokens. Bigger means the tokenizer is more efficient on this text."""
+    raise todo()
+--- solution
+def compression_ratio(text, encode_fn):
+    return len(text) / len(encode_fn(text))
+--- tests
+@check("Compression ratio")
+def t03():
+    fake = lambda s: list(range(len(s) // 2))     # fake tokenizer: two characters per token
+    r = compression_ratio("abcdefgh", fake)
+    true(close(r, 2.0), f"8 characters in 4 tokens should give 2.0; you got {r}. Did you swap the top and the bottom of the fraction?")
+    r = compression_ratio("abcd", lambda s: [1, 2, 3, 4])
+    true(close(r, 1.0), f"one token per character should give 1.0; you got {r}")
+--- hints
+- The number of characters is `len(text)`; for the number of tokens, call `encode_fn(text)` and take its `len`.
+- Both are ints. In Python 3, `/` already gives a float; no conversion needed.
+
+@@ item d3-04
+type: code
+title: get_batch and the x/y shift
+level: 2
+cards: get_batch: y is x shifted by one
+targets: get_batch
+ref: day3
+--- context
+Every training step of a language model starts with get_batch, and the training loops of the coming days all use it. Getting the x/y shift wrong raises no error; the model just learns to copy the answer. It is one of the most common silent bugs in training code.
+--- prompt
+Write `get_batch(data, batch_size, block_size, generator=None)`:
+
+- `data`: a 1D LongTensor, the token ids of the whole corpus.
+- Pick `batch_size` random starts i with `torch.randint`, and pass `generator` to it (the same seed must give the same batch).
+- For each i: `x = data[i : i+block_size]`, `y = data[i+1 : i+1+block_size]`.
+- Return `(x, y)`, both of shape `(batch_size, block_size)` and dtype int64.
+- The starts must keep y inside the data: the largest i is `len(data) - block_size - 1`.
+
+Example: with `data = torch.arange(1000)`, y should equal x + 1 everywhere.
+--- starter
+def get_batch(data, batch_size, block_size, generator=None):
+    """data: 1D LongTensor (the token ids of the whole corpus)
+    Pick batch_size random starts i and return:
+        x = data[i   : i+block_size]
+        y = data[i+1 : i+1+block_size]
+    both of shape (batch_size, block_size), dtype int64.
+    The starts must keep y in range. Pass generator to torch.randint so batches are reproducible.
+    """
+    raise todo()
+--- solution
+def get_batch(data, batch_size, block_size, generator=None):
+    # the upper bound is len-block_size, so the largest start is len-block_size-1 and y ends exactly at len-1
+    hi = len(data) - block_size
+    ix = torch.randint(hi, (batch_size,), generator=generator)
+    x = torch.stack([data[i:i + block_size] for i in ix]).long()
+    y = torch.stack([data[i + 1:i + 1 + block_size] for i in ix]).long()
+    return x, y
+--- tests
+@check("get_batch and the x/y shift")
+def t04():
+    data = torch.arange(1000)
+    g = torch.Generator().manual_seed(0)
+    x, y = get_batch(data, 4, 8, g)
+    shape_is(x, (4, 8), "x should have shape (batch_size, block_size)")
+    shape_is(y, (4, 8), "y should have shape (batch_size, block_size)")
+    true(x.dtype == torch.long and y.dtype == torch.long, f"the dtype must be int64 (torch.long); yours is {x.dtype} / {y.dtype}")
+    eq(y, x + 1, msg="y must be x shifted right by one. Get this line wrong and the model learns to copy the answer: the loss drops to 0 but the generated text is garbage")
+    x2, _ = get_batch(data, 4, 8, torch.Generator().manual_seed(0))
+    eq(x2, x, msg="a generator with the same seed should give the same batch; pass generator to torch.randint")
+    # out-of-range check: sample the shortest valid data many times
+    short = torch.arange(9)
+    for _ in range(50):
+        try:
+            a, b = get_batch(short, 2, 8)
+        except RuntimeError as e:
+            true(False, f"get_batch(torch.arange(9), 2, 8) raised: {str(e)[:80]}. With 9 tokens and block_size=8 the only valid start is 0: "
+                        "the upper bound for torch.randint is len(data) - block_size")
+        shape_is(b, (2, 8), "a start was too far to the right and y got cut short; the upper bound should be len(data)-block_size")
+        true(int(b.max()) <= 8, "y is out of range; the largest start i is len(data)-block_size-1")
+--- hints
+- `torch.randint(high, (batch_size,), generator=generator)` gives integers from 0 to high-1. What should high be? Think about the largest start.
+- `high = len(data) - block_size`. Then `torch.stack([data[i:i + block_size] for i in ix])` stacks the batch_size pieces into one 2D tensor.
+- y is the same, with 1 added to both ends of the slice. Finish with `.long()` to make sure it is int64.
+
+@@ item d3-05
+type: code
+title: Save and load with np.memmap
+level: 2
+cards: Big corpora: a uint16 .bin file and np.memmap
+targets: save_bin, load_bin
+ref: day3
+--- context
+A real corpus is tens of GB and does not fit in memory. nanoGPT writes all token ids into one uint16 .bin file, then reads it during training with np.memmap, which only loads from disk the part you slice.
+--- prompt
+Write two functions (`np` and `os` are already imported):
+
+1. `save_bin(path, ids)`: ids is a `list[int]` or a 1D numpy array. Write them to a binary file as uint16: 2 bytes per token, no header.
+2. `load_bin(path)`: open the file with `np.memmap`, read-only (`mode="r"`), dtype uint16, and return the memmap object itself. Do not read the whole file into memory with something like `np.fromfile`.
+
+Example: after saving 1000 ids (0 to 999), the file is exactly 2000 bytes and `load_bin(path)[999] == 999`.
+--- starter
+def save_bin(path, ids):
+    """Write ids (list[int] or 1D ndarray) to a binary file as uint16."""
+    raise todo()
+
+def load_bin(path):
+    """Open read-only with np.memmap and return the memmap object (do not read it all into memory)."""
+    raise todo()
+--- solution
+def save_bin(path, ids):
+    np.asarray(ids, dtype=np.uint16).tofile(path)
+
+def load_bin(path):
+    return np.memmap(path, dtype=np.uint16, mode="r")
+--- tests
+@check("Save and load with np.memmap")
+def t05():
+    import tempfile
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        p = os.path.join(d, "train.bin")
+        ids = list(range(1000))
+        save_bin(p, ids)
+        m = load_bin(p)
+        true(isinstance(m, np.memmap), f"return an np.memmap; you returned a {type(m).__name__} (the whole file was read into memory)")
+        true(m.dtype == np.uint16, f"the dtype should be uint16; it is {m.dtype}")
+        true(len(m) == 1000, f"you should read back 1000 tokens; you got {len(m)}. Write and read with the same dtype")
+        true(int(m[999]) == 999, f"element 999 should be 999; you read {int(m[999])}")
+        true(os.path.getsize(p) == 2000, f"the file is {os.path.getsize(p)} bytes. uint16 takes 2 bytes per token, so 1000 tokens should be 2000 bytes, with no header")
+        true(not m.flags.writeable, "open it read-only with mode=\"r\", so the training code cannot damage the corpus")
+        del m
+--- hints
+- To write: convert with `np.asarray(ids, dtype=np.uint16)`, then call the array's `.tofile(path)`.
+- To read: `np.memmap(path, dtype=np.uint16, mode="r")`. The dtype must match the one you wrote with, because the file does not store it.
+
+@@ item d3-06
+type: code
+title: Bigram counts, vectorised
+level: 3
+cards: Bigram counts and the ln(V) baseline
+targets: bigram_counts
+ref: day3
+--- context
+A bigram model guesses the next token from a single V×V table of counts. It is the simplest language model and the second baseline a Transformer has to beat. Counting all neighbouring pairs without a Python loop is the classic exercise in turning a loop into tensor operations.
+--- prompt
+Write `bigram_counts(ids, vocab_size)`:
+
+- `ids`: a 1D LongTensor of token ids. V = vocab_size.
+- Return a float tensor C of shape `(V, V)`, where `C[i, j]` is how often j comes right after i.
+- No Python loop over ids. Use `torch.bincount` (or `index_put_`, `scatter_add_`).
+
+Example: `ids = [0, 1, 0, 1, 2]`, V = 3. The neighbouring pairs are (0,1) (1,0) (0,1) (1,2), so `C[0,1] = 2`, `C[1,0] = 1`, `C[1,2] = 1`, and everything else is 0. All counts add up to `len(ids) - 1`.
+--- starter
+def bigram_counts(ids, vocab_size):
+    """ids: 1D LongTensor. Return the (V, V) count matrix C, C[i, j] = how often j follows i.
+    No Python loop over ids (use index_put_, bincount or scatter_add_).
+    """
+    raise todo()
+--- solution
+def bigram_counts(ids, vocab_size):
+    flat = ids[:-1].long() * vocab_size + ids[1:].long()
+    return torch.bincount(flat, minlength=vocab_size ** 2).reshape(vocab_size, vocab_size).float()
+--- tests
+@check("Bigram counts, vectorised")
+def t06():
+    ids = torch.tensor([0, 1, 0, 1, 2])
+    C = bigram_counts(ids, 3)
+    shape_is(C, (3, 3), "C should have shape (V, V)")
+    eq(C, torch.tensor([[0., 2., 0.], [1., 0., 1.], [0., 0., 0.]]), msg="the pairs of [0, 1, 0, 1, 2] are (0,1) (1,0) (0,1) (1,2). The row is the first token, the column the next one")
+    big = torch.randint(0, 50, (20000,))
+    true(bigram_counts(big, 50).sum().item() == 19999, "the counts should add up to len(ids)-1: N tokens have N-1 neighbouring pairs")
+--- hints
+- Neighbouring pairs: the first token is `ids[:-1]`, the next one is `ids[1:]`; the two tensors have the same length.
+- Turn each pair into one number: `ids[:-1] * V + ids[1:]`. It lies between 0 and V*V-1, and different pairs always give different numbers.
+- `torch.bincount(flat, minlength=V * V)` counts how often each number appears; then `.reshape(V, V).float()`. Do not leave out `minlength`.
+
+@@ item d3-07
+type: code
+title: The ln(V) baseline
+level: 1
+cards: Bigram counts and the ln(V) baseline
+targets: uniform_loss, is_broken
+ref: day3
+--- context
+A model that has learned nothing has a loss of ln(V). It is the first ruler you hold against a training log: step 0 should be close to it, and if the loss is still close to it after a long run, the code has a bug.
+--- prompt
+Write two functions:
+
+1. `uniform_loss(vocab_size)`: if the model gives all V tokens the same probability 1/V, what is the cross-entropy loss? Return that float.
+2. `is_broken(loss, vocab_size, tol=0.05)`: return True when loss is within a relative error tol of `uniform_loss(vocab_size)`, that is `|loss - base| / base < tol` (still guessing after all that training); otherwise return False.
+
+Example: for V = 65 the baseline is about 4.17. A loss still at 4.17 after a long run → True; a loss of 1.48 → False.
+--- starter
+def uniform_loss(vocab_size):
+    """What cross-entropy does a model that learned nothing get? Return that number."""
+    raise todo()
+
+def is_broken(loss, vocab_size, tol=0.05):
+    """Return True if the loss is still close to uniform_loss (relative error < tol)."""
+    raise todo()
+--- solution
+def uniform_loss(vocab_size):
+    return math.log(vocab_size)
+
+def is_broken(loss, vocab_size, tol=0.05):
+    base = uniform_loss(vocab_size)
+    return abs(loss - base) / base < tol
+--- tests
+@check("The ln(V) baseline")
+def t07():
+    got = uniform_loss(65)
+    true(close(got, math.log(65)), f"for V=65 it should be ln(65) ≈ 4.1744; yours is {got}")
+    true(is_broken(4.17, 65) is True, "4.17 ≈ ln(65): the model has learned nothing, so this should return True")
+    true(is_broken(1.48, 65) is False, "1.48 is far below ln(65) ≈ 4.17: the model has learned something, so this should return False")
+--- hints
+- Cross-entropy is minus the log of the probability of the right answer. Every token has probability 1/V, so the loss is -ln(1/V).
+- -ln(1/V) = ln(V); compute it with `math.log(vocab_size)` (`math.log` is the natural log, ln, by default).
+- In `is_broken`, first compute `base = uniform_loss(vocab_size)`, then just `return abs(loss - base) / base < tol`: the comparison already is True or False.
+
+@@ item d3-08
+type: code
+title: Padding + mask + position ids
+level: 2
+cards: Padding, attention mask and position ids
+targets: pad_batch
+ref: day3
+--- context
+Real sentences have different lengths, but a batch must be a neat rectangle. After padding you must also hand over an attention mask and position ids; otherwise the model treats padding as real content, and the same sentence gives different results in different batches.
+--- prompt
+Write `pad_batch(seqs, pad_id=0)`:
+
+- `seqs`: a `list[list[int]]` of B sentences with different lengths. Tmax is the length of the longest one.
+- Return three tensors `(ids, attn_mask, pos_ids)`, all of shape `(B, Tmax)` and dtype int64.
+- `ids`: every sentence padded on the right with `pad_id` up to Tmax.
+- `attn_mask`: 1 for a real token, 0 for a padded position.
+- `pos_ids`: the position of each real token in its sentence, counting from 0; padded positions get 0.
+
+Example: `pad_batch([[5, 6, 7], [8], [9, 10]], pad_id=-1)` returns
+
+```
+ids  = [[5, 6, 7], [8, -1, -1], [9, 10, -1]]
+mask = [[1, 1, 1], [1,  0,  0], [1,  1,  0]]
+pos  = [[0, 1, 2], [0,  0,  0], [0,  1,  0]]
+```
+--- starter
+def pad_batch(seqs, pad_id=0):
+    """seqs: list[list[int]]. Return (ids, attn_mask, pos_ids), all (B, Tmax) int64.
+    - ids: padded on the right with pad_id
+    - attn_mask: 1 for real tokens, 0 for padding
+    - pos_ids: count real positions from 0 in each sentence; 0 at padded positions
+    """
+    raise todo()
+--- solution
+def pad_batch(seqs, pad_id=0):
+    B, Tmax = len(seqs), max(len(s) for s in seqs)
+    ids = torch.full((B, Tmax), pad_id, dtype=torch.long)
+    mask = torch.zeros(B, Tmax, dtype=torch.long)
+    pos = torch.zeros(B, Tmax, dtype=torch.long)
+    for i, s in enumerate(seqs):
+        L = len(s)
+        ids[i, :L] = torch.tensor(s, dtype=torch.long)
+        mask[i, :L] = 1
+        pos[i, :L] = torch.arange(L)
+    return ids, mask, pos
+--- tests
+@check("Padding + mask + position ids")
+def t08():
+    ids, m, pos = pad_batch([[5, 6, 7], [8], [9, 10]], pad_id=-1)
+    eq(ids, torch.tensor([[5, 6, 7], [8, -1, -1], [9, 10, -1]]), msg="ids: pad every sentence on the right with pad_id up to the longest length")
+    eq(m, torch.tensor([[1, 1, 1], [1, 0, 0], [1, 1, 0]]), msg="attn_mask: 1 for real tokens, 0 for padding")
+    eq(pos, torch.tensor([[0, 1, 2], [0, 0, 0], [0, 1, 0]]), msg="pos_ids: count real tokens from 0 in each sentence; 0 at padded positions")
+    true(ids.dtype == torch.long and m.dtype == torch.long and pos.dtype == torch.long,
+         f"all three tensors must be int64; yours are {ids.dtype} / {m.dtype} / {pos.dtype}")
+--- hints
+- Start with three "blank" tensors: `torch.full((B, Tmax), pad_id, dtype=torch.long)` and two `torch.zeros(B, Tmax, dtype=torch.long)`.
+- Fill them sentence by sentence with `for i, s in enumerate(seqs):`. Let `L = len(s)`, then assign the first L positions of row i: `ids[i, :L] = torch.tensor(s)`.
+- In the same loop, write `mask[i, :L] = 1` and `pos[i, :L] = torch.arange(L)`.
+
+@@ item d3-09
+type: code
+title: Mask -> additive -inf bias
+level: 2
+cards: Turning the mask into a -inf additive bias
+targets: mask_to_bias
+ref: day3
+--- context
+Attention ignores padding through the mask. The usual way is not to multiply weights by 0 but to add -inf to the padded scores before the softmax: exp(-inf) = 0, so padding gets a weight of exactly 0 and the other weights still add up to 1.
+--- prompt
+Write `mask_to_bias(attn_mask)`:
+
+- `attn_mask`: `(B, T)`, 1 for a real token, 0 for padding.
+- Return a float tensor of shape `(B, 1, 1, T)`: `0.0` at real positions, `float("-inf")` at padded ones.
+- The two 1s are for broadcasting: added to scores of shape `(B, nh, T, T)`, every head and every query position uses the same row of bias.
+- Do not write `(1 - mask) * float("-inf")`: real positions would compute `0 * -inf = nan`.
+
+Example: `mask_to_bias(torch.tensor([[1, 1, 0]]))` returns `tensor([[[[0., 0., -inf]]]])`, of shape `(1, 1, 1, 3)`.
+--- starter
+def mask_to_bias(attn_mask):
+    """attn_mask: (B, T) of 0/1  ->  additive bias of shape (B, 1, 1, T):
+    0.0 at real positions, -inf at padding. Added to the scores before softmax, padding gets weight 0.
+    """
+    raise todo()
+--- solution
+def mask_to_bias(attn_mask):
+    b = torch.zeros(attn_mask.size(0), 1, 1, attn_mask.size(1))
+    # do not write (1-mask)*(-inf): 0 * inf = nan
+    return b.masked_fill(attn_mask[:, None, None, :] == 0, float("-inf"))
+--- tests
+@check("Mask -> additive -inf bias")
+def t09():
+    m = torch.tensor([[1, 1, 0]])
+    b = mask_to_bias(m)
+    shape_is(b, (1, 1, 1, 3), "the bias should have shape (B, 1, 1, T)")
+    true(b[0, 0, 0, 0].item() == 0.0, f"the bias at a real position should be 0.0; yours is {b[0, 0, 0, 0].item()} (did you compute 0 * -inf = nan?)")
+    true(b[0, 0, 0, 2].item() == float("-inf"), f"the bias at a padded position must be exactly float('-inf'); yours is {b[0, 0, 0, 2].item()}")
+    scores = torch.zeros(1, 1, 1, 3) + b
+    w = scores.softmax(-1)
+    eq(w, torch.tensor([[[[0.5, 0.5, 0.0]]]]), msg="after adding the bias and taking the softmax, the padded position should be exactly 0")
+--- hints
+- Start from zeros of shape `(B, 1, 1, T)`: `torch.zeros(B, 1, 1, T)`, with B and T taken from `attn_mask.shape`.
+- Bring the mask to `(B, 1, 1, T)` as well: `attn_mask[:, None, None, :]` (None inserts a dimension of size 1 at that place).
+- `zeros.masked_fill(mask4d == 0, float("-inf"))` puts -inf where the condition is True and leaves 0 everywhere else.
+
+@@ item d3-10
+type: fix
+title: Find the bugs: get_batch_buggy
+level: 2
+cards: get_batch: y is x shifted by one
+targets: get_batch_buggy
+ref: day3
+--- context
+This get_batch has 3 bugs: one raises an error only sometimes, one makes the embedding layer fail right away, and the most dangerous one raises nothing at all and just teaches the model to copy the answer. When you review training code, these lines are the first place to look.
+--- prompt
+`get_batch_buggy(data, batch_size, block_size)` should do the same as get_batch from d3-04: pick random starts, x is a piece of data, y is x shifted right by one, both of shape `(batch_size, block_size)` and dtype int64.
+
+It has 3 mistakes. Find and fix them; keep the function name and arguments.
+--- starter
+def get_batch_buggy(data, batch_size, block_size):
+    ix = torch.randint(len(data), (batch_size,))
+    x = torch.stack([data[i:i + block_size] for i in ix])
+    y = torch.stack([data[i:i + block_size] for i in ix])
+    return x.float(), y.float()
+--- solution
+def get_batch_buggy(data, batch_size, block_size):
+    ix = torch.randint(len(data) - block_size, (batch_size,))   # fix 1: starts out of range
+    x = torch.stack([data[i:i + block_size] for i in ix])
+    y = torch.stack([data[i + 1:i + 1 + block_size] for i in ix])  # fix 2: y was not shifted
+    return x.long(), y.long()                                   # fix 3: must not be float
+--- tests
+@check("Find the bugs: get_batch_buggy")
+def t10():
+    data = torch.arange(200)
+    for _ in range(30):
+        try:
+            x, y = get_batch_buggy(data, 4, 16)
+        except RuntimeError as e:
+            true(False, f"it raised: {str(e)[:80]}. A start was too far to the right, the slice got shorter and torch.stack could not stack it; the upper bound should be len(data) - block_size")
+        shape_is(x, (4, 16), "x should have shape (batch_size, block_size)")
+        true(x.dtype == torch.long and y.dtype == torch.long, f"the embedding layer only accepts int64; you return {x.dtype} / {y.dtype}")
+        eq(y, x + 1, msg="y is not shifted: its slice should start at i + 1")
+--- hints
+- Mistake 1: the upper bound for the start. When i is `len(data) - 1`, how many elements does `data[i:i + block_size]` have?
+- Mistake 2: the slices of y and x are identical. y should start at `i + 1` and end at `i + 1 + block_size`.
+- Mistake 3: the `.float()` on the last line. Which dtype do the embedding input and the cross_entropy labels need?
+
+@@ item d3-11
+type: code
+title: Every shape in one training step
+level: 2
+cards: Every shape in one training step
+targets: BATCH_SHAPES
+ref: day3
+--- context
+"What shape is this tensor here?" is the most common question in interviews and in debugging. If you can say the shape of every tensor in one training step without thinking, code like nanoGPT will never lose you.
+--- prompt
+Let B = 8 (batch size), T = 256 (block_size), V = 50257 (vocabulary size), C = 768 (the width of each token vector). Work it out in your head first, then replace every `None` in the dict with a shape tuple, like `(8, 256)`.
+
+- `wte = nn.Embedding(V, C)`, `wpe = nn.Embedding(T, C)`, `lm_head = nn.Linear(C, V)`.
+- `pos = torch.arange(T)`, of shape `(T,)`.
+- A scalar (a tensor holding one number) has the empty tuple `()` as its shape.
+- You can write products like `8 * 256`. Do not change the keys.
+--- starter
+BATCH_SHAPES = {
+    "x  (input token ids)":           None,
+    "y  (labels)":                    None,
+    "tok_emb = wte(x)":               None,
+    "pos_emb = wpe(pos)":             None,   # pos is (T,)
+    "hidden (output of every block)": None,
+    "logits = lm_head(hidden)":       None,
+    "logits.view(-1, V)":             None,
+    "y.view(-1)":                     None,
+    "loss":                           None,   # a scalar is the empty tuple ()
+}
+--- solution
+BATCH_SHAPES = {
+    "x  (input token ids)":           (8, 256),
+    "y  (labels)":                    (8, 256),
+    "tok_emb = wte(x)":               (8, 256, 768),
+    "pos_emb = wpe(pos)":             (256, 768),
+    "hidden (output of every block)": (8, 256, 768),
+    "logits = lm_head(hidden)":       (8, 256, 50257),
+    "logits.view(-1, V)":             (8 * 256, 50257),
+    "y.view(-1)":                     (8 * 256,),
+    "loss":                           (),
+}
+--- tests
+@check("Every shape in one training step")
+def t11():
+    B, T, V, C = 8, 256, 50257, 768
+    want = {
+        "x  (input token ids)": (B, T),
+        "y  (labels)": (B, T),
+        "tok_emb = wte(x)": (B, T, C),
+        "pos_emb = wpe(pos)": (T, C),
+        "hidden (output of every block)": (B, T, C),
+        "logits = lm_head(hidden)": (B, T, V),
+        "logits.view(-1, V)": (B * T, V),
+        "y.view(-1)": (B * T,),
+        "loss": (),
+    }
+    missing = [k for k in want if k not in BATCH_SHAPES]
+    true(not missing, f"these keys are missing from the dict (do not rename them): {missing}")
+    wrong = [f"{k!r}: you wrote {v}, expected {want[k]}" for k, v in BATCH_SHAPES.items()
+             if k in want and (not isinstance(v, (tuple, list)) or tuple(v) != want[k])]
+    true(not wrong, "(a tuple with one element needs a comma, like (2048,))\n       " + "\n       ".join(wrong))
+--- hints
+- An embedding is a table lookup: whatever the input shape, the output adds one dimension C at the end. `(B, T)` → `(B, T, C)`.
+- Every Transformer block keeps the shape; lm_head changes only the last dimension: C → V.
+- `cross_entropy` wants logits of shape `(N, V)` and labels of shape `(N,)`, with N = B*T. A tuple with one element needs a comma: `(8 * 256,)`.
+
+@@ item d3-12
+type: predict
+title: BPE: counted twice, merged once
+level: 1
+cards: BPE and compression ratio
+ref: day3
+--- context
+BPE counts overlapping pairs but does not merge them. So merging the "most frequent" pair can remove fewer tokens than its count suggests. Once this is clear, the edge case in d3-02 will not trip you up.
+--- prompt
+The code below uses `pair_counts` and `merge_pair` from d3-02 (the reference versions are already loaded). Do not run it yet: write down the two lines it prints.
+--- code
+tokens = list("aaab")
+print(pair_counts(tokens))
+print(merge_pair(tokens, ("a", "a")))
+--- explain
+`"aaab"` has 3 neighbouring pairs: positions 0-1 are (a,a), positions 1-2 are (a,a), positions 2-3 are (a,b). Overlaps count, so `('a', 'a')` appears 2 times and `('a', 'b')` once.
+
+The merge scans from left to right: positions 0-1 become `'aa'`, and the scan jumps straight to position 2. Positions 2-3 are (a,b), which is not the pair being merged, so `'a'` and `'b'` stay as they are. The result is `['aa', 'a', 'b']`: the count said 2, but only 1 merge happened.
+--- hints
+- When counting, every two neighbours form a pair, and pairs may overlap: 4 tokens give 3 pairs.
+- The merge scans left to right: after merging positions 0-1, it jumps to position 2 and looks at the pair at positions 2 and 3.
+- A dict prints like `{('x', 'y'): 1}`, a list like `['x', 'y']`.
+
+@@ item d3-13
+type: predict
+title: When uint16 is too small
+level: 2
+cards: Big corpora: a uint16 .bin file and np.memmap
+--- context
+Storing token ids as uint16 in a .bin file uses 4 times less disk than int64. But uint16 stops at 65535. Force a bigger vocabulary into it and numpy raises no error; it quietly turns ids into other numbers, and your training data is broken.
+--- prompt
+Do not run it yet: write down the two lines this code prints. uint16 holds 0 to 65535; `.nbytes` is how many bytes an array takes in total.
+--- code
+import numpy as np
+ids = np.array([50256, 65535, 65536, 70000], dtype=np.int64)
+print(ids.astype(np.uint16).tolist())
+print(np.array([1, 2, 3], dtype=np.uint16).nbytes, np.array([1, 2, 3], dtype=np.int64).nbytes)
+--- explain
+50256 and 65535 fit and stay as they are. 65536 becomes 0 and 70000 becomes 4464: when converting, numpy keeps only the lowest 16 bits, which is the remainder after dividing by 65536 (70000 - 65536 = 4464). No error, no warning. That is why a tokenizer with more than 65,536 tokens (a 100k vocabulary, for example) must be stored as uint32.
+
+Second line: 3 uint16 values take 3 × 2 = 6 bytes, 3 int64 values take 3 × 8 = 24 bytes. That is why .bin files use uint16.
+--- hints
+- A number that does not fit in uint16 raises no error; only the remainder after dividing by 65536 is kept.
+- 65536 % 65536 = 0 and 70000 % 65536 = 4464.
+- uint16 takes 2 bytes per element and int64 takes 8; both arrays have 3 elements.
+
+@@ item d3-14
+type: predict
+title: A mask by multiplication makes nan
+level: 2
+cards: Turning the mask into a -inf additive bias
+--- context
+Turning a mask into a -inf bias by multiplication looks natural, but it is a classic bug: nan appears in the result, and once a nan enters the softmax it spreads through the whole row, and then the loss becomes nan too.
+--- prompt
+Do not run it yet: write down the two lines this code prints. A tensor prints as `tensor([..., ..., ...])`, with one space after each comma.
+--- code
+mask = torch.tensor([1., 1., 0.])
+bias = (1 - mask) * float("-inf")
+print(bias)
+print((torch.zeros(3) + bias).softmax(-1))
+--- explain
+`1 - mask` is `[0., 0., 1.]`. Floating point defines `0 × (-inf)` as nan ("not a number"), while `1 × (-inf)` is still -inf. So bias is `tensor([nan, nan, -inf])`: the real positions, which should be 0, all became nan.
+
+The softmax divides by the sum of the exp of the whole row. If one value in that sum is nan, the whole row is nan. The right way is `torch.zeros(...).masked_fill(mask == 0, float("-inf"))`: it changes only the padded positions and leaves the real ones at 0.
+--- hints
+- Compute `1 - mask` first: it is `[0., 0., 1.]`.
+- Floating point says `0 × (-inf)` is nan, not 0; `1 × (-inf)` is still -inf.
+- The softmax divides by the sum of the exp of the whole row: one nan in it makes every position nan.
+
+@@ item d3-15
+type: choice
+title: Compare the loss with ln(V)
+level: 2
+cards: Bigram counts and the ln(V) baseline
+--- context
+The first thing to do with a training log is to compare the loss with ln(V). It takes seconds and tells you whether the initialisation is sane and whether the model is learning at all.
+--- prompt
+You are training a model with the GPT-2 tokenizer: V = 50257, ln(V) ≈ 10.82. Which statements are right? (Pick all that apply.)
+--- options
+- The loss at step 0 is 10.9: normal. A freshly initialised model guesses roughly uniformly, so the loss should be close to ln(V).
+- The loss at step 0 is 10.9: too high, the initialisation is broken. A good initialisation should make the loss start close to 0.
+- After 5000 steps the loss is still about 10.8: the model has learned nothing. Check the training loop first, for example a missing `optimizer.step()` or a learning rate of 0.
+- The loss at step 0 is 45: far above ln(V). The model starts out "confidently wrong" (its logits are too large), so check the initialisation.
+answer: 1,3,4
+--- explain
+With uniform guessing, the right answer has probability 1/V, so the loss is -ln(1/V) = ln(V) ≈ 10.82. A step-0 loss of 10.9 is completely normal (option 1 is right). A model that has not learned anything yet cannot start close to 0 (option 2 is wrong).
+
+A loss still near ln(V) after a long run means the model is still guessing; most likely its parameters are not being updated at all (option 3 is right).
+
+A loss far above ln(V) means the model gives the right answer a probability even smaller than 1/V: it is not guessing, it is confidently betting on the wrong tokens, usually because the initialisation makes the logits too large (option 4 is right).
+--- hints
+- With uniform guessing the right answer has probability 1/V, so the loss is -ln(1/V) = ln(V).
+- A loss above ln(V) means the model gives the right answer less than 1/V probability.
+
+@@ item d3-16
+type: code
+title: Closed book: get_batch
+level: 2
+cards: get_batch: y is x shifted by one
+targets: get_batch
+ref: day3
+exam: yes
+--- context
+get_batch is the function you write most often in a training loop, and it almost always comes up when an interview asks you to write a training loop by hand. You only really know it once you can write it from a blank page.
+--- prompt
+Without the cards or earlier answers, write `get_batch(data, batch_size, block_size, generator=None)`:
+
+- `data` is a 1D LongTensor; pick `batch_size` random starts and pass `generator` to `torch.randint`.
+- `x` is the `block_size` tokens from a start; `y` is x shifted right by one.
+- Return `(x, y)`, both of shape `(batch_size, block_size)` and dtype int64; y must stay in range.
+--- starter
+def get_batch(data, batch_size, block_size, generator=None):
+    raise todo()
+--- solution
+def get_batch(data, batch_size, block_size, generator=None):
+    hi = len(data) - block_size
+    ix = torch.randint(hi, (batch_size,), generator=generator)
+    x = torch.stack([data[i:i + block_size] for i in ix]).long()
+    y = torch.stack([data[i + 1:i + 1 + block_size] for i in ix]).long()
+    return x, y
+--- tests
+@check("get_batch and the x/y shift")
+def t04():
+    data = torch.arange(1000)
+    g = torch.Generator().manual_seed(0)
+    x, y = get_batch(data, 4, 8, g)
+    shape_is(x, (4, 8), "x should have shape (batch_size, block_size)")
+    shape_is(y, (4, 8), "y should have shape (batch_size, block_size)")
+    true(x.dtype == torch.long and y.dtype == torch.long, f"the dtype must be int64 (torch.long); yours is {x.dtype} / {y.dtype}")
+    eq(y, x + 1, msg="y must be x shifted right by one. Get this line wrong and the model learns to copy the answer: the loss drops to 0 but the generated text is garbage")
+    x2, _ = get_batch(data, 4, 8, torch.Generator().manual_seed(0))
+    eq(x2, x, msg="a generator with the same seed should give the same batch; pass generator to torch.randint")
+    # out-of-range check: sample the shortest valid data many times
+    short = torch.arange(9)
+    for _ in range(50):
+        try:
+            a, b = get_batch(short, 2, 8)
+        except RuntimeError as e:
+            true(False, f"get_batch(torch.arange(9), 2, 8) raised: {str(e)[:80]}. With 9 tokens and block_size=8 the only valid start is 0: "
+                        "the upper bound for torch.randint is len(data) - block_size")
+        shape_is(b, (2, 8), "a start was too far to the right and y got cut short; the upper bound should be len(data)-block_size")
+        true(int(b.max()) <= 8, "y is out of range; the largest start i is len(data)-block_size-1")
+--- hints
+- The upper bound for the start: `len(data) - block_size`.
+- `torch.stack` stacks the pieces; both ends of y's slice are 1 more than x's.
+
+@@ item d3-17
+type: code
+title: Closed book: pad_batch
+level: 2
+cards: Padding, attention mask and position ids
+targets: pad_batch
+ref: day3
+exam: yes
+--- context
+Padding with an attention mask and position ids comes up in training, in batched inference and in serving. Write it once from a blank page to make sure you get all three right the first time.
+--- prompt
+Without the cards or earlier answers, write `pad_batch(seqs, pad_id=0)`:
+
+- `seqs` is a `list[list[int]]`; return `(ids, attn_mask, pos_ids)`, all of shape `(B, Tmax)` and dtype int64.
+- `ids` is padded on the right with `pad_id`; `attn_mask` is 1 for real tokens and 0 for padding; `pos_ids` counts real tokens from 0 in each sentence, with 0 at padded positions.
+--- starter
+def pad_batch(seqs, pad_id=0):
+    raise todo()
+--- solution
+def pad_batch(seqs, pad_id=0):
+    B, Tmax = len(seqs), max(len(s) for s in seqs)
+    ids = torch.full((B, Tmax), pad_id, dtype=torch.long)
+    mask = torch.zeros(B, Tmax, dtype=torch.long)
+    pos = torch.zeros(B, Tmax, dtype=torch.long)
+    for i, s in enumerate(seqs):
+        L = len(s)
+        ids[i, :L] = torch.tensor(s, dtype=torch.long)
+        mask[i, :L] = 1
+        pos[i, :L] = torch.arange(L)
+    return ids, mask, pos
+--- tests
+@check("Padding + mask + position ids")
+def t08():
+    ids, m, pos = pad_batch([[5, 6, 7], [8], [9, 10]], pad_id=-1)
+    eq(ids, torch.tensor([[5, 6, 7], [8, -1, -1], [9, 10, -1]]), msg="ids: pad every sentence on the right with pad_id up to the longest length")
+    eq(m, torch.tensor([[1, 1, 1], [1, 0, 0], [1, 1, 0]]), msg="attn_mask: 1 for real tokens, 0 for padding")
+    eq(pos, torch.tensor([[0, 1, 2], [0, 0, 0], [0, 1, 0]]), msg="pos_ids: count real tokens from 0 in each sentence; 0 at padded positions")
+    true(ids.dtype == torch.long and m.dtype == torch.long and pos.dtype == torch.long,
+         f"all three tensors must be int64; yours are {ids.dtype} / {m.dtype} / {pos.dtype}")
+--- hints
+- Build the three `(B, Tmax)` tensors first with `torch.full` and `torch.zeros`.
+- Loop over the sentences and fill the first `len(s)` positions of row i.

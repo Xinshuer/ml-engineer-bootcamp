@@ -1,0 +1,13 @@
+# PyTorch: install the build for your machine first (CUDA or CPU), see https://pytorch.org/get-started/locally/
+# The course runs on a CPU too; a GPU only makes the optional local tasks faster.
+torch>=2.5
+numpy
+# days 20-26 (checkpoints, export, serving, operations)
+safetensors
+onnx
+onnxruntime
+onnxscript
+fastapi
+pydantic>=2
+httpx
+uvicorn

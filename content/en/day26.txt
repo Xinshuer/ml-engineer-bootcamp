@@ -1,0 +1,1749 @@
+@@ day 26
+title: Capstone: from training to production
+part: Capstone
+hours: 4–5 hours
+--- goal
+Take one small classifier all the way from data to production: pre-training checks, seeded training, a checkpoint you can resume, an ONNX export checked against PyTorch, a FastAPI service, and latency and drift monitoring. At the end you run all six steps from one script on your own machine.
+--- checklist
+- Read the first card: see the six-step pipeline and which earlier day each step comes from
+- Do the practice items in order; if you get stuck, skip ahead (each item's hidden code has reference versions of the other steps)
+- Do item 13: run capstone.py on your own machine and paste back the summary line
+- In the closed-book tab, rewrite the checkpoint and the service from a blank page
+
+@@ concept
+title: The capstone: a six-step pipeline
+ref: day26
+--- body
+Today you connect what you have learned into one line: a very small classifier, from making the data all the way to serving and monitoring.
+
+The story: a machine has 8 sensor readings, and the model says whether it is `ok`, `overheat` (running too hot) or `vibration` (shaking). `make_data` builds the data from a fixed seed, so everyone gets exactly the same numbers. The model, `TinyNet`, is already written: `Linear(8, 32)` → ReLU → Dropout(0.1) → `Linear(32, 3)`.
+
+Six steps, each one taken from earlier days:
+1. Data + pre-training checks: reproducible data, a smoke test, overfitting one batch (days 14, 15, 16)
+2. Training: a fixed seed, a second or two on a CPU, a clear drop in the loss (days 15, 17, 18)
+3. Checkpoint: weights in safetensors, plus the optimizer and random-number state, so training can resume (day 20)
+4. Export: `torch.onnx.export(..., dynamo=True)`, then compare with onnxruntime (day 21)
+5. Service: FastAPI + pydantic validation, load once at start-up, warm up once (day 22)
+6. Monitoring: latency p50 / p95 / p99 and a PSI drift check (days 19, 22, 25)
+
+How the items work: each item asks you to write one piece of the pipeline. The item's hidden code contains **reference versions of every step**. The name you write is deleted first and replaced by your version, so the later steps call your code. You can go in order, or jump straight to the step you want to practise.
+
+Item 13 puts the six steps together into one `capstone.py` that you run on your own machine (on the GPU if you have one) and paste back the summary line.
+--- code
+x, y = make_data(6, seed=0)
+print("x:", tuple(x.shape), x.dtype, "  y:", tuple(y.shape), y.dtype)
+print("labels:", [LABELS[i] for i in y.tolist()])
+torch.manual_seed(0)
+model = TinyNet()
+print(model)
+print("parameters:", sum(p.numel() for p in model.parameters()))
+
+@@ concept
+title: Step 1: data, smoke test, overfit
+ref: day26
+--- body
+### Reproducible data
+`make_data(n, seed)` draws its random numbers from its own `torch.Generator`. The same seed always gives the same data, and the global random state (the one `torch.manual_seed` sets) is not touched. So making data does not change the order in which training later draws its batches (day 18: reproducibility).
+
+Labels must be `int64` (long); that is what `F.cross_entropy` accepts (day 16).
+
+### Smoke test: one forward + backward before training
+- Is the output shape right? It should be `(batch, 3)`.
+- Any nan or inf? `torch.isfinite(logits).all()`.
+- The first loss should be close to `ln 3 ≈ 1.099`: a freshly initialised model treats the 3 classes about equally (day 15). If it is far off, the scale of the initialisation or of the inputs is usually wrong.
+- After backward, every trainable parameter needs a finite `.grad`. `grad is None` means that parameter is not connected to the computation at all (day 15).
+
+### Overfit one batch
+Train again and again on just 16 rows. The loss should fall close to 0. If it does not, the code has a bug; do not start tuning hyperparameters yet (day 14).
+--- code
+x, y = make_data(16, seed=0)
+torch.manual_seed(0)
+model = TinyNet()
+print("first loss:", round(smoke_test(model, x, y), 3), "  ln 3 =", round(math.log(3), 3))
+losses = overfit_one_batch(model, x, y, steps=200)
+print("overfit 16 rows:", round(losses[0], 3), "->", round(losses[-1], 4))
+
+@@ concept
+title: Step 2: a fixed seed, a few seconds of training
+ref: day26
+--- body
+The training loop (several day-15 traps live here):
+- Each step draws 64 random rows with `torch.randint(0, len(x), (batch_size,))` → forward → `F.cross_entropy` → `opt.zero_grad()` → `loss.backward()` → `opt.step()`.
+- Record `loss.item()`, not `loss` itself: a tensor keeps its whole computation graph in memory (day 19).
+- Call `model.train()` first. `accuracy` switches the model to `eval()` (dropout off); if you do not switch back, the rest of training runs without dropout (day 17).
+- The caller builds the optimizer and passes it in: when you resume, it is the one read back from the checkpoint.
+
+A fixed seed: call `torch.manual_seed(0)`, then build the model and train, and the same code gives exactly the same losses every time. The "resume == uninterrupted" test in step 3 depends on this (day 18).
+
+The example below takes a second or two on a CPU. The mean loss of the first 20 steps is about 0.75, of the last 20 steps about 0.18, and the validation accuracy is about 0.95. The three classes overlap, so no amount of training reaches 100%.
+--- code
+torch.manual_seed(0)
+x_train, y_train = make_data(2000, seed=1)
+x_val, y_val = make_data(500, seed=2)
+model = TinyNet()
+opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+losses = train_steps(model, opt, x_train, y_train, steps=300)
+print(f"mean loss, first 20 steps: {sum(losses[:20]) / 20:.3f}")
+print(f"mean loss, last 20 steps:  {sum(losses[-20:]) / 20:.3f}")
+print(f"val accuracy: {accuracy(model, x_val, y_val):.3f}")
+
+@@ concept
+title: Step 3: a checkpoint you can resume
+ref: day26
+--- body
+Training can be interrupted: a machine restarts, or a cheap preemptible cloud GPU is taken back. A resumable checkpoint must make "save → load → keep training" give exactly the same weights as training in one go (day 20).
+
+Save two files:
+- `model.safetensors`: the weights only. Save with `save_file(model.state_dict(), path)`, load with `load_file(path)`. A safetensors file holds only tensors, no executable pickle, so loading someone else's file is safe. The service needs only this one file.
+- `train_state.pt`: what only resuming needs: `{"opt": opt.state_dict(), "step": step, "rng": torch.get_rng_state()}`. Load it with `torch.load(path, weights_only=True)`: only tensors, numbers, lists and dicts are allowed, so no code hidden in the file can run.
+
+What goes wrong when one piece is missing:
+- No optimizer state: AdamW's two running averages (`exp_avg`, `exp_avg_sq`) start again from 0, so every step after the resume differs.
+- No random-number state: the batches drawn after the resume, and the dropout masks, differ from the uninterrupted run.
+
+Neither case raises an error, and the loss still goes down; the result just changes quietly. That is why a test must prove "resume == uninterrupted". Real projects also write to a temporary file first and then `os.replace` it, so a crash half-way through never leaves a broken file (day 20).
+--- code
+import os, tempfile
+from safetensors.torch import load_file
+torch.manual_seed(0)
+x, y = make_data(2000, seed=1)
+model = TinyNet()
+opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+train_steps(model, opt, x, y, steps=10)
+folder = tempfile.mkdtemp()
+save_checkpoint(folder, model, opt, step=10)
+for name in sorted(os.listdir(folder)):
+    print(name, os.path.getsize(os.path.join(folder, name)), "bytes")
+print("weights:", list(load_file(os.path.join(folder, "model.safetensors")).keys()))
+state = torch.load(os.path.join(folder, "train_state.pt"), weights_only=True)
+print("train_state:", list(state.keys()), "  step =", state["step"])
+print("AdamW state of fc1.weight:", list(state["opt"]["state"][0].keys()))
+
+@@ concept
+title: Step 4: export to ONNX and compare
+ref: day26
+--- body
+In production you often do not ship the PyTorch training code. You export the model to an ONNX file and run it with onnxruntime (day 21):
+```python
+model.eval()                                # dropout off: export the inference graph
+torch.onnx.export(model, (torch.randn(2, FEATURES),), "tinynet.onnx", dynamo=True,
+                  input_names=["x"], output_names=["logits"],
+                  dynamic_shapes={"x": {0: "batch"}},   # dimension 0 (the batch) may change
+                  external_data=False,                  # weights go into the same file
+                  verbose=False)                        # no progress messages
+```
+- The example input is only used to trace the graph. Its batch is 2; without `dynamic_shapes`, the exported file accepts batch 2 only.
+- The keys of `dynamic_shapes` are the argument names of `forward`: the `x` in `TinyNet.forward(self, x)`.
+- Without `external_data=False`, the weights go into a second file next to it, `.onnx.data`. Forget to copy it when you deploy, and the model will not load.
+- Always compare after exporting: feed the same inputs to onnxruntime and to the model in eval mode, and take the largest absolute difference. In float32 it is usually between 1e-7 and 1e-6; use a tolerance of 1e-4. Try several batch sizes (1, 5, 64) to prove the batch dimension really is dynamic.
+
+Exporting traces the whole model and takes a few seconds: after you press Run on the example below, wait a moment. The two export items have a 120-second time limit.
+--- code
+import os, tempfile
+import onnxruntime as ort
+torch.manual_seed(0)
+model = TinyNet()
+path = export_onnx(model, os.path.join(tempfile.mkdtemp(), "tinynet.onnx"))
+sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+print("inputs: ", [(i.name, i.shape) for i in sess.get_inputs()])
+print("outputs:", [(o.name, o.shape) for o in sess.get_outputs()])
+for b in (1, 5, 64):
+    x = torch.randn(b, FEATURES)
+    with torch.inference_mode():
+        want = model(x).numpy()
+    got = sess.run(None, {"x": x.numpy()})[0]
+    print(f"batch {b:2d}: max |onnx - torch| = {abs(got - want).max():.1e}")
+
+@@ concept
+title: Step 5: a FastAPI service
+ref: day26
+--- body
+The shape of the service (day 22):
+- **Load once at start-up**: `create_app(load_model)` calls `load_model()` right away and gets a `predict` function that every request then reuses. Loading the model on every request is the most common reason a service is slow.
+- **Warm up once**: after loading, call `predict` once on a row of zeros. The first call is often much slower (memory allocation, initialisation); do not make your first user pay for it.
+- `GET /health` returns `{"status": "ok"}`, for load balancers and monitoring.
+- `POST /predict` takes `{"rows": [[8 numbers], ...]}`, sends all rows of one request to the model **at once** (one batch), and returns each row's label and its 3 class probabilities.
+
+Input validation is pydantic's job:
+```python
+Row = Annotated[list[FiniteFloat], Field(min_length=FEATURES, max_length=FEATURES)]
+
+class PredictRequest(BaseModel):
+    rows: list[Row] = Field(min_length=1, max_length=MAX_ROWS)
+```
+- `FiniteFloat`: an ordinary float that rejects nan and inf.
+- `Annotated[type, Field(...)]` adds limits to a type; `min_length` / `max_length` limit a list's length: exactly 8 numbers per row, 1 to 64 rows per request.
+- Write the route's parameter as `req: PredictRequest` and FastAPI validates first. A bad request gets a **422** straight away: your function is never called and the model never runs.
+
+Tests do not need a real server: `TestClient(app)` sends requests inside the same process.
+--- code
+from fastapi.testclient import TestClient
+torch.manual_seed(0)
+model = TinyNet()
+client = TestClient(create_app(lambda: torch_predictor(model)))
+print(client.get("/health").json())
+x, _ = make_data(2, seed=5)
+r = client.post("/predict", json={"rows": x.tolist()})
+print(r.status_code, r.json()["labels"])
+r = client.post("/predict", json={"rows": [[1.0] * 7]})
+print(r.status_code, r.json()["detail"][0]["msg"])
+
+@@ concept
+title: Step 6: latency percentiles and PSI drift
+ref: day26
+--- body
+### Latency: percentiles, not the mean
+- Send a few warm-up requests first and do not time them (day 19).
+- Time each request with `time.perf_counter()` before and after; multiply by 1000 for milliseconds.
+- Count successful (200) requests only: a 422 comes back fast, and mixing them in makes latency look better than it is.
+- Report p50 / p95 / p99: `np.percentile(times, 95)` is the time 95% of requests beat. A few slow requests pull the mean up and also hide inside it; the lag users notice lives in p95 / p99 (day 22).
+
+### Drift: PSI
+After launch, the input distribution can change slowly (a new sensor model, the seasons). PSI, the population stability index, compares one feature's distribution in the training data (expected) with the live data (actual) (day 25):
+1. Cut 10 buckets at the quantiles of the training data, so each bucket holds exactly 10% of the training data.
+2. Count the share of live data that falls into each bucket, a, and the share of training data, e.
+3. `PSI = Σ (a − e) · ln(a / e)`. First raise any share of 0 to a small number eps, otherwise ln 0 = −∞.
+
+Common rules of thumb: below 0.1, nothing much changed; 0.1 to 0.25, worth a look; above 0.25, a clear shift: find the cause and consider retraining.
+--- code
+times = [3.1, 2.9, 3.0, 3.2, 2.8, 3.0, 3.1, 2.9, 3.0, 25.0]
+report = latency_report(times)
+print("mean:", round(sum(times) / len(times), 2), " p50 / p95 / p99:", [round(report[k], 2) for k in ("p50", "p95", "p99")])
+x_train, _ = make_data(5000, seed=1)
+x_same, _ = make_data(5000, seed=2)
+x_moved, _ = make_data(5000, seed=3, shift=1.0)
+print("PSI, same distribution:", round(psi(x_train[:, 0], x_same[:, 0]), 4))
+print("PSI, shifted by 1.0:   ", round(psi(x_train[:, 0], x_moved[:, 0]), 4))
+
+@@ item d26-01
+type: code
+title: Step 1: reproducible data
+level: 1
+cards: Step 1: data, smoke test, overfit; The capstone: a six-step pipeline
+targets: make_data
+ref: day26
+--- context
+If the data changes, nothing lines up any more: loss curves, accuracy, bug reproductions. Build the data from its own random generator: the same seed always gives the same data, and training's batch order is left alone.
+--- prompt
+Write `make_data(n, seed=0, shift=0.0)`. It makes sensor data for n machines and returns `(x, y)`:
+- First create your own generator `g`, seeded with `seed`; pass `generator=g` to both random draws below.
+- Draw the labels `y` first: n random integers from 0 to `CLASSES - 1` (`torch.randint`), dtype int64.
+- Then draw the features `x`, shape `(n, FEATURES)`, float32: each row = the center of that row's class (`class_centers()[y]`) + standard normal noise + `shift`.
+
+Keep this order (y first, then x); otherwise the same seed draws different numbers and you will not match the reference. Do not use `torch.manual_seed`: it changes the global random state. `class_centers()`, `FEATURES = 8` and `CLASSES = 3` already exist.
+--- starter
+def make_data(n, seed=0, shift=0.0):
+    """Return x: (n, FEATURES) float32 and y: (n,) int64.
+    The same seed must give the same data; do not touch the global random state."""
+    raise todo()
+--- solution
+def make_data(n, seed=0, shift=0.0):
+    g = torch.Generator().manual_seed(seed)                  # our own random numbers, not the global ones
+    y = torch.randint(0, CLASSES, (n,), generator=g)          # labels first
+    x = class_centers()[y] + torch.randn(n, FEATURES, generator=g) + shift
+    return x, y
+--- setup
+_make_data_ref = make_data
+--- tests
+@check("Exactly the same as the reference")
+def _():
+    x, y = make_data(50, seed=3)
+    x0, y0 = _make_data_ref(50, seed=3)
+    true(x.dtype == torch.float32, f"x should be float32; yours is {x.dtype}")
+    true(y.dtype == torch.int64, f"y should be int64 (cross_entropy needs long labels); yours is {y.dtype}")
+    shape_is(x, (50, FEATURES))
+    shape_is(y, (50,))
+    eq(y, y0, msg="the labels differ: draw y first, torch.randint(0, CLASSES, (n,), generator=g)")
+    eq(x, x0, msg="the features differ: x = class_centers()[y] + torch.randn(n, FEATURES, generator=g) + shift")
+
+@check("shift moves every number")
+def _():
+    x, y = make_data(50, seed=3)
+    xs, ys = make_data(50, seed=3, shift=0.5)
+    eq(ys, y, msg="shift must not change the labels")
+    eq(xs, x + 0.5, msg="with shift=0.5 every number in x should be exactly 0.5 larger")
+
+@check("Same seed, same data; different seed, different data")
+def _():
+    a, _ = make_data(20, seed=1)
+    b, _ = make_data(20, seed=1)
+    c, _ = make_data(20, seed=2)
+    true(torch.equal(a, b), "the same seed gave different data twice: use g = torch.Generator().manual_seed(seed), created fresh on every call")
+    true(not torch.equal(a, c), "different seeds gave the same data: seed is not being used")
+
+@check("Leaves the global random state alone")
+def _():
+    before = torch.get_rng_state()
+    make_data(20, seed=1)
+    true(torch.equal(before, torch.get_rng_state()),
+         "the global random state changed: pass generator=g to both torch.randint and torch.randn, and do not call torch.manual_seed")
+--- hints
+- `g = torch.Generator().manual_seed(seed)`: `manual_seed` returns the generator itself, so you can assign it directly.
+- `class_centers()` has shape `(3, 8)`; `class_centers()[y]` uses the labels as indices and gives `(n, 8)`: each row gets its own class's center.
+- `x = class_centers()[y] + torch.randn(n, FEATURES, generator=g) + shift`
+
+@@ item d26-02
+type: code
+title: Step 1: the smoke test
+level: 2
+cards: Step 1: data, smoke test, overfit
+targets: smoke_test
+ref: day26
+--- context
+Finding out after two hours of training that the output shape is wrong, or that a layer was never connected, is painful. One second of forward + backward before training stops these mistakes at the door.
+--- prompt
+Write `smoke_test(model, x, y)`. Run one forward + backward on a small batch and check the 4 rules below, in order. If a rule fails, `raise AssertionError("...")` with a message that says which one; if all pass, return the first loss (a Python float).
+1. `logits = model(x)` has shape `(len(x), CLASSES)`.
+2. `logits` contains no nan or inf (`torch.isfinite`).
+3. `loss = F.cross_entropy(logits, y)`; `loss.item()` is within 0.5 of `math.log(CLASSES)`.
+4. After `loss.backward()`, every parameter with `requires_grad` True has a `.grad`, and all its values are finite. Use `model.named_parameters()` and put the parameter's name in the message.
+--- starter
+def smoke_test(model, x, y):
+    """One forward + backward. 4 checks; raise AssertionError when one fails.
+    If all pass, return the first loss (float)."""
+    raise todo()
+--- solution
+def smoke_test(model, x, y):
+    logits = model(x)
+    if tuple(logits.shape) != (len(x), CLASSES):
+        raise AssertionError(f"logits have shape {tuple(logits.shape)}, expected {(len(x), CLASSES)}")
+    if not torch.isfinite(logits).all():
+        raise AssertionError("logits contain nan / inf")
+    loss = F.cross_entropy(logits, y)
+    if abs(loss.item() - math.log(CLASSES)) > 0.5:
+        raise AssertionError(f"first loss {loss.item():.3f} is far from ln 3 = {math.log(CLASSES):.3f}")
+    loss.backward()
+    for name, p in model.named_parameters():
+        if p.requires_grad and (p.grad is None or not torch.isfinite(p.grad).all()):
+            raise AssertionError(f"{name} got no finite gradient")
+    return loss.item()
+--- setup
+def _must_raise(fn, msg):
+    try:
+        fn()
+    except AssertionError:
+        return
+    raise AssertionError(msg)
+--- tests
+@check("A good model: returns the first loss (float)")
+def _():
+    x, y = make_data(64, seed=0)
+    seed(0)
+    got = smoke_test(TinyNet(), x, y)
+    true(isinstance(got, float), f"return a Python float (loss.item()); you returned a {type(got).__name__}")
+    true(abs(got - math.log(3)) < 0.5, f"you returned {got:.3f}: return the first loss, which is close to ln 3 = 1.099")
+
+@check("Raises on a wrong output shape")
+def _():
+    x, y = make_data(64, seed=0)
+    seed(0)
+    m = TinyNet()
+    m.fc2 = nn.Linear(32, 4)
+    _must_raise(lambda: smoke_test(m, x, y),
+                "the model outputs 4 classes (it should be 3) and you did not raise: compare tuple(logits.shape) with (len(x), CLASSES)")
+
+@check("Raises on nan in the output")
+def _():
+    x, y = make_data(64, seed=0)
+    seed(0)
+    m = TinyNet()
+    with torch.no_grad():
+        m.fc1.bias[0] = float("nan")
+    _must_raise(lambda: smoke_test(m, x, y), "the logits contain nan and you did not raise: check torch.isfinite(logits).all()")
+
+@check("Raises when the first loss is far from ln 3")
+def _():
+    x, y = make_data(64, seed=0)
+    seed(0)
+    m = TinyNet()
+    with torch.no_grad():
+        m.fc2.weight.mul_(30)
+    _must_raise(lambda: smoke_test(m, x, y),
+                "the last layer's weights are 30 times too large, the first loss is far from ln 3, and you did not raise: check abs(loss.item() - math.log(CLASSES)) > 0.5")
+
+@check("Raises when a parameter gets no gradient")
+def _():
+    class WithUnused(TinyNet):
+        def __init__(self):
+            super().__init__()
+            self.unused = nn.Linear(FEATURES, CLASSES)   # defined, but never used in forward
+    x, y = make_data(64, seed=0)
+    seed(0)
+    _must_raise(lambda: smoke_test(WithUnused(), x, y),
+                "the unused layer is not connected to the graph, so its .grad is None after backward, and you did not raise")
+--- hints
+- Every rule is `if it fails: raise AssertionError("...")`. Comparing shapes: `tuple(logits.shape) != (len(x), CLASSES)`.
+- Rule 4: `for name, p in model.named_parameters():`, skip those with `requires_grad` False; raise when `p.grad is None or not torch.isfinite(p.grad).all()`.
+- At the end, `return loss.item()`.
+
+@@ item d26-03
+type: fix
+title: Step 1: fix "overfit one batch"
+level: 2
+cards: Step 1: data, smoke test, overfit
+targets: overfit_one_batch
+ref: day26
+--- context
+Overfitting one batch is the cheapest "is my code right?" test: if the model cannot memorise 16 rows, the model or the loss is wrong. The code below has 3 classic bugs from days 15 and 19.
+--- prompt
+`overfit_one_batch(model, x, y, steps=200, lr=1e-2)` should train on the same `(x, y)` for `steps` steps and return the loss of every step (a list of Python floats). Right now it has 3 bugs:
+- the loss can never get close to 0;
+- gradients pile up from one step to the next;
+- the returned list holds tensors that still carry their computation graph.
+
+Find them and fix them. The tests check: the losses are floats; after 2 steps the parameters equal a correct implementation's exactly; after 200 steps the last loss is below 0.05.
+--- starter
+def overfit_one_batch(model, x, y, steps=200, lr=1e-2):
+    model.train()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    losses = []
+    for _ in range(steps):
+        probs = F.softmax(model(x), dim=-1)
+        loss = F.cross_entropy(probs, y)
+        loss.backward()
+        opt.step()
+        losses.append(loss)
+    return losses
+--- solution
+def overfit_one_batch(model, x, y, steps=200, lr=1e-2):
+    model.train()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    losses = []
+    for _ in range(steps):
+        loss = F.cross_entropy(model(x), y)       # cross_entropy applies log_softmax itself
+        opt.zero_grad(set_to_none=True)           # clear the previous step's gradients
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())                # store a float, not the graph
+    return losses
+--- setup
+_overfit_ref = overfit_one_batch
+--- tests
+@check("Each step records a float")
+def _():
+    x, y = make_data(16, seed=0)
+    seed(0)
+    losses = overfit_one_batch(TinyNet(), x, y, steps=3)
+    true(len(losses) == 3, f"steps=3 should return 3 losses; you returned {len(losses)}")
+    true(all(isinstance(l, float) for l in losses),
+         "store loss.item() (a Python float): storing the tensor keeps every step's graph in memory (day 19)")
+
+@check("After 2 steps the parameters match a correct implementation")
+def _():
+    x, y = make_data(16, seed=0)
+    seed(0)
+    m = TinyNet()
+    overfit_one_batch(m, x, y, steps=2)
+    seed(0)
+    m0 = TinyNet()
+    _overfit_ref(m0, x, y, steps=2)
+    for (name, p), p0 in zip(m.named_parameters(), m0.parameters()):
+        eq(p, p0, tol=1e-6,
+           msg=f"{name} differs. Two common causes: an extra softmax before cross_entropy (it does its own); "
+               "no opt.zero_grad() before each backward, so gradients keep adding up")
+
+@check("16 rows memorised: last loss < 0.05")
+def _():
+    x, y = make_data(16, seed=0)
+    seed(0)
+    losses = overfit_one_batch(TinyNet(), x, y)
+    last = float(losses[-1])
+    true(last < 0.05, f"after 200 steps the loss is still {last:.3f}. With softmax before cross_entropy the loss cannot go below about 0.55")
+--- hints
+- `F.cross_entropy` expects logits (raw scores, before softmax); it applies log_softmax inside.
+- PyTorch adds gradients up by default: call `opt.zero_grad()` before every `backward()`.
+- `losses.append(loss.item())`
+
+@@ item d26-04
+type: code
+title: Step 2: a fixed seed, a few seconds of training
+level: 2
+cards: Step 2: a fixed seed, a few seconds of training
+targets: train_steps
+ref: day26
+--- context
+The training loop is the heart of the pipeline. Batches are drawn with the global random state, so with a fixed seed every run gives the same result: the "resume == uninterrupted" test in step 3 depends on it.
+--- prompt
+Write `train_steps(model, opt, x, y, steps, batch_size=64)`. It returns the loss of every step (a list of `steps` floats):
+- Start with `model.train()`.
+- Each step: draw a random batch with `idx = torch.randint(0, len(x), (batch_size,))` (the global random state, exactly one draw per step, before the forward pass) → `F.cross_entropy(model(x[idx]), y[idx])` → `opt.zero_grad(set_to_none=True)` → `loss.backward()` → `opt.step()` → record `loss.item()`.
+- The caller builds the optimizer and passes it in (when resuming, it is the one read back from disk); do not create one inside.
+
+The tests build a model after `seed(0)` and compare you step by step with the reference; then they train 300 steps and check that the loss clearly drops and that validation accuracy is above 0.88.
+--- starter
+def train_steps(model, opt, x, y, steps, batch_size=64):
+    """Train for `steps` steps on random mini-batches; return every step's loss (float)."""
+    raise todo()
+--- solution
+def train_steps(model, opt, x, y, steps, batch_size=64):
+    model.train()                                            # accuracy() may just have switched it to eval
+    losses = []
+    for _ in range(steps):
+        idx = torch.randint(0, len(x), (batch_size,))        # global random state: reproducible with a seed
+        loss = F.cross_entropy(model(x[idx]), y[idx])
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+--- setup
+_train_steps_ref = train_steps
+--- tests
+@check("Matches the reference step by step")
+def _():
+    x, y = make_data(2000, seed=1)
+    seed(0)
+    m = TinyNet()
+    got = train_steps(m, torch.optim.AdamW(m.parameters(), lr=3e-3), x, y, 30)
+    seed(0)
+    m0 = TinyNet()
+    want = _train_steps_ref(m0, torch.optim.AdamW(m0.parameters(), lr=3e-3), x, y, 30)
+    true(len(got) == 30, f"steps=30 should return 30 losses; you returned {len(got)}")
+    true(all(isinstance(l, float) for l in got), "record loss.item() (a float), not the tensor")
+    eq(torch.tensor(got), torch.tensor(want), tol=1e-5,
+       msg="the losses differ from the reference: each step first idx = torch.randint(0, len(x), (batch_size,)) (one draw only), "
+           "then forward, zero_grad, backward, step")
+    for (name, p), p0 in zip(m.named_parameters(), m0.parameters()):
+        eq(p, p0, tol=1e-5, msg=f"after training, {name} differs from the reference")
+
+@check("Switches back to train mode first")
+def _():
+    x, y = make_data(200, seed=1)
+    seed(0)
+    m = TinyNet()
+    m.eval()
+    train_steps(m, torch.optim.AdamW(m.parameters(), lr=3e-3), x, y, 1)
+    true(m.training, "the model came in eval mode (for example right after measuring accuracy) and you did not call model.train(), so dropout stays off during training")
+
+@check("300 steps: the loss clearly drops, val accuracy > 0.88")
+def _():
+    x, y = make_data(2000, seed=1)
+    xv, yv = make_data(500, seed=2)
+    seed(0)
+    m = TinyNet()
+    losses = train_steps(m, torch.optim.AdamW(m.parameters(), lr=3e-3), x, y, 300)
+    first, last = sum(losses[:20]) / 20, sum(losses[-20:]) / 20
+    true(last < 0.5 * first, f"mean loss of the first 20 steps {first:.3f}, of the last 20 {last:.3f}: it did not fall below half")
+    acc = accuracy(m, xv, yv)
+    true(acc > 0.88, f"validation accuracy {acc:.3f}; it should be > 0.88")
+--- hints
+- The skeleton: `model.train()`, `losses = []`, `for _ in range(steps): ...`, and finally `return losses`.
+- Drawing a batch: `idx = torch.randint(0, len(x), (batch_size,))`, then use `x[idx]` and `y[idx]`.
+- Inside the loop, in order: `loss = F.cross_entropy(...)`, `opt.zero_grad(set_to_none=True)`, `loss.backward()`, `opt.step()`, `losses.append(loss.item())`.
+
+@@ item d26-05
+type: code
+title: Step 3: a checkpoint you can resume
+level: 3
+cards: Step 3: a checkpoint you can resume
+targets: save_checkpoint, load_checkpoint
+ref: day26
+--- context
+After an interruption, training must pick up where it stopped and end with the same result as if nothing had happened. Forgetting the optimizer or random state raises no error; it just quietly changes the result. So a test must prove "resume == uninterrupted".
+--- prompt
+Write two functions.
+
+`save_checkpoint(folder, model, opt, step)`:
+- Create `folder` if it does not exist: `Path(folder).mkdir(parents=True, exist_ok=True)`.
+- `folder/model.safetensors`: save `model.state_dict()` with `save_file`.
+- `folder/train_state.pt`: save the dict `{"opt": opt.state_dict(), "step": step, "rng": torch.get_rng_state()}` with `torch.save`.
+
+`load_checkpoint(folder, model, opt)`:
+- Read the weights with `load_file` and call `model.load_state_dict(...)`.
+- Read train_state.pt with `torch.load(path, weights_only=True)`, then restore the optimizer (`opt.load_state_dict`) and the global random state (`torch.set_rng_state`).
+- Return step.
+
+`save_file`, `load_file` (from `safetensors.torch`) and `Path` are already imported. The test first trains 20 steps in one go; then it trains 10 steps, saves, loads into a new randomly initialised model, and trains 10 more. The weights must match exactly.
+--- starter
+def save_checkpoint(folder, model, opt, step):
+    """folder/model.safetensors: the weights
+    folder/train_state.pt: {"opt": ..., "step": ..., "rng": ...}"""
+    raise todo()
+
+
+def load_checkpoint(folder, model, opt):
+    """Restore the weights, the optimizer state and the global random state; return step."""
+    raise todo()
+--- solution
+def save_checkpoint(folder, model, opt, step):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    save_file(model.state_dict(), folder / "model.safetensors")          # tensors only: safe to load
+    torch.save({"opt": opt.state_dict(), "step": step, "rng": torch.get_rng_state()},
+               folder / "train_state.pt")
+
+
+def load_checkpoint(folder, model, opt):
+    folder = Path(folder)
+    model.load_state_dict(load_file(folder / "model.safetensors"))
+    state = torch.load(folder / "train_state.pt", weights_only=True)
+    opt.load_state_dict(state["opt"])                                      # AdamW's running averages
+    torch.set_rng_state(state["rng"])                                      # future batches and dropout masks
+    return state["step"]
+--- tests
+import os, tempfile
+
+@check("Both files exist; the weights are safetensors")
+def _():
+    seed(0)
+    m = TinyNet()
+    opt = torch.optim.AdamW(m.parameters(), lr=3e-3)
+    folder = os.path.join(tempfile.mkdtemp(), "run1", "step10")
+    save_checkpoint(folder, m, opt, 10)
+    true(os.path.exists(os.path.join(folder, "model.safetensors")),
+         "no folder/model.safetensors (when the folder does not exist, create it first: mkdir(parents=True, exist_ok=True))")
+    true(os.path.exists(os.path.join(folder, "train_state.pt")), "no folder/train_state.pt")
+    w = load_file(os.path.join(folder, "model.safetensors"))
+    true(set(w) == set(m.state_dict()), f"model.safetensors should hold {sorted(m.state_dict())}; yours holds {sorted(w)}")
+    for k, v in m.state_dict().items():
+        eq(w[k], v, tol=0, msg=f"{k} was saved wrongly")
+
+@check("train_state.pt loads with weights_only=True")
+def _():
+    seed(0)
+    m = TinyNet()
+    opt = torch.optim.AdamW(m.parameters(), lr=3e-3)
+    folder = tempfile.mkdtemp()
+    save_checkpoint(folder, m, opt, 10)
+    try:
+        st = torch.load(os.path.join(folder, "train_state.pt"), weights_only=True)
+    except Exception as e:
+        raise AssertionError(f"weights_only=True cannot load it ({type(e).__name__}): save only state_dicts, numbers and tensors, "
+                             "not the whole optimizer or model object")
+    true(isinstance(st, dict) and {"opt", "step", "rng"} <= set(st),
+         "train_state.pt should be a dict with the three keys opt / step / rng")
+    true(st["step"] == 10, f"step should be 10; you saved {st['step']}")
+
+@check("Resume == uninterrupted")
+def _():
+    x, y = make_data(2000, seed=1)
+    seed(0)
+    m1 = TinyNet()
+    o1 = torch.optim.AdamW(m1.parameters(), lr=3e-3)
+    train_steps(m1, o1, x, y, 20)                      # 20 steps in one go
+    seed(0)
+    m2 = TinyNet()
+    o2 = torch.optim.AdamW(m2.parameters(), lr=3e-3)
+    train_steps(m2, o2, x, y, 10)                      # 10 steps, then save
+    folder = tempfile.mkdtemp()
+    save_checkpoint(folder, m2, o2, 10)
+    seed(123)                                          # a simulated restart: new random init, different random state
+    m3 = TinyNet()
+    o3 = torch.optim.AdamW(m3.parameters(), lr=3e-3)
+    step = load_checkpoint(folder, m3, o3)
+    true(step == 10, f"load_checkpoint should return 10; you returned {step}")
+    train_steps(m3, o3, x, y, 10)                      # 10 more steps
+    for (name, p), p1 in zip(m3.named_parameters(), m1.parameters()):
+        eq(p, p1, tol=1e-6, msg=f"after resuming, {name} differs from the uninterrupted run. "
+                               "Did you forget the optimizer state (opt.load_state_dict) or the random state (torch.set_rng_state)?")
+--- hints
+- Start with `folder = Path(folder)`, then build paths with `folder / "model.safetensors"`.
+- Loading: `model.load_state_dict(load_file(...))`, `state = torch.load(..., weights_only=True)`, then `opt.load_state_dict(state["opt"])` and `torch.set_rng_state(state["rng"])`.
+- If "resume" does not match, ask one by one: did I load the weights? The optimizer state? Did I restore the random state?
+
+@@ item d26-06
+type: choice
+title: Step 3: what if the random state is not saved?
+level: 1
+cards: Step 3: a checkpoint you can resume; Step 2: a fixed seed, a few seconds of training
+--- context
+A common interview follow-up: "What is in your checkpoint, and what happens if something is missing?" You only really understand resuming when you can say what each piece is for.
+--- prompt
+Your `save_checkpoint` saves the model weights and the optimizer state but **not** `torch.get_rng_state()`. In a new process you load it, train 10 more steps, and compare with a run that was never interrupted. Which statement is true?
+--- options
+- Loading raises an error, because train_state.pt has no "rng" key
+- No error, and the loss goes down normally; but the batches drawn and the dropout masks differ from the uninterrupted run, so the final weights do not match
+- The results are identical: `make_data` always uses a fixed seed, so the random numbers are already fixed
+- The results are identical: the optimizer state already contains the random state
+answer: 2
+--- explain
+The global random state decides two things: which rows `train_steps` draws with `torch.randint` at each step, and which neurons dropout switches off. In the new process the random state is not what it was at the interruption, so every later step takes a different path. Training still works and the loss still goes down; the weights simply do not match the uninterrupted run.
+- Option 1: `load_checkpoint` only reads the keys it saved, so nothing raises. That is exactly what makes this kind of bug dangerous.
+- Option 3: `make_data` uses its own `torch.Generator` and never touches the global random state (item 1 was designed that way). The same data does not mean the same batch order.
+- Option 4: `opt.state_dict()` holds only AdamW's running averages (`exp_avg`, `exp_avg_sq`), step counts and hyperparameters; no random state.
+
+When you train on a GPU, also save `torch.cuda.get_rng_state_all()`: dropout on the GPU uses CUDA's own random numbers (the script in item 13 does this).
+
+@@ item d26-07
+type: code
+title: Step 4: export to ONNX
+level: 2
+cards: Step 4: export to ONNX and compare
+targets: export_onnx
+ref: day26
+timeout: 120
+--- context
+Many production systems run only an ONNX file, without the training code. Forgetting eval(), a batch size frozen into the file, or weights split into a second file: in each case the export succeeds and the problem only shows up after launch.
+--- prompt
+Write `export_onnx(model, path)`. Export the model to **one** ONNX file and return `str(path)`:
+- Start with `model.eval()`.
+- The example input: `torch.randn(2, FEATURES)`.
+- Call `torch.onnx.export(model, (example,), str(path), dynamo=True, ...)` and add: input name `"x"`, output name `"logits"` (`input_names`, `output_names`); a dynamic dimension 0: `dynamic_shapes={"x": {0: "batch"}}`; `external_data=False`; `verbose=False`.
+
+The tests pass in a model that is still in train mode, open the exported file with onnxruntime, run batch 1 and batch 7, compare with PyTorch in eval mode, and check that the graph has no Dropout node. Exporting takes a few seconds.
+--- starter
+def export_onnx(model, path):
+    """Export to one ONNX file: input "x", output "logits", dynamic batch. Return str(path)."""
+    raise todo()
+--- solution
+def export_onnx(model, path):
+    model.eval()                                             # export the inference graph: no dropout
+    example = torch.randn(2, FEATURES)                       # only used to trace the graph
+    torch.onnx.export(model, (example,), str(path), dynamo=True,
+                      input_names=["x"], output_names=["logits"],
+                      dynamic_shapes={"x": {0: "batch"}},    # without this the batch is fixed at 2
+                      external_data=False, verbose=False)
+    return str(path)
+--- tests
+import os, tempfile
+import numpy as np
+import onnx
+import onnxruntime as ort
+
+_EXPORTED = {}
+
+def _exported():
+    if not _EXPORTED:
+        seed(0)
+        m = TinyNet()                                   # left in train mode on purpose
+        folder = tempfile.mkdtemp()
+        path = os.path.join(folder, "tinynet.onnx")
+        ret = export_onnx(m, path)
+        _EXPORTED.update(model=m, folder=folder, path=path, ret=ret)
+    return _EXPORTED
+
+@check("One file, input named x, output named logits")
+def _():
+    e = _exported()
+    true(e["ret"] == e["path"], f"return str(path); you returned {e['ret']!r}")
+    files = sorted(os.listdir(e["folder"]))
+    true(files == ["tinynet.onnx"], f"the folder holds {files}: the weights went into a separate .data file; add external_data=False")
+    sess = ort.InferenceSession(e["path"], providers=["CPUExecutionProvider"])
+    ins = [i.name for i in sess.get_inputs()]
+    outs = [o.name for o in sess.get_outputs()]
+    true(ins == ["x"], f"the inputs should be named ['x']; yours are {ins}: add input_names=['x']")
+    true(outs == ["logits"], f"the outputs should be named ['logits']; yours are {outs}: add output_names=['logits']")
+
+@check("Dynamic batch: batch 1 and batch 7 both run")
+def _():
+    e = _exported()
+    sess = ort.InferenceSession(e["path"], providers=["CPUExecutionProvider"])
+    name = sess.get_inputs()[0].name
+    for b in (1, 7):
+        try:
+            out = sess.run(None, {name: np.zeros((b, FEATURES), dtype=np.float32)})[0]
+        except Exception:
+            raise AssertionError(f"batch {b} does not run: the batch dimension is frozen at the example input's 2. "
+                                 "Add dynamic_shapes={'x': {0: 'batch'}}")
+        shape_is(out, (b, CLASSES))
+
+@check("Matches PyTorch in eval mode")
+def _():
+    e = _exported()
+    m = e["model"]
+    m.eval()
+    x = torch.randn(2, FEATURES)
+    with torch.inference_mode():
+        want = m(x)
+    sess = ort.InferenceSession(e["path"], providers=["CPUExecutionProvider"])
+    got = sess.run(None, {sess.get_inputs()[0].name: x.numpy()})[0]
+    eq(torch.from_numpy(got), want, tol=1e-4, msg="the ONNX output is too far from PyTorch's")
+
+@check("No Dropout in the graph (eval before exporting)")
+def _():
+    e = _exported()
+    ops = [n.op_type for n in onnx.load(e["path"]).graph.node]
+    true("Dropout" not in ops,
+         f"the graph is {ops}: call model.eval() before exporting. onnxruntime happens to skip Dropout at inference, "
+         "but other inference engines may not; and layers like BatchNorm compute wrong results when exported in train mode")
+--- hints
+- Line one: `model.eval()`; line two: `example = torch.randn(2, FEATURES)`.
+- The second argument of `torch.onnx.export` is a **tuple**: `(example,)`; do not drop the comma.
+- The full call: `torch.onnx.export(model, (example,), str(path), dynamo=True, input_names=["x"], output_names=["logits"], dynamic_shapes={"x": {0: "batch"}}, external_data=False, verbose=False)`, then `return str(path)`.
+
+@@ item d26-08
+type: fill
+title: Step 4: compare with onnxruntime
+level: 1
+cards: Step 4: export to ONNX and compare
+targets: verify_onnx
+ref: day26
+timeout: 120
+--- context
+An export that "succeeded" is not an export that is correct. After every export, feed the same inputs to ONNX and to PyTorch and compare the outputs; this belongs in an automated test, not in someone's eyeballs.
+--- prompt
+Fill in the blanks to finish `verify_onnx(model, path, batch_sizes=(1, 5, 64), tol=1e-4)`. For each batch size, make a random batch, run it through PyTorch (eval mode, `inference_mode`) and through onnxruntime, and keep the largest absolute difference. If it is above `tol`, `raise AssertionError`; otherwise return it (a float).
+
+The tests have an exported file ready. They pass in a model still in train mode (switch it to eval first), and a model that was changed after exporting (you must raise).
+--- template
+import numpy as np
+import onnxruntime as ort
+
+
+def verify_onnx(model, path, batch_sizes=(1, 5, 64), tol=1e-4):
+    [[model.eval()]]
+    sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    name = sess.[[get_inputs()]][0].name
+    worst = 0.0
+    for b in batch_sizes:
+        x = torch.randn(b, FEATURES)
+        with [[torch.inference_mode()]]:
+            want = model(x).numpy()
+        got = sess.run(None, {name: [[x.numpy()]]})[0]
+        worst = max(worst, float(np.abs(got - want).[[max()]]))
+    if worst > tol:
+        raise AssertionError(f"ONNX and PyTorch differ by {worst:.2e}, above the tolerance {tol}")
+    return worst
+--- setup
+import copy as _copy
+import tempfile as _tempfile
+torch.manual_seed(0)
+_MODEL = TinyNet()
+_ONNX = export_onnx(_MODEL, os.path.join(_tempfile.mkdtemp(), "tinynet.onnx"))
+--- tests
+@check("The right file: returns a tiny difference (float)")
+def _():
+    _MODEL.eval()
+    d = verify_onnx(_MODEL, _ONNX)
+    true(isinstance(d, float), f"return a float; you returned a {type(d).__name__}")
+    true(0 <= d < 1e-4, f"you returned a difference of {d}; it should be between 0 and 1e-4")
+
+@check("Still matches when the model comes in train mode (eval first)")
+def _():
+    _MODEL.train()
+    try:
+        verify_onnx(_MODEL, _ONNX)
+    except AssertionError:
+        raise AssertionError("in train mode, dropout switches neurons off at random, so the PyTorch output changes: call model.eval() first")
+
+@check("Raises when the model and the file disagree")
+def _():
+    m = _copy.deepcopy(_MODEL)
+    with torch.no_grad():
+        m.fc2.bias[0] += 0.5                           # change class 0's output only
+    try:
+        verify_onnx(m, _ONNX)
+    except AssertionError:
+        return
+    raise AssertionError("the model was changed after exporting (class 0's bias is 0.5 larger) and you did not raise: take the largest of all the differences")
+--- hints
+- First blank: switch the model to inference mode so dropout is off.
+- An onnxruntime session lists its inputs with `sess.get_inputs()`; `sess.run` takes numpy arrays, not torch tensors.
+- The third blank is `torch.inference_mode()`; the last blank takes the maximum: `max()`.
+
+@@ item d26-09
+type: code
+title: Step 5: keep bad input out with pydantic
+level: 2
+cards: Step 5: a FastAPI service
+targets: Row, PredictRequest
+ref: day26
+--- context
+A live service always gets bad requests: a number missing, an empty list, ten thousand rows at once, a nan. Stopping them at the door with a 422 is far better than letting the model compute a pile of nan and answering 200.
+--- prompt
+Complete the request format `{"rows": [[8 numbers], [8 numbers], ...]}`:
+- `Row`: one row, exactly `FEATURES` **finite** floats. Write it as `Annotated[list[type of each number], Field(min_length=..., max_length=...)]`.
+- `PredictRequest`: a single field `rows`, a list of `Row`, at least 1 row and at most `MAX_ROWS`: `rows: list[Row] = Field(min_length=..., max_length=...)`.
+
+`Annotated`, `BaseModel`, `Field` and `FiniteFloat` are imported; `FEATURES = 8`, `MAX_ROWS = 64`. The last check plugs your `PredictRequest` into the reference FastAPI service and checks that a bad request gets a 422.
+--- starter
+Row = Annotated[list[float], Field()]           # TODO: finite numbers, exactly FEATURES of them
+
+
+class PredictRequest(BaseModel):
+    rows: list[Row]                             # TODO: 1 to MAX_ROWS rows
+--- solution
+Row = Annotated[list[FiniteFloat], Field(min_length=FEATURES, max_length=FEATURES)]
+
+
+class PredictRequest(BaseModel):
+    rows: list[Row] = Field(min_length=1, max_length=MAX_ROWS)
+--- tests
+from pydantic import ValidationError
+from fastapi.testclient import TestClient
+
+def _rejects(rows):
+    try:
+        PredictRequest.model_validate({"rows": rows})
+    except ValidationError:
+        return True
+    return False
+
+@check("Valid requests pass")
+def _():
+    r = PredictRequest.model_validate({"rows": [[0.5] * 8]})
+    true(len(r.rows) == 1, "1 row of 8 numbers should pass")
+    r = PredictRequest.model_validate({"rows": [[0.0] * 8] * 64})
+    true(len(r.rows) == 64, "64 rows (MAX_ROWS) should pass")
+
+@check("Each row has exactly 8 numbers")
+def _():
+    true(_rejects([[0.0] * 7]), "a row of 7 numbers got through: Row needs Field(min_length=FEATURES, ...)")
+    true(_rejects([[0.0] * 9]), "a row of 9 numbers got through: Row also needs max_length=FEATURES")
+
+@check("1 to 64 rows per request")
+def _():
+    true(_rejects([]), "empty rows got through: rows needs Field(min_length=1, ...)")
+    true(_rejects([[0.0] * 8] * 65), "65 rows got through: rows needs Field(..., max_length=MAX_ROWS)")
+
+@check("nan and inf are rejected")
+def _():
+    true(_rejects([[float("nan")] + [0.0] * 7]), "nan got through: use FiniteFloat for each number, not float")
+    true(_rejects([[float("inf")] + [0.0] * 7]), "inf got through: use FiniteFloat for each number")
+
+@check("Plugged into the service: bad requests get 422")
+def _():
+    seed(0)
+    client = TestClient(create_app(lambda: torch_predictor(TinyNet())), raise_server_exceptions=False)
+    ok = client.post("/predict", json={"rows": [[0.0] * 8]})
+    true(ok.status_code == 200, f"a valid request should get 200; the service answered {ok.status_code}")
+    bad = client.post("/predict", json={"rows": [[0.0] * 7]})
+    true(bad.status_code == 422, f"a request with 7 numbers should get 422; the service answered {bad.status_code}")
+--- hints
+- `FiniteFloat` is "a float that rejects nan and inf": replace `list[float]` with `list[FiniteFloat]`.
+- The row length goes into `Row`'s `Field(...)`: `Field(min_length=FEATURES, max_length=FEATURES)`.
+- The number of rows goes where the field's default value would be: `rows: list[Row] = Field(min_length=1, max_length=MAX_ROWS)`.
+
+@@ item d26-10
+type: code
+title: Step 5: the FastAPI service
+level: 3
+cards: Step 5: a FastAPI service
+targets: create_app
+ref: day26
+--- context
+A slow service is most often one that reloads the model on every request; a slow first user means no warm-up; poor throughput means running the model one row at a time. This item gets all three right at once.
+--- prompt
+Write `create_app(load_model)`, which returns a FastAPI app. `load_model()` returns a `predict` function: input an `np.ndarray` of shape `(B, 8)`, float32; output the 3 class probabilities of each row, shape `(B, 3)`.
+- At start-up: call `load_model()` once to get `predict`; then call `predict` once on `np.zeros((1, FEATURES), dtype=np.float32)` to warm up. Never load again after that.
+- `GET /health` → `{"status": "ok"}`.
+- `POST /predict` with the parameter `req: PredictRequest` (it exists already; FastAPI answers 422 on its own when it fails): `np.asarray(req.rows, dtype=np.float32)` gives `(B, 8)`; call `predict` **once** for the whole request; return `{"labels": [the most likely class name of each row], "probs": probs.tolist()}`. The class names are in `LABELS`.
+
+`FastAPI`, `np`, `LABELS`, `FEATURES` and `PredictRequest` already exist.
+--- starter
+def create_app(load_model):
+    """Load once and warm up once at start-up; GET /health; POST /predict (one predict call per request)."""
+    raise todo()
+--- solution
+def create_app(load_model):
+    predict = load_model()                                     # load once, at start-up
+    predict(np.zeros((1, FEATURES), dtype=np.float32))         # warm-up: the first call is the slowest
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict_route(req: PredictRequest):                    # bad requests got their 422 before this line
+        x = np.asarray(req.rows, dtype=np.float32)             # (B, 8)
+        probs = predict(x)                                     # the whole request as one batch
+        return {"labels": [LABELS[i] for i in probs.argmax(axis=1)], "probs": probs.tolist()}
+
+    return app
+--- setup
+from fastapi.testclient import TestClient
+
+def _counting_loader():
+    torch.manual_seed(0)
+    base = torch_predictor(TinyNet())
+    calls = {"load": 0, "predict": 0, "rows": []}
+
+    def load_model():
+        calls["load"] += 1
+
+        def predict(x):
+            calls["predict"] += 1
+            calls["rows"].append(len(x))
+            return base(x)
+
+        return predict
+
+    return load_model, calls, base
+--- tests
+@check("GET /health")
+def _():
+    load, calls, _ = _counting_loader()
+    r = TestClient(create_app(load)).get("/health")
+    true(r.status_code == 200 and r.json() == {"status": "ok"},
+         f"/health should return 200 and {{'status': 'ok'}}; yours returned {r.status_code} {r.text[:200]}")
+
+@check("POST /predict: a label and 3 probabilities per row")
+def _():
+    load, calls, base = _counting_loader()
+    client = TestClient(create_app(load))
+    x, _ = make_data(3, seed=5)
+    r = client.post("/predict", json={"rows": x.tolist()})
+    true(r.status_code == 200, f"status {r.status_code}: {r.text[:300]}")
+    body = r.json()
+    true(isinstance(body, dict) and "labels" in body and "probs" in body, f"return a dict with labels and probs; yours is {body}")
+    p = base(x.numpy())
+    want = [LABELS[i] for i in p.argmax(axis=1)]
+    true(body["labels"] == want, f"labels should be {want}; yours are {body['labels']} (take each row's most likely class, then look it up in LABELS)")
+    eq(torch.tensor(body["probs"]), torch.from_numpy(p), tol=1e-5, msg="probs should be the probabilities predict returned")
+
+@check("Loads once and warms up once at start-up")
+def _():
+    load, calls, _ = _counting_loader()
+    app = create_app(load)
+    true(calls["load"] == 1, f"create_app should call load_model() once; you called it {calls['load']} times")
+    true(calls["predict"] == 1, f"before any request, predict should already have been called once (the warm-up); it was called {calls['predict']} times")
+    client = TestClient(app)
+    for _ in range(3):
+        client.post("/predict", json={"rows": [[0.0] * 8]})
+    true(calls["load"] == 1, f"after 3 requests load_model has been called {calls['load']} times: load the model only once, inside create_app")
+
+@check("One model call per request")
+def _():
+    load, calls, _ = _counting_loader()
+    client = TestClient(create_app(load))
+    before = calls["predict"]
+    client.post("/predict", json={"rows": [[0.0] * 8] * 5})
+    n = calls["predict"] - before
+    true(n == 1 and calls["rows"][-1] == 5,
+         f"a 5-row request called predict {n} times: put the 5 rows into one (5, 8) array and call it once")
+
+@check("Bad requests get 422 and the model does not run")
+def _():
+    load, calls, _ = _counting_loader()
+    client = TestClient(create_app(load), raise_server_exceptions=False)
+    before = calls["predict"]
+    for rows in ([[0.0] * 7], [], [[0.0] * 8] * 65):
+        r = client.post("/predict", json={"rows": rows})
+        true(r.status_code == 422, f"a request with {len(rows)} row(s) of {len(rows[0]) if rows else 0} numbers should get 422, "
+                                   f"your service answered {r.status_code}: write the route's parameter as req: PredictRequest")
+    true(calls["predict"] == before, "a bad request ran the model: validation must happen before predict is called")
+--- hints
+- The structure: first `predict = load_model()` and the warm-up, then `app = FastAPI()`, then two functions decorated with `@app.get("/health")` and `@app.post("/predict")`, and finally `return app`.
+- The route function: `def predict_route(req: PredictRequest):`. FastAPI sees this type annotation and validates the request body first.
+- `probs.argmax(axis=1)` gives each row's class number; `[LABELS[i] for i in ...]` turns them into names.
+
+@@ item d26-11
+type: code
+title: Step 6: measure latency, report percentiles
+level: 2
+cards: Step 6: latency percentiles and PSI drift
+targets: measure_latency, latency_report
+ref: day26
+--- context
+"5 ms on average" can mean most requests take 3 ms and 1 in 20 stalls for 40 ms. In production you watch p95 / p99. When measuring, leave out warm-up and failed requests, or the numbers look good without being true.
+--- prompt
+Write two functions.
+
+`measure_latency(client, payload, n=50, warmup=5)`:
+- First send `client.post("/predict", json=payload)` `warmup` times, untimed.
+- Then send it `n` times; time each with `time.perf_counter()` before and after, and record it in **milliseconds**.
+- If a response's `status_code` is not 200, `raise AssertionError`: failed requests do not count as latency.
+- Return the list of n milliseconds.
+
+`latency_report(times_ms)`: return `{"p50": ..., "p95": ..., "p99": ...}`, computed with `np.percentile`, as Python floats.
+
+The tests use a fake client: the first request takes 300 ms (a cold start), then each takes about 3 ms. `time` and `np` are imported.
+--- starter
+def measure_latency(client, payload, n=50, warmup=5):
+    """warmup untimed requests, then n timed ones; return n milliseconds. Raise AssertionError if not 200."""
+    raise todo()
+
+
+def latency_report(times_ms):
+    """Return {"p50": float, "p95": float, "p99": float}."""
+    raise todo()
+--- solution
+def measure_latency(client, payload, n=50, warmup=5):
+    for _ in range(warmup):                                    # warm-up: not timed
+        client.post("/predict", json=payload)
+    times = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        r = client.post("/predict", json=payload)
+        times.append((time.perf_counter() - t0) * 1000)        # seconds -> milliseconds
+        if r.status_code != 200:
+            raise AssertionError(f"status {r.status_code}: failed requests do not count as latency")
+    return times
+
+
+def latency_report(times_ms):
+    t = np.asarray(times_ms, dtype=float)
+    return {"p50": float(np.percentile(t, 50)), "p95": float(np.percentile(t, 95)),
+            "p99": float(np.percentile(t, 99))}
+--- setup
+class _Resp:
+    def __init__(self, code):
+        self.status_code = code
+
+
+class _FakeClient:
+    """The first request takes 300 ms (a cold start), then each takes about 3 ms."""
+
+    def __init__(self, code=200, cold=0.3):
+        self.code, self.cold, self.calls = code, cold, 0
+
+    def post(self, url, json=None):
+        self.calls += 1
+        time.sleep(self.cold if self.calls == 1 else 0.003)
+        return _Resp(self.code)
+--- tests
+@check("latency_report: p50 / p95 / p99")
+def _():
+    rep = latency_report(list(range(1, 101)))
+    true(isinstance(rep, dict) and {"p50", "p95", "p99"} <= set(rep), f"return a dict with p50 / p95 / p99; yours is {rep}")
+    true(all(type(rep[k]) is float for k in ("p50", "p95", "p99")), "convert the values to Python floats: float(np.percentile(...))")
+    true(close(rep["p50"], 50.5) and close(rep["p95"], 95.05) and close(rep["p99"], 99.01),
+         f"for 1 to 100, p50 / p95 / p99 should be 50.5 / 95.05 / 99.01 (np.percentile's default method); yours are {rep}")
+
+@check("measure_latency: warm-up + timing, in milliseconds")
+def _():
+    c = _FakeClient()
+    t = measure_latency(c, {"rows": [[0.0] * 8]}, n=20, warmup=3)
+    true(c.calls == 23, f"there should be 23 requests in total (3 warm-up + 20 timed); you sent {c.calls}")
+    true(len(t) == 20, f"return 20 numbers; you returned {len(t)}")
+    true(min(t) >= 2.0, f"the smallest value is {min(t):.4f}: every request takes at least 3 ms, so you seem to return seconds; multiply by 1000")
+    true(max(t) < 150, f"the largest value is {max(t):.1f} ms: the 300 ms cold-start request was counted; do not time the warm-up requests")
+
+@check("Failed requests do not count: raise when not 200")
+def _():
+    c = _FakeClient(code=422, cold=0.0)
+    try:
+        measure_latency(c, {"rows": [[0.0] * 7]}, n=5, warmup=1)
+    except AssertionError:
+        return
+    raise AssertionError("every response was 422, yet you returned latencies: check r.status_code and raise AssertionError when it is not 200")
+--- hints
+- Timing: `t0 = time.perf_counter()`; after the request, `(time.perf_counter() - t0) * 1000` is the time in milliseconds.
+- The warm-up loop only sends requests and records nothing; in the timed loop, keep `r = client.post(...)` and check `r.status_code`.
+- `float(np.percentile(times_ms, 95))` is p95.
+
+@@ item d26-12
+type: code
+title: Step 6: a PSI drift check
+level: 2
+cards: Step 6: latency percentiles and PSI drift
+targets: psi
+ref: day26
+--- context
+A model can run without a single error in production while its accuracy slowly drops; a common cause is that the input distribution changed. Compute PSI per feature every day and alert above 0.25: much earlier than waiting for user complaints.
+--- prompt
+Write `psi(expected, actual, bins=10, eps=1e-4)`: `expected` holds one feature's values in the training data, `actual` its values in the live data (both 1-D tensors). Return a Python float.
+1. Turn both into 1-D float64: `torch.as_tensor(v, dtype=torch.float64).flatten()`.
+2. Cut points: use `torch.quantile` to take the quantiles of expected at 0, 1/bins, 2/bins, …, 1 (`torch.linspace(0, 1, bins + 1, dtype=torch.float64)`), drop the first and the last, and keep the bins − 1 cut points `edges`.
+3. Buckets: `torch.bucketize(v, edges)` gives each value a bucket number from 0 to bins − 1; `torch.bincount(bucket numbers, minlength=bins)` counts each bucket; divide by the number of values to get shares. The shares of expected are e, those of actual are a.
+4. Raise every share in e and a to at least eps (`clamp_min`) and return `Σ (a − e) · ln(a / e)`.
+--- starter
+def psi(expected, actual, bins=10, eps=1e-4):
+    """Cut bins buckets at the quantiles of expected and compare the shares in each bucket. Return a float."""
+    raise todo()
+--- solution
+def psi(expected, actual, bins=10, eps=1e-4):
+    expected = torch.as_tensor(expected, dtype=torch.float64).flatten()
+    actual = torch.as_tensor(actual, dtype=torch.float64).flatten()
+    qs = torch.linspace(0, 1, bins + 1, dtype=torch.float64)
+    edges = torch.quantile(expected, qs)[1:-1]                 # bins - 1 inner cut points
+    e = torch.bincount(torch.bucketize(expected, edges), minlength=bins) / len(expected)
+    a = torch.bincount(torch.bucketize(actual, edges), minlength=bins) / len(actual)
+    e, a = e.clamp_min(eps), a.clamp_min(eps)                  # empty buckets: avoid ln 0
+    return float(((a - e) * torch.log(a / e)).sum())
+--- setup
+_psi_ref = psi
+--- tests
+@check("A small example worked by hand")
+def _():
+    # expected = 0..9, bins=2: the cut point is the median 4.5, 50% in each bucket
+    # actual = [0, 0, 0, 9]: 75% in the left bucket, 25% in the right
+    # PSI = 0.25 * ln(0.75 / 0.5) + (-0.25) * ln(0.25 / 0.5) = 0.2747
+    got = psi(torch.arange(10.0), torch.tensor([0.0, 0.0, 0.0, 9.0]), bins=2)
+    true(isinstance(got, float), f"return a Python float; you returned a {type(got).__name__}")
+    true(close(got, 0.2746531, 1e-5), f"it should be 0.2747; yours is {got:.4f}")
+
+@check("An empty bucket must not become inf")
+def _():
+    got = psi(torch.arange(10.0), torch.zeros(4), bins=2)
+    true(math.isfinite(got), "actual's right bucket is empty and ln(0) = -inf: clamp_min(eps) the shares first")
+    true(close(got, 4.6043, 1e-3), f"it should be about 4.604; yours is {got:.4f}")
+
+@check("Tiny for the same distribution, > 0.25 after a shift of 1.0")
+def _():
+    a, _ = make_data(5000, seed=1)
+    b, _ = make_data(5000, seed=2)
+    s, _ = make_data(5000, seed=3, shift=1.0)
+    same, moved = psi(a[:, 0], b[:, 0]), psi(a[:, 0], s[:, 0])
+    true(same < 0.02, f"two samples of the same distribution should give a PSI near 0; yours is {same:.4f}")
+    true(moved > 0.25, f"a shift of 1.0 is a clear drift, so PSI should be > 0.25; yours is {moved:.4f}")
+
+@check("Matches the reference (10 buckets, 8 features)")
+def _():
+    a, _ = make_data(3000, seed=1)
+    s, _ = make_data(1000, seed=4, shift=0.3)
+    for j in range(FEATURES):
+        got, want = psi(a[:, j], s[:, j]), _psi_ref(a[:, j], s[:, j])
+        true(close(got, want, 1e-3), f"feature {j}: yours {got:.5f}, reference {want:.5f}")
+--- hints
+- Cut points: `edges = torch.quantile(expected, torch.linspace(0, 1, bins + 1, dtype=torch.float64))[1:-1]`.
+- Shares: `torch.bincount(torch.bucketize(v, edges), minlength=bins) / len(v)`, once for expected and once for actual.
+- Finally: `e, a = e.clamp_min(eps), a.clamp_min(eps)` and `return float(((a - e) * torch.log(a / e)).sum())`.
+
+@@ item d26-13
+type: local
+title: On your machine: all six steps in one script
+level: 2
+cards: The capstone: a six-step pipeline
+verify: CAPSTONE OK \| device=\w+ \| val_acc=0\.\d+ \| resume_diff=\S+ \| onnx_diff=\S+ \| p50_ms=[\d.]+ \| p95_ms=[\d.]+ \| psi_ok=[\d.]+ \| psi_shifted=[\d.]+
+placeholder: Paste the complete output of python capstone.py here
+--- context
+The real deliverable is not a set of functions that each pass on their own; it is a pipeline that runs from start to finish. Running it on your own machine (on the GPU if you have one) shows you what the course environment cannot: GPU start-up cost, files on disk, real latency.
+--- prompt
+The `capstone.py` below is the functions you wrote in items 1–12, plus a `main()` that chains the six steps.
+
+1. Make a new folder and save the script as `capstone.py`. To use your own versions, replace the matching functions with yours.
+2. Run it with the Python that has the course's packages (the one that runs `serve.py`): `python capstone.py`.
+3. The script creates a `capstone_out` folder next to itself, with two checkpoints and `tinynet.onnx`, a few dozen KB in total.
+4. The last line is `CAPSTONE OK | ...`. Paste the complete output below.
+
+What is different from the items:
+- With an NVIDIA GPU, training runs on the GPU: the data and the model go `.to(DEVICE)`. The first forward / backward on a GPU has to load CUDA kernels and can take several seconds, so the script warms up for a few untimed steps first (day 19). This model is so small that GPU training may even be slower than CPU training: every step pays a fixed cost to launch its kernels.
+- `save_checkpoint` also saves `torch.cuda.get_rng_state_all()`: dropout on the GPU uses CUDA's own random numbers, and without them resuming on the GPU does not match.
+- Before exporting, a new model is loaded on the CPU from `model.safetensors`: that one file is all the service side gets.
+- The service's `predict` runs on onnxruntime (`onnx_predictor`), not PyTorch.
+- A few warnings may appear at the start (for example `triton not found`); ignore them. In line [5], 1 of the 4 predicted labels may differ from the true one: the three classes overlap and accuracy is about 93%, which is expected.
+
+```python
+"""capstone.py: the day-26 capstone. One small classifier, from data to serving and monitoring.
+
+Run: python capstone.py
+Needs: torch numpy safetensors onnx onnxscript onnxruntime fastapi httpx
+Trains on the GPU if there is an NVIDIA GPU; export, serving and monitoring run on the CPU.
+"""
+import math
+import time
+import warnings
+from pathlib import Path
+from typing import Annotated
+
+warnings.filterwarnings("ignore", message=".*(httpx|LeafSpec).*")   # harmless notices from the installed library versions
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field, FiniteFloat
+from safetensors.torch import load_file, save_file
+
+FEATURES, CLASSES, MAX_ROWS = 8, 3, 64
+LABELS = ["ok", "overheat", "vibration"]
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+OUT = Path(__file__).resolve().parent / "capstone_out"
+
+
+# ---------------- step 1: data and pre-training checks (items 1-3)
+def class_centers():
+    g = torch.Generator().manual_seed(1234)
+    return torch.randn(CLASSES, FEATURES, generator=g)
+
+
+def make_data(n, seed=0, shift=0.0):
+    g = torch.Generator().manual_seed(seed)
+    y = torch.randint(0, CLASSES, (n,), generator=g)
+    x = class_centers()[y] + torch.randn(n, FEATURES, generator=g) + shift
+    return x, y
+
+
+class TinyNet(nn.Module):
+    def __init__(self, hidden=32, p_drop=0.1):
+        super().__init__()
+        self.fc1 = nn.Linear(FEATURES, hidden)
+        self.drop = nn.Dropout(p_drop)
+        self.fc2 = nn.Linear(hidden, CLASSES)
+
+    def forward(self, x):
+        return self.fc2(self.drop(F.relu(self.fc1(x))))
+
+
+def smoke_test(model, x, y):
+    logits = model(x)
+    if tuple(logits.shape) != (len(x), CLASSES):
+        raise AssertionError(f"logits have shape {tuple(logits.shape)}")
+    if not torch.isfinite(logits).all():
+        raise AssertionError("logits contain nan / inf")
+    loss = F.cross_entropy(logits, y)
+    if abs(loss.item() - math.log(CLASSES)) > 0.5:
+        raise AssertionError(f"first loss {loss.item():.3f} is far from ln 3")
+    loss.backward()
+    for name, p in model.named_parameters():
+        if p.requires_grad and (p.grad is None or not torch.isfinite(p.grad).all()):
+            raise AssertionError(f"{name} got no finite gradient")
+    return loss.item()
+
+
+def overfit_one_batch(model, x, y, steps=200, lr=1e-2):
+    model.train()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    losses = []
+    for _ in range(steps):
+        loss = F.cross_entropy(model(x), y)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+
+
+# ---------------- step 2: training (item 4)
+def train_steps(model, opt, x, y, steps, batch_size=64):
+    model.train()
+    losses = []
+    for _ in range(steps):
+        idx = torch.randint(0, len(x), (batch_size,))
+        loss = F.cross_entropy(model(x[idx]), y[idx])
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+
+
+def accuracy(model, x, y):
+    model.eval()
+    with torch.inference_mode():
+        return (model(x).argmax(dim=1) == y).float().mean().item()
+
+
+# ---------------- step 3: checkpoint (item 5), plus the GPU's random state
+def save_checkpoint(folder, model, opt, step):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    save_file(model.state_dict(), folder / "model.safetensors")
+    state = {"opt": opt.state_dict(), "step": step, "rng": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda_rng"] = torch.cuda.get_rng_state_all()   # dropout on the GPU uses CUDA's own random numbers
+    torch.save(state, folder / "train_state.pt")
+
+
+def load_checkpoint(folder, model, opt):
+    folder = Path(folder)
+    model.load_state_dict(load_file(folder / "model.safetensors"))
+    state = torch.load(folder / "train_state.pt", weights_only=True)
+    opt.load_state_dict(state["opt"])
+    torch.set_rng_state(state["rng"])
+    if "cuda_rng" in state:
+        torch.cuda.set_rng_state_all(state["cuda_rng"])
+    return state["step"]
+
+
+# ---------------- step 4: export to ONNX and compare (items 7 and 8)
+def export_onnx(model, path):
+    model.eval()
+    example = torch.randn(2, FEATURES)
+    torch.onnx.export(model, (example,), str(path), dynamo=True,
+                      input_names=["x"], output_names=["logits"],
+                      dynamic_shapes={"x": {0: "batch"}},
+                      external_data=False, verbose=False)
+    return str(path)
+
+
+def verify_onnx(model, path, batch_sizes=(1, 5, 64), tol=1e-4):
+    import onnxruntime as ort
+
+    model.eval()
+    sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    name = sess.get_inputs()[0].name
+    worst = 0.0
+    for b in batch_sizes:
+        x = torch.randn(b, FEATURES)
+        with torch.inference_mode():
+            want = model(x).numpy()
+        got = sess.run(None, {name: x.numpy()})[0]
+        worst = max(worst, float(np.abs(got - want).max()))
+    if worst > tol:
+        raise AssertionError(f"ONNX and PyTorch differ by {worst:.2e}, above the tolerance {tol}")
+    return worst
+
+
+# ---------------- step 5: the service (items 9 and 10)
+Row = Annotated[list[FiniteFloat], Field(min_length=FEATURES, max_length=FEATURES)]
+
+
+class PredictRequest(BaseModel):
+    rows: list[Row] = Field(min_length=1, max_length=MAX_ROWS)
+
+
+def onnx_predictor(path):
+    import onnxruntime as ort
+
+    sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    name = sess.get_inputs()[0].name
+
+    def predict(x):
+        logits = sess.run(None, {name: np.asarray(x, dtype=np.float32)})[0]
+        e = np.exp(logits - logits.max(axis=1, keepdims=True))
+        return e / e.sum(axis=1, keepdims=True)
+
+    return predict
+
+
+def create_app(load_model):
+    predict = load_model()
+    predict(np.zeros((1, FEATURES), dtype=np.float32))
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict_route(req: PredictRequest):
+        x = np.asarray(req.rows, dtype=np.float32)
+        probs = predict(x)
+        return {"labels": [LABELS[i] for i in probs.argmax(axis=1)], "probs": probs.tolist()}
+
+    return app
+
+
+# ---------------- step 6: latency and drift (items 11 and 12)
+def measure_latency(client, payload, n=50, warmup=5):
+    for _ in range(warmup):
+        client.post("/predict", json=payload)
+    times = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        r = client.post("/predict", json=payload)
+        times.append((time.perf_counter() - t0) * 1000)
+        if r.status_code != 200:
+            raise AssertionError(f"status {r.status_code}: failed requests do not count as latency")
+    return times
+
+
+def latency_report(times_ms):
+    t = np.asarray(times_ms, dtype=float)
+    return {"p50": float(np.percentile(t, 50)), "p95": float(np.percentile(t, 95)),
+            "p99": float(np.percentile(t, 99))}
+
+
+def psi(expected, actual, bins=10, eps=1e-4):
+    expected = torch.as_tensor(expected, dtype=torch.float64).flatten()
+    actual = torch.as_tensor(actual, dtype=torch.float64).flatten()
+    edges = torch.quantile(expected, torch.linspace(0, 1, bins + 1, dtype=torch.float64))[1:-1]
+    e = torch.bincount(torch.bucketize(expected, edges), minlength=bins) / len(expected)
+    a = torch.bincount(torch.bucketize(actual, edges), minlength=bins) / len(actual)
+    e, a = e.clamp_min(eps), a.clamp_min(eps)
+    return float(((a - e) * torch.log(a / e)).sum())
+
+
+# ---------------- chain the six steps
+def main():
+    t_start = time.perf_counter()
+    gpu = f" ({torch.cuda.get_device_name(0)})" if DEVICE == "cuda" else ""
+    print(f"torch {torch.__version__} | device: {DEVICE}{gpu}")
+
+    # step 1
+    x_train, y_train = make_data(4000, seed=1)
+    x_val, y_val = make_data(1000, seed=2)
+    torch.manual_seed(0)
+    first = smoke_test(TinyNet(), x_train[:64], y_train[:64])
+    over = overfit_one_batch(TinyNet(), x_train[:16], y_train[:16])
+    print(f"[1] smoke test passed, first loss {first:.3f} (ln 3 = {math.log(3):.3f}); "
+          f"overfit 16 rows: {over[0]:.3f} -> {over[-1]:.4f}")
+    if over[-1] > 0.05:
+        raise SystemExit("the model cannot memorise 16 rows: fix the code before going further")
+
+    # step 2: train 600 steps on DEVICE, with a checkpoint at step 300
+    xd, yd = x_train.to(DEVICE), y_train.to(DEVICE)
+    # warm-up: the first forward/backward on a GPU loads CUDA kernels and can take seconds; not part of the training time (day 19)
+    t0 = time.perf_counter()
+    warm = TinyNet().to(DEVICE)
+    train_steps(warm, torch.optim.AdamW(warm.parameters()), xd, yd, 5)
+    warm_s = time.perf_counter() - t0
+    torch.manual_seed(0)
+    model = TinyNet().to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+    t0 = time.perf_counter()
+    losses = train_steps(model, opt, xd, yd, 300)
+    save_checkpoint(OUT / "ckpt_300", model, opt, 300)
+    losses += train_steps(model, opt, xd, yd, 300)
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+    train_s = time.perf_counter() - t0
+    acc = accuracy(model, x_val.to(DEVICE), y_val.to(DEVICE))
+    save_checkpoint(OUT / "ckpt_600", model, opt, 600)
+    print(f"[2] warm-up {warm_s:.1f} s; 600 steps on {DEVICE} took {train_s:.2f} s; loss (mean of 20 steps) "
+          f"{sum(losses[:20]) / 20:.3f} -> {sum(losses[-20:]) / 20:.3f}; val accuracy {acc:.3f}")
+
+    # step 3: a new, randomly initialised model resumes from the step-300 checkpoint to 600; it must match
+    torch.manual_seed(123)
+    resumed = TinyNet().to(DEVICE)
+    opt2 = torch.optim.AdamW(resumed.parameters(), lr=3e-3)
+    step = load_checkpoint(OUT / "ckpt_300", resumed, opt2)
+    train_steps(resumed, opt2, xd, yd, 600 - step)
+    resume_diff = max((a - b).abs().max().item()
+                      for a, b in zip(model.state_dict().values(), resumed.state_dict().values()))
+    print(f"[3] resumed from step {step} to 600; max weight difference from the uninterrupted run {resume_diff:.1e}")
+
+    # step 4: the service side gets only model.safetensors: load a new model on the CPU, export, compare
+    serve_model = TinyNet()
+    serve_model.load_state_dict(load_file(OUT / "ckpt_600" / "model.safetensors"))
+    t0 = time.perf_counter()
+    onnx_path = export_onnx(serve_model, OUT / "tinynet.onnx")
+    export_s = time.perf_counter() - t0
+    onnx_diff = verify_onnx(serve_model, onnx_path)
+    size_kb = Path(onnx_path).stat().st_size / 1024
+    print(f"[4] exported tinynet.onnx ({size_kb:.1f} KB, {export_s:.1f} s); max onnxruntime vs PyTorch difference {onnx_diff:.1e}")
+
+    # step 5: the service, running on onnxruntime
+    client = TestClient(create_app(lambda: onnx_predictor(onnx_path)))
+    if client.get("/health").json() != {"status": "ok"}:
+        raise SystemExit("/health is wrong")
+    got = client.post("/predict", json={"rows": x_val[:4].tolist()}).json()["labels"]
+    want = [LABELS[i] for i in y_val[:4].tolist()]
+    bad = client.post("/predict", json={"rows": [[0.0] * 7]}).status_code
+    print(f"[5] /health ok; /predict says {got}, truth {want}; a request with only 7 numbers -> {bad}")
+
+    # step 6: latency percentiles + PSI drift
+    lat1 = latency_report(measure_latency(client, {"rows": x_val[:1].tolist()}, n=200))
+    lat64 = latency_report(measure_latency(client, {"rows": x_val[:64].tolist()}, n=200))
+    print(f"[6] latency (ms, including TestClient overhead) 1 row: p50 {lat1['p50']:.2f} p95 {lat1['p95']:.2f} "
+          f"p99 {lat1['p99']:.2f}; 64 rows: p50 {lat64['p50']:.2f} p95 {lat64['p95']:.2f} p99 {lat64['p99']:.2f}")
+    live_ok, _ = make_data(1000, seed=3)
+    live_moved, _ = make_data(1000, seed=4, shift=0.8)
+    psi_ok = max(psi(x_train[:, j], live_ok[:, j]) for j in range(FEATURES))
+    psi_moved = max(psi(x_train[:, j], live_moved[:, j]) for j in range(FEATURES))
+    alert = "ALERT" if psi_moved > 0.25 else "no alert"
+    print(f"    PSI (largest of the 8 features): normal traffic {psi_ok:.3f}, traffic shifted by 0.8 {psi_moved:.3f} -> {alert}")
+
+    problems = []
+    if acc < 0.88:
+        problems.append(f"val accuracy {acc:.3f} < 0.88")
+    if resume_diff > 1e-5:
+        problems.append(f"resumed and uninterrupted differ by {resume_diff:.1e}")
+    if bad != 422:
+        problems.append(f"a bad request got {bad}; it should be 422")
+    if psi_ok > 0.1 or psi_moved < 0.25:
+        problems.append(f"PSI is off: normal {psi_ok:.3f} (should be < 0.1), shifted {psi_moved:.3f} (should be > 0.25)")
+    if problems:
+        raise SystemExit("CAPSTONE FAILED: " + "; ".join(problems))
+    total_s = time.perf_counter() - t_start
+    print(f"CAPSTONE OK | device={DEVICE} | val_acc={acc:.3f} | resume_diff={resume_diff:.1e} | "
+          f"onnx_diff={onnx_diff:.1e} | p50_ms={lat1['p50']:.2f} | p95_ms={lat1['p95']:.2f} | "
+          f"psi_ok={psi_ok:.3f} | psi_shifted={psi_moved:.3f} | total_s={total_s:.1f}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Things worth looking at in the output: in line [2], how long the GPU or CPU took; in line [3], whether the resume difference is 0; in line [6], how much 1 row and 64 rows differ in latency (as one batch, each row costs far less), and why the shifted traffic triggers the PSI alert.
+--- hints
+- `ModuleNotFoundError`: you are not using the Python that has the course's packages. Use the same Python that runs `serve.py`.
+- The last line says `CAPSTONE FAILED: ...`: it names the step that failed. Put the script's original version of that function back and run again, to see whether your change caused it.
+
+@@ item d26-14
+type: code
+title: Closed book: a checkpoint you can resume
+level: 3
+exam: yes
+cards: Step 3: a checkpoint you can resume
+targets: save_checkpoint, load_checkpoint
+ref: day26
+--- context
+You will meet this in interviews and at work: a training job is interrupted, must resume from a checkpoint, and must end with exactly the result it would have had without the interruption.
+--- prompt
+Without notes, write `save_checkpoint(folder, model, opt, step)` and `load_checkpoint(folder, model, opt)`:
+- `folder/model.safetensors`: the model weights (safetensors).
+- `folder/train_state.pt`: `{"opt": ..., "step": ..., "rng": ...}`, loadable with `torch.load(..., weights_only=True)`.
+- Create `folder` if it does not exist; `load_checkpoint` restores the weights, the optimizer state and the global random state, and returns step.
+
+`save_file`, `load_file` and `Path` are imported. The tests are the same as in item 5, including "resume == uninterrupted".
+--- starter
+def save_checkpoint(folder, model, opt, step):
+    raise todo()
+
+
+def load_checkpoint(folder, model, opt):
+    raise todo()
+--- solution
+def save_checkpoint(folder, model, opt, step):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    save_file(model.state_dict(), folder / "model.safetensors")
+    torch.save({"opt": opt.state_dict(), "step": step, "rng": torch.get_rng_state()},
+               folder / "train_state.pt")
+
+
+def load_checkpoint(folder, model, opt):
+    folder = Path(folder)
+    model.load_state_dict(load_file(folder / "model.safetensors"))
+    state = torch.load(folder / "train_state.pt", weights_only=True)
+    opt.load_state_dict(state["opt"])
+    torch.set_rng_state(state["rng"])
+    return state["step"]
+--- tests
+import os, tempfile
+
+@check("Both files exist; the weights are safetensors")
+def _():
+    seed(0)
+    m = TinyNet()
+    opt = torch.optim.AdamW(m.parameters(), lr=3e-3)
+    folder = os.path.join(tempfile.mkdtemp(), "run1", "step10")
+    save_checkpoint(folder, m, opt, 10)
+    true(os.path.exists(os.path.join(folder, "model.safetensors")),
+         "no folder/model.safetensors (when the folder does not exist, create it first: mkdir(parents=True, exist_ok=True))")
+    true(os.path.exists(os.path.join(folder, "train_state.pt")), "no folder/train_state.pt")
+    w = load_file(os.path.join(folder, "model.safetensors"))
+    true(set(w) == set(m.state_dict()), f"model.safetensors should hold {sorted(m.state_dict())}; yours holds {sorted(w)}")
+    for k, v in m.state_dict().items():
+        eq(w[k], v, tol=0, msg=f"{k} was saved wrongly")
+
+@check("train_state.pt loads with weights_only=True")
+def _():
+    seed(0)
+    m = TinyNet()
+    opt = torch.optim.AdamW(m.parameters(), lr=3e-3)
+    folder = tempfile.mkdtemp()
+    save_checkpoint(folder, m, opt, 10)
+    try:
+        st = torch.load(os.path.join(folder, "train_state.pt"), weights_only=True)
+    except Exception as e:
+        raise AssertionError(f"weights_only=True cannot load it ({type(e).__name__}): save only state_dicts, numbers and tensors, "
+                             "not the whole optimizer or model object")
+    true(isinstance(st, dict) and {"opt", "step", "rng"} <= set(st),
+         "train_state.pt should be a dict with the three keys opt / step / rng")
+    true(st["step"] == 10, f"step should be 10; you saved {st['step']}")
+
+@check("Resume == uninterrupted")
+def _():
+    x, y = make_data(2000, seed=1)
+    seed(0)
+    m1 = TinyNet()
+    o1 = torch.optim.AdamW(m1.parameters(), lr=3e-3)
+    train_steps(m1, o1, x, y, 20)                      # 20 steps in one go
+    seed(0)
+    m2 = TinyNet()
+    o2 = torch.optim.AdamW(m2.parameters(), lr=3e-3)
+    train_steps(m2, o2, x, y, 10)                      # 10 steps, then save
+    folder = tempfile.mkdtemp()
+    save_checkpoint(folder, m2, o2, 10)
+    seed(123)                                          # a simulated restart: new random init, different random state
+    m3 = TinyNet()
+    o3 = torch.optim.AdamW(m3.parameters(), lr=3e-3)
+    step = load_checkpoint(folder, m3, o3)
+    true(step == 10, f"load_checkpoint should return 10; you returned {step}")
+    train_steps(m3, o3, x, y, 10)                      # 10 more steps
+    for (name, p), p1 in zip(m3.named_parameters(), m1.parameters()):
+        eq(p, p1, tol=1e-6, msg=f"after resuming, {name} differs from the uninterrupted run. "
+                               "Did you forget the optimizer state (opt.load_state_dict) or the random state (torch.set_rng_state)?")
+--- hints
+- Two files, and the three things resuming needs: weights, optimizer state, random state; plus the step.
+- Load train_state.pt with `torch.load(..., weights_only=True)`.
+
+@@ item d26-15
+type: code
+title: Closed book: the FastAPI service
+level: 3
+exam: yes
+cards: Step 5: a FastAPI service
+targets: create_app
+ref: day26
+--- context
+"Turn this model into a service" is a favourite ML-engineering interview question: loading once, warm-up, a health check, input validation and batched inference should all come out of your head onto the whiteboard.
+--- prompt
+Without notes, write `create_app(load_model)`:
+- At start-up, call `load_model()` once to get `predict` (`(B, 8)` float32 → `(B, 3)` probabilities), then warm it up once with a row of zeros.
+- `GET /health` → `{"status": "ok"}`.
+- `POST /predict` with a `PredictRequest` body (422 on its own when invalid): call `predict` once for the whole request and return `{"labels": [...], "probs": [...]}`; the class names are in `LABELS`.
+
+`FastAPI`, `np`, `LABELS`, `FEATURES` and `PredictRequest` already exist. The tests are the same as in item 10.
+--- starter
+def create_app(load_model):
+    raise todo()
+--- solution
+def create_app(load_model):
+    predict = load_model()
+    predict(np.zeros((1, FEATURES), dtype=np.float32))
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post("/predict")
+    def predict_route(req: PredictRequest):
+        x = np.asarray(req.rows, dtype=np.float32)
+        probs = predict(x)
+        return {"labels": [LABELS[i] for i in probs.argmax(axis=1)], "probs": probs.tolist()}
+
+    return app
+--- setup
+from fastapi.testclient import TestClient
+
+def _counting_loader():
+    torch.manual_seed(0)
+    base = torch_predictor(TinyNet())
+    calls = {"load": 0, "predict": 0, "rows": []}
+
+    def load_model():
+        calls["load"] += 1
+
+        def predict(x):
+            calls["predict"] += 1
+            calls["rows"].append(len(x))
+            return base(x)
+
+        return predict
+
+    return load_model, calls, base
+--- tests
+@check("GET /health")
+def _():
+    load, calls, _ = _counting_loader()
+    r = TestClient(create_app(load)).get("/health")
+    true(r.status_code == 200 and r.json() == {"status": "ok"},
+         f"/health should return 200 and {{'status': 'ok'}}; yours returned {r.status_code} {r.text[:200]}")
+
+@check("POST /predict: a label and 3 probabilities per row")
+def _():
+    load, calls, base = _counting_loader()
+    client = TestClient(create_app(load))
+    x, _ = make_data(3, seed=5)
+    r = client.post("/predict", json={"rows": x.tolist()})
+    true(r.status_code == 200, f"status {r.status_code}: {r.text[:300]}")
+    body = r.json()
+    true(isinstance(body, dict) and "labels" in body and "probs" in body, f"return a dict with labels and probs; yours is {body}")
+    p = base(x.numpy())
+    want = [LABELS[i] for i in p.argmax(axis=1)]
+    true(body["labels"] == want, f"labels should be {want}; yours are {body['labels']} (take each row's most likely class, then look it up in LABELS)")
+    eq(torch.tensor(body["probs"]), torch.from_numpy(p), tol=1e-5, msg="probs should be the probabilities predict returned")
+
+@check("Loads once and warms up once at start-up")
+def _():
+    load, calls, _ = _counting_loader()
+    app = create_app(load)
+    true(calls["load"] == 1, f"create_app should call load_model() once; you called it {calls['load']} times")
+    true(calls["predict"] == 1, f"before any request, predict should already have been called once (the warm-up); it was called {calls['predict']} times")
+    client = TestClient(app)
+    for _ in range(3):
+        client.post("/predict", json={"rows": [[0.0] * 8]})
+    true(calls["load"] == 1, f"after 3 requests load_model has been called {calls['load']} times: load the model only once, inside create_app")
+
+@check("One model call per request")
+def _():
+    load, calls, _ = _counting_loader()
+    client = TestClient(create_app(load))
+    before = calls["predict"]
+    client.post("/predict", json={"rows": [[0.0] * 8] * 5})
+    n = calls["predict"] - before
+    true(n == 1 and calls["rows"][-1] == 5,
+         f"a 5-row request called predict {n} times: put the 5 rows into one (5, 8) array and call it once")
+
+@check("Bad requests get 422 and the model does not run")
+def _():
+    load, calls, _ = _counting_loader()
+    client = TestClient(create_app(load), raise_server_exceptions=False)
+    before = calls["predict"]
+    for rows in ([[0.0] * 7], [], [[0.0] * 8] * 65):
+        r = client.post("/predict", json={"rows": rows})
+        true(r.status_code == 422, f"a request with {len(rows)} row(s) of {len(rows[0]) if rows else 0} numbers should get 422, "
+                                   f"your service answered {r.status_code}: write the route's parameter as req: PredictRequest")
+    true(calls["predict"] == before, "a bad request ran the model: validation must happen before predict is called")
+--- hints
+- The order: load, warm up, create the app, two routes, `return app`.
+- Write the route's parameter as `req: PredictRequest` and FastAPI validates first.

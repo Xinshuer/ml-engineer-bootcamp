@@ -1,0 +1,1095 @@
+@@ day 19
+title: 生产坑二：显存、内存与速度
+part: 生产环境常见坑
+hours: 3–4 小时
+--- goal
+学完今天，你能算出一个模型推理和训练各要多少显存（权重、梯度、Adam 状态、激活），能找出「循环里存 tensor」这类泄漏，能写出一个靠得住的计时函数，还知道激活检查点、DataLoader worker 和 torch.compile 重编译这几个常见的显存和速度坑。
+--- checklist
+- 先清空复习区（昨天看过答案的题从空白重做）
+- 读完 8 张知识卡片，每张都改一改代码再运行
+- 练习区全部通过，算显存的题先在纸上算一遍再写代码
+- 闭卷区从空白写出 benchmark 和 train_state_bytes
+
+@@ concept
+title: 一个张量占多少字节
+--- body
+显存和内存都按字节算。一个张量占的字节数 = 元素个数 × 每个元素的字节数，写成代码是 `t.numel() * t.element_size()`，也可以直接用 `t.nbytes`。
+
+常见 dtype 每个元素的字节数：
+
+- float32（fp32）：4
+- bfloat16（bf16）、float16（fp16）：2
+- int8：1
+- int64（也叫 long，比如分类标签）：8
+
+一个模型占的内存 = **参数**（parameters）+ **buffer**。buffer 是模型里「要跟着模型保存、跟着 `.to(device)` 一起搬，但不训练」的张量，比如 BatchNorm 的 `running_mean` 和 `running_var`。用 `model.parameters()` 和 `model.buffers()` 分别遍历它们。
+
+两个容易算错的地方：
+
+- 冻结的参数（`requires_grad=False`）只是不训练，照样占内存。
+- 共享的权重只占一份内存。比如很多语言模型的输入 embedding 和输出层用同一个矩阵。`model.parameters()` 会自动去重，`model.state_dict()` 却会把它列两次。
+--- code
+for dt in [torch.float32, torch.bfloat16, torch.int64]:
+    print(dt, "每个元素", torch.zeros(1, dtype=dt).element_size(), "字节")
+
+model = nn.Sequential(nn.Linear(512, 512), nn.BatchNorm1d(512))
+for name, t in model.named_parameters():
+    print("参数  ", name, tuple(t.shape), t.dtype, t.numel() * t.element_size(), "字节")
+for name, t in model.named_buffers():
+    print("buffer", name, tuple(t.shape), t.dtype, t.numel() * t.element_size(), "字节")
+
+emb = nn.Embedding(100, 16)
+head = nn.Linear(16, 100, bias=False)
+head.weight = emb.weight                     # 输出层和 embedding 共用同一个矩阵
+tied = nn.ModuleDict({"emb": emb, "head": head})
+print("parameters() 里有", len(list(tied.parameters())), "个张量；state_dict() 里有", len(tied.state_dict()), "个")
+
+@@ concept
+title: 训练显存的四大块
+--- body
+训练时，GPU 显存主要花在四个地方：
+
+1. **权重**（weights）：每个参数一个数。
+2. **梯度**（gradients）：`backward()` 之后，每个参数都有一个同样大小的 `.grad`。
+3. **优化器状态**：Adam 给每个参数存两个数，一阶动量 m 和二阶动量 v，通常是 fp32，各 4 字节。SGD 什么都不存，带 momentum 的 SGD 存一个。
+4. **激活值**（activations）：前向时为反向保存的中间结果。它随 batch 和序列长度变化，下一张卡片专门讲。
+
+前三块只和参数个数有关。按「每个参数几个字节」来记：
+
+- fp32 训练 + Adam：权重 4 + 梯度 4 + Adam 8 = **16 字节**
+- 混合精度 + Adam：bf16 权重 2 + bf16 梯度 2 + fp32 主权重 4 + Adam 8 = **还是 16 字节**
+- 纯 bf16（权重、梯度、Adam 状态全是 bf16）：2 + 2 + 4 = **8 字节**
+
+主权重（master weights）是混合精度训练额外留的一份 fp32 权重。优化器在它上面做更新，因为 bf16 太粗，很小的更新会被舍入成 0。所以混合精度省的主要是激活和计算时间，不是这三块。（PyTorch 自带的 `torch.autocast` 做法不同：权重和梯度一直是 fp32，只在计算时临时转成 bf16。合起来同样是 4 + 4 + 8 = 16 字节。）
+
+拿一个 7B（70 亿参数）的模型算一算。本课为了好算，1 GB 按 10⁹ 字节：
+
+- 只推理，bf16 权重：7×10⁹ × 2 = 14 GB
+- fp32 + Adam 全量训练：7×10⁹ × 16 = 112 GB。激活还没算，一张 80 GB 的卡已经放不下了。
+
+这就是大模型微调要用 LoRA（第 6 天）、把这些状态分到多张卡上（ZeRO / FSDP）或者用 8-bit 优化器的原因。（显卡上标的「24 GB」其实是 24×2³⁰ ≈ 25.8×10⁹ 字节，估算时这 7% 可以忽略。）
+--- code
+model = nn.Linear(1000, 1000)
+opt = torch.optim.Adam(model.parameters())
+model(torch.randn(8, 1000)).sum().backward()
+opt.step()                                   # 第一次 step 时，Adam 才创建 m 和 v
+
+w = sum(p.nbytes for p in model.parameters())
+g = sum(p.grad.nbytes for p in model.parameters())
+s = sum(v.nbytes for st in opt.state.values() for k, v in st.items() if k != "step")
+print("权重", w, " 梯度", g, " Adam 状态", s, "字节")   # 1 : 1 : 2
+
+n = 7_000_000_000
+for name, per_param in [("fp32 + Adam", 4 + 4 + 8), ("混合精度 + Adam", 2 + 2 + 4 + 8), ("纯 bf16 + Adam", 2 + 2 + 4)]:
+    print(f"7B {name}: 每个参数 {per_param} 字节 -> {n * per_param / 1e9:.0f} GB（不含激活）")
+
+@@ concept
+title: 激活值：随 batch 和长度一起涨
+--- body
+前向时，很多层要把输入或输出存下来，反向算梯度时要用。比如 `y = x @ W`，求 W 的梯度要用到 x。这些为反向存下的中间结果，就是激活值。
+
+激活和参数个数无关，和「这一次喂进去多少数据」成正比：batch 翻倍，激活翻倍；序列长度翻倍，激活至少翻倍（普通 attention 还要存 T×T 的分数矩阵，涨得更快）。
+
+粗略估算 Transformer：每一层前向时大约要存十几个 (batch, seq, hidden) 大小的张量（attention 和 MLP 里的各种中间结果）。本课按 16 个算：
+
+```
+每个样本的激活 ≈ seq × hidden × 层数 × 16 × 每个数的字节
+```
+
+例子：24 层、hidden 2048、seq 2048、bf16（2 字节）。每个样本的激活约 3.2 GB。这个模型大约 12 亿参数，混合精度 + Adam 的前三块按 16 字节/参数算约 19.3 GB。一张 24 GB 的卡只剩约 4.7 GB 给激活，micro-batch 只能开到 1。想开大 batch，可以用梯度累积（第 17 天）、激活检查点（后面的卡片），或者缩短序列。
+
+没有 GPU 也能「量」激活：`torch.autograd.graph.saved_tensors_hooks` 让你在 autograd 每存一个张量时都被通知一次。下面的 `saved_bytes` 把这些张量的字节数加起来：同一块内存只算一次；`skip` 里的张量（比如模型参数）本来就在内存里，不算。后面几道题的测试也用这个函数。
+--- code
+def act_bytes_per_sample(seq, hidden, n_layers, bytes_per_value, tensors_per_layer=16):
+    return seq * hidden * n_layers * tensors_per_layer * bytes_per_value
+
+per = act_bytes_per_sample(2048, 2048, 24, 2)
+print(f"每个样本 {per / 1e9:.2f} GB；batch=8 要 {8 * per / 1e9:.1f} GB")
+
+def saved_bytes(fn, *args, skip=()):
+    skip_ptrs = {t.untyped_storage().data_ptr() for t in skip}
+    seen = {}
+    def pack(t):                              # autograd 每为反向存一个张量，就调用一次 pack
+        s = t.untyped_storage()
+        if s.data_ptr() not in skip_ptrs:
+            seen[s.data_ptr()] = s.nbytes()   # 同一块内存只记一次
+        return t
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        out = fn(*args)
+    return out, sum(seen.values())
+
+mlp = nn.Sequential(nn.Linear(64, 256), nn.GELU(), nn.Linear(256, 64))
+for batch in (8, 16, 32):
+    _, n = saved_bytes(mlp, torch.randn(batch, 64), skip=mlp.parameters())
+    print(f"batch={batch:2d}: 为反向存了 {n} 字节")
+
+@@ concept
+title: 泄漏：存下来的 loss 拖着整张图
+--- body
+一个需要梯度的张量（比如 loss）身上挂着 `grad_fn`。顺着它能找到整张计算图，图里又存着前向的激活值。只要你还拿着这个张量，这些东西就都活着。
+
+经典的写法：
+
+```
+losses.append(loss)      # 存的是 tensor，连着计算图
+total += loss            # total 也变成带图的 tensor，每一步都接到同一条链上
+```
+
+- 如果这一步没有做 `backward()`（比如验证循环，或者只是记录一下），整张图连同所有激活都留在显存里，几个 batch 就 OOM（显存不够）。
+- 就算做了 `backward()`（它会释放图里存的激活），图的节点还在；`total += loss` 把每一步的图串成一条越来越长的链，内存慢慢往上涨。
+
+改法：要记一个数，就存数。`loss.item()` 返回一个 Python float，和计算图没有任何关系。要留一个张量（比如预测结果）时，用 `.detach()`，通常再加 `.cpu()` 挪出显存。（在 GPU 上，`.item()` 要等 GPU 算完才能拿到数，所以记日志时可以每 N 步才调用一次。）
+
+怎么看显存：`nvidia-smi` 显示的是 PyTorch **预留**的显存。PyTorch 有一个缓存分配器（caching allocator）：张量释放后，那块显存先留在 PyTorch 手里，下次直接复用，不还给显卡驱动。所以：
+
+- `torch.cuda.memory_allocated()`：张量真正占着的显存
+- `torch.cuda.max_memory_allocated()`：到目前为止的峰值
+- `torch.cuda.memory_reserved()`：PyTorch 预留的总量，接近 nvidia-smi 里的数
+
+下面的代码没有 GPU 也能看到泄漏：`weakref.ref(h)` 是一个「弱引用」，它不会让 h 活着。循环结束后，如果弱引用还能拿到 h，说明有别的东西（计算图）还抓着它。
+--- code
+import weakref
+
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(4, 256), nn.ReLU(), nn.Linear(256, 1))
+
+def run(keep_tensor):
+    alive, kept = [], []
+    for _ in range(3):
+        h = model[1](model[0](torch.randn(64, 4)))   # 中间激活，(64, 256)
+        alive.append(weakref.ref(h))
+        loss = model[2](h).pow(2).mean()              # 没有 backward，比如只是记录一下
+        kept.append(loss if keep_tensor else loss.item())
+        del h, loss
+    return [r() is not None for r in alive], kept[0]
+
+print("append(loss)       激活还活着吗:", run(True))
+print("append(loss.item()) 激活还活着吗:", run(False))
+
+@@ concept
+title: 推理时别建图：no_grad 和 inference_mode
+--- body
+默认情况下，只要有一个输入需要梯度（模型参数都需要），PyTorch 就会一边算一边建计算图、存激活。推理和验证根本不做反向，这些都是白占显存、白花时间。
+
+- `with torch.no_grad():` 里算出来的张量 `requires_grad=False`，没有 `grad_fn`，也不存激活。
+- `with torch.inference_mode():` 更彻底，还省掉了一些内部记账，所以稍快一点。代价是：它产生的「推理张量」以后不能再参与需要梯度的计算，否则报错。
+- 两个都能当装饰器用：在函数上面写 `@torch.no_grad()` 或 `@torch.inference_mode()`。
+
+注意：它们管的是「在 with 块里做的计算」，不会改动模型参数的 `requires_grad`。出了 with 块，用同一个模型算出来的结果又会带上计算图。
+
+还有，`model.eval()` 是另一回事（第 18 天）：它切换 dropout 和 BatchNorm 的行为，不管建不建图。推理时两个都要。
+--- code
+lin = nn.Linear(4, 2)
+x = torch.randn(3, 4)
+
+y = lin(x)
+print("默认:           requires_grad =", y.requires_grad, " 有 grad_fn:", y.grad_fn is not None)
+with torch.no_grad():
+    y = lin(x)
+print("no_grad:        requires_grad =", y.requires_grad, " 有 grad_fn:", y.grad_fn is not None)
+with torch.inference_mode():
+    y = lin(x)
+print("inference_mode: requires_grad =", y.requires_grad, " is_inference =", y.is_inference())
+print("参数本身:       lin.weight.requires_grad =", lin.weight.requires_grad)
+
+try:
+    lin(y).sum().backward()        # 拿推理张量去参与训练
+except RuntimeError as e:
+    print("报错:", str(e).split(".")[0])
+
+@@ concept
+title: 计时：预热、同步、取中位数
+--- body
+「这个改动让模型快了多少」要靠计时回答。常见的错法有三种：
+
+1. **不预热**。第一次调用往往特别慢：要分配显存，cuDNN 要挑算法，`torch.compile` 要编译。所以先空跑几次（warm-up，预热），这几次不计时。
+2. **不同步**。GPU 是异步的：`y = model(x)` 只是把任务排进队列就立刻返回，GPU 还在后台算。不等它算完就读时间，量到的只是「排队」的时间。所以读开始时间之前、读结束时间之前，都要调用 `torch.cuda.synchronize()`，等 GPU 把队列里的活干完。开始前那一次，是为了不把之前没干完的活（比如预热）算到这一次头上。
+3. **只跑一次，或者取平均**。每次的时间都会抖（别的程序、系统调度）。要跑很多次，取**中位数**（median，排好序后中间那个）。偶尔一次特别慢，不会把中位数带偏；平均数却会被它拉高。
+
+读时间用 `time.perf_counter()`，它是专门测时间间隔的高精度时钟。`time.time()` 是日历时间，精度差，还可能被系统校时改掉。
+
+下面先用一个「假 GPU」演示第 2 点：`launch` 只排队，`sync` 才让时钟往前走。这里没有真实时间流逝，所以每次运行结果都一样。
+--- code
+import statistics, time
+
+class FakeGPU:
+    def __init__(self):
+        self.now, self.pending = 0.0, 0.0
+    def launch(self, seconds):        # 像一个 CUDA kernel：排进队列，马上返回
+        self.pending += seconds
+    def sync(self):                   # 像 torch.cuda.synchronize()：等队列清空
+        self.now += self.pending
+        self.pending = 0.0
+    def clock(self):
+        return self.now
+
+gpu = FakeGPU()
+t0 = gpu.clock(); gpu.launch(0.010); t1 = gpu.clock()
+print(f"不 sync:          {t1 - t0:.3f} s   只量到了排队")
+t0 = gpu.clock(); gpu.launch(0.010); gpu.sync(); t1 = gpu.clock()
+print(f"只在结束前 sync:  {t1 - t0:.3f} s   上一次没干完的 10 ms 也算进来了")
+gpu.sync(); t0 = gpu.clock(); gpu.launch(0.010); gpu.sync(); t1 = gpu.clock()
+print(f"前后都 sync:      {t1 - t0:.3f} s   对了")
+
+times = [0.010, 0.011, 0.250, 0.010, 0.012]     # 有一次被别的程序打断了
+print("平均:", round(statistics.mean(times), 4), " 中位数:", statistics.median(times))
+
+x = torch.randn(256, 256)
+for _ in range(3):                  # 预热
+    x @ x
+ts = []
+for _ in range(20):
+    t0 = time.perf_counter()
+    x @ x
+    ts.append(time.perf_counter() - t0)
+print(f"本机 CPU 上 256x256 矩阵乘：中位数 {statistics.median(ts) * 1e3:.3f} ms")
+
+@@ concept
+title: 激活检查点：用计算换显存
+ref: day19
+--- body
+激活检查点（activation checkpointing，也叫 gradient checkpointing）：前向时，一个 block 内部的中间结果都不存，只存这个 block 的输入；反向时，用这个输入把 block 重新算一遍，拿到需要的中间结果，再算梯度。
+
+- 省了：每个 block 只剩一个输入张量，激活大约从每层十几份降到一份。
+- 花了：每个 block 的前向要多算一遍，大约多三分之一的计算量。
+- 没变：输出和梯度。它只是换了一种算法省显存，数学上完全一样。
+
+写法：
+
+```
+from torch.utils.checkpoint import checkpoint
+x = checkpoint(block, x, use_reentrant=False)   # 代替 x = block(x)
+```
+
+一定要写 `use_reentrant=False`。旧的 `use_reentrant=True` 有个坑：如果传进去的张量都不需要梯度（比如第一层的输入就是数据），这一段里的参数就拿不到梯度，backward 甚至直接报错。不写这个参数时，现在的 PyTorch 会给一个警告，用的还是旧的 True。
+
+block 里有 dropout 也没关系：checkpoint 默认会记下随机数状态，重算时用同一个 dropout mask，梯度完全一样。
+
+下面的代码用卡片「激活值：随 batch 和长度一起涨」里的 `saved_bytes` 量一量。
+--- code
+from torch.utils.checkpoint import checkpoint
+
+torch.manual_seed(0)
+blocks = nn.ModuleList([nn.Sequential(nn.Linear(64, 256), nn.GELU(), nn.Linear(256, 64)) for _ in range(4)])
+x = torch.randn(32, 64)
+
+def plain(x):
+    for b in blocks:
+        x = b(x)
+    return x
+
+def ckpt(x):
+    for b in blocks:
+        x = checkpoint(b, x, use_reentrant=False)
+    return x
+
+grads = []
+for f in (plain, ckpt):
+    blocks.zero_grad()
+    out, n = saved_bytes(f, x, skip=blocks.parameters())
+    out.pow(2).mean().backward()
+    grads.append([p.grad.clone() for p in blocks.parameters()])
+    print(f"{f.__name__:5s}: 为反向存了 {n:6d} 字节")
+print("梯度完全一样:", all(torch.equal(a, b) for a, b in zip(*grads)))
+
+@@ concept
+title: DataLoader worker 和 torch.compile 重编译
+--- body
+### DataLoader
+
+`num_workers=0` 时，读数据和预处理都在主进程里做，这段时间 GPU 在干等。设成 `num_workers=4` 这类值，就会开几个子进程（worker）并行准备后面的 batch。
+
+- Windows 和 macOS 用 spawn 方式启动 worker：每个 worker 是一个全新的 Python，它会先重新 import 你的脚本。脚本顶层的代码会在每个 worker 里再跑一遍。如果顶层就在建 DataLoader、开始训练，worker 又会去开 worker，Python 直接报 RuntimeError。所以训练代码要放进函数，用 `if __name__ == "__main__":` 保护起来。
+- Dataset 类要写在能被 import 的 .py 文件里。在 Jupyter 里定义的类，spawn 出来的 worker 找不到。
+- `pin_memory=True`：把 batch 放进「锁页内存」，往 GPU 拷贝更快，还能配合 `.to("cuda", non_blocking=True)` 一边拷贝一边计算。
+- `persistent_workers=True`：一个 epoch 结束后不关 worker，下个 epoch 不用重新启动（Windows 上启动很慢）。
+
+```
+def main():
+    loader = DataLoader(ds, batch_size=32, num_workers=4, pin_memory=True, persistent_workers=True)
+    for x, y in loader:
+        ...
+
+if __name__ == "__main__":
+    main()
+```
+
+### torch.compile
+
+第一次调用时，`torch.compile` 按这次输入的形状，把模型编译成更快的代码。这一步可能要几秒到几十秒。之后形状一样就直接复用。形状变了会触发重新编译（recompile）。默认设置下，第二个不同的形状出现时，PyTorch 会把变化的那一维改成「动态」再编译一次，之后的新长度一般都能复用。如果写了 `dynamic=False`，每个新形状都要编译一次，编到上限（这个版本是 8 次）以后就不再编译，退回普通的慢速执行。
+
+上线时的做法：启动时用几种典型形状预热；或者把输入 pad 到几个固定长度（比如 64、128、256，叫「分桶」）。想知道为什么重编译，设置环境变量 `TORCH_LOGS=recompiles`。
+
+下面的代码打印本机启动 worker 的方式，再用一个「只计数、不真编译」的 backend 数一数编译了几次。
+--- code
+import multiprocessing
+print("本机启动 worker 的方式:", multiprocessing.get_start_method())
+
+compiles = []
+def counting_backend(gm, example_inputs):
+    compiles.append(1)
+    return gm.forward                          # 不真的编译，照原样执行
+
+for dynamic in (None, False):
+    compiles.clear()
+    torch._dynamo.reset()                      # 清掉之前的编译记录，多次运行结果才一样
+    f = torch.compile(lambda x: (x * 2).sum(), backend=counting_backend, dynamic=dynamic)
+    for n in [4, 4, 5, 6, 7, 4]:
+        f(torch.ones(n))
+    print(f"dynamic={dynamic}: 长度 4,4,5,6,7,4 一共编译了 {len(compiles)} 次")
+
+@@ item d19-01
+type: predict
+title: 数一数字节
+level: 1
+cards: 一个张量占多少字节
+--- context
+显存预算、模型文件大小、下载要多久，全都从「元素个数 × 每个元素几字节」算起。先把常见 dtype 的字节数记牢。
+--- prompt
+写出下面的代码打印什么。
+--- code
+for dt in [torch.float32, torch.bfloat16, torch.int8, torch.int64]:
+    print(dt, torch.zeros(1, dtype=dt).element_size())
+w = torch.zeros(1000, 1000)
+print(w.numel(), w.nbytes)
+print(w.half().nbytes, w[:10].nbytes)
+--- explain
+字节数 = 元素个数 × 每个元素的字节数。fp32 是 32 位 = 4 字节，bf16 和 fp16 是 2 字节，int8 是 1 字节，int64 是 8 字节。w 有 1000×1000 = 1000000 个元素，fp32 占 4000000 字节（约 4 MB）；转成 half 后减半。`w[:10]` 是前 10 行，`nbytes` 只按这 10 行算：10×1000×4 = 40000。它和 w 共用同一块内存，并没有多占。
+--- hints
+- 1 字节 = 8 位，所以 fp32（32 位）是 4 字节。
+- `nbytes` 就是 `numel() * element_size()`。`w[:10]` 只有 10 行。
+
+@@ item d19-02
+type: code
+title: 模型占多少字节
+level: 1
+cards: 一个张量占多少字节
+targets: model_bytes
+--- context
+部署前要知道「这个模型加载进来占多少显存」。只数参数会漏掉 buffer（比如 BatchNorm 的统计量）；把 int64 当成 4 字节会算错；共享的权重算两遍又会多算。
+--- prompt
+写 `model_bytes(model)`，返回一个元组 `(param_bytes, buffer_bytes)`：
+
+- `param_bytes`：所有参数的字节数之和（冻结的参数也算）
+- `buffer_bytes`：所有 buffer 的字节数之和
+
+每个张量的字节数用 `numel() * element_size()` 算，不要把「4 字节」写死。共享的权重只算一次（`model.parameters()` 已经帮你去重了）。
+--- starter
+def model_bytes(model):
+    """返回 (参数的字节数, buffer 的字节数)。"""
+    raise todo()
+--- solution
+def model_bytes(model):
+    p = sum(t.numel() * t.element_size() for t in model.parameters())
+    b = sum(t.numel() * t.element_size() for t in model.buffers())
+    return p, b
+--- tests
+class _Tied(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.emb = nn.Embedding(100, 16)
+        self.head = nn.Linear(16, 100, bias=False)
+        self.head.weight = self.emb.weight       # 共用同一个矩阵
+
+@check("Linear：只有参数，没有 buffer")
+def _():
+    p, b = model_bytes(nn.Linear(10, 5))
+    true(p == 220, f"Linear(10, 5) 有 10*5 + 5 = 55 个 fp32 参数 = 220 字节，你的 {p}")
+    true(b == 0, f"Linear 没有 buffer，应为 0，你的 {b}")
+
+@check("BatchNorm 的 buffer 也要算，注意 dtype")
+def _():
+    p, b = model_bytes(nn.BatchNorm1d(8))
+    true(p == 64, f"weight 和 bias 各 8 个 fp32 = 64 字节，你的 {p}")
+    true(b == 72, f"running_mean 32 + running_var 32 + num_batches_tracked 8 = 72 字节，你的 {b}。"
+                  "如果是 68，你把 int64 的 num_batches_tracked 当成了 4 字节 —— 用 element_size()")
+
+@check("half 之后字节数减半")
+def _():
+    p, _ = model_bytes(nn.Linear(10, 5).half())
+    true(p == 110, f"fp16 每个数 2 字节，55 个参数 = 110 字节，你的 {p}")
+
+@check("冻结的参数也占内存")
+def _():
+    m = nn.Linear(10, 5)
+    m.weight.requires_grad_(False)
+    p, _ = model_bytes(m)
+    true(p == 220, f"requires_grad=False 只是不训练，权重照样在内存里。应为 220，你的 {p}")
+
+@check("共享的权重只算一次")
+def _():
+    p, _ = model_bytes(_Tied())
+    true(p == 6400, f"emb 和 head 共用一个 100x16 的矩阵，只占 1600*4 = 6400 字节，你的 {p}。"
+                    "用 model.parameters()，不要用 state_dict()")
+--- hints
+- 用 `model.parameters()` 和 `model.buffers()` 各遍历一遍，分别求和。
+- 每个张量是 `t.numel() * t.element_size()`，求和写成 `sum(... for t in model.parameters())`。
+
+@@ item d19-03
+type: code
+title: 训练要多少显存（不含激活）
+level: 2
+cards: 训练显存的四大块
+targets: train_state_bytes
+--- context
+做预算和面试时最常被问：「全量微调一个 7B 模型要多少显存？」答案从「每个参数几个字节」算起。这道题把权重、梯度、主权重和 Adam 状态分开算清楚。
+--- prompt
+写 `train_state_bytes(n_params, precision)`。优化器是 Adam。返回一个 dict，单位是字节，值都是 int，键是 `"weights"`、`"grads"`、`"master"`、`"adam"`、`"total"`。每个参数占的字节数：
+
+```
+precision   weights  grads  master  adam (m + v)
+"fp32"         4       4      0        8
+"mixed"        2       2      4        8
+"bf16"         2       2      0        4
+```
+
+- `total` 是前四项之和。
+- 其他的 `precision` 要 `raise ValueError`。
+- 例：`train_state_bytes(7_000_000_000, "fp32")["total"] == 112_000_000_000`
+--- starter
+def train_state_bytes(n_params, precision):
+    """Adam 训练时，权重、梯度、主权重、Adam 状态各占多少字节，再加上总数。"""
+    raise todo()
+--- solution
+PER_PARAM = {           # weights, grads, master, adam
+    "fp32": (4, 4, 0, 8),
+    "mixed": (2, 2, 4, 8),
+    "bf16": (2, 2, 0, 4),
+}
+
+def train_state_bytes(n_params, precision):
+    if precision not in PER_PARAM:
+        raise ValueError(precision)
+    w, g, m, a = PER_PARAM[precision]
+    out = {"weights": n_params * w, "grads": n_params * g, "master": n_params * m, "adam": n_params * a}
+    out["total"] = sum(out.values())
+    return out
+--- tests
+@check("fp32 + Adam：每个参数 16 字节")
+def _():
+    r = train_state_bytes(7_000_000_000, "fp32")
+    true(isinstance(r, dict), f"应返回 dict，你返回了 {type(r).__name__}")
+    for k in ("weights", "grads", "master", "adam", "total"):
+        true(k in r, f"dict 里缺少键 {k!r}")
+    true(r["weights"] == 28_000_000_000, f"7B 个 fp32 权重 = 28000000000 字节，你的 {r['weights']}")
+    true(r["grads"] == 28_000_000_000, f"梯度和权重一样大，应为 28000000000，你的 {r['grads']}")
+    true(r["master"] == 0, f"fp32 训练不需要额外的主权重，应为 0，你的 {r['master']}")
+    true(r["adam"] == 56_000_000_000, f"Adam 每个参数存 m 和 v 两个 fp32 数 = 8 字节，应为 56000000000，你的 {r['adam']}")
+    true(r["total"] == 112_000_000_000, f"一共 16 字节/参数 = 112000000000，你的 {r['total']}")
+
+@check("混合精度：权重变小了，总数没变")
+def _():
+    r = train_state_bytes(7_000_000_000, "mixed")
+    want = {"weights": 14_000_000_000, "grads": 14_000_000_000, "master": 28_000_000_000,
+            "adam": 56_000_000_000, "total": 112_000_000_000}
+    for k, v in want.items():
+        true(r.get(k) == v, f"mixed 的 {k} 应为 {v}，你的 {r.get(k)}。混合精度多了一份 fp32 主权重，总数还是 16 字节/参数")
+
+@check("纯 bf16：每个参数 8 字节")
+def _():
+    r = train_state_bytes(7_000_000_000, "bf16")
+    want = {"weights": 14_000_000_000, "grads": 14_000_000_000, "master": 0,
+            "adam": 28_000_000_000, "total": 56_000_000_000}
+    for k, v in want.items():
+        true(r.get(k) == v, f"bf16 的 {k} 应为 {v}，你的 {r.get(k)}")
+
+@check("total 是四项之和，全是 int")
+def _():
+    r = train_state_bytes(1_234_567, "mixed")
+    bad = [k for k, v in r.items() if type(v) is not int]
+    true(not bad, f"{bad} 不是 int —— 字节数用整数相乘，不要出现 / 或 1e9")
+    true(r["total"] == r["weights"] + r["grads"] + r["master"] + r["adam"], "total 应等于四项之和")
+    true(r["total"] == 1_234_567 * 16, f"mixed 是 16 字节/参数，应为 {1_234_567 * 16}，你的 {r['total']}")
+
+@check("不认识的 precision 要报错")
+def _():
+    try:
+        r = train_state_bytes(10, "fp8")
+    except (ValueError, KeyError):
+        return
+    raise AssertionError(f"precision='fp8' 应该 raise ValueError，你却返回了 {r!r}。悄悄返回一个错的数更危险")
+--- hints
+- 把表格写成一个 dict：`{"fp32": (4, 4, 0, 8), ...}`，四个数分别乘以 `n_params`。
+- 先 `if precision not in 表: raise ValueError(precision)`；最后 `out["total"] = sum(out.values())`。
+
+@@ item d19-04
+type: code
+title: micro-batch 最多开多大
+level: 2
+cards: 激活值：随 batch 和长度一起涨; 训练显存的四大块
+targets: max_micro_batch
+--- context
+OOM 常常不是模型放不下，而是激活放不下。先算出权重、梯度、优化器状态之外还剩多少显存，再除以每个样本的激活，就知道 micro-batch 最多开多大，不用一次次试到 OOM。
+--- prompt
+写 `max_micro_batch(gpu_bytes, static_bytes, seq, hidden, n_layers, bytes_per_value, tensors_per_layer=16)`：
+
+- 每个样本的激活 = `seq * hidden * n_layers * tensors_per_layer * bytes_per_value`
+- 最大 batch = (`gpu_bytes` − `static_bytes`) ÷ 每个样本的激活，**向下取整**
+- `static_bytes` 已经 ≥ `gpu_bytes` 时返回 0，不能是负数
+- 返回 int
+
+例：24 GB 的卡（`24_000_000_000`），静态部分 `19_327_352_832`（约 12 亿参数，混合精度 + Adam），seq=2048，hidden=2048，24 层，bf16（2 字节）→ 返回 1。
+--- starter
+def max_micro_batch(gpu_bytes, static_bytes, seq, hidden, n_layers, bytes_per_value, tensors_per_layer=16):
+    """显存减去静态部分，剩下的最多放得下几个样本的激活。"""
+    raise todo()
+--- solution
+def max_micro_batch(gpu_bytes, static_bytes, seq, hidden, n_layers, bytes_per_value, tensors_per_layer=16):
+    per_sample = seq * hidden * n_layers * tensors_per_layer * bytes_per_value
+    free = gpu_bytes - static_bytes
+    if free <= 0:
+        return 0
+    return free // per_sample
+--- tests
+@check("例子：24 GB 的卡只能开到 1")
+def _():
+    r = max_micro_batch(24_000_000_000, 19_327_352_832, 2048, 2048, 24, 2)
+    true(type(r) is int, f"应返回 int，你返回了 {type(r).__name__} —— 用整数除法 //")
+    true(r == 1, f"每个样本 2048*2048*24*16*2 ≈ 3.2e9 字节，剩下约 4.7e9，只放得下 1 个。你的 {r}")
+
+@check("检查点把每层 16 份降到 1 份，batch 能开到 23")
+def _():
+    r = max_micro_batch(24_000_000_000, 19_327_352_832, 2048, 2048, 24, 2, tensors_per_layer=1)
+    true(r == 23, f"tensors_per_layer=1 时每个样本约 2.0e8 字节，应为 23，你的 {r}。tensors_per_layer 参数用上了吗？")
+
+@check("fp32 的激活是 bf16 的两倍")
+def _():
+    a = max_micro_batch(80_000_000_000, 19_327_352_832, 2048, 2048, 24, 2)
+    b = max_micro_batch(80_000_000_000, 19_327_352_832, 2048, 2048, 24, 4)
+    true((a, b) == (18, 9), f"80 GB 的卡：bf16 激活应为 18，fp32 激活应为 9，你的 {a} 和 {b}")
+
+@check("刚好放满也算；放不下返回 0")
+def _():
+    r = max_micro_batch(1000, 200, 2, 5, 2, 4, tensors_per_layer=2)
+    true(r == 5, f"每个样本 2*5*2*2*4 = 160 字节，剩下 800 字节刚好放 5 个，你的 {r}")
+    r = max_micro_batch(80_000_000_000, 112_000_000_000, 2048, 2048, 24, 2)
+    true(r == 0, f"静态部分就超过了显存，应返回 0，你的 {r}")
+--- hints
+- 先算 `per_sample`，再算剩下的显存 `free = gpu_bytes - static_bytes`。
+- `free <= 0` 时 `return 0`；否则 `return free // per_sample`（`//` 是向下取整的整数除法）。
+
+@@ item d19-05
+type: fix
+title: 修好泄漏的训练循环
+level: 1
+cards: 泄漏：存下来的 loss 拖着整张图
+targets: train_epoch
+--- context
+「跑着跑着内存越来越多」「第二个 epoch 就 OOM」，最常见的原因之一，就是循环里存了带计算图的 tensor。要记一个数，就存数。
+--- prompt
+下面的 `train_epoch` 能训练，但它把带计算图的 loss 存进了列表，还用 `total += loss` 把每一步的图串在一起。改成只存 Python float：
+
+- 返回 `(losses, mean_loss)`：`losses` 是每个 batch 的 loss，是 Python `float` 的列表；`mean_loss` 是它们的平均，也是 Python `float`
+- 训练的几步（zero_grad、backward、step）不要改
+--- starter
+def train_epoch(model, opt, batches):
+    losses = []
+    total = 0
+    for x, y in batches:
+        loss = F.mse_loss(model(x), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        losses.append(loss)
+        total += loss
+    return losses, total / len(batches)
+--- solution
+def train_epoch(model, opt, batches):
+    losses = []
+    total = 0.0
+    for x, y in batches:
+        loss = F.mse_loss(model(x), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        v = loss.item()          # Python float，和计算图再没有关系
+        losses.append(v)
+        total += v
+    return losses, total / len(batches)
+--- tests
+def _make():
+    seed(0)
+    model = nn.Sequential(nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1))
+    opt = torch.optim.SGD(model.parameters(), lr=0.05)
+    seed(1)
+    batches = [(torch.randn(8, 4), torch.randn(8, 1)) for _ in range(4)]
+    return model, opt, batches
+
+@check("列表里存的是 Python float")
+def _():
+    model, opt, batches = _make()
+    losses, _ = train_epoch(model, opt, batches)
+    true(len(losses) == 4, f"4 个 batch 应该有 4 个 loss，你的列表长度是 {len(losses)}")
+    bad = [type(v).__name__ for v in losses if type(v) is not float]
+    true(not bad, f"列表里存的是 {bad[0] if bad else None}，不是 float。每个 tensor loss 都挂着 grad_fn，拖着自己的计算图 —— 用 loss.item()")
+
+@check("平均 loss 也是 float")
+def _():
+    model, opt, batches = _make()
+    _, mean = train_epoch(model, opt, batches)
+    true(type(mean) is float, f"mean_loss 是 {type(mean).__name__}。total 从 0 开始 += 一个 tensor，就变成了带图的 tensor，把每一步的图串成一条链")
+
+@check("数值不变，模型确实在训练")
+def _():
+    model, opt, batches = _make()
+    before = [p.detach().clone() for p in model.parameters()]
+    losses, mean = train_epoch(model, opt, batches)
+    ref_model, ref_opt, _ = _make()
+    want = []
+    for x, y in batches:
+        loss = F.mse_loss(ref_model(x), y)
+        ref_opt.zero_grad()
+        loss.backward()
+        ref_opt.step()
+        want.append(loss.item())
+    for i, (a, w) in enumerate(zip(losses, want)):
+        true(close(a, w, 1e-6), f"第 {i} 个 batch 的 loss 是 {float(a):.6f}，应为 {w:.6f} —— 训练的步骤被改动了？")
+    true(close(mean, sum(want) / 4, 1e-6), f"平均 loss 应为 {sum(want) / 4:.6f}，你的 {float(mean):.6f}")
+    true(any(not torch.equal(a, b) for a, b in zip(before, model.parameters())), "参数一点没变 —— 训练的步骤丢了")
+--- hints
+- `loss.item()` 把只有一个元素的 tensor 变成 Python float。
+- 在 `opt.step()` 后面写 `v = loss.item()`，然后 `losses.append(v)`、`total += v`。
+
+@@ item d19-06
+type: choice
+title: nvidia-smi 里的显存为什么没降
+level: 2
+cards: 泄漏：存下来的 loss 拖着整张图
+--- context
+查显存问题，第一步是看对数字。nvidia-smi 显示的不是「张量正在用的显存」。看错了数字，就会去追一个并不存在的泄漏。
+--- prompt
+训练脚本在 GPU 上跑。你 `del` 掉了一个 4 GB 的张量（确认没有别的变量再引用它），`torch.cuda.memory_allocated()` 也降了 4 GB，可 nvidia-smi 里这个进程的显存占用一点没变。最可能的原因是？
+--- options
+- `del` 只删掉了变量名，张量本身要等程序退出才释放
+- PyTorch 的缓存分配器把这块显存留着，准备给下一个张量用；它还算在 `torch.cuda.memory_reserved()` 里，nvidia-smi 看到的就是这部分
+- 张量被自动挪到了 CPU 内存，显卡驱动还没来得及更新
+- 发生了显存泄漏，只能重启进程
+answer: 2
+--- explain
+`memory_allocated()` 降了，说明张量确实释放了。PyTorch 不把释放的显存还给显卡驱动，而是自己留着（reserved），下次分配直接复用，因为向驱动申请显存很慢。你的程序之后可以用这 4 GB，别的进程用不了。`torch.cuda.empty_cache()` 能把没在用的缓存还给驱动，一般只在和别的进程共用一张卡时才需要。如果连 `memory_allocated()` 都没降，才说明还有东西引用着它，比如存在列表里的 loss 拖着计算图。
+--- hints
+- 注意题目里说 `memory_allocated()` 已经降了。
+- 向显卡驱动申请显存很慢，所以 PyTorch 要来的显存会留着反复用。
+
+@@ item d19-07
+type: predict
+title: no_grad 管的是计算，不是模型
+level: 1
+cards: 推理时别建图：no_grad 和 inference_mode
+--- context
+no_grad 只影响在 with 块里做的计算，不会改动模型参数。出了 with 块，用同一个模型算出来的结果又会带上计算图。分不清这一点，就会以为「模型已经关掉梯度了」。
+--- prompt
+写出下面的代码打印什么。
+--- code
+torch.manual_seed(0)
+lin = nn.Linear(4, 4)
+x = torch.randn(3, 4)
+with torch.no_grad():
+    a = lin(x)
+b = lin(x).detach()
+c = a * 2
+print(a.requires_grad, b.requires_grad, c.requires_grad)
+print(lin.weight.requires_grad)
+d = lin(a)
+print(d.requires_grad, d.grad_fn is None)
+--- explain
+a 是在 no_grad 里算的，不需要梯度。b 被 detach 了，也不需要。c 是从 a 算来的，a 不需要梯度，所以 c 也不需要。no_grad 没有改动 `lin.weight`，它还是 True。d 是在 with 块外面算的，用到了需要梯度的 weight，所以 d 需要梯度，也有 `grad_fn`（`d.grad_fn is None` 是 False）。
+--- hints
+- 一个结果需要梯度，要同时满足两条：它是在允许建图的时候算的；至少有一个输入需要梯度。
+- d 是在 with 块外面算的，而 `lin.weight` 一直需要梯度。
+
+@@ item d19-08
+type: fill
+title: 不建图的验证循环
+level: 1
+cards: 推理时别建图：no_grad 和 inference_mode; 泄漏：存下来的 loss 拖着整张图; 激活值：随 batch 和长度一起涨
+targets: evaluate
+ref: day19
+--- context
+验证和推理不做反向，建计算图纯属浪费：白占一个 batch 的全部激活，还更慢。两处小改动就能避免。
+--- prompt
+补全 `evaluate(model, batches)`：返回所有 batch 的平均 MSE loss（Python float）。整个过程不能让 autograd 为反向存任何东西，测试会用卡片「激活值：随 batch 和长度一起涨」里的 `saved_bytes` 来量。
+--- template
+def evaluate(model, batches):
+    """返回所有 batch 的平均 loss（Python float）。"""
+    model.eval()
+    total = 0.0
+    with torch.[[no_grad]]():
+        for x, y in batches:
+            loss = F.mse_loss(model(x), y)
+            total += loss.[[item]]()
+    return total / len(batches)
+--- tests
+def _data():
+    seed(0)
+    model = nn.Sequential(nn.Linear(4, 32), nn.ReLU(), nn.Linear(32, 1))
+    batches = [(torch.randn(8, 4), torch.randn(8, 1)) for _ in range(3)]
+    return model, batches
+
+@check("返回 Python float，数值正确")
+def _():
+    model, batches = _data()
+    got = evaluate(model, batches)
+    true(type(got) is float, f"应返回 Python float，你返回了 {type(got).__name__}")
+    with torch.no_grad():
+        want = sum(F.mse_loss(model(x), y).item() for x, y in batches) / 3
+    true(close(got, want, 1e-6), f"平均 loss 应为 {want:.6f}，你的 {got:.6f}")
+
+@check("evaluate 期间没有为反向存任何东西")
+def _():
+    model, batches = _data()
+    _, n = saved_bytes(evaluate, model, batches)
+    true(n == 0, f"evaluate 期间 autograd 为反向存了 {n} 字节 —— 你在建计算图。验证时用 torch.no_grad() 或 torch.inference_mode()")
+--- hints
+- 第一个空：一个让里面的计算都不建图的上下文管理器。第二个空：把只有一个元素的 tensor 变成 Python float。
+- `torch.no_grad`（`torch.inference_mode` 也行）；`item`。
+
+@@ item d19-09
+type: code
+title: 写一个靠得住的 benchmark
+level: 2
+cards: 计时：预热、同步、取中位数
+targets: benchmark
+ref: day19
+--- context
+「新版本快了 30%」这种结论，全靠计时写对。不预热，会把启动开销算进去；GPU 上不同步，只量到了排队时间；只跑一次，会被偶然的抖动带偏。
+--- prompt
+写 `benchmark(fn, warmup=3, runs=10, clock=time.perf_counter, sync=None)`，返回调用一次 `fn()` 的耗时中位数（秒）：
+
+1. 先调用 `fn()` 共 `warmup` 次，不计时。
+2. 再计时 `runs` 次，每次单独计时：`sync()` → `t0 = clock()` → `fn()` → `sync()` → 耗时 = `clock() - t0`。
+3. `sync` 是 `None` 时不调用它（CPU 上不需要）；在 GPU 上，调用的人会传 `torch.cuda.synchronize`。
+4. 返回这 `runs` 个耗时的中位数（可以用 `statistics.median`）。
+
+读时间一定要用参数 `clock`，不要直接调 `time.perf_counter()`：测试会传一个假时钟进来，结果才每次都一样。
+--- starter
+import statistics
+import time
+
+def benchmark(fn, warmup=3, runs=10, clock=time.perf_counter, sync=None):
+    """预热 warmup 次，再单独计时 runs 次，返回耗时的中位数（秒）。"""
+    raise todo()
+--- solution
+import statistics
+import time
+
+def benchmark(fn, warmup=3, runs=10, clock=time.perf_counter, sync=None):
+    for _ in range(warmup):
+        fn()
+    times = []
+    for _ in range(runs):
+        if sync is not None:
+            sync()               # 先等之前的活（比如预热）干完
+        t0 = clock()
+        fn()
+        if sync is not None:
+            sync()               # 等这一次真的算完
+        times.append(clock() - t0)
+    return statistics.median(times)
+--- tests
+@check("fn 一共调用了 warmup + runs 次")
+def _():
+    dev = FakeGPU([100, 100, 100, 2, 3, 50, 4, 5], async_=False)
+    benchmark(dev.fn, warmup=3, runs=5, clock=dev.clock)
+    true(dev.calls == 8, f"warmup=3、runs=5 时，fn 应该被调用 8 次，你调用了 {dev.calls} 次")
+
+@check("预热不计时，返回中位数")
+def _():
+    dev = FakeGPU([100, 100, 100, 2, 3, 50, 4, 5], async_=False)
+    t = benchmark(dev.fn, warmup=3, runs=5, clock=dev.clock)
+    true(t is not None, "没有返回值 —— 最后要 return 中位数")
+    true(close(t, 4, 1e-9), f"应为 4：预热 3 次各 100 秒不算，计时的 5 次是 2, 3, 50, 4, 5，中位数是 4。你的 {t}。"
+                           "12.8 = 你算的是平均数；27.5 = 预热也被计时了；接近 0 = 没用参数 clock 读时间")
+
+@check("GPU 是异步的：计时前后都要 sync")
+def _():
+    dev = FakeGPU([100, 100, 2, 3, 4], async_=True)
+    t = benchmark(dev.fn, warmup=2, runs=3, clock=dev.clock, sync=dev.sync)
+    true(dev.syncs > 0, "传了 sync，你却一次都没调用")
+    true(t is not None and close(t, 3, 1e-9), f"应为 3，你的 {t}。0 = 读结束时间之前没 sync，只量到了排队；"
+                                              "4 = 开始计时之前没 sync，预热还没跑完的 200 秒算进了第一次")
+
+@check("warmup=0、runs=1 也能用")
+def _():
+    dev = FakeGPU([7], async_=False)
+    t = benchmark(dev.fn, warmup=0, runs=1, clock=dev.clock)
+    true(dev.calls == 1 and t is not None and close(t, 7, 1e-9), f"只跑 1 次、耗时 7 秒，应返回 7，你的 {t}（fn 调用了 {dev.calls} 次）")
+--- hints
+- 两个 for 循环：第一个只调用 `fn()`；第二个把每次的耗时 append 到一个列表里。
+- 第二个循环里：`if sync is not None: sync()`，`t0 = clock()`，`fn()`，再 sync 一次，`times.append(clock() - t0)`。最后 `return statistics.median(times)`。
+
+@@ item d19-10
+type: code
+title: 用激活检查点跑前向
+level: 2
+cards: 激活检查点：用计算换显存; 激活值：随 batch 和长度一起涨
+targets: forward_checkpointed
+ref: day19
+--- context
+显存不够、batch 又不想再小时，激活检查点是最常用的办法：多花大约三分之一的计算，换回大部分激活显存。它不改变数学，所以输出和梯度必须和原来一模一样。
+--- prompt
+写 `forward_checkpointed(blocks, x)`。`blocks` 是一个 `nn.ModuleList`。结果要和 `for b in blocks: x = b(x)` 完全一样，但每个 block 都用 `torch.utils.checkpoint.checkpoint(..., use_reentrant=False)` 包起来。
+
+测试会检查三件事：
+
+- 输出一样（block 里有 dropout，测试会固定随机种子）
+- 输入 x 不需要梯度时，参数的梯度也和不用检查点时完全一样
+- 为反向存下的字节数少了一半以上（用 `saved_bytes` 量）
+--- starter
+from torch.utils.checkpoint import checkpoint
+
+def forward_checkpointed(blocks, x):
+    """依次过每个 block，每个 block 都包在 checkpoint 里。"""
+    raise todo()
+--- solution
+from torch.utils.checkpoint import checkpoint
+
+def forward_checkpointed(blocks, x):
+    for b in blocks:
+        x = checkpoint(b, x, use_reentrant=False)
+    return x
+--- tests
+def _blocks():
+    seed(0)
+    return nn.ModuleList([nn.Sequential(nn.Linear(16, 64), nn.GELU(), nn.Dropout(0.1), nn.Linear(64, 16))
+                          for _ in range(4)])
+
+def _plain(blocks, x):
+    for b in blocks:
+        x = b(x)
+    return x
+
+def _grads(f, blocks, x):
+    blocks.zero_grad()
+    seed(1)                          # 同一个随机种子 -> 同样的 dropout mask
+    f(blocks, x).pow(2).mean().backward()
+    return [None if p.grad is None else p.grad.clone() for p in blocks.parameters()]
+
+@check("输出和普通前向一样")
+def _():
+    blocks = _blocks()
+    x = torch.randn(8, 16)
+    seed(1)
+    want = _plain(blocks, x)
+    seed(1)
+    got = forward_checkpointed(blocks, x)
+    eq(got, want, tol=1e-6, msg="结果变了。checkpoint 不改变数学：每个 block 都要按顺序过一遍")
+
+@check("x 不需要梯度时，参数梯度也完全一样")
+def _():
+    blocks = _blocks()
+    x = torch.randn(8, 16)          # 数据本身不需要梯度
+    want = _grads(_plain, blocks, x)
+    try:
+        got = _grads(forward_checkpointed, blocks, x)
+    except RuntimeError as e:
+        raise AssertionError(f"backward 报错：{str(e)[:70]}。输入都不需要梯度时，use_reentrant=True（不写时也是它）"
+                             "会让这一段没有梯度 —— 写 use_reentrant=False")
+    for i, (g, w) in enumerate(zip(got, want)):
+        true(g is not None, f"第 {i} 个参数没有梯度 —— 用 use_reentrant=False")
+        eq(g, w, tol=1e-6, msg=f"第 {i} 个参数的梯度和不用检查点时不一样")
+
+@check("为反向存的字节少了一半以上")
+def _():
+    blocks = _blocks()
+    x = torch.randn(8, 16)
+    _, plain_n = saved_bytes(_plain, blocks, x, skip=blocks.parameters())
+    _, ck_n = saved_bytes(forward_checkpointed, blocks, x, skip=blocks.parameters())
+    true(ck_n < plain_n / 2, f"不用检查点时存了 {plain_n} 字节，你的存了 {ck_n} 字节 —— 每个 block 都要包在 checkpoint 里")
+--- hints
+- 和普通循环一样写 `for b in blocks:`，只是把 `x = b(x)` 换掉。
+- `x = checkpoint(b, x, use_reentrant=False)`，循环结束后 `return x`。
+
+@@ item d19-11
+type: choice
+title: Windows 上的 num_workers
+level: 1
+cards: DataLoader worker 和 torch.compile 重编译
+--- context
+同一个训练脚本，在 Linux 服务器上好好的，拿到 Windows 电脑上一开 num_workers 就崩。原因是两边启动子进程的方式不一样。
+--- prompt
+你在 Windows 上运行 `train.py`。文件顶层直接写着下面几行，没有函数，也没有 `if __name__ == "__main__":`：
+
+```
+ds = MyDataset("data/")
+loader = DataLoader(ds, batch_size=32, num_workers=4)
+for x, y in loader:
+    train_step(x, y)
+```
+
+会发生什么？
+--- options
+- 正常运行，4 个 worker 并行读数据，比 `num_workers=0` 快
+- 报 RuntimeError：每个 worker 是一个新启动的 Python，会重新执行 train.py 的顶层代码，于是又去建 DataLoader、又要开 worker；Python 发现「进程还没启动完就要开新进程」，直接报错
+- PyTorch 发现是 Windows，自动退回 `num_workers=0`，只打印一条警告
+- 不报错，但每个 batch 会被读 4 遍，训练结果不对
+answer: 2
+--- explain
+Windows 上 Python 用 spawn 启动子进程：新进程先 import 你的主脚本（这时它的 `__name__` 是 `"__mp_main__"`，不是 `"__main__"`），再接活。没有保护的顶层代码会在每个 worker 里重跑，worker 又去开 worker。Python 会报 RuntimeError（「An attempt has been made to start a new process before the current process has finished its bootstrapping phase」），主进程接着报「DataLoader worker (pid ...) exited unexpectedly」。改法：训练代码放进 `main()`，文件最后写 `if __name__ == "__main__": main()`。Linux 上，Python 3.13 及以前默认用 fork（直接复制当前进程，不重新执行脚本），所以同一个脚本在服务器上常常没事。
+--- hints
+- Windows 上的子进程不是「复制」出来的，而是从头启动一个新的 Python。
+- 新的 Python 要先 import 你的脚本。脚本顶层的那几行会怎么样？
+
+@@ item d19-12
+type: choice
+title: torch.compile 为什么又编译了一次
+level: 2
+cards: DataLoader worker 和 torch.compile 重编译
+--- context
+torch.compile 能让模型快很多，但它是按输入形状编译的。形状一直在变的服务（比如每个请求长度都不一样）会在意想不到的时候突然变慢。
+--- prompt
+推理服务启动时写了 `model = torch.compile(model)`，其他参数都是默认值。请求的序列长度各不相同：第 1 个是 37，第 2 个是 52，之后是 18、64、37、41……你发现第 1 个和第 2 个请求都特别慢（几十秒），后面基本正常。最合理的解释是？
+--- options
+- torch.compile 每遇到一个没见过的长度都要重新编译，后面其实也一直在编译，只是你没注意到
+- 第 1 个请求按长度 37 编译了一份固定形状的代码；第 2 个请求长度对不上，触发重新编译，这次 PyTorch 把长度当成动态维度，编出一份通用的代码，后面的新长度都复用它
+- 前两个请求慢，是因为 DataLoader 的 worker 在启动
+- torch.compile 在推理时不起作用，慢是因为 GPU 在预热
+answer: 2
+--- explain
+默认设置（`dynamic=None`）下，第一次按具体形状编译；形状变了就重新编译，并自动把变化的那一维标成动态。卡片里用只计数的 backend 数过：长度 4, 4, 5, 6, 7, 4 一共编译 2 次。如果写了 `dynamic=False`，每个新形状都编译一次（同样这组长度要 4 次），编到上限（这个版本是 8 次）以后退回不编译的慢速执行。上线时的做法：启动时用几种典型长度预热，或者把输入 pad 到几个固定长度（分桶）。设置环境变量 `TORCH_LOGS=recompiles` 能看到每次重新编译的原因。
+--- hints
+- torch.compile 生成的代码和输入形状有关。第 2 个请求的形状和第 1 个不同。
+- 默认设置下，PyTorch 看到某一维变过一次，就会把它当成「会变的」维度。
+
+@@ item d19-13
+type: code
+title: 闭卷：benchmark
+level: 2
+cards: 计时：预热、同步、取中位数
+targets: benchmark
+ref: day19
+exam: yes
+--- context
+计时函数是性能工作的地基：每次说「快了多少」都靠它。闭卷从空白写出来，确认预热、同步、中位数这三件事已经记住了。
+--- prompt
+从空白写出 `benchmark(fn, warmup=3, runs=10, clock=time.perf_counter, sync=None)`：预热 `warmup` 次不计时；再单独计时 `runs` 次；`sync` 不是 `None` 时，读开始时间前和读结束时间前都调用它；读时间只用 `clock`；返回耗时的中位数（秒）。
+--- starter
+import statistics
+import time
+
+def benchmark(fn, warmup=3, runs=10, clock=time.perf_counter, sync=None):
+    raise todo()
+--- solution
+import statistics
+import time
+
+def benchmark(fn, warmup=3, runs=10, clock=time.perf_counter, sync=None):
+    for _ in range(warmup):
+        fn()
+    times = []
+    for _ in range(runs):
+        if sync is not None:
+            sync()
+        t0 = clock()
+        fn()
+        if sync is not None:
+            sync()
+        times.append(clock() - t0)
+    return statistics.median(times)
+--- tests
+@check("fn 一共调用了 warmup + runs 次")
+def _():
+    dev = FakeGPU([100, 100, 100, 2, 3, 50, 4, 5], async_=False)
+    benchmark(dev.fn, warmup=3, runs=5, clock=dev.clock)
+    true(dev.calls == 8, f"warmup=3、runs=5 时，fn 应该被调用 8 次，你调用了 {dev.calls} 次")
+
+@check("预热不计时，返回中位数")
+def _():
+    dev = FakeGPU([100, 100, 100, 2, 3, 50, 4, 5], async_=False)
+    t = benchmark(dev.fn, warmup=3, runs=5, clock=dev.clock)
+    true(t is not None, "没有返回值 —— 最后要 return 中位数")
+    true(close(t, 4, 1e-9), f"应为 4：预热 3 次各 100 秒不算，计时的 5 次是 2, 3, 50, 4, 5，中位数是 4。你的 {t}。"
+                           "12.8 = 你算的是平均数；27.5 = 预热也被计时了；接近 0 = 没用参数 clock 读时间")
+
+@check("GPU 是异步的：计时前后都要 sync")
+def _():
+    dev = FakeGPU([100, 100, 2, 3, 4], async_=True)
+    t = benchmark(dev.fn, warmup=2, runs=3, clock=dev.clock, sync=dev.sync)
+    true(dev.syncs > 0, "传了 sync，你却一次都没调用")
+    true(t is not None and close(t, 3, 1e-9), f"应为 3，你的 {t}。0 = 读结束时间之前没 sync，只量到了排队；"
+                                              "4 = 开始计时之前没 sync，预热还没跑完的 200 秒算进了第一次")
+
+@check("warmup=0、runs=1 也能用")
+def _():
+    dev = FakeGPU([7], async_=False)
+    t = benchmark(dev.fn, warmup=0, runs=1, clock=dev.clock)
+    true(dev.calls == 1 and t is not None and close(t, 7, 1e-9), f"只跑 1 次、耗时 7 秒，应返回 7，你的 {t}（fn 调用了 {dev.calls} 次）")
+--- hints
+- 两个循环：预热一个，计时一个。
+- 计时循环：sync → clock → fn → sync → clock；最后 `statistics.median`。
+
+@@ item d19-14
+type: code
+title: 闭卷：训练要多少显存
+level: 2
+cards: 训练显存的四大块
+targets: train_state_bytes
+exam: yes
+--- context
+「7B 模型全量微调要多少显存」是面试高频题。闭卷写一遍，确认三种精度下每个参数几个字节已经记住了。
+--- prompt
+从空白写出 `train_state_bytes(n_params, precision)`，优化器是 Adam。返回 dict（字节，int），键是 `"weights"`、`"grads"`、`"master"`、`"adam"`、`"total"`；`precision` 是 `"fp32"`、`"mixed"` 或 `"bf16"`，其他值 `raise ValueError`。每种精度下每一项几个字节，要靠你自己记住。
+--- starter
+def train_state_bytes(n_params, precision):
+    raise todo()
+--- solution
+PER_PARAM = {           # weights, grads, master, adam
+    "fp32": (4, 4, 0, 8),
+    "mixed": (2, 2, 4, 8),
+    "bf16": (2, 2, 0, 4),
+}
+
+def train_state_bytes(n_params, precision):
+    if precision not in PER_PARAM:
+        raise ValueError(precision)
+    w, g, m, a = PER_PARAM[precision]
+    out = {"weights": n_params * w, "grads": n_params * g, "master": n_params * m, "adam": n_params * a}
+    out["total"] = sum(out.values())
+    return out
+--- tests
+@check("fp32 + Adam：每个参数 16 字节")
+def _():
+    r = train_state_bytes(7_000_000_000, "fp32")
+    true(isinstance(r, dict), f"应返回 dict，你返回了 {type(r).__name__}")
+    for k in ("weights", "grads", "master", "adam", "total"):
+        true(k in r, f"dict 里缺少键 {k!r}")
+    true(r["weights"] == 28_000_000_000, f"7B 个 fp32 权重 = 28000000000 字节，你的 {r['weights']}")
+    true(r["grads"] == 28_000_000_000, f"梯度和权重一样大，应为 28000000000，你的 {r['grads']}")
+    true(r["master"] == 0, f"fp32 训练不需要额外的主权重，应为 0，你的 {r['master']}")
+    true(r["adam"] == 56_000_000_000, f"Adam 每个参数存 m 和 v 两个 fp32 数 = 8 字节，应为 56000000000，你的 {r['adam']}")
+    true(r["total"] == 112_000_000_000, f"一共 16 字节/参数 = 112000000000，你的 {r['total']}")
+
+@check("混合精度：权重变小了，总数没变")
+def _():
+    r = train_state_bytes(7_000_000_000, "mixed")
+    want = {"weights": 14_000_000_000, "grads": 14_000_000_000, "master": 28_000_000_000,
+            "adam": 56_000_000_000, "total": 112_000_000_000}
+    for k, v in want.items():
+        true(r.get(k) == v, f"mixed 的 {k} 应为 {v}，你的 {r.get(k)}。混合精度多了一份 fp32 主权重，总数还是 16 字节/参数")
+
+@check("纯 bf16：每个参数 8 字节")
+def _():
+    r = train_state_bytes(7_000_000_000, "bf16")
+    want = {"weights": 14_000_000_000, "grads": 14_000_000_000, "master": 0,
+            "adam": 28_000_000_000, "total": 56_000_000_000}
+    for k, v in want.items():
+        true(r.get(k) == v, f"bf16 的 {k} 应为 {v}，你的 {r.get(k)}")
+
+@check("total 是四项之和，全是 int")
+def _():
+    r = train_state_bytes(1_234_567, "mixed")
+    bad = [k for k, v in r.items() if type(v) is not int]
+    true(not bad, f"{bad} 不是 int —— 字节数用整数相乘，不要出现 / 或 1e9")
+    true(r["total"] == r["weights"] + r["grads"] + r["master"] + r["adam"], "total 应等于四项之和")
+    true(r["total"] == 1_234_567 * 16, f"mixed 是 16 字节/参数，应为 {1_234_567 * 16}，你的 {r['total']}")
+
+@check("不认识的 precision 要报错")
+def _():
+    try:
+        r = train_state_bytes(10, "fp8")
+    except (ValueError, KeyError):
+        return
+    raise AssertionError(f"precision='fp8' 应该 raise ValueError，你却返回了 {r!r}。悄悄返回一个错的数更危险")
+--- hints
+- 三种精度：fp32 是 4/4/0/8，mixed 是 2/2/4/8，bf16 是 2/2/0/4。
+- 每一项都是 `n_params *` 这一项的字节数；total 是四项之和。

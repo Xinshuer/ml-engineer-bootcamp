@@ -1,16 +1,10 @@
-# imports of the drill file (the checks use them)
-import sys, os
+"""Day 1 reference implementations: loaded as hidden setup for the day-1 exercises (the names in each item's
+`targets:` are removed again before the learner's code runs)."""
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 import functools
-import time
 
-"""Day 01 参考答案。卡住超过 5 分钟再看。"""
-from dataclasses import dataclass, field
-from pathlib import Path
-import functools
-
-CALLS = []
+CALLS = []   # d1-08: the decorator `logged` appends (name, args, kwargs) here
 
 
 @dataclass
@@ -20,7 +14,7 @@ class TrainConfig:
     n_layer: int = 6
     device: str = "cuda"
     betas: tuple = (0.9, 0.95)
-    tags: list = field(default_factory=list)   # 可变默认值必须走 default_factory
+    tags: list = field(default_factory=list)   # a mutable default needs default_factory
 
     def scaled_lr(self, k):
         return self.lr * k
@@ -127,11 +121,11 @@ def ckpt_path(root, run_name, step):
 
 
 def bucket_by_len(samples, bucket_size=2):
-    out = {}                       # 修 1: 可变默认值挪进函数体
+    out = {}                       # a fresh dict on every call (not a mutable default argument)
     for s in samples:
         L = len(s)
         out.setdefault(L, [])
         if len(out[L]) >= bucket_size:
-            continue               # 修 2+3: 满了跳过，不 append 也不报错
+            continue               # bucket full: skip this sample, no error
         out[L].append(s)
     return out

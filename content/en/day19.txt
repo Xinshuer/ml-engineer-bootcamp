@@ -1,0 +1,1095 @@
+@@ day 19
+title: Pitfalls 2: memory and speed
+part: Production pitfalls
+hours: 3–4 hours
+--- goal
+After today you can work out how much GPU memory a model needs for inference and for training (weights, gradients, Adam states, activations), find leaks like "a tensor kept in a loop", write a timing function you can trust, and you know the common memory and speed traps: activation checkpointing, DataLoader workers and torch.compile recompiles.
+--- checklist
+- Clear the Review tab first (redo from blank the exercises where you looked at the answer yesterday)
+- Read all 8 cards; change the code in each one and run it again
+- Pass every practice exercise; for the memory ones, do the sums on paper before you write code
+- On the Closed-book tab, write benchmark and train_state_bytes from blank
+
+@@ concept
+title: How many bytes a tensor takes
+--- body
+GPU memory and RAM are counted in bytes. A tensor takes (number of elements) × (bytes per element). In code that is `t.numel() * t.element_size()`, or simply `t.nbytes`.
+
+Bytes per element for the common dtypes:
+
+- float32 (fp32): 4
+- bfloat16 (bf16), float16 (fp16): 2
+- int8: 1
+- int64 (also called long, e.g. class labels): 8
+
+A model's memory = **parameters** + **buffers**. A buffer is a tensor the model saves with itself and moves with `.to(device)`, but does not train, for example BatchNorm's `running_mean` and `running_var`. Loop over them with `model.parameters()` and `model.buffers()`.
+
+Two easy mistakes:
+
+- A frozen parameter (`requires_grad=False`) is not trained, but it still takes memory.
+- A shared weight takes memory only once. Many language models use the same matrix for the input embedding and the output layer. `model.parameters()` removes duplicates for you; `model.state_dict()` lists the matrix twice.
+--- code
+for dt in [torch.float32, torch.bfloat16, torch.int64]:
+    print(dt, "per element:", torch.zeros(1, dtype=dt).element_size(), "bytes")
+
+model = nn.Sequential(nn.Linear(512, 512), nn.BatchNorm1d(512))
+for name, t in model.named_parameters():
+    print("param ", name, tuple(t.shape), t.dtype, t.numel() * t.element_size(), "bytes")
+for name, t in model.named_buffers():
+    print("buffer", name, tuple(t.shape), t.dtype, t.numel() * t.element_size(), "bytes")
+
+emb = nn.Embedding(100, 16)
+head = nn.Linear(16, 100, bias=False)
+head.weight = emb.weight                     # the output layer shares the embedding matrix
+tied = nn.ModuleDict({"emb": emb, "head": head})
+print("parameters() has", len(list(tied.parameters())), "tensor(s); state_dict() has", len(tied.state_dict()))
+
+@@ concept
+title: The four parts of training memory
+--- body
+During training, GPU memory goes to four places:
+
+1. **Weights**: one number per parameter.
+2. **Gradients**: after `backward()`, every parameter has a `.grad` of the same size.
+3. **Optimizer states**: Adam keeps two numbers per parameter, the first moment m and the second moment v, usually in fp32, 4 bytes each. Plain SGD keeps nothing; SGD with momentum keeps one.
+4. **Activations**: intermediate results saved in the forward pass for the backward pass. They change with batch size and sequence length; the next card is about them.
+
+The first three depend only on the number of parameters. Remember them as bytes per parameter:
+
+- fp32 training + Adam: weights 4 + grads 4 + Adam 8 = **16 bytes**
+- mixed precision + Adam: bf16 weights 2 + bf16 grads 2 + fp32 master weights 4 + Adam 8 = **still 16 bytes**
+- pure bf16 (weights, grads and Adam states all bf16): 2 + 2 + 4 = **8 bytes**
+
+Master weights are an extra fp32 copy of the weights that mixed-precision training keeps. The optimizer updates this copy, because bf16 is so coarse that a tiny update would round to zero. So mixed precision mainly saves activation memory and compute time, not these three parts. (PyTorch's own `torch.autocast` works differently: weights and grads stay fp32 and are cast to bf16 only for the computation. That is also 4 + 4 + 8 = 16 bytes.)
+
+Let's do a 7B (7 billion parameter) model. To keep the sums simple, this course uses 1 GB = 10⁹ bytes:
+
+- Inference only, bf16 weights: 7×10⁹ × 2 = 14 GB
+- Full training in fp32 + Adam: 7×10⁹ × 16 = 112 GB. That is before activations, and it already does not fit on one 80 GB GPU.
+
+This is why people fine-tune large models with LoRA (day 6), split these states across several GPUs (ZeRO / FSDP), or use 8-bit optimizers. (A GPU sold as "24 GB" really has 24×2³⁰ ≈ 25.8×10⁹ bytes; for estimates you can ignore that 7%.)
+--- code
+model = nn.Linear(1000, 1000)
+opt = torch.optim.Adam(model.parameters())
+model(torch.randn(8, 1000)).sum().backward()
+opt.step()                                   # Adam creates m and v at the first step
+
+w = sum(p.nbytes for p in model.parameters())
+g = sum(p.grad.nbytes for p in model.parameters())
+s = sum(v.nbytes for st in opt.state.values() for k, v in st.items() if k != "step")
+print("weights", w, " grads", g, " Adam states", s, "bytes")   # 1 : 1 : 2
+
+n = 7_000_000_000
+for name, per_param in [("fp32 + Adam", 4 + 4 + 8), ("mixed precision + Adam", 2 + 2 + 4 + 8), ("pure bf16 + Adam", 2 + 2 + 4)]:
+    print(f"7B {name}: {per_param} bytes per parameter -> {n * per_param / 1e9:.0f} GB (no activations)")
+
+@@ concept
+title: Activations grow with batch and length
+--- body
+In the forward pass, many layers save their input or output because the backward pass needs it. For example, for `y = x @ W`, the gradient of W needs x. These saved intermediate results are the activations.
+
+Activations do not depend on the number of parameters. They grow with how much data you feed in at once: double the batch and they double; double the sequence length and they at least double (plain attention also stores a T×T score matrix, which grows faster).
+
+A rough estimate for a Transformer: in the forward pass each layer saves a dozen or more tensors of size (batch, seq, hidden) (the various intermediate results of attention and the MLP). This course uses 16:
+
+```
+activations per sample ≈ seq × hidden × layers × 16 × bytes per value
+```
+
+Example: 24 layers, hidden 2048, seq 2048, bf16 (2 bytes). One sample needs about 3.2 GB of activations. This model has about 1.2 billion parameters, so the first three parts with mixed precision + Adam (16 bytes per parameter) take about 19.3 GB. A 24 GB GPU has only about 4.7 GB left for activations: the micro-batch can be 1 at most. To use bigger batches: gradient accumulation (day 17), activation checkpointing (a later card), or shorter sequences.
+
+You can "measure" activations without a GPU. `torch.autograd.graph.saved_tensors_hooks` calls you every time autograd saves a tensor for the backward pass. The `saved_bytes` function below adds up their bytes: each block of memory counts once, and tensors in `skip` (such as the model's parameters) exist anyway, so they do not count. The tests of several exercises today use this function.
+--- code
+def act_bytes_per_sample(seq, hidden, n_layers, bytes_per_value, tensors_per_layer=16):
+    return seq * hidden * n_layers * tensors_per_layer * bytes_per_value
+
+per = act_bytes_per_sample(2048, 2048, 24, 2)
+print(f"{per / 1e9:.2f} GB per sample; batch=8 needs {8 * per / 1e9:.1f} GB")
+
+def saved_bytes(fn, *args, skip=()):
+    skip_ptrs = {t.untyped_storage().data_ptr() for t in skip}
+    seen = {}
+    def pack(t):                              # called each time autograd saves a tensor for backward
+        s = t.untyped_storage()
+        if s.data_ptr() not in skip_ptrs:
+            seen[s.data_ptr()] = s.nbytes()   # each block of memory counts once
+        return t
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        out = fn(*args)
+    return out, sum(seen.values())
+
+mlp = nn.Sequential(nn.Linear(64, 256), nn.GELU(), nn.Linear(256, 64))
+for batch in (8, 16, 32):
+    _, n = saved_bytes(mlp, torch.randn(batch, 64), skip=mlp.parameters())
+    print(f"batch={batch:2d}: saved {n} bytes for backward")
+
+@@ concept
+title: Leaks: a stored loss keeps its whole graph
+--- body
+A tensor that needs gradients (a loss, for example) carries a `grad_fn`. Through it you can reach the whole computation graph, and the graph holds the activations of the forward pass. As long as you keep that tensor, all of this stays alive.
+
+The classic mistake:
+
+```
+losses.append(loss)      # stores a tensor, still connected to its graph
+total += loss            # total becomes a tensor with a graph too, and every step joins the same chain
+```
+
+- If that step never calls `backward()` (a validation loop, or you only wanted to log the value), the whole graph and all its activations stay in GPU memory. A few batches later you get OOM (out of memory).
+- Even with `backward()` (which frees the activations stored in the graph), the graph nodes remain, and `total += loss` links every step's graph into one chain that keeps growing. Memory creeps up.
+
+The fix: if you want to keep a number, keep a number. `loss.item()` returns a Python float that has nothing to do with the graph. If you need to keep a tensor (predictions, say), use `.detach()`, and usually `.cpu()` to move it out of GPU memory. (On a GPU, `.item()` has to wait for the GPU to finish, so for logging you can call it every N steps.)
+
+How to read GPU memory: `nvidia-smi` shows the memory PyTorch has **reserved**. PyTorch has a caching allocator: when a tensor is freed, its memory stays with PyTorch for the next tensor instead of going back to the driver. So:
+
+- `torch.cuda.memory_allocated()`: memory that tensors really use
+- `torch.cuda.max_memory_allocated()`: the peak so far
+- `torch.cuda.memory_reserved()`: everything PyTorch holds, close to the nvidia-smi number
+
+The code below shows a leak without a GPU. `weakref.ref(h)` is a weak reference: it does not keep h alive. If the weak reference can still reach h after the loop, something else (the graph) is holding on to it.
+--- code
+import weakref
+
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(4, 256), nn.ReLU(), nn.Linear(256, 1))
+
+def run(keep_tensor):
+    alive, kept = [], []
+    for _ in range(3):
+        h = model[1](model[0](torch.randn(64, 4)))   # an intermediate activation, (64, 256)
+        alive.append(weakref.ref(h))
+        loss = model[2](h).pow(2).mean()              # no backward, e.g. we only log it
+        kept.append(loss if keep_tensor else loss.item())
+        del h, loss
+    return [r() is not None for r in alive], kept[0]
+
+print("append(loss)        activations still alive?", run(True))
+print("append(loss.item()) activations still alive?", run(False))
+
+@@ concept
+title: No graph at inference: no_grad and inference_mode
+--- body
+By default, as soon as one input needs gradients (and model parameters do), PyTorch builds a computation graph and saves activations as it computes. Inference and validation never run a backward pass, so that is wasted memory and wasted time.
+
+- Tensors computed inside `with torch.no_grad():` have `requires_grad=False`, no `grad_fn`, and no activations are saved.
+- `with torch.inference_mode():` goes further and skips some internal bookkeeping too, so it is a little faster. The price: the "inference tensors" it creates cannot be used later in a computation that needs gradients, or you get an error.
+- Both also work as decorators: put `@torch.no_grad()` or `@torch.inference_mode()` above a function.
+
+Note: they control the computations done inside the with block. They do not change the parameters' `requires_grad`. Outside the block, results computed with the same model carry a graph again.
+
+Also, `model.eval()` is a different thing (day 18): it switches how dropout and BatchNorm behave and has nothing to do with the graph. For inference you need both.
+--- code
+lin = nn.Linear(4, 2)
+x = torch.randn(3, 4)
+
+y = lin(x)
+print("default:        requires_grad =", y.requires_grad, " has grad_fn:", y.grad_fn is not None)
+with torch.no_grad():
+    y = lin(x)
+print("no_grad:        requires_grad =", y.requires_grad, " has grad_fn:", y.grad_fn is not None)
+with torch.inference_mode():
+    y = lin(x)
+print("inference_mode: requires_grad =", y.requires_grad, " is_inference =", y.is_inference())
+print("the parameter:  lin.weight.requires_grad =", lin.weight.requires_grad)
+
+try:
+    lin(y).sum().backward()        # use an inference tensor for training
+except RuntimeError as e:
+    print("error:", str(e).split(".")[0])
+
+@@ concept
+title: Timing: warm up, synchronize, take the median
+--- body
+"How much faster did this change make the model?" You answer that with timing. There are three common ways to get it wrong:
+
+1. **No warm-up.** The first call is often much slower: memory gets allocated, cuDNN picks its algorithms, `torch.compile` compiles. So run the function a few times first (warm-up) and do not time those runs.
+2. **No synchronization.** The GPU is asynchronous: `y = model(x)` only puts the work in a queue and returns at once, while the GPU keeps working in the background. If you read the clock before the work is done, you measure only the time to queue it. So call `torch.cuda.synchronize()` (wait until the GPU has finished everything in its queue) before you read the start time and before you read the end time. The first one makes sure leftover work (from the warm-up, say) is not counted in this run.
+3. **One run, or the mean.** Every run's time jitters (other programs, the OS scheduler). Run many times and take the **median** (the middle value after sorting). One unusually slow run does not move the median; it pulls the mean up.
+
+Read the time with `time.perf_counter()`, a high-resolution clock made for measuring intervals. `time.time()` is calendar time: less precise, and the system may adjust it.
+
+The code first uses a "fake GPU" to show point 2: `launch` only queues work, and only `sync` moves the clock forward. No real time passes, so the output is the same every run.
+--- code
+import statistics, time
+
+class FakeGPU:
+    def __init__(self):
+        self.now, self.pending = 0.0, 0.0
+    def launch(self, seconds):        # like a CUDA kernel: queue the work, return at once
+        self.pending += seconds
+    def sync(self):                   # like torch.cuda.synchronize(): wait for the queue
+        self.now += self.pending
+        self.pending = 0.0
+    def clock(self):
+        return self.now
+
+gpu = FakeGPU()
+t0 = gpu.clock(); gpu.launch(0.010); t1 = gpu.clock()
+print(f"no sync:               {t1 - t0:.3f} s   only the queueing was measured")
+t0 = gpu.clock(); gpu.launch(0.010); gpu.sync(); t1 = gpu.clock()
+print(f"sync only at the end:  {t1 - t0:.3f} s   includes the 10 ms left over from before")
+gpu.sync(); t0 = gpu.clock(); gpu.launch(0.010); gpu.sync(); t1 = gpu.clock()
+print(f"sync before and after: {t1 - t0:.3f} s   correct")
+
+times = [0.010, 0.011, 0.250, 0.010, 0.012]     # one run was interrupted by another program
+print("mean:", round(statistics.mean(times), 4), " median:", statistics.median(times))
+
+x = torch.randn(256, 256)
+for _ in range(3):                  # warm-up
+    x @ x
+ts = []
+for _ in range(20):
+    t0 = time.perf_counter()
+    x @ x
+    ts.append(time.perf_counter() - t0)
+print(f"256x256 matmul on this CPU: median {statistics.median(ts) * 1e3:.3f} ms")
+
+@@ concept
+title: Activation checkpointing: compute for memory
+ref: day19
+--- body
+Activation checkpointing (also called gradient checkpointing): in the forward pass, a block saves none of its internal intermediate results, only its input. In the backward pass, it runs the block again from that input to get the intermediate results it needs, then computes the gradients.
+
+- You save: each block keeps just one input tensor, so activations drop from a dozen or more copies per layer to about one.
+- You pay: every block's forward runs twice, roughly one third more compute.
+- Nothing changes in the outputs or the gradients. It is a different way to compute the same math, using less memory.
+
+How to write it:
+
+```
+from torch.utils.checkpoint import checkpoint
+x = checkpoint(block, x, use_reentrant=False)   # instead of x = block(x)
+```
+
+Always pass `use_reentrant=False`. The old `use_reentrant=True` has a trap: if none of the tensors you pass in needs gradients (for example, the first layer's input is just data), the parameters inside that part get no gradients, and backward may even raise an error. If you leave the argument out, current PyTorch warns you and still uses the old True.
+
+Dropout inside a block is fine: by default checkpoint remembers the random-number state and reuses the same dropout mask when it recomputes, so the gradients are identical.
+
+The code below measures it with `saved_bytes` from the card "Activations grow with batch and length".
+--- code
+from torch.utils.checkpoint import checkpoint
+
+torch.manual_seed(0)
+blocks = nn.ModuleList([nn.Sequential(nn.Linear(64, 256), nn.GELU(), nn.Linear(256, 64)) for _ in range(4)])
+x = torch.randn(32, 64)
+
+def plain(x):
+    for b in blocks:
+        x = b(x)
+    return x
+
+def ckpt(x):
+    for b in blocks:
+        x = checkpoint(b, x, use_reentrant=False)
+    return x
+
+grads = []
+for f in (plain, ckpt):
+    blocks.zero_grad()
+    out, n = saved_bytes(f, x, skip=blocks.parameters())
+    out.pow(2).mean().backward()
+    grads.append([p.grad.clone() for p in blocks.parameters()])
+    print(f"{f.__name__:5s}: saved {n:6d} bytes for backward")
+print("identical gradients:", all(torch.equal(a, b) for a, b in zip(*grads)))
+
+@@ concept
+title: DataLoader workers and torch.compile recompiles
+--- body
+### DataLoader
+
+With `num_workers=0`, loading and preprocessing happen in the main process while the GPU waits. With a value like `num_workers=4`, the DataLoader starts a few child processes (workers) that prepare the next batches in parallel.
+
+- Windows and macOS start workers with spawn: each worker is a brand-new Python that first imports your script again. The top-level code of your script runs again in every worker. If the top level builds the DataLoader and starts training, each worker tries to start its own workers, and Python raises a RuntimeError. So put the training code in a function and guard it with `if __name__ == "__main__":`.
+- Define your Dataset class in a .py file that can be imported. A class defined in a Jupyter notebook cannot be found by spawned workers.
+- `pin_memory=True`: puts batches in page-locked memory, which copies to the GPU faster and allows `.to("cuda", non_blocking=True)` to copy while the GPU computes.
+- `persistent_workers=True`: keeps the workers alive after an epoch, so the next epoch does not start them again (starting them is slow on Windows).
+
+```
+def main():
+    loader = DataLoader(ds, batch_size=32, num_workers=4, pin_memory=True, persistent_workers=True)
+    for x, y in loader:
+        ...
+
+if __name__ == "__main__":
+    main()
+```
+
+### torch.compile
+
+On the first call, `torch.compile` compiles the model into faster code for the shapes of that input. This can take seconds or even tens of seconds. Later calls with the same shapes reuse it. A new shape triggers a recompile. With the default settings, when a second, different shape shows up, PyTorch marks the changing dimension as "dynamic" and compiles once more; later new lengths can usually reuse that code. With `dynamic=False`, every new shape compiles again, until a limit (8 in this version); after that it stops compiling and falls back to plain, slower execution.
+
+What to do in production: warm up at start-up with a few typical shapes, or pad inputs to a few fixed lengths (e.g. 64, 128, 256; this is called bucketing). To see why a recompile happened, set the environment variable `TORCH_LOGS=recompiles`.
+
+The code below prints how this machine starts workers, then counts compiles with a backend that only counts and does not really compile.
+--- code
+import multiprocessing
+print("how this machine starts workers:", multiprocessing.get_start_method())
+
+compiles = []
+def counting_backend(gm, example_inputs):
+    compiles.append(1)
+    return gm.forward                          # no real compiling, run the code as it is
+
+for dynamic in (None, False):
+    compiles.clear()
+    torch._dynamo.reset()                      # forget earlier compiles so every run prints the same
+    f = torch.compile(lambda x: (x * 2).sum(), backend=counting_backend, dynamic=dynamic)
+    for n in [4, 4, 5, 6, 7, 4]:
+        f(torch.ones(n))
+    print(f"dynamic={dynamic}: lengths 4,4,5,6,7,4 compiled {len(compiles)} time(s)")
+
+@@ item d19-01
+type: predict
+title: Count the bytes
+level: 1
+cards: How many bytes a tensor takes
+--- context
+Memory budgets, model file sizes and download times all start from "number of elements × bytes per element". Learn the bytes of the common dtypes by heart first.
+--- prompt
+Write what the code below prints.
+--- code
+for dt in [torch.float32, torch.bfloat16, torch.int8, torch.int64]:
+    print(dt, torch.zeros(1, dtype=dt).element_size())
+w = torch.zeros(1000, 1000)
+print(w.numel(), w.nbytes)
+print(w.half().nbytes, w[:10].nbytes)
+--- explain
+Bytes = number of elements × bytes per element. fp32 is 32 bits = 4 bytes, bf16 and fp16 are 2 bytes, int8 is 1 byte and int64 is 8 bytes. w has 1000×1000 = 1000000 elements, 4000000 bytes in fp32 (about 4 MB); half precision halves that. `w[:10]` is the first 10 rows, and `nbytes` counts only those rows: 10×1000×4 = 40000. It shares memory with w and takes no extra memory.
+--- hints
+- 1 byte = 8 bits, so fp32 (32 bits) is 4 bytes.
+- `nbytes` is `numel() * element_size()`. `w[:10]` has only 10 rows.
+
+@@ item d19-02
+type: code
+title: How many bytes a model takes
+level: 1
+cards: How many bytes a tensor takes
+targets: model_bytes
+--- context
+Before you deploy a model you need to know how much memory it takes once loaded. Counting only parameters misses the buffers (like BatchNorm statistics); treating int64 as 4 bytes gets it wrong; counting a shared weight twice overestimates.
+--- prompt
+Write `model_bytes(model)`. It returns a tuple `(param_bytes, buffer_bytes)`:
+
+- `param_bytes`: the bytes of all parameters added up (frozen ones included)
+- `buffer_bytes`: the bytes of all buffers added up
+
+Compute each tensor's bytes with `numel() * element_size()`; do not hard-code 4 bytes. Count a shared weight only once (`model.parameters()` already removes duplicates).
+--- starter
+def model_bytes(model):
+    """Return (bytes of the parameters, bytes of the buffers)."""
+    raise todo()
+--- solution
+def model_bytes(model):
+    p = sum(t.numel() * t.element_size() for t in model.parameters())
+    b = sum(t.numel() * t.element_size() for t in model.buffers())
+    return p, b
+--- tests
+class _Tied(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.emb = nn.Embedding(100, 16)
+        self.head = nn.Linear(16, 100, bias=False)
+        self.head.weight = self.emb.weight       # the same matrix
+
+@check("Linear: parameters only, no buffers")
+def _():
+    p, b = model_bytes(nn.Linear(10, 5))
+    true(p == 220, f"Linear(10, 5) has 10*5 + 5 = 55 fp32 parameters = 220 bytes; yours: {p}")
+    true(b == 0, f"Linear has no buffers, expected 0; yours: {b}")
+
+@check("BatchNorm buffers count too; mind the dtype")
+def _():
+    p, b = model_bytes(nn.BatchNorm1d(8))
+    true(p == 64, f"weight and bias, 8 fp32 values each = 64 bytes; yours: {p}")
+    true(b == 72, f"running_mean 32 + running_var 32 + num_batches_tracked 8 = 72 bytes; yours: {b}. "
+                  "If you got 68, you counted the int64 num_batches_tracked as 4 bytes: use element_size()")
+
+@check("half precision halves the bytes")
+def _():
+    p, _ = model_bytes(nn.Linear(10, 5).half())
+    true(p == 110, f"fp16 is 2 bytes per value, 55 parameters = 110 bytes; yours: {p}")
+
+@check("frozen parameters take memory too")
+def _():
+    m = nn.Linear(10, 5)
+    m.weight.requires_grad_(False)
+    p, _ = model_bytes(m)
+    true(p == 220, f"requires_grad=False only means it is not trained; the weight is still in memory. Expected 220, yours: {p}")
+
+@check("a shared weight counts once")
+def _():
+    p, _ = model_bytes(_Tied())
+    true(p == 6400, f"emb and head share one 100x16 matrix, which takes 1600*4 = 6400 bytes; yours: {p}. "
+                    "Use model.parameters(), not state_dict()")
+--- hints
+- Loop over `model.parameters()` and over `model.buffers()` and add up each one separately.
+- Each tensor is `t.numel() * t.element_size()`; the sum is `sum(... for t in model.parameters())`.
+
+@@ item d19-03
+type: code
+title: Training memory (without activations)
+level: 2
+cards: The four parts of training memory
+targets: train_state_bytes
+--- context
+The question you get most in budgets and interviews: "How much GPU memory does full fine-tuning of a 7B model need?" The answer starts from bytes per parameter. This exercise works out weights, gradients, master weights and Adam states separately.
+--- prompt
+Write `train_state_bytes(n_params, precision)`. The optimizer is Adam. Return a dict in bytes, every value an int, with the keys `"weights"`, `"grads"`, `"master"`, `"adam"`, `"total"`. Bytes per parameter:
+
+```
+precision   weights  grads  master  adam (m + v)
+"fp32"         4       4      0        8
+"mixed"        2       2      4        8
+"bf16"         2       2      0        4
+```
+
+- `total` is the sum of the first four.
+- Any other `precision` must `raise ValueError`.
+- Example: `train_state_bytes(7_000_000_000, "fp32")["total"] == 112_000_000_000`
+--- starter
+def train_state_bytes(n_params, precision):
+    """Bytes of weights, grads, master weights and Adam states when training with Adam, plus the total."""
+    raise todo()
+--- solution
+PER_PARAM = {           # weights, grads, master, adam
+    "fp32": (4, 4, 0, 8),
+    "mixed": (2, 2, 4, 8),
+    "bf16": (2, 2, 0, 4),
+}
+
+def train_state_bytes(n_params, precision):
+    if precision not in PER_PARAM:
+        raise ValueError(precision)
+    w, g, m, a = PER_PARAM[precision]
+    out = {"weights": n_params * w, "grads": n_params * g, "master": n_params * m, "adam": n_params * a}
+    out["total"] = sum(out.values())
+    return out
+--- tests
+@check("fp32 + Adam: 16 bytes per parameter")
+def _():
+    r = train_state_bytes(7_000_000_000, "fp32")
+    true(isinstance(r, dict), f"should return a dict; yours returned {type(r).__name__}")
+    for k in ("weights", "grads", "master", "adam", "total"):
+        true(k in r, f"the dict has no key {k!r}")
+    true(r["weights"] == 28_000_000_000, f"7B fp32 weights = 28000000000 bytes; yours: {r['weights']}")
+    true(r["grads"] == 28_000_000_000, f"gradients are as big as the weights, expected 28000000000; yours: {r['grads']}")
+    true(r["master"] == 0, f"fp32 training needs no extra master weights, expected 0; yours: {r['master']}")
+    true(r["adam"] == 56_000_000_000, f"Adam keeps m and v, two fp32 numbers = 8 bytes per parameter, expected 56000000000; yours: {r['adam']}")
+    true(r["total"] == 112_000_000_000, f"16 bytes per parameter in total = 112000000000; yours: {r['total']}")
+
+@check("mixed precision: smaller weights, same total")
+def _():
+    r = train_state_bytes(7_000_000_000, "mixed")
+    want = {"weights": 14_000_000_000, "grads": 14_000_000_000, "master": 28_000_000_000,
+            "adam": 56_000_000_000, "total": 112_000_000_000}
+    for k, v in want.items():
+        true(r.get(k) == v, f"mixed {k} should be {v}; yours: {r.get(k)}. Mixed precision adds an fp32 copy of the weights, so the total is still 16 bytes per parameter")
+
+@check("pure bf16: 8 bytes per parameter")
+def _():
+    r = train_state_bytes(7_000_000_000, "bf16")
+    want = {"weights": 14_000_000_000, "grads": 14_000_000_000, "master": 0,
+            "adam": 28_000_000_000, "total": 56_000_000_000}
+    for k, v in want.items():
+        true(r.get(k) == v, f"bf16 {k} should be {v}; yours: {r.get(k)}")
+
+@check("total is the sum of the four, all ints")
+def _():
+    r = train_state_bytes(1_234_567, "mixed")
+    bad = [k for k, v in r.items() if type(v) is not int]
+    true(not bad, f"{bad} are not ints: multiply whole numbers, with no / and no 1e9")
+    true(r["total"] == r["weights"] + r["grads"] + r["master"] + r["adam"], "total should be the sum of the four parts")
+    true(r["total"] == 1_234_567 * 16, f"mixed is 16 bytes per parameter, expected {1_234_567 * 16}; yours: {r['total']}")
+
+@check("an unknown precision raises an error")
+def _():
+    try:
+        r = train_state_bytes(10, "fp8")
+    except (ValueError, KeyError):
+        return
+    raise AssertionError(f"precision='fp8' should raise ValueError, but yours returned {r!r}. Quietly returning a wrong number is more dangerous")
+--- hints
+- Write the table as a dict: `{"fp32": (4, 4, 0, 8), ...}` and multiply each of the four numbers by `n_params`.
+- Start with `if precision not in table: raise ValueError(precision)`; end with `out["total"] = sum(out.values())`.
+
+@@ item d19-04
+type: code
+title: The largest micro-batch that fits
+level: 2
+cards: Activations grow with batch and length; The four parts of training memory
+targets: max_micro_batch
+--- context
+An OOM often happens not because the model does not fit, but because the activations do not. Work out how much memory is left after weights, gradients and optimizer states, divide by the activations of one sample, and you know the largest micro-batch without trying until it crashes.
+--- prompt
+Write `max_micro_batch(gpu_bytes, static_bytes, seq, hidden, n_layers, bytes_per_value, tensors_per_layer=16)`:
+
+- activations per sample = `seq * hidden * n_layers * tensors_per_layer * bytes_per_value`
+- the largest batch = (`gpu_bytes` − `static_bytes`) ÷ activations per sample, **rounded down**
+- if `static_bytes` ≥ `gpu_bytes`, return 0, never a negative number
+- return an int
+
+Example: a 24 GB GPU (`24_000_000_000`), static part `19_327_352_832` (about 1.2 billion parameters, mixed precision + Adam), seq=2048, hidden=2048, 24 layers, bf16 (2 bytes) → returns 1.
+--- starter
+def max_micro_batch(gpu_bytes, static_bytes, seq, hidden, n_layers, bytes_per_value, tensors_per_layer=16):
+    """After the static part, how many samples' activations fit in the rest of the memory."""
+    raise todo()
+--- solution
+def max_micro_batch(gpu_bytes, static_bytes, seq, hidden, n_layers, bytes_per_value, tensors_per_layer=16):
+    per_sample = seq * hidden * n_layers * tensors_per_layer * bytes_per_value
+    free = gpu_bytes - static_bytes
+    if free <= 0:
+        return 0
+    return free // per_sample
+--- tests
+@check("the example: a 24 GB GPU fits only 1")
+def _():
+    r = max_micro_batch(24_000_000_000, 19_327_352_832, 2048, 2048, 24, 2)
+    true(type(r) is int, f"should return an int; yours returned {type(r).__name__}: use integer division //")
+    true(r == 1, f"one sample is 2048*2048*24*16*2 ≈ 3.2e9 bytes and about 4.7e9 is left, so only 1 fits. Yours: {r}")
+
+@check("checkpointing cuts 16 copies per layer to 1: batch 23")
+def _():
+    r = max_micro_batch(24_000_000_000, 19_327_352_832, 2048, 2048, 24, 2, tensors_per_layer=1)
+    true(r == 23, f"with tensors_per_layer=1 one sample is about 2.0e8 bytes, expected 23; yours: {r}. Did you use the tensors_per_layer argument?")
+
+@check("fp32 activations are twice as big as bf16")
+def _():
+    a = max_micro_batch(80_000_000_000, 19_327_352_832, 2048, 2048, 24, 2)
+    b = max_micro_batch(80_000_000_000, 19_327_352_832, 2048, 2048, 24, 4)
+    true((a, b) == (18, 9), f"on an 80 GB GPU: 18 with bf16 activations, 9 with fp32; yours: {a} and {b}")
+
+@check("an exact fit counts; no room returns 0")
+def _():
+    r = max_micro_batch(1000, 200, 2, 5, 2, 4, tensors_per_layer=2)
+    true(r == 5, f"one sample is 2*5*2*2*4 = 160 bytes and 800 bytes are left, exactly 5; yours: {r}")
+    r = max_micro_batch(80_000_000_000, 112_000_000_000, 2048, 2048, 24, 2)
+    true(r == 0, f"the static part alone is bigger than the GPU, expected 0; yours: {r}")
+--- hints
+- Compute `per_sample` first, then the memory left: `free = gpu_bytes - static_bytes`.
+- If `free <= 0`, `return 0`; otherwise `return free // per_sample` (`//` is integer division, rounded down).
+
+@@ item d19-05
+type: fix
+title: Fix the leaking training loop
+level: 1
+cards: Leaks: a stored loss keeps its whole graph
+targets: train_epoch
+--- context
+"Memory keeps growing while it trains" or "OOM in the second epoch": one of the most common causes is keeping tensors with a graph inside a loop. If you want to keep a number, keep a number.
+--- prompt
+The `train_epoch` below trains fine, but it stores losses with their graphs in a list, and `total += loss` links every step's graph together. Make it store Python floats only:
+
+- return `(losses, mean_loss)`: `losses` is the loss of each batch, a list of Python `float`s; `mean_loss` is their mean, also a Python `float`
+- do not change the training steps (zero_grad, backward, step)
+--- starter
+def train_epoch(model, opt, batches):
+    losses = []
+    total = 0
+    for x, y in batches:
+        loss = F.mse_loss(model(x), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        losses.append(loss)
+        total += loss
+    return losses, total / len(batches)
+--- solution
+def train_epoch(model, opt, batches):
+    losses = []
+    total = 0.0
+    for x, y in batches:
+        loss = F.mse_loss(model(x), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        v = loss.item()          # a Python float, no link to the graph any more
+        losses.append(v)
+        total += v
+    return losses, total / len(batches)
+--- tests
+def _make():
+    seed(0)
+    model = nn.Sequential(nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1))
+    opt = torch.optim.SGD(model.parameters(), lr=0.05)
+    seed(1)
+    batches = [(torch.randn(8, 4), torch.randn(8, 1)) for _ in range(4)]
+    return model, opt, batches
+
+@check("the list holds Python floats")
+def _():
+    model, opt, batches = _make()
+    losses, _ = train_epoch(model, opt, batches)
+    true(len(losses) == 4, f"4 batches should give 4 losses; your list has {len(losses)}")
+    bad = [type(v).__name__ for v in losses if type(v) is not float]
+    true(not bad, f"the list holds {bad[0] if bad else None}, not float. Each tensor loss carries a grad_fn and keeps its graph: use loss.item()")
+
+@check("the mean loss is a float too")
+def _():
+    model, opt, batches = _make()
+    _, mean = train_epoch(model, opt, batches)
+    true(type(mean) is float, f"mean_loss is a {type(mean).__name__}. total starts at 0, and += a tensor turns it into a tensor with a graph that links every step together")
+
+@check("same values, and the model really trains")
+def _():
+    model, opt, batches = _make()
+    before = [p.detach().clone() for p in model.parameters()]
+    losses, mean = train_epoch(model, opt, batches)
+    ref_model, ref_opt, _ = _make()
+    want = []
+    for x, y in batches:
+        loss = F.mse_loss(ref_model(x), y)
+        ref_opt.zero_grad()
+        loss.backward()
+        ref_opt.step()
+        want.append(loss.item())
+    for i, (a, w) in enumerate(zip(losses, want)):
+        true(close(a, w, 1e-6), f"the loss of batch {i} is {float(a):.6f}, expected {w:.6f}: did the training steps change?")
+    true(close(mean, sum(want) / 4, 1e-6), f"the mean loss should be {sum(want) / 4:.6f}; yours: {float(mean):.6f}")
+    true(any(not torch.equal(a, b) for a, b in zip(before, model.parameters())), "the parameters did not change at all: a training step is missing")
+--- hints
+- `loss.item()` turns a one-element tensor into a Python float.
+- After `opt.step()`, write `v = loss.item()`, then `losses.append(v)` and `total += v`.
+
+@@ item d19-06
+type: choice
+title: Why nvidia-smi still shows the memory
+level: 2
+cards: Leaks: a stored loss keeps its whole graph
+--- context
+When you debug GPU memory, the first step is reading the right number. nvidia-smi does not show the memory tensors are using right now. Read the wrong number and you will chase a leak that does not exist.
+--- prompt
+A training script runs on a GPU. You `del` a 4 GB tensor (and you checked that no other variable refers to it). `torch.cuda.memory_allocated()` drops by 4 GB, but in nvidia-smi the process uses exactly as much memory as before. What is the most likely reason?
+--- options
+- `del` only removes the variable name; the tensor itself is freed only when the program exits
+- PyTorch's caching allocator keeps that memory for the next tensor; it still counts in `torch.cuda.memory_reserved()`, and that is what nvidia-smi sees
+- The tensor was moved to CPU memory automatically and the driver has not updated yet
+- Memory has leaked and only restarting the process helps
+answer: 2
+--- explain
+`memory_allocated()` went down, so the tensor really was freed. PyTorch does not give freed memory back to the driver; it keeps it (reserved) and reuses it for the next allocation, because asking the driver for memory is slow. Your program can use those 4 GB later; other processes cannot. `torch.cuda.empty_cache()` gives unused cached memory back to the driver, which you usually need only when you share the GPU with other processes. Only if `memory_allocated()` did not go down is something still referring to the tensor, such as a loss stored in a list that keeps its graph.
+--- hints
+- Note that the question says `memory_allocated()` already went down.
+- Asking the GPU driver for memory is slow, so PyTorch keeps the memory it got and reuses it.
+
+@@ item d19-07
+type: predict
+title: no_grad controls computations, not the model
+level: 1
+cards: No graph at inference: no_grad and inference_mode
+--- context
+no_grad affects only the computations inside the with block; it does not change the model's parameters. Outside the block, results from the same model carry a graph again. Mix this up and you will believe "the model's gradients are turned off".
+--- prompt
+Write what the code below prints.
+--- code
+torch.manual_seed(0)
+lin = nn.Linear(4, 4)
+x = torch.randn(3, 4)
+with torch.no_grad():
+    a = lin(x)
+b = lin(x).detach()
+c = a * 2
+print(a.requires_grad, b.requires_grad, c.requires_grad)
+print(lin.weight.requires_grad)
+d = lin(a)
+print(d.requires_grad, d.grad_fn is None)
+--- explain
+a was computed inside no_grad, so it needs no gradient. b was detached, so it needs none either. c comes from a, and a needs no gradient, so c needs none. no_grad did not change `lin.weight`: it is still True. d was computed outside the with block and uses the weight, which needs gradients, so d needs gradients and has a `grad_fn` (`d.grad_fn is None` is False).
+--- hints
+- A result needs gradients when both are true: it was computed while graph building was allowed, and at least one input needs gradients.
+- d is computed outside the with block, and `lin.weight` always needs gradients.
+
+@@ item d19-08
+type: fill
+title: A validation loop without a graph
+level: 1
+cards: No graph at inference: no_grad and inference_mode; Leaks: a stored loss keeps its whole graph; Activations grow with batch and length
+targets: evaluate
+ref: day19
+--- context
+Validation and inference never run backward, so building a graph is pure waste: it holds all the activations of a batch and it is slower. Two small changes avoid it.
+--- prompt
+Complete `evaluate(model, batches)`: it returns the mean MSE loss over all batches (a Python float). Autograd must save nothing for backward during the whole call; the test measures that with `saved_bytes` from the card "Activations grow with batch and length".
+--- template
+def evaluate(model, batches):
+    """Return the mean loss over all batches (a Python float)."""
+    model.eval()
+    total = 0.0
+    with torch.[[no_grad]]():
+        for x, y in batches:
+            loss = F.mse_loss(model(x), y)
+            total += loss.[[item]]()
+    return total / len(batches)
+--- tests
+def _data():
+    seed(0)
+    model = nn.Sequential(nn.Linear(4, 32), nn.ReLU(), nn.Linear(32, 1))
+    batches = [(torch.randn(8, 4), torch.randn(8, 1)) for _ in range(3)]
+    return model, batches
+
+@check("returns a correct Python float")
+def _():
+    model, batches = _data()
+    got = evaluate(model, batches)
+    true(type(got) is float, f"should return a Python float; yours returned {type(got).__name__}")
+    with torch.no_grad():
+        want = sum(F.mse_loss(model(x), y).item() for x, y in batches) / 3
+    true(close(got, want, 1e-6), f"the mean loss should be {want:.6f}; yours: {got:.6f}")
+
+@check("nothing is saved for backward during evaluate")
+def _():
+    model, batches = _data()
+    _, n = saved_bytes(evaluate, model, batches)
+    true(n == 0, f"autograd saved {n} bytes for backward during evaluate: you are building a graph. Use torch.no_grad() or torch.inference_mode() for validation")
+--- hints
+- First blank: a context manager that stops graph building for everything inside it. Second blank: turns a one-element tensor into a Python float.
+- `torch.no_grad` (`torch.inference_mode` works too); `item`.
+
+@@ item d19-09
+type: code
+title: Write a benchmark you can trust
+level: 2
+cards: Timing: warm up, synchronize, take the median
+targets: benchmark
+ref: day19
+--- context
+A claim like "the new version is 30% faster" is only as good as the timing behind it. Without warm-up you count start-up costs; without synchronizing on a GPU you measure only the queueing; with a single run, random jitter decides the result.
+--- prompt
+Write `benchmark(fn, warmup=3, runs=10, clock=time.perf_counter, sync=None)`. It returns the median time of one call to `fn()`, in seconds:
+
+1. Call `fn()` `warmup` times without timing.
+2. Then time `runs` calls, each one separately: `sync()` → `t0 = clock()` → `fn()` → `sync()` → time = `clock() - t0`.
+3. If `sync` is `None`, do not call it (not needed on a CPU); on a GPU the caller passes `torch.cuda.synchronize`.
+4. Return the median of the `runs` times (you may use `statistics.median`).
+
+Always read the time through the `clock` argument, never call `time.perf_counter()` directly: the tests pass in a fake clock so the results are the same every time.
+--- starter
+import statistics
+import time
+
+def benchmark(fn, warmup=3, runs=10, clock=time.perf_counter, sync=None):
+    """Warm up `warmup` times, then time `runs` calls one by one; return the median time in seconds."""
+    raise todo()
+--- solution
+import statistics
+import time
+
+def benchmark(fn, warmup=3, runs=10, clock=time.perf_counter, sync=None):
+    for _ in range(warmup):
+        fn()
+    times = []
+    for _ in range(runs):
+        if sync is not None:
+            sync()               # first wait for earlier work (e.g. the warm-up) to finish
+        t0 = clock()
+        fn()
+        if sync is not None:
+            sync()               # wait until this call has really finished
+        times.append(clock() - t0)
+    return statistics.median(times)
+--- tests
+@check("fn is called warmup + runs times")
+def _():
+    dev = FakeGPU([100, 100, 100, 2, 3, 50, 4, 5], async_=False)
+    benchmark(dev.fn, warmup=3, runs=5, clock=dev.clock)
+    true(dev.calls == 8, f"with warmup=3 and runs=5, fn should be called 8 times; yours called it {dev.calls} times")
+
+@check("the warm-up is not timed; returns the median")
+def _():
+    dev = FakeGPU([100, 100, 100, 2, 3, 50, 4, 5], async_=False)
+    t = benchmark(dev.fn, warmup=3, runs=5, clock=dev.clock)
+    true(t is not None, "nothing was returned: end with return and the median")
+    true(close(t, 4, 1e-9), f"expected 4: the 3 warm-up calls of 100 s each do not count, the 5 timed calls take 2, 3, 50, 4, 5, and the median is 4. Yours: {t}. "
+                           "12.8 = you took the mean; 27.5 = the warm-up was timed too; close to 0 = you did not read the time through the clock argument")
+
+@check("the GPU is asynchronous: sync before and after timing")
+def _():
+    dev = FakeGPU([100, 100, 2, 3, 4], async_=True)
+    t = benchmark(dev.fn, warmup=2, runs=3, clock=dev.clock, sync=dev.sync)
+    true(dev.syncs > 0, "sync was passed in, but yours never called it")
+    true(t is not None and close(t, 3, 1e-9), f"expected 3; yours: {t}. 0 = no sync before reading the end time, so only the queueing was measured; "
+                                              "4 = no sync before starting the timer, so the 200 s of unfinished warm-up landed in the first run")
+
+@check("works with warmup=0 and runs=1")
+def _():
+    dev = FakeGPU([7], async_=False)
+    t = benchmark(dev.fn, warmup=0, runs=1, clock=dev.clock)
+    true(dev.calls == 1 and t is not None and close(t, 7, 1e-9), f"one run that takes 7 s should return 7; yours: {t} (fn was called {dev.calls} times)")
+--- hints
+- Two for loops: the first one only calls `fn()`; the second appends each run's time to a list.
+- In the second loop: `if sync is not None: sync()`, `t0 = clock()`, `fn()`, sync again, `times.append(clock() - t0)`. At the end, `return statistics.median(times)`.
+
+@@ item d19-10
+type: code
+title: A forward pass with activation checkpointing
+level: 2
+cards: Activation checkpointing: compute for memory; Activations grow with batch and length
+targets: forward_checkpointed
+ref: day19
+--- context
+When memory runs out and you do not want an even smaller batch, activation checkpointing is the standard fix: about one third more compute buys back most of the activation memory. It does not change the math, so the outputs and gradients must be exactly the same as before.
+--- prompt
+Write `forward_checkpointed(blocks, x)`. `blocks` is an `nn.ModuleList`. The result must equal `for b in blocks: x = b(x)`, but every block is wrapped in `torch.utils.checkpoint.checkpoint(..., use_reentrant=False)`.
+
+The tests check three things:
+
+- the output is the same (the blocks contain dropout, so the tests fix the random seed)
+- when the input x needs no gradients, the parameters' gradients are exactly the same as without checkpointing
+- the bytes saved for backward drop by more than half (measured with `saved_bytes`)
+--- starter
+from torch.utils.checkpoint import checkpoint
+
+def forward_checkpointed(blocks, x):
+    """Run x through every block in order, each block wrapped in checkpoint."""
+    raise todo()
+--- solution
+from torch.utils.checkpoint import checkpoint
+
+def forward_checkpointed(blocks, x):
+    for b in blocks:
+        x = checkpoint(b, x, use_reentrant=False)
+    return x
+--- tests
+def _blocks():
+    seed(0)
+    return nn.ModuleList([nn.Sequential(nn.Linear(16, 64), nn.GELU(), nn.Dropout(0.1), nn.Linear(64, 16))
+                          for _ in range(4)])
+
+def _plain(blocks, x):
+    for b in blocks:
+        x = b(x)
+    return x
+
+def _grads(f, blocks, x):
+    blocks.zero_grad()
+    seed(1)                          # same random seed -> same dropout masks
+    f(blocks, x).pow(2).mean().backward()
+    return [None if p.grad is None else p.grad.clone() for p in blocks.parameters()]
+
+@check("same output as the plain forward pass")
+def _():
+    blocks = _blocks()
+    x = torch.randn(8, 16)
+    seed(1)
+    want = _plain(blocks, x)
+    seed(1)
+    got = forward_checkpointed(blocks, x)
+    eq(got, want, tol=1e-6, msg="the result changed. Checkpointing does not change the math: run every block, in order")
+
+@check("x needs no gradients: parameter gradients still identical")
+def _():
+    blocks = _blocks()
+    x = torch.randn(8, 16)          # plain data, no gradients needed
+    want = _grads(_plain, blocks, x)
+    try:
+        got = _grads(forward_checkpointed, blocks, x)
+    except RuntimeError as e:
+        raise AssertionError(f"backward failed: {str(e)[:70]}. When no input needs gradients, use_reentrant=True (also what you get "
+                             "when you leave it out) gives this part no gradients: pass use_reentrant=False")
+    for i, (g, w) in enumerate(zip(got, want)):
+        true(g is not None, f"parameter {i} has no gradient: use use_reentrant=False")
+        eq(g, w, tol=1e-6, msg=f"the gradient of parameter {i} differs from the one without checkpointing")
+
+@check("less than half the bytes saved for backward")
+def _():
+    blocks = _blocks()
+    x = torch.randn(8, 16)
+    _, plain_n = saved_bytes(_plain, blocks, x, skip=blocks.parameters())
+    _, ck_n = saved_bytes(forward_checkpointed, blocks, x, skip=blocks.parameters())
+    true(ck_n < plain_n / 2, f"without checkpointing {plain_n} bytes were saved, yours saved {ck_n}: wrap every block in checkpoint")
+--- hints
+- Write the same loop, `for b in blocks:`, and only replace `x = b(x)`.
+- `x = checkpoint(b, x, use_reentrant=False)`, and after the loop `return x`.
+
+@@ item d19-11
+type: choice
+title: num_workers on Windows
+level: 1
+cards: DataLoader workers and torch.compile recompiles
+--- context
+A training script that runs fine on a Linux server crashes on a Windows PC as soon as num_workers is set. The reason: the two systems start child processes in different ways.
+--- prompt
+You run `train.py` on Windows. These lines sit at the top level of the file, with no function and no `if __name__ == "__main__":`:
+
+```
+ds = MyDataset("data/")
+loader = DataLoader(ds, batch_size=32, num_workers=4)
+for x, y in loader:
+    train_step(x, y)
+```
+
+What happens?
+--- options
+- It runs normally: 4 workers load data in parallel, faster than `num_workers=0`
+- A RuntimeError: each worker is a freshly started Python that runs the top level of train.py again, so it builds a DataLoader and tries to start workers of its own; Python sees "a new process is being started before this one has finished starting" and raises an error
+- PyTorch detects Windows, falls back to `num_workers=0` and prints a warning
+- No error, but every batch is read 4 times and training goes wrong
+answer: 2
+--- explain
+On Windows, Python starts child processes with spawn: the new process first imports your main script (with `__name__` set to `"__mp_main__"`, not `"__main__"`), then takes its work. Unguarded top-level code runs again in every worker, and each worker tries to start workers. Python raises a RuntimeError ("An attempt has been made to start a new process before the current process has finished its bootstrapping phase"), and the main process then reports "DataLoader worker (pid ...) exited unexpectedly". The fix: put the training code in `main()` and end the file with `if __name__ == "__main__": main()`. On Linux, Python 3.13 and earlier use fork by default (copy the running process, without running the script again), which is why the same script often works on a server.
+--- hints
+- On Windows, a child process is not a copy; it is a new Python started from scratch.
+- The new Python first imports your script. What happens to the lines at its top level?
+
+@@ item d19-12
+type: choice
+title: Why torch.compile compiled again
+level: 2
+cards: DataLoader workers and torch.compile recompiles
+--- context
+torch.compile can make a model much faster, but it compiles for the input shapes. A service whose shapes keep changing (every request a different length) can suddenly slow down when you least expect it.
+--- prompt
+An inference service does `model = torch.compile(model)` at start-up, with every other setting left at its default. Requests have different sequence lengths: the 1st is 37, the 2nd is 52, then 18, 64, 37, 41, and so on. You notice that the 1st and the 2nd request are both very slow (tens of seconds) and later ones are mostly fine. What is the best explanation?
+--- options
+- torch.compile recompiles for every length it has not seen, so it keeps compiling later too; you just did not notice
+- The 1st request compiled code for the fixed length 37; the 2nd request's length did not match, which triggered a recompile, and this time PyTorch treated the length as a dynamic dimension and compiled general code that later lengths reuse
+- The first two requests are slow because the DataLoader workers are starting
+- torch.compile does nothing at inference time; the GPU was warming up
+answer: 2
+--- explain
+With the default setting (`dynamic=None`), the first compile is for the exact shapes; when a shape changes it recompiles and automatically marks the changing dimension as dynamic. The card counted this with a counting backend: lengths 4, 4, 5, 6, 7, 4 compiled 2 times. With `dynamic=False`, every new shape compiles once (4 times for the same lengths), until a limit (8 in this version); after that it falls back to slow execution without compiling. In production: warm up at start-up with a few typical lengths, or pad inputs to a few fixed lengths (bucketing). The environment variable `TORCH_LOGS=recompiles` shows the reason for every recompile.
+--- hints
+- The code torch.compile generates depends on the input shapes. The 2nd request has a different shape from the 1st.
+- With the default settings, once PyTorch has seen a dimension change, it treats it as a dimension that changes.
+
+@@ item d19-13
+type: code
+title: Closed book: benchmark
+level: 2
+cards: Timing: warm up, synchronize, take the median
+targets: benchmark
+ref: day19
+exam: yes
+--- context
+A timing function is the foundation of performance work: every "how much faster" rests on it. Writing it from blank, closed book, shows you remember warm-up, synchronization and the median.
+--- prompt
+Write `benchmark(fn, warmup=3, runs=10, clock=time.perf_counter, sync=None)` from blank: warm up `warmup` times without timing; then time `runs` calls one by one; when `sync` is not `None`, call it before reading the start time and before reading the end time; read the time only through `clock`; return the median time in seconds.
+--- starter
+import statistics
+import time
+
+def benchmark(fn, warmup=3, runs=10, clock=time.perf_counter, sync=None):
+    raise todo()
+--- solution
+import statistics
+import time
+
+def benchmark(fn, warmup=3, runs=10, clock=time.perf_counter, sync=None):
+    for _ in range(warmup):
+        fn()
+    times = []
+    for _ in range(runs):
+        if sync is not None:
+            sync()
+        t0 = clock()
+        fn()
+        if sync is not None:
+            sync()
+        times.append(clock() - t0)
+    return statistics.median(times)
+--- tests
+@check("fn is called warmup + runs times")
+def _():
+    dev = FakeGPU([100, 100, 100, 2, 3, 50, 4, 5], async_=False)
+    benchmark(dev.fn, warmup=3, runs=5, clock=dev.clock)
+    true(dev.calls == 8, f"with warmup=3 and runs=5, fn should be called 8 times; yours called it {dev.calls} times")
+
+@check("the warm-up is not timed; returns the median")
+def _():
+    dev = FakeGPU([100, 100, 100, 2, 3, 50, 4, 5], async_=False)
+    t = benchmark(dev.fn, warmup=3, runs=5, clock=dev.clock)
+    true(t is not None, "nothing was returned: end with return and the median")
+    true(close(t, 4, 1e-9), f"expected 4: the 3 warm-up calls of 100 s each do not count, the 5 timed calls take 2, 3, 50, 4, 5, and the median is 4. Yours: {t}. "
+                           "12.8 = you took the mean; 27.5 = the warm-up was timed too; close to 0 = you did not read the time through the clock argument")
+
+@check("the GPU is asynchronous: sync before and after timing")
+def _():
+    dev = FakeGPU([100, 100, 2, 3, 4], async_=True)
+    t = benchmark(dev.fn, warmup=2, runs=3, clock=dev.clock, sync=dev.sync)
+    true(dev.syncs > 0, "sync was passed in, but yours never called it")
+    true(t is not None and close(t, 3, 1e-9), f"expected 3; yours: {t}. 0 = no sync before reading the end time, so only the queueing was measured; "
+                                              "4 = no sync before starting the timer, so the 200 s of unfinished warm-up landed in the first run")
+
+@check("works with warmup=0 and runs=1")
+def _():
+    dev = FakeGPU([7], async_=False)
+    t = benchmark(dev.fn, warmup=0, runs=1, clock=dev.clock)
+    true(dev.calls == 1 and t is not None and close(t, 7, 1e-9), f"one run that takes 7 s should return 7; yours: {t} (fn was called {dev.calls} times)")
+--- hints
+- Two loops: one for the warm-up, one for timing.
+- The timing loop: sync → clock → fn → sync → clock; at the end, `statistics.median`.
+
+@@ item d19-14
+type: code
+title: Closed book: training memory
+level: 2
+cards: The four parts of training memory
+targets: train_state_bytes
+exam: yes
+--- context
+"How much GPU memory does full fine-tuning of a 7B model need?" comes up in interviews all the time. Write it once closed book to check that you remember the bytes per parameter for all three precisions.
+--- prompt
+Write `train_state_bytes(n_params, precision)` from blank; the optimizer is Adam. Return a dict (bytes, ints) with the keys `"weights"`, `"grads"`, `"master"`, `"adam"`, `"total"`; `precision` is `"fp32"`, `"mixed"` or `"bf16"`, and any other value must `raise ValueError`. The bytes of each part for each precision are for you to remember.
+--- starter
+def train_state_bytes(n_params, precision):
+    raise todo()
+--- solution
+PER_PARAM = {           # weights, grads, master, adam
+    "fp32": (4, 4, 0, 8),
+    "mixed": (2, 2, 4, 8),
+    "bf16": (2, 2, 0, 4),
+}
+
+def train_state_bytes(n_params, precision):
+    if precision not in PER_PARAM:
+        raise ValueError(precision)
+    w, g, m, a = PER_PARAM[precision]
+    out = {"weights": n_params * w, "grads": n_params * g, "master": n_params * m, "adam": n_params * a}
+    out["total"] = sum(out.values())
+    return out
+--- tests
+@check("fp32 + Adam: 16 bytes per parameter")
+def _():
+    r = train_state_bytes(7_000_000_000, "fp32")
+    true(isinstance(r, dict), f"should return a dict; yours returned {type(r).__name__}")
+    for k in ("weights", "grads", "master", "adam", "total"):
+        true(k in r, f"the dict has no key {k!r}")
+    true(r["weights"] == 28_000_000_000, f"7B fp32 weights = 28000000000 bytes; yours: {r['weights']}")
+    true(r["grads"] == 28_000_000_000, f"gradients are as big as the weights, expected 28000000000; yours: {r['grads']}")
+    true(r["master"] == 0, f"fp32 training needs no extra master weights, expected 0; yours: {r['master']}")
+    true(r["adam"] == 56_000_000_000, f"Adam keeps m and v, two fp32 numbers = 8 bytes per parameter, expected 56000000000; yours: {r['adam']}")
+    true(r["total"] == 112_000_000_000, f"16 bytes per parameter in total = 112000000000; yours: {r['total']}")
+
+@check("mixed precision: smaller weights, same total")
+def _():
+    r = train_state_bytes(7_000_000_000, "mixed")
+    want = {"weights": 14_000_000_000, "grads": 14_000_000_000, "master": 28_000_000_000,
+            "adam": 56_000_000_000, "total": 112_000_000_000}
+    for k, v in want.items():
+        true(r.get(k) == v, f"mixed {k} should be {v}; yours: {r.get(k)}. Mixed precision adds an fp32 copy of the weights, so the total is still 16 bytes per parameter")
+
+@check("pure bf16: 8 bytes per parameter")
+def _():
+    r = train_state_bytes(7_000_000_000, "bf16")
+    want = {"weights": 14_000_000_000, "grads": 14_000_000_000, "master": 0,
+            "adam": 28_000_000_000, "total": 56_000_000_000}
+    for k, v in want.items():
+        true(r.get(k) == v, f"bf16 {k} should be {v}; yours: {r.get(k)}")
+
+@check("total is the sum of the four, all ints")
+def _():
+    r = train_state_bytes(1_234_567, "mixed")
+    bad = [k for k, v in r.items() if type(v) is not int]
+    true(not bad, f"{bad} are not ints: multiply whole numbers, with no / and no 1e9")
+    true(r["total"] == r["weights"] + r["grads"] + r["master"] + r["adam"], "total should be the sum of the four parts")
+    true(r["total"] == 1_234_567 * 16, f"mixed is 16 bytes per parameter, expected {1_234_567 * 16}; yours: {r['total']}")
+
+@check("an unknown precision raises an error")
+def _():
+    try:
+        r = train_state_bytes(10, "fp8")
+    except (ValueError, KeyError):
+        return
+    raise AssertionError(f"precision='fp8' should raise ValueError, but yours returned {r!r}. Quietly returning a wrong number is more dangerous")
+--- hints
+- The three precisions: fp32 is 4/4/0/8, mixed is 2/2/4/8, bf16 is 2/2/0/4.
+- Each part is `n_params *` its bytes; total is the sum of the four.

@@ -1,27 +1,19 @@
-# imports of the drill file (the checks use them)
-import sys, os
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+"""Day 10 reference: DiT + rectified flow.
 
-"""Day 10 参考答案 —— 注意 DiTBlock 和 Day 4 的 Block 差别有多小。"""
+Loaded as hidden setup after content/ref/day8.py, which provides timestep_embedding (used by MiniDiT).
+Note how little DiTBlock differs from day 4's Block: modulate before each branch, a gate after it,
+and no causal mask in the attention.
+"""
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-DICTATION_DONE = True
-REUSE_CONFIRMED = True
-LOC = {
-    "DDPM 的 q_sample + p_sample_step": 9,
-    "Flow 的 flow_interpolate + 欧拉一步": 3,
-}
 
 
 class SelfAttention(nn.Module):
+    """Day 4's CausalSelfAttention without the causal mask (and so without block_size)."""
+
     def __init__(self, dim, n_head):
         super().__init__()
         self.n_head = n_head
@@ -33,7 +25,7 @@ class SelfAttention(nn.Module):
         hd = C // self.n_head
         q, k, v = self.qkv(x).split(C, dim=-1)
         q, k, v = (t.view(B, T, self.n_head, hd).transpose(1, 2) for t in (q, k, v))
-        o = F.scaled_dot_product_attention(q, k, v)
+        o = F.scaled_dot_product_attention(q, k, v)      # is_causal=False: every patch sees every patch
         return self.proj(o.transpose(1, 2).reshape(B, T, C))
 
 
@@ -76,7 +68,7 @@ class AdaLNModulation(nn.Module):
         super().__init__()
         self.act = nn.SiLU()
         self.lin = nn.Linear(dim, 6 * dim)
-        nn.init.zeros_(self.lin.weight)      # Zero 的来历
+        nn.init.zeros_(self.lin.weight)      # the "Zero" in adaLN-Zero
         nn.init.zeros_(self.lin.bias)
 
     def forward(self, c):
@@ -132,7 +124,6 @@ class MiniDiT(nn.Module):
         self.in_ch, self.img, self.patch, self.dim = in_ch, img, patch, dim
         pdim = patch * patch * in_ch
         self.embed = nn.Linear(pdim, dim)
-        n = (img // patch) ** 2
         self.register_buffer("pos", pos_embed_2d(dim, img // patch, img // patch))
         self.t_mlp = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.blocks = nn.ModuleList([DiTBlock(dim, n_head) for _ in range(n_layer)])
@@ -155,19 +146,21 @@ class MiniDiT(nn.Module):
 
 
 class DiTBlockBuggy(nn.Module):
+    """The fixed version of the buggy block (the answer to the find-the-bugs item)."""
+
     def __init__(self, dim, n_head):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)   # 修 4
-        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)   # 修 4
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)   # fix 4
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)   # fix 4
         self.attn = SelfAttention(dim, n_head)
         self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
         self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
-        nn.init.zeros_(self.modulation[1].weight)                  # 修 1
+        nn.init.zeros_(self.modulation[1].weight)                  # fix 1
         nn.init.zeros_(self.modulation[1].bias)
 
     def forward(self, x, c):
         s1, sc1, g1, s2, sc2, g2 = self.modulation(c).chunk(6, dim=-1)
-        # 修 2: 补上 gate；修 3: scale 要写成 (1 + scale)
+        # fix 2: add the gate; fix 3: scale must be (1 + scale)
         x = x + g1.unsqueeze(1) * self.attn(
             self.norm1(x) * (1 + sc1.unsqueeze(1)) + s1.unsqueeze(1))
         x = x + g2.unsqueeze(1) * self.mlp(

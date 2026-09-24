@@ -1,11 +1,4 @@
-# imports of the drill file (the checks use them)
-import sys, os
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-"""Day 06 参考答案。"""
+"""Day 6 reference code: the hidden setup of the exercises (each item removes the names the learner writes)."""
 import math
 
 import torch

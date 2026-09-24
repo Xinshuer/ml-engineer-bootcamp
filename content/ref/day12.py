@@ -1,11 +1,9 @@
-# imports of the drill file (the checks use them)
-import sys, os
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+"""Day 12 reference implementations (TTS: text -> mel -> waveform).
 
-"""Day 12 参考答案。"""
+Loaded as hidden setup by the day-12 items; each item removes the names the learner writes (its `targets:`),
+so the other functions here stay available (e.g. d12-07 calls duration_from_log, d12-11 calls
+make_decoder_inputs / masked_mel_loss / duration_loss).
+"""
 import math
 
 import torch
@@ -83,7 +81,7 @@ def alignment_matrix(durations, n_frames):
 
 @torch.no_grad()
 def ar_decode(step_fn, n_mels, max_steps, stop_thresh=0.5):
-    prev = torch.zeros(1, 1, n_mels)          # go 帧
+    prev = torch.zeros(1, 1, n_mels)          # go frame
     frames = []
     for _ in range(max_steps):
         mel_next, stop_logit = step_fn(prev)
@@ -96,8 +94,8 @@ def ar_decode(step_fn, n_mels, max_steps, stop_thresh=0.5):
 
 def tts_step_buggy(mel, lengths, log_dur_pred, durations, dur_mask):
     T = mel.size(1)
-    dec_in = make_decoder_inputs(mel)                          # 修 1
+    dec_in = make_decoder_inputs(mel)                          # fix 1
     mask = (torch.arange(T)[None] < lengths[:, None]).long()
-    mel_l = masked_mel_loss(torch.zeros_like(mel), mel, mask)  # 修 2
-    dur_l = duration_loss(log_dur_pred, durations, dur_mask)   # 修 3
+    mel_l = masked_mel_loss(torch.zeros_like(mel), mel, mask)  # fix 2
+    dur_l = duration_loss(log_dur_pred, durations, dur_mask)   # fix 3
     return dec_in, mask, mel_l, dur_l

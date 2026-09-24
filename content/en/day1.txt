@@ -1,0 +1,1329 @@
+@@ day 1
+title: Only the 20% of Python that model code uses
+part: Foundations
+hours: 3–4 hours
+--- goal
+Read and write the Python that shows up in model code every day: functions and return, slices and loops, counting with a dict, classes and self, inheritance and super(), @property, dataclass configs, decorators, f-string logs and pathlib paths. When you see an error, you know which line to read first.
+--- checklist
+- Read the 8 cards in order; press Run on each example, change one number and run it again
+- Pass every practice exercise (open a hint only after 5 minutes stuck)
+- Exercises where you saw the answer go to Review: redo them from blank tomorrow
+- Finish with the 2 closed-book exercises: write RunningMean and make_xy from blank, without the cards
+
+@@ concept
+title: Functions: return hands the result back
+--- body
+A function is a piece of code with a name. When you define it with `def`, the code inside does not run yet. It runs when you call it: the name followed by parentheses.
+
+`return` does three things:
+
+1. It hands a value back to the caller. After `r = double(5)`, r holds that value.
+2. It ends the function at once. Code below `return` does not run.
+3. A function without `return` gives back `None` ("no value"). Even if it computed the right thing, the result is thrown away.
+
+Parameters can have defaults: with `def power(base, exp=2)`, calling it without `exp` uses 2. You can also pass by name: `power(3, exp=4)`. That is clearer, and model code does it everywhere.
+
+To return several values, write `return lo, hi`. That returns a tuple, and the caller can split it: `lo, hi = min_max(xs)`. This is called unpacking. You will see it all the time: `logits, loss = model(x, y)`.
+
+### Reading an error: start at the last line
+
+The last line of an error message (a traceback) says what went wrong. The lines above it say where. The line that failed is often just the victim; the cause is earlier. The most common ones:
+
+- `TypeError: ... 'NoneType' ...`: you computed with `None`. First question: which function gave you this value, and does it have a `return`?
+- `NameError: name 'x' is not defined`: a typo, or you used a local variable from another function.
+- `AttributeError: 'X' object has no attribute 'y'`: the object has no y. Usual causes: you forgot `self.y = ...` in `__init__`, or you forgot `super().__init__()`.
+- `KeyError`: the dict has no such key. `IndexError`: the index is out of range (the largest index is `len(xs) - 1`).
+--- code
+def double(n):
+    return n * 2
+
+def no_return(n):
+    n * 2              # computed, but no return: the result is thrown away
+
+def min_max(xs):
+    return min(xs), max(xs)
+
+print(double(5))
+print(no_return(5))
+lo, hi = min_max([3, 1, 4, 1, 5])
+print(lo, hi)
+
+try:
+    no_return(5) * 3   # multiplying None by 3
+except TypeError as e:
+    print("TypeError:", e)
+
+@@ concept
+title: Slices and loops: the start is in, the end is out
+--- body
+`xs[a:b]` takes the elements at indexes a, a+1, …, b-1: **the start is included, the end is not**, so you get b-a elements. Indexes start at 0, and `xs[-1]` is the last element. `xs[:k]` and `xs[k:]` split a list into two halves that do not overlap. Strings slice the same way, and a slice of a string is a string.
+
+`range(start, stop, step)` follows the same rule: `range(0, 10, 3)` gives 0, 3, 6, 9.
+
+`for x in xs:` takes the elements out one at a time. For each one, it runs the indented code below from top to bottom. Common patterns:
+
+- Accumulate: start with `total = 0`, then `total += x` inside the loop. Summing up the loss during training works like this.
+- Comprehension: `[x * x for x in xs]` builds a new list in one line. To read it, look at the `for` in the middle first, then at the front: what each round produces.
+- `enumerate(xs)` gives the index and the element together. `zip(a, b)` pairs two lists by position and stops at the shorter one, so `zip(xs, xs[1:])` gives every pair of neighbours.
+- `continue` skips the rest of this round and moves to the next one; `break` ends the whole loop at once.
+
+### Next-token training data is two slices
+
+`x = data[i:i + T]` and `y = data[i + 1:i + 1 + T]`. Each element of y is the element that comes right after the one at the same position in x. Get this `+ 1` wrong and the model learns to copy the answer, with no error at all.
+--- code
+xs = [10, 20, 30, 40, 50]
+print(xs[1:3], xs[:2], xs[2:], xs[-1])
+print("abcdef"[1:4])
+print(list(range(0, 10, 3)))
+
+total = 0
+for x in xs:
+    total += x
+print("total =", total)
+print([x // 10 for x in xs])
+
+for i, (a, b) in enumerate(zip(xs, xs[1:])):
+    print(i, a, b, b - a)
+
+data = list(range(10))
+i, T = 3, 4
+print("x =", data[i:i + T])
+print("y =", data[i + 1:i + 1 + T])
+
+@@ concept
+title: dict: counting and sorting
+--- body
+A list uses number indexes (`xs[0]`). A dict uses keys that you choose: `cfg["lr"]`. If the key is missing, `cfg["x"]` raises `KeyError`, while `cfg.get("x", 0)` returns the default you gave, 0.
+
+The standard way to count. Read it as "take c's count so far (0 if there is none), add 1, store it back":
+
+```
+counts[c] = counts.get(c, 0) + 1
+```
+
+`d.items()` gives every `(key, value)` pair. `sorted(things, key=function)` sorts by the value the function computes, smallest first, and returns a new list:
+
+- `lambda kv: ...` is a small function without a name. Here kv is one `(key, value)` pair, and `kv[1]` is the value.
+- Largest first: negate inside the key, `key=lambda kv: -kv[1]`.
+- "By count, largest first; if counts tie, by key, smallest first": let the key return a tuple, `(-kv[1], kv[0])`. Tuples compare their first elements first, and only look at the second element on a tie.
+
+A dict comprehension works like a list comprehension: `{c: i for i, c in enumerate(chars)}`. On day 3 the tokenizer uses exactly this to turn characters into numbers.
+--- code
+counts = {}
+for c in "banana":
+    counts[c] = counts.get(c, 0) + 1
+print(counts)
+print(counts.get("z", 0))
+
+for k, v in counts.items():
+    print(k, v)
+
+print(sorted(counts.items(), key=lambda kv: -kv[1]))
+print(sorted([("x", 1), ("r", 2), ("b", 2)], key=lambda kv: (-kv[1], kv[0])))
+
+stoi = {c: i for i, c in enumerate("abc")}
+print(stoi)
+
+@@ concept
+title: Assignment is a label, not a copy
+--- body
+In Python, `b = a` never copies data. It sticks a second label, b, on the thing a points to. If that thing can be changed in place (a list, a dict, and later tensors and models), changing it through b also changes what you see through a. Passing a list to a function works the same way: the function gets the same list, not a copy.
+
+- To really copy, say so: `a.copy()` or `list(a)`.
+- `==` asks "are the values equal?"; `is` asks "is it the same object?".
+- Numbers, strings and tuples cannot be changed in place. `n = n + 1` makes n point to a new number, and no other name is affected, so there is nothing to worry about.
+
+### The trap that follows: mutable default arguments
+
+In `def f(x, acc=[])`, that `[]` is created **when the function is defined**, and only once. Every later call uses the same list, so results from one call leak into the next.
+
+The fix: use `None` as the default and create the list inside the function (`if acc is None: acc = []`), or do not make it a parameter at all and write `acc = []` as the function's first line.
+
+A list field in a dataclass must be `field(default_factory=list)` for the same reason: each object gets a fresh list.
+--- code
+a = [1, 2, 3]
+b = a
+b.append(4)
+print("a =", a, "| a is b:", a is b)
+
+c = a.copy()
+c.append(5)
+print("a =", a, "| c =", c, "| a is c:", a is c)
+
+def bad(x, acc=[]):
+    acc.append(x)
+    return acc
+
+print(bad(1))
+print(bad(2))      # you expected [2]
+
+def good(x, acc=None):
+    if acc is None:
+        acc = []   # a new list on every call
+    acc.append(x)
+    return acc
+
+print(good(1))
+print(good(2))
+
+@@ concept
+title: class: self, __init__ and __call__
+--- body
+A class is a blueprint. It packs some data together with the functions that work on that data. The things built from the blueprint are instances (objects). You can build many, and they do not affect each other.
+
+- `__init__(self, ...)`: Python calls it automatically when an object is built. Use it to attach the starting data to the object. It has no `return`.
+- `self` is the object to the left of the dot. When you write `a.add(5)`, Python actually runs `Counter.add(a, 5)`. That is why a method's first parameter is `self`, and why you do not pass it when you call the method.
+- `self.n = 0` attaches data to the object, so other methods and outside code can read it. A variable without `self.` inside a method is local and disappears when the method ends. In one sentence: **if data must outlive the function, attach it to self.**
+- `__call__(self, ...)`: define it and the object can be called like a function. `obj(x)` is the same as `obj.__call__(x)`.
+
+Methods with two underscores on each side ("dunder" methods) are the ones Python calls for you at specific moments.
+
+In PyTorch, `y = model(x)` works because `nn.Module` defines `__call__`, which then calls the `forward` you wrote. So always write `model(x)`, never `model.forward(x)` (that skips the hooks PyTorch has registered).
+--- code
+class Scaler:
+    def __init__(self, factor):
+        self.factor = factor      # attached to self: every later method can use it
+        self.calls = 0
+
+    def __call__(self, x):
+        self.calls += 1
+        return x * self.factor
+
+double = Scaler(2)
+triple = Scaler(3)
+print(double(21), triple(21))
+print(double(1), double.calls, triple.calls)
+print(Scaler.__call__(double, 5))  # exactly the same as double(5)
+
+class Tiny(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(4, 2)
+
+    def forward(self, x):
+        return self.fc(x)
+
+m = Tiny()
+y = m(torch.ones(3, 4))            # nn.Module's __call__ -> your forward
+print(y.shape)
+
+@@ concept
+title: Inheritance, super() and @property
+--- body
+Inheritance: `class B(A):` means B starts with a copy of all of A's methods, then adds some and changes some. A method in the child with the same name replaces the parent's.
+
+`super()` means "the parent class". Two standard uses:
+
+- If the child writes its own `__init__`, the parent's `__init__` is replaced and does not run by itself. So the first line of the child's `__init__` is `super().__init__(...)`: let the parent attach its attributes first, then add your own.
+- If the child rewrites a method but wants to keep the parent's behaviour, call `super().method_name(...)` inside it first, then add your own steps.
+
+The first line of every `nn.Module` subclass's `__init__` is `super().__init__()`. Forget it, and assigning `self.fc = nn.Linear(...)` raises `AttributeError: cannot assign module before Module.__init__() call`.
+
+### @property: a method you read without parentheses
+
+Put `@property` on the line above a method, and you read it without parentheses: `m.left` instead of `m.left()`. It suits values computed from other attributes: every read computes it fresh, so it always matches the data and you can never forget to update it.
+
+A property is read-only by default. `m.left = 1` raises an error (`property 'left' of ... object has no setter`). If a child class needs a different formula, it defines a new `@property` with the same name.
+--- code
+class Meter:
+    def __init__(self, total):
+        self.total = total
+        self.used = 0
+
+    def use(self, k):
+        self.used += k
+
+    @property
+    def left(self):                # computed fresh on every read
+        return self.total - self.used
+
+class LoggedMeter(Meter):
+    def __init__(self, total):
+        super().__init__(total)    # let the parent attach total and used first
+        self.history = []
+
+    def use(self, k):
+        super().use(k)             # keep the parent's behaviour
+        self.history.append(k)     # then add our own step
+
+m = LoggedMeter(10)
+m.use(3)
+m.use(4)
+print(m.used, m.left, m.history)
+
+class Forgot(Meter):
+    def __init__(self, total):
+        self.history = []          # forgot super().__init__(total)
+
+try:
+    Forgot(10).left
+except AttributeError as e:
+    print("AttributeError:", e)
+
+class BadNet(nn.Module):
+    def __init__(self):
+        self.fc = nn.Linear(2, 2)  # forgot super().__init__()
+
+try:
+    BadNet()
+except AttributeError as e:
+    print("AttributeError:", e)
+
+@@ concept
+title: The shell of a training script: dataclass, f-strings, pathlib
+--- body
+Open any training project and the outer layer looks the same: a config object, a log line every few steps, and checkpoints (saved copies of the model's weights) written to some folder.
+
+### dataclass: the config object
+
+Put `@dataclass` above a class and write only "field_name: type = default". The `__init__`, the printed form and comparisons are generated for you. To change a value, pass it by name: `Cfg(lr=1e-3)`. You can still write methods in a dataclass. The type after the colon is only for humans; Python does not check it.
+
+A mutable default such as a list or dict cannot be written as `= []` (dataclass raises an error right away). Write `field(default_factory=list)` so each object builds its own new list (the card "Assignment is a label, not a copy" explains why).
+
+### f-strings: logs
+
+Put `f` in front of a string and you can place variables and expressions inside `{}`. After a colon comes the format:
+
+- `{step:5d}`: an integer, right-aligned, width 5
+- `{loss:.4f}`: 4 decimal places
+- `{lr:.2e}`: scientific notation with 2 decimals (`3e-4` prints as `3.00e-04`)
+- `{step:06d}`: width 6, padded with zeros
+- `{dt * 1000:.1f}`: compute first, then format
+
+### pathlib: paths
+
+`Path("runs") / "gpt-tiny" / "ckpt.pt"` joins paths with `/`, and it is right on both Windows and Linux. `p.name` is the file name and `p.parent` is its folder. `d.mkdir(parents=True, exist_ok=True)` creates the folder: `parents=True` also creates missing parent folders, and `exist_ok=True` means no error if it already exists.
+
+Pad the step number in file names with zeros (`ckpt_000009.pt`) so that sorting by name gives the right order.
+--- code
+from dataclasses import dataclass, field
+from pathlib import Path
+
+@dataclass
+class Cfg:
+    lr: float = 3e-4
+    n_layer: int = 6
+    tags: list = field(default_factory=list)
+
+a = Cfg()
+b = Cfg(lr=1e-3)
+a.tags.append("baseline")
+print(a)
+print(b)
+
+step, loss, lr, dt = 7, 2.718281, 6e-4, 0.0421
+print(f"[{step:5d}] [{loss:.4f}] [{lr:.2e}] [{dt * 1000:.1f}ms] [{step:06d}]")
+
+p = Path("runs") / "gpt-tiny" / "last.pt"
+print(p.name, p.parent.name, p.suffix)
+print(sorted(f"ckpt_{s}.pt" for s in [9, 10, 100]))
+print(sorted(f"ckpt_{s:06d}.pt" for s in [9, 10, 100]))
+
+@@ concept
+title: *args / **kwargs and decorators
+--- body
+`def f(*args, **kwargs)` accepts any arguments. Arguments passed by position are collected in `args` (a tuple); arguments passed by name are collected in `kwargs` (a dict). The other way round, stars in a call unpack: `g(*args, **kwargs)` hands them on to another function unchanged.
+
+A decorator is a function that takes a function and returns a new function.
+
+```
+@deco
+def f(x): ...
+```
+
+This is the same as defining `f` and then running `f = deco(f)`.
+
+The standard shape of a decorator: inside it, define `wrapper(*args, **kwargs)`. Do the extra work first, then `return fn(*args, **kwargs)` to pass everything on, and finally `return wrapper`. Put `@functools.wraps(fn)` above the wrapper so the new function keeps the original name (`__name__`); otherwise its name becomes `wrapper`.
+
+Decorators you will see in model code every day: `@dataclass`, `@property`, and `@torch.no_grad()` (do not record gradient information inside this function; used for inference).
+--- code
+import functools
+
+def show_all(*args, **kwargs):
+    print("args =", args, "| kwargs =", kwargs)
+
+show_all(1, 2, lr=0.01)
+
+def power(base, exp):
+    return base ** exp
+
+print(power(*(2, 10)), power(**{"base": 3, "exp": 4}))
+
+def traced(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        print("calling", fn.__name__, args, kwargs)
+        return fn(*args, **kwargs)
+    return wrapper
+
+@traced
+def add(a, b):
+    return a + b
+
+print(add(1, b=2))
+print(add.__name__)
+
+def no_wraps(fn):
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+    return wrapper
+
+@no_wraps
+def mul(a, b):
+    return a * b
+
+print(mul.__name__)   # the name is lost
+
+@@ item d1-01
+type: code
+title: A dataclass as the config
+level: 2
+cards: The shell of a training script: dataclass, f-strings, pathlib; Assignment is a label, not a copy
+targets: TrainConfig
+ref: day1
+--- context
+Almost every open-source training script starts with a config class: learning rate, batch size and number of layers all live there. With a dataclass you only list the fields and their defaults, and printing it, changing one value by name and saving it into a checkpoint are all easy.
+--- prompt
+Define a dataclass `TrainConfig` with these fields and defaults:
+
+- `lr: float = 3e-4`
+- `batch_size: int = 32`
+- `n_layer: int = 6`
+- `device: str = "cuda"`
+- `betas: tuple = (0.9, 0.95)`
+- `tags: list`, an empty list by default. You cannot write `= []` (dataclass raises an error). Write `field(default_factory=list)` instead, so every instance gets its own new list.
+
+Then add a method `scaled_lr(self, k)` that returns `self.lr * k`.
+
+```
+TrainConfig().batch_size          ->  32
+TrainConfig(lr=1e-3).scaled_lr(2) ->  0.002
+```
+--- starter
+from dataclasses import dataclass, field
+
+@dataclass
+class TrainConfig:
+    lr: float = 3e-4
+    # continue with batch_size, n_layer, device, betas, tags
+    # then add the method scaled_lr(self, k)
+--- solution
+from dataclasses import dataclass, field
+
+@dataclass
+class TrainConfig:
+    lr: float = 3e-4
+    batch_size: int = 32
+    n_layer: int = 6
+    device: str = "cuda"
+    betas: tuple = (0.9, 0.95)
+    tags: list = field(default_factory=list)   # a mutable default needs default_factory
+
+    def scaled_lr(self, k):
+        return self.lr * k
+--- tests
+@check("all defaults are right")
+def t01a():
+    c = TrainConfig()
+    true(c.lr == 3e-4, f"lr should default to 3e-4, yours: {c.lr!r}")
+    true(c.batch_size == 32 and c.n_layer == 6, f"batch_size / n_layer should be 32 / 6, yours: {c.batch_size!r} / {c.n_layer!r}")
+    true(c.device == "cuda", f"device should default to 'cuda', yours: {c.device!r}")
+    true(c.betas == (0.9, 0.95), f"betas should default to (0.9, 0.95), yours: {c.betas!r}")
+
+@check("two instances do not share one tags list")
+def t01b():
+    a, b = TrainConfig(), TrainConfig()
+    a.tags.append("x")
+    true(b.tags == [], "the two instances share the same list: this is exactly why you need field(default_factory=list)")
+
+@check("scaled_lr(k) returns lr * k")
+def t01c():
+    got = TrainConfig(lr=1e-3).scaled_lr(2)
+    true(close(got, 2e-3), f"TrainConfig(lr=1e-3).scaled_lr(2) should be 0.002, yours: {got!r}")
+--- hints
+- One field per line: `name: type = default`. Copy the shape of the `lr` line.
+- The list field is `tags: list = field(default_factory=list)`; `field` is already imported on the first line.
+- Write the method as in any class, indented inside the class: `def scaled_lr(self, k):`, and on the next line `return self.lr * k`.
+
+@@ item d1-02
+type: code
+title: Slicing: chunk
+level: 2
+cards: Slices and loops: the start is in, the end is out
+targets: chunk
+ref: day1
+--- context
+To train a language model, a long stream of tokens is cut into samples of equal length. Pieces of different lengths cannot be stacked into one batch, so the short piece at the end is usually dropped.
+--- prompt
+Write `chunk(seq, n)`: cut the sequence `seq`, in order, into pieces of `n` elements each and return a list of the pieces. Drop the last piece if it has fewer than `n` elements.
+
+```
+chunk([0, 1, 2, 3, 4, 5, 6], 3)  ->  [[0, 1, 2], [3, 4, 5]]    # 6 alone is not 3 elements: dropped
+chunk("abcdefg", 2)              ->  ["ab", "cd", "ef"]
+chunk([], 3)                     ->  []
+```
+
+Use slices to take each piece, so that it works for lists and for strings (a slice of a string is a string). Return a real list.
+--- starter
+def chunk(seq, n):
+    """chunk([0, 1, 2, 3, 4, 5, 6], 3) -> [[0, 1, 2], [3, 4, 5]] (the last 6 is not a full piece of 3: dropped)"""
+    raise todo()
+--- solution
+def chunk(seq, n):
+    return [seq[i:i + n] for i in range(0, len(seq) - n + 1, n)]
+--- tests
+@check("list: pieces of n, the short piece at the end is dropped")
+def t02a():
+    got = chunk(list(range(7)), 3)
+    true(got == [[0, 1, 2], [3, 4, 5]], f"chunk(list(range(7)), 3) should be [[0, 1, 2], [3, 4, 5]], yours: {got!r}")
+    got = chunk(list(range(6)), 3)
+    true(got == [[0, 1, 2], [3, 4, 5]], f"chunk(list(range(6)), 3) should be [[0, 1, 2], [3, 4, 5]], yours: {got!r}")
+    got = chunk([], 3)
+    true(got == [], f"chunk([], 3) should be [], yours: {got!r}")
+
+@check("strings work too")
+def t02b():
+    got = chunk("abcdefg", 2)
+    true(got == ["ab", "cd", "ef"], f"it must work for strings too (slicing works on any sequence): chunk('abcdefg', 2) should be ['ab', 'cd', 'ef'], yours: {got!r}")
+--- hints
+- The pieces start at 0, n, 2n, …; `range(0, len(seq), n)` gives you those starts one by one. The piece that starts at `i` is `seq[i:i + n]`.
+- The last piece may be short: check `len(piece) == n` before keeping it, or let the range stop at `len(seq) - n + 1` so every start has n elements after it.
+- With a loop: `out = []`, then for each start take `piece = seq[i:i + n]`, `out.append(piece)` only if it is full, and finally `return out`.
+
+@@ item d1-03
+type: code
+title: Next-token prediction: shifting x and y
+level: 1
+cards: Slices and loops: the start is in, the end is out
+targets: make_xy
+ref: day1
+--- context
+A language model is trained to predict the next token. The input x and the answer y come from the same stretch of data; y is just shifted one step to the right. Get that shift wrong and the model copies the answer: the loss drops close to 0, it learns nothing, and no error is raised.
+--- prompt
+Write `make_xy(data, i, block_size)`: take one training sample starting at position `i` and return two lists `(x, y)`:
+
+- `x = data[i : i + block_size]`
+- `y` has the same length as `x` but is shifted one step to the right: each element of `y` is the element that comes right after the one at the same position in `x`.
+
+```
+data = list(range(20))
+make_xy(data, 3, 5)  ->  ([3, 4, 5, 6, 7], [4, 5, 6, 7, 8])
+```
+
+This is the plain Python version. On day 3, `get_batch` does the same thing with tensors for a whole batch at once.
+--- starter
+def make_xy(data, i, block_size):
+    """Take one training sample starting at i; return (x, y), two lists of length block_size.
+    x = data[i : i+block_size]
+    y = x shifted one step to the right (the "next" element at each position)
+    """
+    raise todo()
+--- solution
+def make_xy(data, i, block_size):
+    x = data[i:i + block_size]
+    y = data[i + 1:i + 1 + block_size]
+    return x, y
+--- tests
+@check("x is block_size elements starting at i")
+def t03a():
+    x, y = make_xy(list(range(20)), 3, 5)
+    true(x == [3, 4, 5, 6, 7], f"x should be [3, 4, 5, 6, 7], yours: {x}")
+
+@check("y is x shifted by one, same length")
+def t03b():
+    x, y = make_xy(list(range(20)), 3, 5)
+    true(y == [4, 5, 6, 7, 8], f"y should be [4, 5, 6, 7, 8], yours: {y}  (y is x shifted one step to the right, not x itself)")
+    true(len(x) == len(y) == 5, f"x and y should both have 5 elements, yours: {len(x)} and {len(y)}")
+--- hints
+- Write x exactly as the task says: `x = data[i:i + block_size]`.
+- y starts one later and ends one later than x: `data[i + 1 : ...]`.
+- Finish with `return x, y` to return both values.
+
+@@ item d1-04
+type: code
+title: Counting and sorting with a dict
+level: 2
+cards: dict: counting and sorting; Slices and loops: the start is in, the end is out
+targets: char_freq, top_k
+ref: day1
+--- context
+The first step of building a tokenizer is counting how often each character appears and sorting by count to decide what goes into the vocabulary. Each round of a BPE tokenizer is the same idea: count, then pick the most frequent pair.
+--- prompt
+Write two functions:
+
+1. `char_freq(text)`: count how many times each character appears in the string `text` and return a dict `{character: count}`. Do not use `collections.Counter`; count with a plain dict.
+2. `top_k(freq, k)`: take a dict like that, sort by count from high to low, and return a list of the first `k` `(character, count)` tuples. When counts tie, the smaller character comes first (`"b"` before `"r"`).
+
+```
+f = char_freq("abracadabra")   ->  {"a": 5, "b": 2, "r": 2, "c": 1, "d": 1}
+top_k(f, 3)                    ->  [("a", 5), ("b", 2), ("r", 2)]
+```
+--- starter
+def char_freq(text):
+    """Count how often each character appears; return a dict. No collections.Counter."""
+    raise todo()
+
+def top_k(freq, k):
+    """The first k (character, count) pairs, highest count first; ties sorted by character."""
+    raise todo()
+--- solution
+def char_freq(text):
+    f = {}
+    for ch in text:
+        f[ch] = f.get(ch, 0) + 1
+    return f
+
+def top_k(freq, k):
+    return sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[:k]
+--- tests
+@check("char_freq counts every character")
+def t04a():
+    f = char_freq("abracadabra")
+    want = {"a": 5, "b": 2, "r": 2, "c": 1, "d": 1}
+    true(f == want, f"char_freq('abracadabra') should be {want}, yours: {f}")
+
+@check("top_k: highest count first, ties by character")
+def t04b():
+    f = {"a": 5, "b": 2, "r": 2, "c": 1, "d": 1}
+    got = top_k(f, 3)
+    want = [("a", 5), ("b", 2), ("r", 2)]
+    true(got == want, f"top_k(f, 3) should be {want}, yours: {got}")
+--- hints
+- Counting: start with `f = {}`; for each character `ch` in text write `f[ch] = f.get(ch, 0) + 1`; finally `return f`.
+- `freq.items()` gives `(character, count)` pairs; `sorted(..., key=...)` sorts by the key's value, smallest first. To put large counts first, negate the count in the key.
+- `key=lambda kv: (-kv[1], kv[0])` sorts by count (largest first), then by character. After sorting, slice `[:k]` to keep the first k.
+
+@@ item d1-05
+type: code
+title: class: __init__ / __call__
+level: 2
+cards: class: self, __init__ and __call__; Inheritance, super() and @property
+targets: RunningMean
+ref: day1
+--- context
+Every training step produces a loss, and what you print is the average over a stretch of steps. A small tool that takes numbers and keeps state is a perfect fit for a class: the sum and the count live on self, and each `m(loss)` call updates them. It is the same mechanism as `model(x)`.
+--- prompt
+Write a class `RunningMean` that computes the average of all the numbers fed to it so far:
+
+- `m = RunningMean()`: when it is new, the count `m.n` is `0` and the average `m.value` is `0.0`.
+- `m(x)`: calling the object like a function records the number `x` (you need `__call__`). The return value is not checked; the reference solution returns the current average.
+- `m.value`: the current average, read **without parentheses**.
+- `m.n`: how many numbers have been recorded.
+- `m.reset()`: clear everything and go back to the "new" state.
+
+```
+m = RunningMean()
+m(1.0); m(3.0)
+m.value   ->  2.0
+m.n       ->  2
+m.reset()
+m.value   ->  0.0
+```
+--- starter
+class RunningMean:
+    def __init__(self):
+        raise todo()
+
+    # still to write: reset, __call__, value
+--- solution
+class RunningMean:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.total = 0.0
+        self.n = 0
+
+    def __call__(self, x):
+        self.total += float(x)
+        self.n += 1
+        return self.value
+
+    @property
+    def value(self):
+        return self.total / self.n if self.n else 0.0
+--- tests
+@check("new: n = 0, value = 0.0")
+def t05a():
+    m = RunningMean()
+    true(not callable(m.value), "value is a normal method: put @property on the line above it so you can read it without parentheses")
+    true(m.value == 0.0 and m.n == 0, f"when new, n should be 0 and value 0.0, yours: n={m.n!r}, value={m.value!r}")
+
+@check("after m(1.0); m(3.0): value = 2.0, n = 2")
+def t05b():
+    m = RunningMean()
+    m(1.0)
+    m(3.0)
+    true(close(m.value, 2.0), f"the average should be 2.0, yours: {m.value}")
+    true(m.n == 2, f"n should be 2, yours: {m.n}")
+
+@check("reset() goes back to the new state")
+def t05c():
+    m = RunningMean()
+    m(1.0)
+    m(3.0)
+    m.reset()
+    true(m.value == 0.0 and m.n == 0, f"after reset(), n should be 0 and value 0.0, yours: n={m.n!r}, value={m.value!r}")
+--- hints
+- Attach what you need to remember to self: the sum `self.total = 0.0` and the count `self.n = 0`. `reset()` does the same thing, so `__init__` can simply call `self.reset()`.
+- In `def __call__(self, x):` add x to `self.total` and add 1 to `self.n`.
+- Write `value` as a method with `@property` above it: return `self.total / self.n`, but return `0.0` when `n` is 0, or you divide by zero.
+
+@@ item d1-06
+type: code
+title: Inheritance and super()
+level: 3
+cards: Inheritance, super() and @property; class: self, __init__ and __call__
+targets: EMAMean
+ref: day1
+--- context
+Every PyTorch model is written by inheriting from `nn.Module`: the parent gives you ready-made features, you change only what you need, and the first line of `__init__` is always `super().__init__()`. This exercise practises the same pattern on a small example.
+--- prompt
+Write a child class `EMAMean(RunningMean)`: an exponential moving average (EMA). Newer numbers get more weight; training logs often use it to smooth a noisy loss curve.
+
+The parent `RunningMean` is the previous exercise's reference solution. It is already in the hidden setup, so just inherit from it (this works even if you have not finished the previous exercise).
+
+- `EMAMean(decay=0.9)`: the first thing `__init__` does is call `super().__init__()`, so that the parent creates `n`; then store `decay` on self.
+- `e(x)`: on the first call the EMA value simply becomes `x`. After that, each call does `new = decay * old + (1 - decay) * x`. Each call adds 1 to `n`, just like the parent.
+- `e.value`: the current EMA value; `0.0` before any number has been fed.
+
+```
+e = EMAMean(decay=0.5)
+e(1.0)     # value = 1.0 (the first value is x itself)
+e(3.0)     # value = 0.5 * 1.0 + 0.5 * 3.0 = 2.0
+e.n   ->  2
+```
+
+Careful: the parent's `value` is a `@property`, so it can be read but not assigned (`self.value = ...` raises an error). Keep the EMA value in another attribute (for example `self._v`) and override the `value` property in the child to return it.
+
+Bonus (not checked): override `reset()`: call `super().reset()` first, then set `self._v` back to `None`.
+--- starter
+class EMAMean(RunningMean):
+    pass
+--- solution
+class EMAMean(RunningMean):
+    def __init__(self, decay=0.9):
+        super().__init__()
+        self.decay = decay
+        self._v = None
+
+    def __call__(self, x):
+        x = float(x)
+        self._v = x if self._v is None else self.decay * self._v + (1 - self.decay) * x
+        self.n += 1
+        return self._v
+
+    @property
+    def value(self):
+        return 0.0 if self._v is None else self._v
+
+    def reset(self):
+        super().reset()
+        self._v = None
+--- tests
+@check("__init__ calls super().__init__()")
+def t06a():
+    e = EMAMean(decay=0.5)
+    true(hasattr(e, "n"), "you forgot super().__init__(), so the parent's n was never created")
+
+@check("first value is x, then decay * old + (1 - decay) * x")
+def t06b():
+    e = EMAMean(decay=0.5)
+    e(1.0)
+    true(close(e.value, 1.0), f"the first value should be x itself (1.0), yours: {e.value}")
+    e(3.0)
+    true(close(e.value, 2.0), f"the second value should be 0.5 * 1.0 + 0.5 * 3.0 = 2.0, yours: {e.value}")
+
+@check("n keeps counting like the parent's")
+def t06c():
+    e = EMAMean(decay=0.5)
+    e(1.0)
+    e(3.0)
+    true(e.n == 2, f"after two calls n should be 2, yours: {e.n} (n is created by the parent's __init__ and goes up by 1 per call)")
+--- hints
+- In `def __init__(self, decay=0.9):` the first line is `super().__init__()`, then `self.decay = decay` and `self._v = None` (None means "nothing fed yet").
+- In `__call__`: if `self._v is None`, set `self._v = x`; otherwise apply the formula. At the end, `self.n += 1`.
+- Override value: under `@property` write `def value(self):` and return `0.0 if self._v is None else self._v`.
+
+@@ item d1-07
+type: code
+title: @property
+level: 1
+cards: Inheritance, super() and @property
+targets: Budget
+ref: day1
+--- context
+Training code is full of values computed from other values: how far training has got, whether it is time to stop. As a @property they read like plain attributes, but they are computed fresh on every read, so they always match the data and you can never forget to update them.
+--- prompt
+Add two properties (read-only attributes computed on every read) to the `Budget` class below:
+
+- `progress`: returns `step / total_steps`
+- `done`: returns `step >= total_steps` (`True` or `False`)
+
+They are attributes, so you read them without parentheses:
+
+```
+b = Budget(100, 25)
+b.progress   ->  0.25
+b.done       ->  False
+b.step = 100
+b.done       ->  True     # step changed, and done follows automatically
+```
+--- starter
+class Budget:
+    def __init__(self, total_steps, step=0):
+        self.total_steps = total_steps
+        self.step = step
+
+    # add the two properties progress and done here
+--- solution
+class Budget:
+    def __init__(self, total_steps, step=0):
+        self.total_steps = total_steps
+        self.step = step
+
+    @property
+    def progress(self):
+        return self.step / self.total_steps
+
+    @property
+    def done(self):
+        return self.step >= self.total_steps
+--- tests
+@check("progress is an attribute equal to step / total_steps")
+def t07a():
+    b = Budget(100, 25)
+    true(not callable(b.progress), "progress is a normal method: put @property on the line above it so you read it without parentheses")
+    true(close(b.progress, 0.25), f"Budget(100, 25).progress should be 0.25, yours: {b.progress}")
+
+@check("done follows step")
+def t07b():
+    b = Budget(100, 25)
+    true(b.done is False, f"with step=25 and total_steps=100, done should be False, yours: {b.done!r}")
+    b.step = 100
+    true(b.done is True, f"after setting step to 100, done should be True, yours: {b.done!r} (compute it on every read; do not compute it once in __init__ and store it)")
+--- hints
+- First write a normal method `def progress(self): return self.step / self.total_steps`, then put `@property` on the line above it.
+- `done` works the same way. The comparison `self.step >= self.total_steps` already is True or False, so return it directly; no `if` needed.
+
+@@ item d1-08
+type: code
+title: *args / **kwargs and a decorator
+level: 3
+cards: *args / **kwargs and decorators
+targets: logged
+ref: day1
+--- context
+Model code is full of lines starting with @, like `@torch.no_grad()` and `@dataclass`. They are decorators: they take a function and return a wrapped version of it. Write one yourself once and no decorator will scare you again. Passing arguments on unchanged with `*args, **kwargs` is a pattern you will meet over and over.
+--- prompt
+Write a decorator `logged(fn)`. Every time a decorated function is called, it must:
+
+1. First append the tuple `(function name, args, kwargs)` to the global list `CALLS`. `CALLS = []` already exists in the hidden setup; just use it.
+2. Then call the original function with the same arguments and return its result unchanged.
+
+It must work for functions with any parameters, and the decorated function must keep its name (`add.__name__` is still `"add"`).
+
+```
+@logged
+def add(a, b, scale=1):
+    return (a + b) * scale
+
+add(1, 2)             ->  3     CALLS gets ("add", (1, 2), {})
+add(1, 2, scale=10)   ->  30    CALLS gets ("add", (1, 2), {"scale": 10})
+```
+--- starter
+import functools
+
+def logged(fn):
+    """Decorator: on each call, append (name, args, kwargs) to CALLS, then call fn unchanged and return its result."""
+    raise todo()
+--- solution
+import functools
+
+def logged(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        CALLS.append((fn.__name__, args, kwargs))
+        return fn(*args, **kwargs)
+    return wrapper
+--- tests
+@check("returns the same result as the original")
+def t08a():
+    @logged
+    def add(a, b, scale=1):
+        return (a + b) * scale
+
+    got = add(1, 2)
+    true(got == 3, f"add(1, 2) should return 3, yours: {got!r} (does the wrapper return fn(*args, **kwargs)?)")
+    got = add(1, 2, scale=10)
+    true(got == 30, f"add(1, 2, scale=10) should return 30, yours: {got!r} (arguments passed by name must be passed on too: **kwargs)")
+
+@check("CALLS records (name, args, kwargs) in order")
+def t08b():
+    CALLS.clear()
+
+    @logged
+    def add(a, b, scale=1):
+        return (a + b) * scale
+
+    add(1, 2)
+    add(1, 2, scale=10)
+    true(CALLS == [("add", (1, 2), {}), ("add", (1, 2), {"scale": 10})], f"wrong records: {CALLS}")
+
+@check("the decorated function is still called add")
+def t08c():
+    @logged
+    def add(a, b, scale=1):
+        return (a + b) * scale
+
+    true(add.__name__ == "add", f"after decorating, the function is called {add.__name__!r}: put @functools.wraps(fn) above the wrapper")
+--- hints
+- The shape: inside `logged`, define a function `wrapper`, and finish with `return wrapper`. `@logged` means `add = logged(add)`, so calling add afterwards calls wrapper.
+- `def wrapper(*args, **kwargs):` accepts any arguments. Inside, first `CALLS.append((fn.__name__, args, kwargs))`, then `return fn(*args, **kwargs)`.
+- Put `@functools.wraps(fn)` on the line above `def wrapper` and the name is kept.
+
+@@ item d1-09
+type: code
+title: Formatting with f-strings
+level: 1
+cards: The shell of a training script: dataclass, f-strings, pathlib
+targets: log_line
+ref: day1
+--- context
+During training you print a log line every few dozen steps, and you want to see at a glance whether the loss is going down and how slow each step is. Only when the numbers are aligned and have a fixed number of digits can you see the trend in lines stacked on top of each other.
+--- prompt
+Write `log_line(step, loss, lr, dt)` that **returns** (not prints) a string like this:
+
+```
+step  1200 | loss 1.4832 | lr 3.00e-04 | 125.3ms
+```
+
+Rules:
+
+- `step`: an integer, right-aligned, width 5 (1200 has 4 digits, so one space goes in front)
+- `loss`: 4 decimal places
+- `lr`: scientific notation with 2 decimals
+- `dt`: given in seconds; convert it to milliseconds (times 1000), keep 1 decimal and put `ms` right after it
+- the parts are separated by ` | ` (one space on each side of the bar)
+
+`log_line(1200, 1.48321, 3e-4, 0.12534)` must match the line above exactly.
+--- starter
+def log_line(step, loss, lr, dt):
+    """Return a string like  step  1200 | loss 1.4832 | lr 3.00e-04 | 125.3ms"""
+    raise todo()
+--- solution
+def log_line(step, loss, lr, dt):
+    return f"step {step:5d} | loss {loss:.4f} | lr {lr:.2e} | {dt * 1000:.1f}ms"
+--- tests
+@check("the log line matches exactly")
+def t09():
+    got = log_line(1200, 1.48321, 3e-4, 0.12534)
+    want = "step  1200 | loss 1.4832 | lr 3.00e-04 | 125.3ms"
+    true(got == want, f"\n       yours:    {got!r}\n       expected: {want!r}")
+--- hints
+- The format goes after a colon inside `{}`: `{step:5d}` is an integer of width 5, `{loss:.4f}` has 4 decimals, `{lr:.2e}` is scientific notation.
+- You can compute inside `{}` before formatting: `{dt * 1000:.1f}ms`.
+- The whole line is one f-string: `return f"step {step:5d} | loss {loss:.4f} | ..."`. Use return, not print: the grader checks the returned value.
+
+@@ item d1-10
+type: code
+title: zip / enumerate
+level: 2
+cards: Slices and loops: the start is in, the end is out
+targets: deltas, label_pairs
+ref: day1
+--- context
+In training you often look at the change between neighbouring steps (how much the loss dropped since the last step), or number a list of results when you print them. With `zip` and `enumerate` you do not write indexes by hand, which removes a whole class of off-by-one bugs.
+--- prompt
+Write two functions:
+
+1. `deltas(xs)`: return the differences between neighbours (each element minus the one before it). Use `zip`, not indexes like `xs[i]`.
+2. `label_pairs(names, values)`: `names` and `values` have the same length. Pair them by position, number the pairs, and return a list of strings of the form `"index:name=value"`, with the index starting at 0.
+
+```
+deltas([3, 5, 4])                  ->  [2, -1]
+deltas([1])                        ->  []
+label_pairs(["a", "b"], [1, 2])    ->  ["0:a=1", "1:b=2"]
+```
+--- starter
+def deltas(xs):
+    """Differences between neighbours: [3, 5, 4] -> [2, -1]. Use zip, not indexes."""
+    raise todo()
+
+def label_pairs(names, values):
+    """Numbered pairs: (["a", "b"], [1, 2]) -> ["0:a=1", "1:b=2"]"""
+    raise todo()
+--- solution
+def deltas(xs):
+    return [b - a for a, b in zip(xs, xs[1:])]
+
+def label_pairs(names, values):
+    return [f"{i}:{n}={v}" for i, (n, v) in enumerate(zip(names, values))]
+--- tests
+@check("deltas: differences between neighbours")
+def t10a():
+    got = deltas([3, 5, 4])
+    true(got == [2, -1], f"deltas([3, 5, 4]) should be [2, -1], yours: {got!r}")
+    got = deltas([1])
+    true(got == [], f"a single number has no neighbours, so deltas([1]) should be [], yours: {got!r}")
+
+@check("label_pairs: numbered pairs")
+def t10b():
+    got = label_pairs(["a", "b"], [1, 2])
+    true(got == ["0:a=1", "1:b=2"], f"label_pairs(['a', 'b'], [1, 2]) should be ['0:a=1', '1:b=2'], yours: {got!r}")
+--- hints
+- `zip(xs, xs[1:])` gives every neighbour pair `(before, after)`: `[3, 5, 4]` gives `(3, 5)` and `(5, 4)`. Use a comprehension: `[b - a for a, b in ...]`.
+- `zip(names, values)` pairs the two lists; wrap it in `enumerate(...)` to add an index starting at 0: `for i, (n, v) in enumerate(zip(names, values))`.
+- Build each string with an f-string: `f"{i}:{n}={v}"`.
+
+@@ item d1-11
+type: code
+title: pathlib and creating folders
+level: 1
+cards: The shell of a training script: dataclass, f-strings, pathlib
+targets: ckpt_path
+ref: day1
+--- context
+A training run of a few hours saves many checkpoints. Build their paths with pathlib and they work on Windows and Linux alike. Create the folder first if it does not exist. Pad the step number to a fixed width so that sorting by name gives the right order (otherwise ckpt_10 sorts before ckpt_9).
+--- prompt
+Write `ckpt_path(root, run_name, step)`:
+
+- Return a `Path` object `root / run_name / ckpt_000500.pt`, with the step in the file name padded with zeros to 6 digits (`step=500` becomes `000500`).
+- Before returning, make sure the folder `root / run_name` exists: create it if it does not, together with any missing parent folders, and do not raise an error if it already exists.
+- `root` may be a string, so wrap it with `Path(root)` first.
+
+```
+p = ckpt_path(root, "gpt-tiny", 500)
+p.name          ->  "ckpt_000500.pt"
+p.parent.name   ->  "gpt-tiny"
+p.parent.is_dir()  ->  True
+```
+--- starter
+from pathlib import Path
+
+def ckpt_path(root, run_name, step):
+    """Return the Path root/run_name/ckpt_000500.pt (step padded to 6 digits) and make sure root/run_name exists."""
+    raise todo()
+--- solution
+from pathlib import Path
+
+def ckpt_path(root, run_name, step):
+    d = Path(root) / run_name
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"ckpt_{step:06d}.pt"
+--- tests
+@check("returns a Path named ckpt_000500.pt")
+def t11a():
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        p = ckpt_path(tmp, "gpt-tiny", 500)
+        true(isinstance(p, Path), f"return a Path object, not a {type(p).__name__}")
+        true(p.name == "ckpt_000500.pt", f"the file name should be ckpt_000500.pt, yours: {p.name}")
+        true(p.parent.name == "gpt-tiny", f"the file should be in the gpt-tiny folder, yours is in: {p.parent.name}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+@check("the folder is created (missing parents too, no error if it exists)")
+def t11b():
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        p = ckpt_path(tmp, "gpt-tiny", 500)
+        true(p.parent.is_dir(), "the parent folder was not created (use mkdir(parents=True, exist_ok=True))")
+        try:
+            p = ckpt_path(Path(tmp) / "runs", "gpt-tiny", 500)
+        except FileNotFoundError:
+            true(False, "it failed when root itself does not exist yet: create missing parents too (mkdir with parents=True)")
+        true(p.parent.is_dir(), "when root itself does not exist yet, create it too (mkdir with parents=True)")
+        try:
+            ckpt_path(tmp, "gpt-tiny", 600)
+        except FileExistsError:
+            true(False, "it failed because the folder already exists (mkdir with exist_ok=True)")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+--- hints
+- Join paths with `/`: `d = Path(root) / run_name`.
+- Create the folder: `d.mkdir(parents=True, exist_ok=True)`. `parents=True` creates missing parents too; `exist_ok=True` means no error if it exists.
+- The file name: `f"ckpt_{step:06d}.pt"` (width 6, padded with 0), and finally `return d / file_name`.
+
+@@ item d1-12
+type: fix
+title: Find the bugs: bucket_by_len
+level: 2
+cards: Assignment is a label, not a copy; Slices and loops: the start is in, the end is out
+targets: bucket_by_len
+ref: day1
+--- context
+Put samples of the same length in the same bucket and a batch needs little padding (useless tokens added only to make lengths match), so training is faster. This code contains Python's most famous trap: a mutable default argument, which makes the second call carry the first call's results.
+--- prompt
+The `bucket_by_len` below is meant to:
+
+- sort samples into buckets by length and return `{length: [sample, ...]}`
+- keep at most `bucket_size` samples per bucket; when a bucket is full, later samples of that length are simply dropped, **with no error**
+- start from empty buckets on every call, so two calls do not affect each other
+
+It has 3 mistakes. Fix it so every check passes.
+
+```
+bucket_by_len(["ab", "cd", "ef", "xyz"], bucket_size=2)  ->  {2: ["ab", "cd"], 3: ["xyz"]}
+bucket_by_len(["q"])                                      ->  {1: ["q"]}
+```
+--- starter
+def bucket_by_len(samples, bucket_size=2, out={}):
+    for s in samples:
+        L = len(s)
+        out[L] = out.get(L, [])
+        out[L].append(s)
+        if len(out[L]) > bucket_size:
+            raise ValueError("bucket full")
+    return out
+--- solution
+def bucket_by_len(samples, bucket_size=2):
+    out = {}                       # fix 1: the mutable default moves into the body, a new dict per call
+    for s in samples:
+        L = len(s)
+        out.setdefault(L, [])
+        if len(out[L]) >= bucket_size:
+            continue               # fixes 2 + 3: check before appending; when full, skip without an error
+        out[L].append(s)
+    return out
+--- tests
+@check("buckets by length, drops samples when full")
+def t12a():
+    got = bucket_by_len(["ab", "cd", "ef", "xyz"], bucket_size=2)
+    true(got == {2: ["ab", "cd"], 3: ["xyz"]}, f"the result should be {{2: ['ab', 'cd'], 3: ['xyz']}}, yours: {got}")
+
+@check("two calls do not affect each other")
+def t12b():
+    bucket_by_len(["ab", "cd"])
+    got2 = bucket_by_len(["q"])
+    true(got2 == {1: ["q"]}, f"the second call still holds the first call's results: {got2} (the default argument out={{}} is created only once, when the function is defined)")
+
+@check("a full bucket skips samples, no error")
+def t12c():
+    got3 = bucket_by_len(["ab", "cd", "ef"], bucket_size=2)
+    true(got3 == {2: ["ab", "cd"]}, f"the result should be {{2: ['ab', 'cd']}} (the bucket is full, so 'ef' is dropped), yours: {got3}")
+--- hints
+- Start with the parameter list: the dict `out={}` is created once, when the function is defined, and every call keeps filling that same dict. Move it into the body: `out = {}`.
+- Then look at the order: it appends first and checks whether the bucket is full afterwards. Check first, and do not add the sample if the bucket is full.
+- "Skip this one and go on with the next" is `continue`. When you check first, the bucket is full when `len(out[L]) >= bucket_size`.
+
+@@ item d1-13
+type: predict
+title: Predict: passing a list into a function
+level: 2
+cards: Assignment is a label, not a copy
+--- context
+Tensors and models can also be changed in place. When you pass one into a function, the function gets the same object, not a copy; if the function changes it, it changes outside too. Miss this and you get bugs like "I never touched it, so why did it change?".
+--- prompt
+Without running it, write the 3 lines this code prints.
+--- code
+def add_tag(tags):
+    tags.append("new")
+    return tags
+
+a = ["x"]
+b = add_tag(a)
+c = list(a)
+c.append("y")
+print(a)
+print(b is a, c is a)
+print(len(a), len(c))
+--- explain
+`add_tag(a)` gets the very list that a points to (it just has one more label, `tags`), so `append("new")` changes a itself, and the returned b is that same list: `b is a` is True. `list(a)` really makes a new list, so `c is a` is False, and adding `"y"` to c does not affect a. In the end a has 2 elements and c has 3.
+--- hints
+- Is `tags` inside `add_tag` the same list as `a` outside?
+- `list(a)` makes a new list; `is` asks "is it the same object?", not "are the values equal?".
+
+@@ item d1-14
+type: predict
+title: Predict: what happens without return
+level: 1
+cards: Functions: return hands the result back
+--- context
+The function computes the right value, yet the caller gets `None`: this is the most common beginner bug. The error usually shows up several lines later (a `'NoneType'` error), far from the real cause. Learn to see at a glance whether a function has a return.
+--- prompt
+Without running it, write the 3 lines this code prints.
+--- code
+def double(n):
+    n * 2
+
+def triple(n):
+    return n * 3
+    print(n)          # code after return never runs
+
+print(double(5))
+print(triple(5))
+r = triple(2) + 1
+print(r)
+--- explain
+`double` computes `n * 2` but has no `return`, so the result is thrown away and it returns `None`. `triple` ends as soon as it reaches `return`, so the `print(n)` below it never runs, and there are only 3 lines of output. `triple(2)` is 6, and adding 1 gives 7.
+--- hints
+- What does a function without `return` give back?
+- Does the `print(n)` after `return` ever run?
+
+@@ item d1-15
+type: choice
+title: Reading an error: where does NoneType come from?
+level: 1
+cards: Functions: return hands the result back
+--- context
+Read an error from the bottom up: the last line says what went wrong, the lines above say where. But the line that failed is often just the victim; the real cause is earlier. Reading errors well saves you most of your debugging time.
+--- prompt
+A training script stops with the error below. What is the most likely cause?
+
+```text
+Traceback (most recent call last):
+  File "train.py", line 14, in <module>
+    total = scale(compute_loss(batch))
+  File "train.py", line 9, in scale
+    return v * 2
+TypeError: unsupported operand type(s) for *: 'NoneType' and 'int'
+```
+--- options
+- `v * 2` in `scale` is wrong; it should be `v * 2.0`
+- `compute_loss` has no `return`, so the `v` passed to `scale` is `None`
+- `batch` is empty
+- `scale` must be defined before `compute_loss`
+answer: 2
+--- explain
+The last line says: `None` was multiplied by an integer. It blew up at `v * 2` inside `scale`, but where does `v` come from? It is the return value of `compute_loss(batch)`. The most common reason a function returns `None` is a missing `return`. When you see `NoneType`, find the function that produced the value and check whether it has a return.
+--- hints
+- The last line says the left side of `*` is `NoneType`, that is, `None`. Which value is that?
+- Who handed `v` to `scale`? When does a function return `None`?
+
+@@ item d1-16
+type: predict
+title: Predict: who is self?
+level: 2
+cards: class: self, __init__ and __call__
+--- context
+Two models built from the same class code each have their own weights, and self is what makes that work: when you call a method, the object to the left of the dot is passed in as `self`. Once this clicks, you stop asking "where does this self come from?" when reading PyTorch code.
+--- prompt
+Without running it, write the 3 lines this code prints.
+--- code
+class Counter:
+    def __init__(self, start):
+        self.n = start
+
+    def add(self, k):
+        self.n = self.n + k
+        return self.n
+
+a = Counter(0)
+b = Counter(100)
+a.add(5)
+a.add(5)
+print(a.n, b.n)
+print(Counter.add(b, 1))
+print(a.n, b.n)
+--- explain
+`a` and `b` are two objects built from the same blueprint, and each has its own `n`. During `a.add(5)`, self is a, so only `a.n` changes: after two calls it is 10, and `b.n` is still 100. `Counter.add(b, 1)` is the "manual" form of `b.add(1)`: b is passed in as self, so `b.n` becomes 101 and is returned.
+--- hints
+- During `a.add(5)`, is self a or b?
+- `Counter.add(b, 1)` and `b.add(1)` are the same thing.
+
+@@ item d1-17
+type: code
+title: Closed book: RunningMean
+level: 2
+exam: yes
+cards: class: self, __init__ and __call__; Inheritance, super() and @property
+targets: RunningMean
+ref: day1
+--- context
+A class with state: the data lives on self, `__call__` makes the object callable, and `@property` lets a computed value read like an attribute. `nn.Module`, optimizers and logging meters all share this skeleton.
+--- prompt
+Without the cards, write the class `RunningMean` from blank:
+
+- `RunningMean()`: when new, `n` is `0` and `value` is `0.0`
+- `m(x)`: records the number x
+- `m.value`: the average so far (read without parentheses)
+- `m.n`: how many numbers have been recorded
+- `m.reset()`: back to the new state
+--- starter
+class RunningMean:
+    def __init__(self):
+        raise todo()
+--- solution
+class RunningMean:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.total = 0.0
+        self.n = 0
+
+    def __call__(self, x):
+        self.total += float(x)
+        self.n += 1
+        return self.value
+
+    @property
+    def value(self):
+        return self.total / self.n if self.n else 0.0
+--- tests
+@check("new: n = 0, value = 0.0")
+def t05a():
+    m = RunningMean()
+    true(not callable(m.value), "value is a normal method: put @property on the line above it so you can read it without parentheses")
+    true(m.value == 0.0 and m.n == 0, f"when new, n should be 0 and value 0.0, yours: n={m.n!r}, value={m.value!r}")
+
+@check("after m(1.0); m(3.0): value = 2.0, n = 2")
+def t05b():
+    m = RunningMean()
+    m(1.0)
+    m(3.0)
+    true(close(m.value, 2.0), f"the average should be 2.0, yours: {m.value}")
+    true(m.n == 2, f"n should be 2, yours: {m.n}")
+
+@check("reset() goes back to the new state")
+def t05c():
+    m = RunningMean()
+    m(1.0)
+    m(3.0)
+    m.reset()
+    true(m.value == 0.0 and m.n == 0, f"after reset(), n should be 0 and value 0.0, yours: n={m.n!r}, value={m.value!r}")
+--- hints
+- Two things to remember, the sum and the count, both on self.
+- `__call__` updates them; `value` is a `@property` computed on read, returning 0.0 when n is 0.
+
+@@ item d1-18
+type: code
+title: Closed book: make_xy
+level: 1
+exam: yes
+cards: Slices and loops: the start is in, the end is out
+targets: make_xy
+ref: day1
+--- context
+"x, and y shifted one step to the right" is what the training data of every language model looks like. You should be able to get this +1 right with your eyes closed.
+--- prompt
+Without the cards, write `make_xy(data, i, block_size)` from blank: x is the `block_size` elements starting at position `i`, y is x shifted one step to the right; return `(x, y)`.
+
+```
+make_xy(list(range(20)), 3, 5)  ->  ([3, 4, 5, 6, 7], [4, 5, 6, 7, 8])
+```
+--- starter
+def make_xy(data, i, block_size):
+    raise todo()
+--- solution
+def make_xy(data, i, block_size):
+    x = data[i:i + block_size]
+    y = data[i + 1:i + 1 + block_size]
+    return x, y
+--- tests
+@check("x is block_size elements starting at i")
+def t03a():
+    x, y = make_xy(list(range(20)), 3, 5)
+    true(x == [3, 4, 5, 6, 7], f"x should be [3, 4, 5, 6, 7], yours: {x}")
+
+@check("y is x shifted by one, same length")
+def t03b():
+    x, y = make_xy(list(range(20)), 3, 5)
+    true(y == [4, 5, 6, 7, 8], f"y should be [4, 5, 6, 7, 8], yours: {y}  (y is x shifted one step to the right, not x itself)")
+    true(len(x) == len(y) == 5, f"x and y should both have 5 elements, yours: {len(x)} and {len(y)}")
+--- hints
+- A slice includes the start and excludes the end: `data[i:i + block_size]` is exactly block_size elements.
+- y starts one later and ends one later than x.

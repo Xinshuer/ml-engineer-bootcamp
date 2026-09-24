@@ -1,32 +1,338 @@
 @@ day 8
-title: DDPM 从零
+title: DDPM 从零：加噪、UNet、去噪
 part: 图像生成
 hours: 3–4 小时
 --- goal
-TODO: 一句话写今天学完能做什么。
+从零写出 DDPM 的全部零件：噪声调度、一步加噪的 q_sample、带时间条件的 UNet、训练 loss 和反向去噪一步。学完之后，任何扩散模型代码库里的 scheduler 和 unet 在做什么，你都能看懂。
 --- checklist
-- 先清空复习区
-- 读完知识卡片并改动运行
-- 练习区全部通过
+- 先清空复习区（昨天看过答案的题从空白重做）
+- 读完 8 张卡片，每张的代码都点「运行」，改一个数字再跑一次
+- 第 4 题（闭式加噪 == 逐步加噪）一定要做通，它是整个扩散模型的地基
+- 练习区全部通过，最后做闭卷题
+
+@@ concept
+title: 扩散模型：先加噪，再学去噪
+--- body
+DDPM（去噪扩散概率模型）是 Stable Diffusion 这一类图像生成模型的地基。它只做两件事：
+
+- **前向过程（加噪）**：拿一张真图 `x0`，分 T 步（常用 T = 1000）一点点往里加高斯噪声。到最后一步，图已经变成纯噪声。这一步是固定的公式，不用学。
+- **反向过程（去噪）**：训练一个网络，让它看着带噪的图，猜出「加进去的是什么噪声」。生成新图时，从纯噪声出发，一步步减掉网络猜的噪声。
+
+今天一直要用的几个名字：
+
+- `t`：时间步，0 到 T-1 的整数。t 越大，噪声越多。
+- `x0` 是原图，`x_t` 是第 t 步的带噪图。
+- `noise`（论文里写作 ε，读 epsilon）：标准高斯噪声，均值 0，标准差 1。
+- `beta_t`：第 t 步加多少噪声。它是个很小的数，比如从 0.0001 慢慢涨到 0.02。
+
+每一步加噪的公式：
+
+```
+x_t = sqrt(1 - beta_t) * x_{t-1} + sqrt(beta_t) * noise
+```
+
+先把上一步的图缩小一点点，再加一点点新噪声。为什么要缩小？两个系数的平方加起来正好是 1，这样方差就一直保持在 1 附近，不会越加越大。
+
+下面的代码拿一张「纯色图」（1 万个像素，全是 2.0）加噪 1000 步。看均值怎么从 2 掉到 0，标准差怎么从 0 涨到 1。
+--- code
+torch.manual_seed(0)
+T = 1000
+betas = torch.linspace(1e-4, 0.02, T)      # 每一步的 beta：从 0.0001 涨到 0.02
+x = torch.full((10000,), 2.0)              # 1 万个像素，全是 2.0
+for t in range(T):
+    x = (1 - betas[t]).sqrt() * x + betas[t].sqrt() * torch.randn_like(x)
+    if t in (0, 99, 299, 599, 999):
+        print(f"t={t:4d}   均值 {x.mean():.3f}   标准差 {x.std():.3f}")
+
+@@ concept
+title: beta 调度：linear 和 cosine
+ref: day8
+--- body
+「调度」（schedule）就是提前算好的三张表，长度都是 T：
+
+- `betas`：每一步加多少噪声。
+- `alphas = 1 - betas`：每一步保留多少信号。
+- `alphas_cumprod`：alphas 的累积乘积，论文里叫 alpha_bar（ᾱ）。第 t 个 = alphas[0] × alphas[1] × … × alphas[t]。意思是：从原图走到第 t 步，一共还剩多少信号。
+
+小例子：alphas = [0.9, 0.8, 0.7]，累积乘积 = [0.9, 0.9×0.8, 0.9×0.8×0.7] = [0.9, 0.72, 0.504]。PyTorch 里一行就够：`alphas.cumprod(0)`（0 表示沿第 0 维乘）。
+
+### linear 调度（DDPM 原论文）
+betas 从 0.0001 到 0.02 均匀取 T 个点：`torch.linspace(1e-4, 0.02, T)`。
+
+### cosine 调度（Improved DDPM）
+linear 有个毛病：信号掉得太早。T = 1000 时，走到第 500 步 alpha_bar 只剩 0.08 左右。后面几百步基本是在「从纯噪声猜纯噪声」，训练步浪费了。低分辨率（32×32、64×64）的图上尤其明显。
+
+cosine 调度反过来：先直接规定 alpha_bar 的曲线，再倒推出 betas。
+
+1. `f(t) = cos((t/T + s) / (1 + s) · π/2)²`，t = 0, 1, …, T（共 T+1 个点），s = 0.008 是一个小偏移
+2. `alpha_bar[i] = f(i+1) / f(0)`，i = 0 … T-1
+3. `beta[i] = 1 - alpha_bar[i] / alpha_bar[i-1]`，i = 0 时把「前一个」当成 1
+4. 最后几步的 beta 会接近 1，所以 clip 到 [0, 0.999]
+
+下面的代码对比两种调度的 alpha_bar。`linear_schedule` 和 `cosine_schedule` 是藏在后台的参考实现，第 1、2 题你会自己写。
+--- code
+alphas = torch.tensor([0.9, 0.8, 0.7])
+print("累积乘积:", alphas.cumprod(0))
+
+lin = linear_schedule(1000)["alphas_cumprod"]
+cos = cosine_schedule(1000)["alphas_cumprod"]
+for t in (0, 250, 500, 750, 999):
+    print(f"t={t:4d}   linear {lin[t]:.4f}   cosine {cos[t]:.4f}")
+
+@@ concept
+title: extract：每个样本取自己的系数
+--- body
+一个 batch 里，每张图抽到的 t 不一样。所以系数要「按样本取」：
+
+- 系数表 `arr` 的形状是 `(T,)`，时间步 `t` 的形状是 `(B,)`。
+- `arr.gather(0, t)`（或者 `arr[t]`）取出每个样本的系数，形状是 `(B,)`。
+
+问题来了：图 x 是 `(B, C, H, W)`，直接拿 `(B,)` 去乘会出错。广播（broadcasting，形状不同的张量自动对齐）是**从最右边的维度**开始对齐的。`(B,)` 对上的是 W，不是 B。
+
+- W ≠ B 时：直接报错，还算好发现。
+- W == B 时：不报错，悄悄算错。这种最危险。
+
+正确做法：reshape 成 `(B, 1, 1, 1)`，每个样本的系数就乘到它自己的所有像素上。1 的个数 = x 的维数 − 1。通用写法：
+
+```
+out.reshape(B, *([1] * (len(x_shape) - 1)))
+```
+
+`[1] * 3` 是 `[1, 1, 1]`；前面的 `*` 把 list 展开成几个参数，等于 `out.reshape(B, 1, 1, 1)`。
+
+还有一点：系数表一般建在 CPU 上，训练时 t 却在 GPU 上。先 `arr.to(t.device)` 再取，不然会报 device 不一致。
+--- code
+arr = torch.tensor([10., 20., 30., 40.])      # T = 4 的系数表
+t = torch.tensor([3, 0])                      # batch 里两张图，t 分别是 3 和 0
+c = arr.gather(0, t)
+print("取出来:", c, tuple(c.shape))
+
+x = torch.ones(2, 3, 4, 4)
+try:
+    x * c
+except RuntimeError as e:
+    print("(2,3,4,4) 直接乘 (2,) 报错:", str(e)[:60])
+
+x2 = torch.ones(2, 3, 2, 2)                   # W 恰好也是 2
+wrong = x2 * c                                # 不报错！但 c 对上的是 W
+print("悄悄算错，第 0 张图:\n", wrong[0, 0])
+right = x2 * c.reshape(2, 1, 1, 1)
+print("reshape 成 (2,1,1,1)，第 0 张图:\n", right[0, 0])
+
+@@ concept
+title: q_sample：一步跳到第 t 步，和 SNR
+--- body
+训练时每个样本要随机抽一个 t。如果从 x0 开始一步步加噪到 t，平均要循环 500 次，太慢了。
+
+好消息：高斯噪声加高斯噪声，还是高斯噪声。所以 t 步可以合成一步：
+
+```
+x_t = sqrt(alpha_bar_t) * x0 + sqrt(1 - alpha_bar_t) * noise
+```
+
+- 信号的系数是 `sqrt(alpha_bar_t)`，噪声的系数是 `sqrt(1 - alpha_bar_t)`。两个平方加起来是 1。
+- t = 0：alpha_bar ≈ 0.9999，x_t 几乎就是原图。
+- t = 999（linear 调度）：alpha_bar ≈ 0.00004，x_t 几乎就是纯噪声。
+
+为什么成立？看前两步。设 alphas 是 a0、a1，e0、e1 是两次采的噪声：
+
+```
+x_1 = sqrt(a1) * (sqrt(a0) * x0 + sqrt(1-a0) * e0) + sqrt(1-a1) * e1
+    = sqrt(a0*a1) * x0 + [ sqrt(a1*(1-a0)) * e0 + sqrt(1-a1) * e1 ]
+```
+
+方括号里是两个独立的高斯噪声相加。独立噪声相加，方差直接相加：a1(1-a0) + (1-a1) = 1 - a0·a1。所以方括号等于 `sqrt(1 - a0*a1) * e`（e 是一个新的标准高斯噪声）。而 a0·a1 正好就是 alpha_bar_1。步数更多时同理。
+
+### 信噪比 SNR
+`SNR(t) = alpha_bar_t / (1 - alpha_bar_t)`，也就是「信号的能量 ÷ 噪声的能量」。t 越大，SNR 越小。它只描述「这一步有多吵」，和你用哪种调度无关，所以论文里常用它来比较调度、给 loss 加权。
+
+下面的代码用两步加噪验证闭式公式：均值和标准差都对得上。
+--- code
+torch.manual_seed(0)
+betas = torch.tensor([0.1, 0.2])
+ab = (1 - betas).cumprod(0)                   # alpha_bar = [0.9, 0.72]
+x0 = torch.full((100000,), 1.0)
+
+x = x0                                        # 逐步加噪两次
+for b in betas:
+    x = (1 - b).sqrt() * x + b.sqrt() * torch.randn_like(x)
+xj = ab[1].sqrt() * x0 + (1 - ab[1]).sqrt() * torch.randn_like(x0)   # 一步跳到 t=1
+
+print(f"逐步两次   均值 {x.mean():.3f}   标准差 {x.std():.3f}")
+print(f"一步跳     均值 {xj.mean():.3f}   标准差 {xj.std():.3f}")
+print(f"公式       均值 {ab[1].sqrt():.3f}   标准差 {(1 - ab[1]).sqrt():.3f}")
+print("SNR:", ab / (1 - ab))
+
+@@ concept
+title: 时间步嵌入：把整数 t 变成向量
+--- body
+UNet 要知道输入里有多少噪声，才知道该去掉多少。所以除了带噪的图，还要把 t 告诉它。
+
+直接喂一个整数（比如 537）效果很差：数太大，相邻的 t 又几乎一样。常用的做法和 Transformer 的位置编码一样：用一串**不同频率**的 cos 和 sin 来表示 t。
+
+```
+half  = dim // 2
+freqs = exp(-ln(max_period) * [0, 1, ..., half-1] / half)   # 从 1 降到约 1/max_period
+args  = t[:, None] * freqs[None]                              # (B, 1) * (1, half) -> (B, half)
+emb   = cat([cos(args), sin(args)], dim=-1)                   # (B, dim)
+```
+
+- 第 0 个频率是 1：t 每变 1，cos(t) 就变很多（高频）。它负责分清相邻的 t。
+- 越往后频率越低：最后几维随 t 变得很慢（低频）。它们负责粗略的位置。
+- t = 0 时：cos 部分全是 1，sin 部分全是 0。
+- 顺序是**先 cos 后 sin**。不同代码库的顺序不一样，加载别人的预训练权重时必须对上。
+- `torch.arange` 默认建在 CPU 上。t 在 GPU 上时，两者一乘就报「Expected all tensors to be on the same device」。所以要写 `device=t.device`。这种 bug 在 CPU 上永远测不出来。
+
+看看 half = 4 时的频率，以及 t = 0、1、100 时的 args：
+--- code
+half, max_period = 4, 10000
+freqs = torch.exp(-math.log(max_period) * torch.arange(half, dtype=torch.float) / half)
+print("freqs:", freqs)                        # 1, 0.1, 0.01, 0.001
+
+t = torch.tensor([0, 1, 100])
+args = t.float()[:, None] * freqs[None]
+print("args 的形状:", tuple(args.shape))
+print(args)
+print("t=0 那一行的 cos:", args.cos()[0])     # 全是 1
+
+@@ concept
+title: FiLM 和 ResBlock：把 t 注入卷积特征
+--- body
+现在 t 变成了向量 `emb`，形状 `(B, t_dim)`。卷积特征 `h` 的形状是 `(B, ch, H, W)`。怎么让 emb 影响 h？
+
+### FiLM：按通道缩放和平移
+1. `emb` 先过 SiLU（一个平滑的激活函数，x · sigmoid(x)），再过 `nn.Linear(t_dim, 2*ch)`，得到 `(B, 2*ch)`。
+2. 加两个维度变成 `(B, 2*ch, 1, 1)`，沿通道维切成两半：`scale` 和 `shift`，各是 `(B, ch, 1, 1)`。
+3. 输出 `h * (1 + scale) + shift`。`(B, ch, 1, 1)` 会广播到每个像素上。
+
+为什么是 `1 + scale` 而不是 `scale`？Linear 的输出接近 0 时（比如权重被清零），`1 + scale` 让这一层接近「什么都不做」（恒等映射），特征原样通过。只写 `scale` 的话，特征会被乘成 0，信息全丢了。
+
+### ResBlock：残差块
+扩散 UNet 的积木。结构：
+
+```
+h = Conv3x3( SiLU( GroupNorm(x) ) )     # 通道 in_ch -> out_ch
+h = FiLM(h, emb)                        # 注入时间
+h = Conv3x3( SiLU( GroupNorm(h) ) )     # 通道 out_ch -> out_ch
+return h + skip(x)                      # 残差：加回输入
+```
+
+- `nn.Conv2d(in_ch, out_ch, 3, 1, 1)`：3×3 卷积，stride 1，padding 1。H 和 W 不变。
+- `nn.GroupNorm(8, ch)`：把通道分成 8 组，每个样本自己做归一化，不依赖 batch 大小（batch 很小时比 BatchNorm 稳）。ch 必须能被 8 整除。
+- `skip`：输入 x 要能和 h 相加。通道数不同时（in_ch ≠ out_ch），用 1×1 卷积 `nn.Conv2d(in_ch, out_ch, 1)` 换通道数；相同时用 `nn.Identity()`（原样返回）。
+--- code
+emb = torch.randn(2, 16)                      # B=2, t_dim=16
+proj = nn.Linear(16, 2 * 8)                   # ch = 8
+p = proj(F.silu(emb))
+print("Linear 之后:", tuple(p.shape))
+p4 = p[:, :, None, None]
+print("加两个维度:", tuple(p4.shape))
+scale, shift = p4.chunk(2, dim=1)
+print("scale / shift:", tuple(scale.shape), tuple(shift.shape))
+
+h = torch.randn(2, 8, 4, 4)
+zero = torch.zeros(2, 8, 1, 1)
+print("scale=shift=0 时，h*(1+scale)+shift 等于 h 吗:", torch.equal(h * (1 + zero) + zero, h))
+print("scale=shift=0 时，h*scale+shift 的绝对值之和:", (h * zero + zero).abs().sum().item())
+
+print("3x3 卷积 8->16:", tuple(nn.Conv2d(8, 16, 3, 1, 1)(h).shape))
+print("1x1 卷积 8->16:", tuple(nn.Conv2d(8, 16, 1)(h).shape))
+print("GroupNorm(8, 8):", tuple(nn.GroupNorm(8, 8)(h).shape))
+
+@@ concept
+title: UNet：下采样、上采样、skip 拼接
+--- body
+扩散模型的网络要输入一张带噪图，输出一张**同样形状**的「噪声预测」。UNet 正好适合：
+
+- **编码器（往下走）**：分辨率一层层减半（32 → 16 → 8），通道数变多。每个像素「看到」的范围越来越大。
+- **中间层**：在最小的分辨率上再处理一次。
+- **解码器（往上走）**：分辨率一层层翻倍（8 → 16 → 32），回到原来的大小。
+- **skip 连接**：编码器每一层的输出都存下来，送到解码器同样分辨率的地方，沿通道维拼在一起。下采样丢掉的细节就从这里补回来。画出来像个 U，所以叫 UNet。
+
+三个操作的形状：
+
+- 下采样 `nn.Conv2d(ch, ch, 4, 2, 1)`：kernel 4、stride 2、padding 1。输出边长 = (H + 2×1 − 4) // 2 + 1，H 是偶数时正好是 H / 2。
+- 上采样 `nn.Upsample(scale_factor=2, mode="nearest")`：每个像素复制成 2×2，边长翻倍。它没有参数。
+- 拼接 `torch.cat([up, skip], dim=1)`：dim=1 是通道维，通道数相加（比如 64 + 64 = 128）。所以拼接之后的那个 ResBlock，输入通道要写两者之和。
+
+奇数尺寸的坑：7 下采样变 3（向下取整），再上采样变 6，和 skip 的 7 对不上，cat 直接报错。解决办法：先给上采样的结果补 0。`F.pad(x, (左, 右, 上, 下))` 的顺序是**从最后一维开始写**：先 W 的左右，再 H 的上下。
+--- code
+x = torch.randn(1, 32, 32, 32)
+down = nn.Conv2d(32, 32, 4, 2, 1)
+up = nn.Upsample(scale_factor=2, mode="nearest")
+d = down(x)
+print("下采样:", tuple(d.shape))
+u = up(d)
+print("上采样:", tuple(u.shape))
+print("和 skip 拼接:", tuple(torch.cat([u, x], dim=1).shape))
+
+odd = torch.randn(1, 8, 7, 7)
+u2 = up(nn.Conv2d(8, 8, 4, 2, 1)(odd))
+print("7x7 下采样再上采样:", tuple(u2.shape))
+print("右边、下边各补 1:", tuple(F.pad(u2, (0, 1, 0, 1)).shape))
+
+@@ concept
+title: 训练目标和反向一步
+--- body
+### 训练：让网络预测噪声
+一步训练只有四行：
+
+1. 每个样本随机抽一个 t：`torch.randint(0, T, (B,))`
+2. 采噪声：`noise = torch.randn_like(x0)`
+3. 加噪：`x_t = q_sample(x0, t, noise, sched)`
+4. loss = `F.mse_loss(model(x_t, t), noise)`
+
+目标是**噪声**，不是 x0。噪声永远是标准高斯，不管 t 是多少，目标的大小都一样，网络好学。
+
+一条很有用的「基准线」：一个永远输出 0 的模型，loss = 噪声平方的均值 ≈ 1。训练时 loss 如果一直停在 1 附近，说明模型什么都没学到。
+
+### 采样：反向一步
+从 x_t 走到 x_{t-1}：
+
+```
+mean    = (x_t - beta_t / sqrt(1 - alpha_bar_t) * eps_pred) / sqrt(alpha_t)
+x_{t-1} = mean + sqrt(beta_t) * z     # t > 0，z 是新采的标准高斯噪声
+x_0     = mean                        # t = 0，最后一步不加噪声
+```
+
+- `eps_pred` 是网络预测的噪声。`mean` 就是「减掉一部分预测的噪声，再放大回来」。
+- 最后一步输出的就是成品图，不能再往上撒随机噪声。
+- batch 里每个样本的 t 可以不一样，所以「加不加噪声」要按样本决定：`(t > 0).float()` 变成 0/1，再 reshape 成 `(B, 1, 1, 1)` 乘上去。
+
+生成一张图：从纯噪声开始，t 从 T-1 走到 0，每一步调用一次网络。T = 1000 就是 1000 次网络调用，所以 DDPM 采样很慢。第 9 天的 DDIM 用少得多的步数。
+--- code
+torch.manual_seed(0)
+x0 = torch.randn(64, 1, 8, 8) * 10           # 一批「图」，数值故意放大 10 倍
+noise = torch.randn_like(x0)
+zero_pred = torch.zeros_like(noise)           # 一个永远输出 0 的「模型」
+print(f"目标是噪声:   loss = {F.mse_loss(zero_pred, noise).item():.3f}")
+print(f"目标写成 x0:  loss = {F.mse_loss(zero_pred, x0).item():.1f}")
+
+print("随机抽的 t:", torch.randint(0, 1000, (4,)))
+t = torch.tensor([0, 5, 0, 9])
+keep = (t > 0).float().reshape(-1, 1, 1, 1)
+print("加噪开关:", keep.flatten(), "形状", tuple(keep.shape))
 
 @@ item d8-01
 type: code
 title: 线性 beta 调度
-level: 2
+level: 1
+cards: beta 调度：linear 和 cosine; 扩散模型：先加噪，再学去噪
 targets: linear_schedule
 ref: day8
 --- context
-TODO
+每个扩散模型代码库都有一个 scheduler，它的核心就是三张长度为 T 的表。后面的加噪、采样、SNR，全都是在查这三张表。
 --- prompt
-01  线性 beta 调度
+写 `linear_schedule(T, beta_start=1e-4, beta_end=0.02)`，返回一个 dict，里面有三个张量，形状都是 `(T,)`：
+
+- `"betas"`：从 beta_start 到 beta_end 均匀取 T 个点（两端都要取到）
+- `"alphas"`：`1 - betas`
+- `"alphas_cumprod"`：alphas 的累积乘积（alpha_bar）。第 i 个 = alphas[0] × alphas[1] × … × alphas[i]
+
+每个都用一行 torch 函数算出来，不需要写 for 循环。
 --- starter
 def linear_schedule(T, beta_start=1e-4, beta_end=0.02):
-    """返回 dict，至少包含:
-        betas          (T,)   在 [beta_start, beta_end] 上线性取 T 个点
-        alphas         (T,)   = 1 - betas
-        alphas_cumprod (T,)   = alphas 的累积乘积（论文里的 alpha_bar）
-    """
-    # --- TODO 01 ---
+    """返回 {"betas": (T,), "alphas": (T,), "alphas_cumprod": (T,)}"""
     raise todo()
 --- solution
 def linear_schedule(T, beta_start=1e-4, beta_end=0.02):
@@ -38,35 +344,41 @@ def linear_schedule(T, beta_start=1e-4, beta_end=0.02):
 def t01():
     s = linear_schedule(1000)
     shape_is(s["betas"], (1000,))
-    eq(s["betas"][0], torch.tensor(1e-4))
-    eq(s["betas"][-1], torch.tensor(0.02))
-    eq(s["alphas"], 1 - s["betas"])
-    eq(s["alphas_cumprod"][0], s["alphas"][0])
-    eq(s["alphas_cumprod"][4], s["alphas"][:5].prod())
+    eq(s["betas"][0], torch.tensor(1e-4), msg="第一个 beta 应该是 beta_start")
+    eq(s["betas"][-1], torch.tensor(0.02), msg="最后一个 beta 应该是 beta_end")
+    eq(s["alphas"], 1 - s["betas"], msg="alphas 应该等于 1 - betas")
+    eq(s["alphas_cumprod"][0], s["alphas"][0], msg="alphas_cumprod[0] 应该就是 alphas[0]")
+    eq(s["alphas_cumprod"][4], s["alphas"][:5].prod(), msg="alphas_cumprod[4] 应该是前 5 个 alphas 的乘积")
     ab = s["alphas_cumprod"]
-    true((ab[1:] < ab[:-1]).all(), "alpha_bar 必须单调递减")
-    true(ab[-1] < 0.01, f"最后一步 alpha_bar 应该接近 0（信号被噪声淹没），实际 {ab[-1]:.4f}")
+    true((ab[1:] < ab[:-1]).all(), "alpha_bar 必须一路变小（信号越来越少）")
+    true(ab[-1] < 0.01, f"最后一步的 alpha_bar 应该接近 0（信号被噪声淹没），实际是 {ab[-1]:.4f}")
 --- hints
-- TODO
+- 均匀取点用 `torch.linspace(start, end, steps)`，两端都包含。
+- 累积乘积用 `alphas.cumprod(0)`。
+- `return {"betas": betas, "alphas": alphas, "alphas_cumprod": alphas.cumprod(0)}`
 
 @@ item d8-02
 type: code
 title: cosine 调度
 level: 2
+cards: beta 调度：linear 和 cosine
 targets: cosine_schedule
 ref: day8
 --- context
-TODO
+linear 调度的信号掉得太早，后半段很多训练步在「从纯噪声猜纯噪声」。Improved DDPM 提出的 cosine 调度让信号掉得更均匀，在 32×32、64×64 这种小图上明显更好，很多代码库都用它。
 --- prompt
-02  cosine 调度 —— 改进版，低分辨率上明显更好
+写 `cosine_schedule(T, s=0.008)`，返回和第 1 题结构一样的 dict（三个 `(T,)` 的张量）。步骤：
+
+1. `t = 0, 1, …, T`，共 T+1 个浮点数
+2. `f = cos((t/T + s) / (1 + s) · π/2) ** 2`
+3. `alphas_cumprod[i] = f[i+1] / f[0]`，i = 0 … T-1（去掉第 0 个，形状变成 `(T,)`）
+4. `betas[i] = 1 - alphas_cumprod[i] / alphas_cumprod[i-1]`；i = 0 时，「前一个」当成 1。然后把 betas clip 到 [0, 0.999]
+5. `alphas = 1 - betas`
+
+`"alphas_cumprod"` 直接用第 3 步算出来的结果。`linear_schedule` 已经提供（检查会拿它来对比）。
 --- starter
 def cosine_schedule(T, s=0.008):
-    """f(t) = cos((t/T + s) / (1 + s) * pi/2) ** 2,  t = 0..T
-    alphas_cumprod[i] = f(i+1) / f(0)
-    betas[i] = 1 - alphas_cumprod[i] / alphas_cumprod[i-1]，并 clip 到 [0, 0.999]
-    返回和第 1 题同样结构的 dict。
-    """
-    # --- TODO 02 ---
+    """返回 {"betas": (T,), "alphas": (T,), "alphas_cumprod": (T,)}，alphas_cumprod 按 cosine 曲线算"""
     raise todo()
 --- solution
 def cosine_schedule(T, s=0.008):
@@ -81,33 +393,43 @@ def cosine_schedule(T, s=0.008):
 def t02():
     c = cosine_schedule(1000)
     ab = c["alphas_cumprod"]
-    shape_is(ab, (1000,))
-    true(ab[0] > 0.999, f"第一步几乎不加噪, alpha_bar[0]={ab[0]:.5f}")
-    true(ab[-1] < 0.01)
-    true((ab[1:] <= ab[:-1]).all(), "必须单调不增")
+    shape_is(ab, (1000,), "alphas_cumprod 应该是 (T,)：记得去掉 f 的第 0 个")
+    true(ab[0] > 0.999, f"第一步几乎不加噪声，alpha_bar[0] 应该 > 0.999，实际是 {ab[0]:.5f}")
+    true(ab[-1] < 0.01, f"最后一步的 alpha_bar 应该接近 0，实际是 {ab[-1]:.4f}")
+    true((ab[1:] <= ab[:-1]).all(), "alpha_bar 不能变大（必须单调不增）")
     true((c["betas"] >= 0).all() and (c["betas"] <= 0.999).all(), "betas 要 clip 到 [0, 0.999]")
-    # cosine 的特点: 中段掉得比 linear 慢
+    # cosine 的特点：中段的信号掉得比 linear 慢
     lin = linear_schedule(1000)["alphas_cumprod"]
-    true(ab[500] > lin[500], "cosine 在中段应该保留更多信号，这就是它更好的原因")
+    true(ab[500] > lin[500], "在 t=500，cosine 应该比 linear 保留更多信号，这正是它更好的原因")
 --- hints
-- TODO
+- `t = torch.arange(T + 1, dtype=torch.float)`；`f = torch.cos(...) ** 2`；π 是 `math.pi`；`ab = (f / f[0])[1:]`。
+- 「前一个」表：在 ab 前面拼一个 1，再去掉最后一个：`prev = torch.cat([torch.ones(1), ab[:-1]])`。
+- `betas = (1 - ab / prev).clamp(0, 0.999)`，最后 `return {"betas": betas, "alphas": 1 - betas, "alphas_cumprod": ab}`。
 
 @@ item d8-03
 type: code
 title: extract 广播工具
 level: 2
+cards: extract：每个样本取自己的系数
 targets: extract
 ref: day8
 --- context
-TODO
+扩散代码里几乎每个公式都要「按每个样本自己的 t 取系数，再乘到整张图上」。extract 就是干这个的，几乎每个 DDPM 代码库里都有它。shape 写错时常常不报错，只是悄悄算错。
 --- prompt
-03  extract —— 扩散代码里出现频率最高的小工具
+写 `extract(arr, t, x_shape)`：
+
+- `arr`：形状 `(T,)` 的系数表，比如 alphas_cumprod
+- `t`：形状 `(B,)` 的 int64 时间步，每个样本一个
+- `x_shape`：要乘的张量的形状，可能是 `(B, C, H, W)`，也可能是 `(B, D)`
+
+返回每个样本的系数 `arr[t]`，但形状要变成 `(B, 1, 1, 1)`（1 的个数 = `len(x_shape) - 1`），这样它能和 x 广播。
+
+例子：arr = [0, 1, …, 9]，t = [3, 7]，x_shape = (2, 3, 4, 4) → 返回形状 (2, 1, 1, 1)，值是 3 和 7；x_shape = (2, 5) → 返回 (2, 1)。
+
+先把 arr 搬到 t 所在的设备上：`arr.to(t.device)`。
 --- starter
 def extract(arr, t, x_shape):
-    """arr: (T,) 的系数表；t: (B,) int64 的时间步；x_shape: 目标张量形状如 (B,C,H,W)。
-    返回 (B, 1, 1, 1) 这样能和 x 广播的张量。
-    """
-    # --- TODO 03 ---
+    """arr (T,), t (B,) -> (B, 1, 1, ...)，能和形状为 x_shape 的张量广播"""
     raise todo()
 --- solution
 def extract(arr, t, x_shape):
@@ -119,31 +441,41 @@ def t03():
     arr = torch.arange(10).float()
     t = torch.tensor([3, 7])
     o = extract(arr, t, (2, 3, 4, 4))
-    shape_is(o, (2, 1, 1, 1))
-    eq(o.flatten(), torch.tensor([3.0, 7.0]))
+    shape_is(o, (2, 1, 1, 1), "四维输入时应该是 (B, 1, 1, 1)")
+    eq(o.flatten(), torch.tensor([3.0, 7.0]), msg="取出来的值不对：应该是 arr[3] 和 arr[7]")
     o2 = extract(arr, t, (2, 5))
-    shape_is(o2, (2, 1), "二维输入时应该是 (B, 1)")
-    true((o * torch.ones(2, 3, 4, 4)).shape == (2, 3, 4, 4), "要能和 x 广播")
+    shape_is(o2, (2, 1), "二维输入时应该是 (B, 1)：1 的个数要跟着 len(x_shape) 变")
+    true((o * torch.ones(2, 3, 4, 4)).shape == (2, 3, 4, 4), "结果要能和 x 广播")
 --- hints
-- TODO
+- 取值：`arr.gather(0, t)` 或 `arr[t]`，都得到 `(B,)`。
+- `[1] * (len(x_shape) - 1)` 是一个 list，前面加 `*` 把它展开：`out.reshape(B, *[1, 1, 1])` 就是 `out.reshape(B, 1, 1, 1)`。
+- `out = arr.to(t.device).gather(0, t)`，然后 `return out.reshape(t.shape[0], *([1] * (len(x_shape) - 1)))`。
 
 @@ item d8-04
 type: code
-title: q_sample 闭式
+title: q_sample 闭式加噪
 level: 2
+cards: q_sample：一步跳到第 t 步，和 SNR; extract：每个样本取自己的系数
 targets: q_sample
 ref: day8
-# merged checks: t05 闭式 == 逐步加噪
 --- context
-TODO
+训练时每个样本随机抽一个 t。如果从 x0 一步步加噪，平均要循环 500 次，太慢。闭式公式让你一步跳到任意 t。第二个检查会验证：一步跳和逐步加噪得到的分布完全一样。这是整个扩散模型的地基。
 --- prompt
-04  q_sample：一步跳到任意时刻 t
+写 `q_sample(x0, t, noise, sched)`，一步算出第 t 步的带噪图：
+
+```
+x_t = sqrt(alpha_bar_t) * x0 + sqrt(1 - alpha_bar_t) * noise
+```
+
+- `x0`、`noise`：`(B, C, H, W)`；`t`：`(B,)`，每个样本的 t 可以不一样
+- `sched`：第 1 题返回的 dict，alpha_bar 就是 `sched["alphas_cumprod"]`
+- 用 `extract`（已提供）把系数变成 `(B, 1, 1, 1)`
+- 返回形状和 x0 一样
+
+第二个检查会先用 2 万个样本逐步加噪 61 步，再拿你的 q_sample 一步跳过去，比较两边的均值和标准差。
 --- starter
 def q_sample(x0, t, noise, sched):
-    """x_t = sqrt(alpha_bar_t) * x0 + sqrt(1 - alpha_bar_t) * noise
-    x0/noise: (B,C,H,W)；t: (B,)。
-    """
-    # --- TODO 04 ---
+    """x0, noise: (B, C, H, W)；t: (B,)  ->  x_t，形状和 x0 一样"""
     raise todo()
 --- solution
 def q_sample(x0, t, noise, sched):
@@ -158,13 +490,13 @@ def t04():
     n = torch.randn_like(x0)
     t0 = torch.zeros(4, dtype=torch.long)
     xt = q_sample(x0, t0, n, s)
-    true((xt - x0).abs().mean() < 0.02, "t=0 时几乎还是原图")
+    true((xt - x0).abs().mean() < 0.02, "t=0 时 x_t 应该几乎还是原图 x0")
     tT = torch.full((4,), 999, dtype=torch.long)
     xT = q_sample(x0, tT, n, s)
-    true((xT - n).abs().mean() < 0.1, "t=T 时几乎就是纯噪声")
-    # 不同样本可以有不同的 t
+    true((xT - n).abs().mean() < 0.1, "t=999 时 x_t 应该几乎就是纯噪声")
+    # 同一个 batch 里，每个样本可以有不同的 t
     tm = torch.tensor([0, 500, 999, 250])
-    shape_is(q_sample(x0, tm, n, s), x0.shape)
+    shape_is(q_sample(x0, tm, n, s), x0.shape, "每个样本的 t 不一样时，输出形状也要和 x0 一样")
 
 @check("闭式 == 逐步加噪")
 def t05():
@@ -172,10 +504,10 @@ def t05():
     T = 200
     s = linear_schedule(T, 1e-4, 0.05)
     N = 20000
-    x0 = torch.full((N, 1), 2.0)                 # 固定信号，方便看统计量
+    x0 = torch.full((N, 1), 2.0)                 # 固定的信号，方便看统计量
     step = 60
 
-    # 逐步: x_t = sqrt(1-beta_t) * x_{t-1} + sqrt(beta_t) * eps
+    # 逐步加噪：x_t = sqrt(1-beta_t) * x_{t-1} + sqrt(beta_t) * eps
     x = x0.clone()
     for i in range(step + 1):
         b = s["betas"][i]
@@ -187,42 +519,45 @@ def t05():
     true(abs(x.mean().item() - want_mean) < 0.02,
          f"逐步加噪的均值 {x.mean().item():.4f} 应该 ≈ sqrt(alpha_bar)*x0 = {want_mean:.4f}")
     true(abs(x.std().item() - want_std) < 0.02,
-         f"逐步加噪的 std {x.std().item():.4f} 应该 ≈ sqrt(1-alpha_bar) = {want_std:.4f}")
+         f"逐步加噪的标准差 {x.std().item():.4f} 应该 ≈ sqrt(1-alpha_bar) = {want_std:.4f}")
 
     # 你的 q_sample 必须给出同样的统计量
     xt = q_sample(x0, torch.full((N,), step, dtype=torch.long), torch.randn(N, 1), s)
-    true(abs(xt.mean().item() - want_mean) < 0.02, "q_sample 的均值和逐步加噪对不上")
-    true(abs(xt.std().item() - want_std) < 0.02, "q_sample 的方差和逐步加噪对不上")
+    true(abs(xt.mean().item() - want_mean) < 0.02,
+         f"q_sample 的均值 {xt.mean().item():.4f} 和逐步加噪的 {want_mean:.4f} 对不上：信号的系数应该是 sqrt(alpha_bar)")
+    true(abs(xt.std().item() - want_std) < 0.02,
+         f"q_sample 的标准差 {xt.std().item():.4f} 和逐步加噪的 {want_std:.4f} 对不上：噪声的系数应该是 sqrt(1-alpha_bar)")
 --- hints
-- TODO
+- 先取系数：`ab = extract(sched["alphas_cumprod"], t, x0.shape)`，形状 `(B, 1, 1, 1)`。
+- 两个系数都要开根号：`ab.sqrt()` 和 `(1 - ab).sqrt()`。
+- `return ab.sqrt() * x0 + (1 - ab).sqrt() * noise`
 
 @@ item d8-05
 type: code
 title: 正弦时间嵌入
 level: 2
+cards: 时间步嵌入：把整数 t 变成向量
 targets: timestep_embedding
 ref: day8
 --- context
-TODO
+UNet 必须知道输入里有多少噪声，才知道该去掉多少。t 是一个整数，直接喂给网络效果很差，所以先把它编码成一串不同频率的 cos/sin。几乎所有扩散模型（包括 DiT）都用这个函数。
 --- prompt
-06  正弦时间嵌入
+写 `timestep_embedding(t, dim, max_period=10000)`：t 是 `(B,)` 的整数时间步，返回 `(B, dim)`。
+
+1. `half = dim // 2`
+2. `freqs = exp(-ln(max_period) * [0, 1, …, half-1] / half)`，形状 `(half,)`
+3. `args = t[:, None] * freqs[None]`，形状 `(B, half)`
+4. 返回 `cat([cos(args), sin(args)], dim=-1)`，**先 cos 后 sin**
+
+`torch.arange` 要写 `device=t.device`。在 CPU 上不写也能过检查，但模型一搬到 GPU 就会报「Expected all tensors to be on the same device」。
 --- starter
 def timestep_embedding(t, dim, max_period=10000):
-    """t: (B,) 整数时间步  ->  (B, dim)
-    half = dim // 2
-    freqs = exp(-log(max_period) * arange(half) / half)
-    args  = t[:, None] * freqs[None]
-    返回 cat([cos(args), sin(args)], dim=-1)   （先 cos 后 sin）
-
-    注意: arange 要写 device=t.device。不写在 CPU 上测不出问题，
-    一搬到 GPU 就报 "Expected all tensors to be on the same device"。
-    """
-    # --- TODO 06 ---
+    """t: (B,) 整数时间步  ->  (B, dim)，前一半 cos，后一半 sin"""
     raise todo()
 --- solution
 def timestep_embedding(t, dim, max_period=10000):
     half = dim // 2
-    # device 必须跟着 t 走，否则模型搬到 GPU 之后这里会报 "two devices" —— 
+    # device 必须跟着 t 走，否则模型搬到 GPU 之后这里会报 "two devices"，
     # 这类 bug 在 CPU 上永远测不出来
     freqs = torch.exp(-math.log(max_period)
                       * torch.arange(half, dtype=torch.float, device=t.device) / half)
@@ -233,35 +568,45 @@ def timestep_embedding(t, dim, max_period=10000):
 def t06():
     e = timestep_embedding(torch.tensor([0, 1, 100]), 64)
     shape_is(e, (3, 64))
-    eq(e[0, :32], torch.ones(32), msg="t=0 时 cos 部分应该全 1")
-    eq(e[0, 32:], torch.zeros(32), msg="t=0 时 sin 部分应该全 0")
-    true(not torch.allclose(e[1], e[2]), "不同 t 必须给出不同嵌入")
-    # 低频维度对 t 的变化不敏感
-    true((e[1, 31] - e[2, 31]).abs() < (e[1, 0] - e[2, 0]).abs(), "高维应该是低频")
+    eq(e[0, :32], torch.ones(32), msg="t=0 时前一半（cos）应该全是 1。是不是把 sin 放在前面了？")
+    eq(e[0, 32:], torch.zeros(32), msg="t=0 时后一半（sin）应该全是 0")
+    true(not torch.allclose(e[1], e[2]), "不同的 t 必须给出不同的嵌入")
+    # 越往后的维度频率越低，对 t 的变化越不敏感
+    true((e[1, 31] - e[2, 31]).abs() < (e[1, 0] - e[2, 0]).abs(),
+         "越往后的维度频率应该越低：freqs 应该从 1 往下降（指数里有个负号）")
 --- hints
-- TODO
+- `freqs = torch.exp(-math.log(max_period) * torch.arange(half, dtype=torch.float, device=t.device) / half)`
+- t 是整数，先 `t.float()`；`[:, None]` 把 `(B,)` 变成 `(B, 1)`，`freqs[None]` 是 `(1, half)`，相乘广播成 `(B, half)`。
+- `return torch.cat([args.cos(), args.sin()], dim=-1)`
 
 @@ item d8-06
 type: code
 title: FiLM 条件注入
 level: 2
+cards: FiLM 和 ResBlock：把 t 注入卷积特征
 targets: FiLM
 ref: day8
 --- context
-TODO
+UNet 里每个 ResBlock 都要知道当前的 t。FiLM 是最常见的注入方式：用时间向量算出每个通道的缩放和平移。OpenAI 的 guided diffusion UNet 就这么做；第 10 天 DiT 里的 adaLN 也是同一个思路。
 --- prompt
-07  FiLM：把时间信息注入卷积特征
+写 `class FiLM(nn.Module)`：
+
+- `__init__(self, t_dim, ch)`：建一个 `nn.Linear(t_dim, 2 * ch)`
+- `forward(self, h, emb)`：h 是 `(B, ch, H, W)`，emb 是 `(B, t_dim)`
+  1. `emb` 过 SiLU，再过 Linear，得到 `(B, 2*ch)`
+  2. 变成 `(B, 2*ch, 1, 1)`，沿 dim=1 切成 scale 和 shift，各 `(B, ch, 1, 1)`
+  3. 返回 `h * (1 + scale) + shift`
+
+检查会把 Linear 的权重和 bias 全部清零，这时输出必须正好等于 h。
 --- starter
 class FiLM(nn.Module):
-    """把 (B, t_dim) 的时间嵌入变成每个通道的 scale 和 shift:
-        emb -> SiLU -> Linear(t_dim, 2*ch) -> 拆成 scale, shift
-        h = h * (1 + scale) + shift        （注意是 1+scale，让初始接近恒等）
-    forward(h, emb): h 是 (B, ch, H, W)
-    """
+    """emb (B, t_dim) -> 每个通道的 scale、shift；输出 h * (1 + scale) + shift"""
 
     def __init__(self, t_dim, ch):
         super().__init__()
-        # --- TODO 07 ---
+        raise todo()
+
+    def forward(self, h, emb):
         raise todo()
 --- solution
 class FiLM(nn.Module):
@@ -279,35 +624,47 @@ def t07():
     h = torch.randn(2, 8, 4, 4)
     emb = torch.randn(2, 16)
     shape_is(m(h, emb), (2, 8, 4, 4))
-    with torch.no_grad():                    # Linear 权重清零 -> scale=shift=0 -> 恒等
+    with torch.no_grad():                    # Linear 权重清零 -> scale = shift = 0 -> 恒等
         for p in m.parameters():
             p.zero_()
-    eq(m(h, emb), h, msg="scale/shift 为 0 时应该是恒等映射（这就是要写 1+scale 的原因）")
+    eq(m(h, emb), h, msg="scale 和 shift 都是 0 时应该原样输出 h（这就是要写 1 + scale 的原因）")
 --- hints
-- TODO
+- `__init__` 里只要一行：`self.proj = nn.Linear(t_dim, 2 * ch)`。
+- `self.proj(F.silu(emb))` 是 `(B, 2*ch)`；`[:, :, None, None]` 加两个维度；`.chunk(2, dim=1)` 切成两半。
+- `scale, shift = self.proj(F.silu(emb))[:, :, None, None].chunk(2, dim=1)`，然后 `return h * (1 + scale) + shift`。
 
 @@ item d8-07
 type: code
 title: ResBlock
 level: 2
+cards: FiLM 和 ResBlock：把 t 注入卷积特征
 targets: ResBlock
 ref: day8
 --- context
-TODO
+ResBlock 是扩散 UNet 的积木：整个网络就是一串 ResBlock 加上下采样和上采样。残差连接（输出 = 变换 + 输入）让很深的网络也训得动。
 --- prompt
-08  ResBlock
+写 `class ResBlock(nn.Module)`，`__init__(self, in_ch, out_ch, t_dim)`，`forward(self, x, emb)`：
+
+```
+h = conv1( SiLU( GroupNorm(8, in_ch)(x) ) )     # conv1: 3x3, in_ch -> out_ch
+h = film(h, emb)                                 # FiLM(t_dim, out_ch)
+h = conv2( SiLU( GroupNorm(8, out_ch)(h) ) )     # conv2: 3x3, out_ch -> out_ch
+return h + skip(x)
+```
+
+- 3×3 卷积用 `nn.Conv2d(..., 3, 1, 1)`（padding 1，H、W 不变）
+- `skip`：in_ch ≠ out_ch 时是 `nn.Conv2d(in_ch, out_ch, 1)`，否则是 `nn.Identity()`
+- x 是 `(B, in_ch, H, W)`，emb 是 `(B, t_dim)`，输出 `(B, out_ch, H, W)`
+- `FiLM` 已经提供（参考版本）
 --- starter
 class ResBlock(nn.Module):
-    """结构:
-        h = Conv3x3(GroupNorm(8, in) -> SiLU -> x)
-        h = FiLM(h, emb)
-        h = Conv3x3(GroupNorm(8, out) -> SiLU -> h)
-        return h + skip(x)      # in != out 时 skip 是 1x1 卷积，否则恒等
-    """
+    """x (B, in_ch, H, W), emb (B, t_dim) -> (B, out_ch, H, W)"""
 
     def __init__(self, in_ch, out_ch, t_dim):
         super().__init__()
-        # --- TODO 08 ---
+        raise todo()
+
+    def forward(self, x, emb):
         raise todo()
 --- solution
 class ResBlock(nn.Module):
@@ -331,29 +688,35 @@ def t08():
     m = ResBlock(8, 8, 16)
     shape_is(m(torch.randn(2, 8, 16, 16), torch.randn(2, 16)), (2, 8, 16, 16))
     m2 = ResBlock(8, 16, 16)
-    shape_is(m2(torch.randn(2, 8, 16, 16), torch.randn(2, 16)), (2, 16, 16, 16))
+    shape_is(m2(torch.randn(2, 8, 16, 16), torch.randn(2, 16)), (2, 16, 16, 16),
+             "in_ch=8、out_ch=16 时输出应该有 16 个通道")
     true(any(isinstance(mm, nn.Conv2d) and mm.kernel_size == (1, 1) for mm in m2.modules()),
          "通道数变了，skip 分支需要一个 1x1 卷积")
 --- hints
-- TODO
+- `__init__` 里建 6 个子模块：`n1`、`c1`、`film`、`n2`、`c2`、`skip`。注意第二个 GroupNorm 的通道数是 out_ch。
+- `self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()`
+- forward：`h = self.c1(F.silu(self.n1(x)))`，`h = self.film(h, emb)`，`h = self.c2(F.silu(self.n2(h)))`，`return h + self.skip(x)`。
 
 @@ item d8-08
 type: code
 title: skip 拼接
-level: 2
+level: 1
+cards: UNet：下采样、上采样、skip 拼接
 targets: unet_skip_concat
 ref: day8
 --- context
-TODO
+UNet 的 U 形靠 skip 连接：编码器的特征原样送到解码器，和上采样回来的特征拼在一起，下采样丢掉的细节就靠它补回来。奇数尺寸对不齐，是拼 UNet 时最常见的报错之一。
 --- prompt
-09  下采样 / 上采样 / skip 拼接
+写 `unet_skip_concat(up_feat, skip_feat)`：
+
+- `up_feat`：`(B, C1, H', W')`，解码器上采样回来的特征
+- `skip_feat`：`(B, C2, H, W)`，编码器存下来的特征
+- 返回沿通道维拼接的结果 `(B, C1+C2, H, W)`，up_feat 在前，skip_feat 在后
+
+如果 H' 或 W' 比 skip 小（奇数尺寸下采样再上采样后常常差 1），先在 up_feat 的右边和下边补 0，补到和 skip_feat 一样大，再拼接。
 --- starter
 def unet_skip_concat(up_feat, skip_feat):
-    """UNet 解码侧的标准操作: 沿通道维拼接。
-    up_feat: (B, C1, H, W)   skip_feat: (B, C2, H, W)  ->  (B, C1+C2, H, W)
-    如果空间尺寸差 1（奇数尺寸下采样后常见），先把 up_feat 用 F.pad 补齐。
-    """
-    # --- TODO 09 ---
+    """(B, C1, H', W') + (B, C2, H, W) -> (B, C1+C2, H, W)"""
     raise todo()
 --- solution
 def unet_skip_concat(up_feat, skip_feat):
@@ -366,41 +729,57 @@ def unet_skip_concat(up_feat, skip_feat):
 @check("skip 拼接")
 def t09():
     a, b = torch.randn(2, 8, 16, 16), torch.randn(2, 4, 16, 16)
-    shape_is(unet_skip_concat(a, b), (2, 12, 16, 16))
-    # 尺寸不齐的情况
+    shape_is(unet_skip_concat(a, b), (2, 12, 16, 16), "要沿通道维（dim=1）拼接")
+    # 尺寸对不齐的情况
     a2 = torch.randn(2, 8, 7, 7)
     b2 = torch.randn(2, 4, 8, 8)
-    shape_is(unet_skip_concat(a2, b2), (2, 12, 8, 8), "尺寸对不齐时要先 pad")
+    shape_is(unet_skip_concat(a2, b2), (2, 12, 8, 8), "尺寸对不齐时要先用 F.pad 补齐")
 --- hints
-- TODO
+- 差多少：`dh = skip_feat.size(-2) - up_feat.size(-2)`，`dw = skip_feat.size(-1) - up_feat.size(-1)`。
+- `F.pad` 的第二个参数从最后一维开始写：(左, 右, 上, 下)。所以是 `F.pad(up_feat, (0, dw, 0, dh))`。
+- 最后 `return torch.cat([up_feat, skip_feat], dim=1)`。
 
 @@ item d8-09
 type: code
 title: MiniUNet 前向
-level: 2
+level: 3
+cards: UNet：下采样、上采样、skip 拼接; FiLM 和 ResBlock：把 t 注入卷积特征; 时间步嵌入：把整数 t 变成向量
 targets: MiniUNet
 ref: day8
 --- context
-TODO
+到这里所有零件都有了。这道题把它们拼成一个能预测噪声的 UNet。它和 DDPM 原论文、Stable Diffusion 的 UNet 是同一个套路，只是小得多。自己拼过一遍，再读大模型的代码就知道每一块在哪。
 --- prompt
-10  一个能跑的 mini UNet
+写 `class MiniUNet(nn.Module)`，`__init__(self, in_ch=1, t_dim=128)`，`forward(self, x, t)`：x 是 `(B, in_ch, 32, 32)`，t 是 `(B,)`，返回和 x 同形状的张量（预测的噪声）。
+
+结构（右边是这一步之后的分辨率）：
+
+```
+t_mlp : timestep_embedding(t, 64) -> Linear(64, t_dim) -> SiLU -> Linear(t_dim, t_dim)  = emb
+stem  : Conv2d(in_ch, 32, 3, 1, 1)                                32x32
+rb1   : ResBlock(32, 32, t_dim)，结果存为 s1                      32x32
+ds1   : Conv2d(32, 32, 4, 2, 1)                                   16x16
+rb2   : ResBlock(32, 64, t_dim)，结果存为 s2                      16x16
+ds2   : Conv2d(64, 64, 4, 2, 1)                                   8x8
+mid   : ResBlock(64, 64, t_dim)                                   8x8
+rb3   : 上采样 -> unet_skip_concat(., s2) -> ResBlock(64+64, 32, t_dim)   16x16
+rb4   : 上采样 -> unet_skip_concat(., s1) -> ResBlock(32+32, 32, t_dim)   32x32
+out   : GroupNorm(8, 32) -> SiLU -> Conv2d(32, in_ch, 3, 1, 1)
+```
+
+- 上采样用 `nn.Upsample(scale_factor=2, mode="nearest")`
+- 每个 ResBlock 都传同一个 emb
+- `timestep_embedding`、`ResBlock`、`unet_skip_concat` 已经提供（参考版本）
+
+检查：输出形状和 x 一样；换一个 t，输出必须跟着变（证明时间条件接上了）。
 --- starter
 class MiniUNet(nn.Module):
-    """结构（32x32 输入）:
-        t_mlp:  timestep_embedding(t, 64) -> Linear(64,128) -> SiLU -> Linear(128,128)
-        stem:   Conv3x3(in_ch -> 32)
-        down1:  ResBlock(32, 32)  存 skip  -> Conv stride2 到 16x16
-        down2:  ResBlock(32, 64)  存 skip  -> Conv stride2 到 8x8
-        mid:    ResBlock(64, 64)
-        up2:    Upsample -> concat(skip2) -> ResBlock(64+64, 32)
-        up1:    Upsample -> concat(skip1) -> ResBlock(32+32, 32)
-        out:    GroupNorm -> SiLU -> Conv3x3(32 -> in_ch)
-    forward(x, t) -> 和 x 同形状（预测的噪声）
-    """
+    """forward(x, t): x (B, in_ch, 32, 32), t (B,) -> 和 x 同形状（预测的噪声）。结构见题目。"""
 
     def __init__(self, in_ch=1, t_dim=128):
         super().__init__()
-        # --- TODO 10 ---
+        raise todo()
+
+    def forward(self, x, t):
         raise todo()
 --- solution
 class MiniUNet(nn.Module):
@@ -440,28 +819,33 @@ def t10():
     # 不同的 t 必须给出不同的输出，否则时间条件根本没接上
     o1 = m(x, torch.zeros(2, dtype=torch.long))
     o2 = m(x, torch.full((2,), 999, dtype=torch.long))
-    true(not torch.allclose(o1, o2, atol=1e-4), "换了时间步输出没变 —— 时间嵌入没接进网络")
+    true(not torch.allclose(o1, o2, atol=1e-4), "换了时间步，输出却没变：时间嵌入没有接进网络（每个 ResBlock 都要传 emb）")
 --- hints
-- TODO
+- `t_mlp` 和 `out` 用 `nn.Sequential(...)` 写最省事；`nn.Upsample` 没有参数，建一个就能用两次。
+- forward 先算 `emb = self.t_mlp(timestep_embedding(t, 64))`，再按表往下走：`h = self.stem(x)`，`s1 = self.rb1(h, emb)`，`h = self.ds1(s1)`……
+- 解码：`h = self.rb3(unet_skip_concat(self.up(h), s2), emb)`，`h = self.rb4(unet_skip_concat(self.up(h), s1), emb)`，最后 `return self.out(h)`。
 
 @@ item d8-10
 type: code
 title: DDPM 训练目标
 level: 2
+cards: 训练目标和反向一步; q_sample：一步跳到第 t 步，和 SNR
 targets: ddpm_loss
 ref: day8
 --- context
-TODO
+DDPM 训练循环里真正的「算法」就这几行。把目标写成 x0 而不是噪声，是复现时最常见的错误之一：不报错，loss 也在降，只是模型学歪了。
 --- prompt
-11  训练目标：就一行
+写 `ddpm_loss(model, x0, sched, T)`，返回一个标量 loss：
+
+1. 每个样本随机抽一个 t，范围 [0, T)，形状 `(B,)`，放在 x0 所在的设备上
+2. `noise = torch.randn_like(x0)`
+3. `x_t = q_sample(x0, t, noise, sched)`（已提供）
+4. 返回 `model(x_t, t)` 和 `noise` 的 MSE —— 目标是噪声，不是 x0
+
+检查里有一个永远输出 0 的模型：它的 loss 应该约等于噪声的方差，也就是 1。
 --- starter
 def ddpm_loss(model, x0, sched, T):
-    """1) 每个样本随机采一个 t ~ U[0, T)
-       2) 采噪声 noise ~ N(0, I)
-       3) x_t = q_sample(x0, t, noise)
-       4) 返回 mse(model(x_t, t), noise)
-    """
-    # --- TODO 11 ---
+    """返回标量 loss：mse(model(x_t, t), noise)"""
     raise todo()
 --- solution
 def ddpm_loss(model, x0, sched, T):
@@ -476,38 +860,46 @@ def t11():
     s = linear_schedule(100)
     m = MiniUNet(1)
     loss = ddpm_loss(m, torch.randn(4, 1, 32, 32), s, 100)
-    true(loss.dim() == 0, "loss 要是标量")
-    true(loss.item() > 0.1, "随机初始化的模型预测噪声，loss 应该在 1 附近")
+    true(loss.dim() == 0, "loss 要是一个标量（0 维张量）")
+    true(loss.item() > 0.1, "随机初始化的模型去预测噪声，loss 应该在 1 附近")
     # 目标必须是 noise 而不是 x0
     class Zero(nn.Module):
         def forward(self, x, t):
             return torch.zeros_like(x)
     l0 = ddpm_loss(Zero(), torch.randn(64, 1, 8, 8) * 10, s, 100)
     true(abs(l0.item() - 1.0) < 0.15,
-         f"永远输出 0 的模型，loss 应该 ≈ 噪声的方差 = 1，实际 {l0.item():.3f}。"
+         f"永远输出 0 的模型，loss 应该 ≈ 噪声的方差 = 1，实际是 {l0.item():.3f}。"
          "如果远大于 1，说明你的目标写成了 x0")
 --- hints
-- TODO
+- `t = torch.randint(0, T, (x0.size(0),), device=x0.device)`
+- 模型的调用方式是 `model(xt, t)`，它返回的是预测的噪声。
+- 最后一行：`return F.mse_loss(model(xt, t), noise)`
 
 @@ item d8-11
 type: code
-title: p_sample 一步
-level: 2
+title: p_sample 反向一步
+level: 3
+cards: 训练目标和反向一步; extract：每个样本取自己的系数
 targets: p_sample_step
 ref: day8
 --- context
-TODO
+生成一张图，就是从纯噪声开始把这一步重复 T 次。t = 0 那一步不该再加噪声；batch 里每个样本的 t 不同时，「加不加」要按样本决定。这两点是手写采样循环时最容易错的地方。
 --- prompt
-12  反向一步 p_sample
+写 `p_sample_step(x_t, t, eps_pred, sched, noise=None)`，做一步 t → t-1：
+
+```
+mean    = (x_t - beta_t / sqrt(1 - alpha_bar_t) * eps_pred) / sqrt(alpha_t)
+x_{t-1} = mean + sqrt(beta_t) * noise     # t > 0
+x_0     = mean                            # t == 0：最后一步不加噪声
+```
+
+- `x_t`、`eps_pred`：`(B, C, H, W)`；`eps_pred` 是网络预测的噪声
+- `t`：`(B,)`，每个样本可以不一样。所以「加不加噪声」要按样本决定（一个 `(B, 1, 1, 1)` 的 0/1 开关），不要对整个 batch 写一个 Python `if`
+- `noise` 是 None 时，自己用 `torch.randn_like(x_t)` 采
+- beta_t、alpha_t、alpha_bar_t 分别从 `sched["betas"]`、`sched["alphas"]`、`sched["alphas_cumprod"]` 用 `extract` 取
 --- starter
 def p_sample_step(x_t, t, eps_pred, sched, noise=None):
-    """DDPM 反向一步:
-        mean = (x_t - beta_t / sqrt(1 - alpha_bar_t) * eps_pred) / sqrt(alpha_t)
-        t > 0 时:  x_{t-1} = mean + sqrt(beta_t) * noise
-        t == 0 时: x_0 = mean          （最后一步不加噪声）
-    t 是 (B,) 张量；noise 为 None 时自己采。
-    """
-    # --- TODO 12 ---
+    """DDPM 反向一步：x_t -> x_{t-1}。t: (B,)；t == 0 的样本不加噪声"""
     raise todo()
 --- solution
 def p_sample_step(x_t, t, eps_pred, sched, noise=None):
@@ -531,34 +923,44 @@ def t12():
     a = p_sample_step(x, t50, eps, s, noise=n)
     shape_is(a, x.shape)
     b = p_sample_step(x, t50, eps, s, noise=torch.zeros_like(x))
-    true(not torch.allclose(a, b), "t>0 时应该加噪声")
+    true(not torch.allclose(a, b), "t > 0 时应该加上 sqrt(beta_t) * noise")
     t0 = torch.zeros(4, dtype=torch.long)
     c1 = p_sample_step(x, t0, eps, s, noise=n)
     c2 = p_sample_step(x, t0, eps, s, noise=torch.randn_like(x))
-    eq(c1, c2, msg="最后一步（t=0）不能加噪声，否则生成的图会永远带一层沙")
-    # 完美预测噪声时，一步应该把 x_t 拉回接近 x0 的方向
+    eq(c1, c2, msg="最后一步（t=0）不能加噪声：它输出的就是成品图，换一个 noise 结果不该变")
+    # 喂进真实的噪声，反向一步应该回到 x0 附近
     x0 = torch.ones(1, 1, 2, 2)
     tt = torch.tensor([1])
     xt = q_sample(x0, tt, eps[:1, :, :2, :2], s)
     back = p_sample_step(xt, tt, eps[:1, :, :2, :2], s, noise=torch.zeros_like(xt))
-    true((back - x0).abs().mean() < 0.2, "喂进真实噪声，反向一步应该接近 x0")
+    true((back - x0).abs().mean() < 0.2, "喂进真实的噪声，反向一步应该回到 x0 附近：检查 mean 的公式")
 --- hints
-- TODO
+- 三个系数：`beta = extract(sched["betas"], t, x_t.shape)`，`alpha` 和 `ab` 同理，都是 `(B, 1, 1, 1)`。
+- `mean = (x_t - beta / (1 - ab).sqrt() * eps_pred) / alpha.sqrt()`
+- 按样本的开关：`keep = (t > 0).float().reshape(-1, *([1] * (x_t.dim() - 1)))`，然后 `return mean + keep * beta.sqrt() * noise`。
 
 @@ item d8-12
 type: code
-title: 信噪比
-level: 2
+title: 信噪比 SNR
+level: 1
+cards: q_sample：一步跳到第 t 步，和 SNR
 targets: snr
 ref: day8
 --- context
-TODO
+SNR（信噪比）把「第 t 步有多吵」变成一个数，而且和用哪种调度无关。比较不同调度、min-SNR 这类给 loss 加权的方法，都用它来说话。
 --- prompt
-13  信噪比
+写 `snr(sched, t)`：
+
+```
+SNR(t) = alpha_bar_t / (1 - alpha_bar_t)
+```
+
+- `sched`：第 1 题的 dict，alpha_bar 是 `sched["alphas_cumprod"]`
+- `t`：`(B,)` 的时间步
+- 返回 `(B,)`（这里不需要 reshape 成 `(B, 1, 1, 1)`）
 --- starter
 def snr(sched, t):
-    """SNR(t) = alpha_bar_t / (1 - alpha_bar_t)。t 是 (B,)，返回 (B,)。"""
-    # --- TODO 13 ---
+    """t: (B,) -> (B,)"""
     raise todo()
 --- solution
 def snr(sched, t):
@@ -569,33 +971,35 @@ def snr(sched, t):
 def t13():
     s = linear_schedule(1000)
     v = snr(s, torch.tensor([0, 500, 999]))
-    shape_is(v, (3,))
-    true(v[0] > v[1] > v[2], "SNR 必须随 t 单调下降")
-    true(v[0] > 1000, "t=0 时几乎没噪声，SNR 应该很大")
-    true(v[-1] < 0.01, "t=T 时几乎全是噪声")
+    shape_is(v, (3,), "输入 3 个 t，应该返回 3 个数")
+    true(v[0] > v[1] > v[2], "SNR 必须随 t 变大而下降")
+    true(v[0] > 1000, "t=0 时几乎没有噪声，SNR 应该很大")
+    true(v[-1] < 0.01, "t=999 时几乎全是噪声，SNR 应该很小")
 --- hints
-- TODO
+- 取值：`sched["alphas_cumprod"][t]` 或 `.gather(0, t)`。
+- `return ab / (1 - ab)`
 
 @@ item d8-13
 type: fix
-title: 找 bug: q_sample_buggy
+title: 找 bug：q_sample_buggy
 level: 2
+cards: q_sample：一步跳到第 t 步，和 SNR; beta 调度：linear 和 cosine
 targets: q_sample_buggy
 ref: day8
 --- context
-TODO
+这段代码能跑、不报错、shape 也对，只是模型永远训不好。这种 bug 只能靠「和参考实现对拍」抓出来。
 --- prompt
-14  找 bug —— 这个加噪函数有 2 处错
+下面这个加噪函数有 **2 处**错。改好它，让它的输出和正确的 `q_sample` 完全一样（检查会在 t = 0、300、999 三处对比）。函数名不要改。
 --- starter
 def q_sample_buggy(x0, t, noise, sched):
     a = extract(sched["alphas"], t, x0.shape)
     return a * x0 + (1 - a) * noise
 --- solution
 def q_sample_buggy(x0, t, noise, sched):
-    ab = extract(sched["alphas_cumprod"], t, x0.shape)   # 修 1: alphas -> alphas_cumprod
-    return ab.sqrt() * x0 + (1 - ab).sqrt() * noise      # 修 2: 两个系数都要开根号
+    ab = extract(sched["alphas_cumprod"], t, x0.shape)   # 修 1：alphas -> alphas_cumprod
+    return ab.sqrt() * x0 + (1 - ab).sqrt() * noise      # 修 2：两个系数都要开根号
 --- tests
-@check("找 bug: q_sample_buggy")
+@check("找 bug：q_sample_buggy")
 def t14():
     seed(4)
     s = linear_schedule(1000)
@@ -603,6 +1007,223 @@ def t14():
     for tv in [0, 300, 999]:
         t = torch.full((4,), tv, dtype=torch.long)
         eq(q_sample_buggy(x0, t, n, s), q_sample(x0, t, n, s), tol=1e-5,
-           msg="两处: 系数表应该用 alphas_cumprod 而不是 alphas；两个系数都要开根号")
+           msg=f"t={tv} 时和正确答案不一样。两处：系数表应该用 alphas_cumprod 而不是 alphas；两个系数都要开根号")
 --- hints
-- TODO
+- 看它查的是哪张表。一步跳到第 t 步，要的是「从 0 到 t 一共还剩多少信号」。
+- 再对一下公式：信号和噪声的系数都带 sqrt。
+- 改成 `alphas_cumprod`，并且用 `.sqrt()` 和 `(1 - ab).sqrt()`。
+
+@@ item d8-14
+type: predict
+title: 手算 alpha_bar
+level: 1
+cards: beta 调度：linear 和 cosine
+ref: day8
+--- context
+调试调度时最快的办法：拿一个很小的 T 手算几项，和代码的输出对一下。面试里也常让你手算累积乘积。
+--- prompt
+先自己算，再写出这段代码打印的 3 行。`linear_schedule` 就是第 1 题的函数。
+--- code
+s = linear_schedule(5, beta_start=0.1, beta_end=0.5)
+print(" ".join(f"{b:.1f}" for b in s["betas"].tolist()))
+print(" ".join(f"{a:.1f}" for a in s["alphas"].tolist()))
+print(" ".join(f"{ab:.3f}" for ab in s["alphas_cumprod"].tolist()))
+--- explain
+betas 在 0.1 到 0.5 之间均匀取 5 个点：0.1 0.2 0.3 0.4 0.5。alphas = 1 - betas：0.9 0.8 0.7 0.6 0.5。
+
+累积乘积一项一项乘：0.9；0.9 × 0.8 = 0.72；0.72 × 0.7 = 0.504；0.504 × 0.6 = 0.3024；0.3024 × 0.5 = 0.1512。保留 3 位小数就是最后一行。才走 5 步，信号就只剩 15% 了。
+
+@@ item d8-15
+type: predict
+title: UNet 的形状账
+level: 2
+cards: UNet：下采样、上采样、skip 拼接
+--- context
+拼 UNet 时最常见的报错，就是 cat 的时候尺寸或通道对不上。先在脑子里把形状算一遍，比看报错快得多。
+--- prompt
+先脑算，再写出这段代码打印的 4 行（每行一个形状）。
+--- code
+x = torch.randn(1, 64, 8, 8)
+down = nn.Conv2d(64, 64, 4, 2, 1)
+up = nn.Upsample(scale_factor=2, mode="nearest")
+d = down(x)
+print(tuple(d.shape))
+u = up(d)
+print(tuple(u.shape))
+print(tuple(torch.cat([u, x], dim=1).shape))
+print(tuple(up(down(torch.randn(1, 64, 5, 5))).shape))
+--- explain
+- 下采样：(8 + 2 − 4) // 2 + 1 = 4，得到 (1, 64, 4, 4)。
+- 上采样：边长翻倍回到 8，得到 (1, 64, 8, 8)。
+- 沿 dim=1 拼接：通道 64 + 64 = 128，得到 (1, 128, 8, 8)。
+- 5×5 的输入：(5 + 2 − 4) // 2 + 1 = 2，上采样后是 4，比原来的 5 少了 1。这就是第 8 题要先 `F.pad` 的原因。
+
+@@ item d8-16
+type: choice
+title: 训练为什么用闭式加噪
+level: 1
+cards: q_sample：一步跳到第 t 步，和 SNR
+--- context
+面试常问：「DDPM 训练时 x_t 是怎么来的？」答案直接决定训练跑不跑得动。
+--- prompt
+训练 DDPM 时，我们用 `q_sample` 的闭式公式一步得到 x_t，而不是从 x0 开始一步步加噪 t 次。主要原因是什么？
+--- options
+- 闭式公式的结果更准确，逐步加噪会累积误差
+- 一步就到，不用循环；batch 里每个样本随机抽不同的 t，也能一次算完
+- 逐步加噪会让方差越来越大，最后爆炸
+- 闭式公式不需要 beta 调度
+answer: 2
+--- explain
+两种做法得到的是**同一个分布**（第 4 题的第二个检查就在验证这一点），所以谈不上「更准」。逐步加噪也不会爆炸：每一步都先乘 sqrt(1 - beta) 缩小，方差一直在 1 附近。闭式公式照样要用 alpha_bar，而 alpha_bar 就是从 betas 算出来的。
+
+真正的原因是速度：每个样本随机抽 t，逐步加噪平均要循环 500 次；闭式只要一次乘加，而且 batch 里不同的 t 用 extract 一起算。
+
+@@ item d8-17
+type: choice
+title: 生成一批图要调用几次网络
+level: 1
+cards: 训练目标和反向一步
+--- context
+线上跑扩散模型时，延迟几乎全花在网络调用上。知道 DDPM 要调用多少次，就明白它为什么慢，以及为什么大家都换成了步数更少的采样器。
+--- prompt
+用今天的 DDPM（T = 1000）生成一批 16 张图：从纯噪声开始，一直走到最终的 x0。UNet 一共要被调用多少次？（一次调用处理整个 batch）
+--- options
+- 1 次：网络一次就能预测出全部噪声
+- 16 次：每张图一次
+- 1000 次：每个时间步一次
+- 16000 次：每张图的每个时间步各一次
+answer: 3
+--- explain
+反向过程只能一步一步走：算 x_{t-1} 需要网络先看 x_t，而 x_t 又是上一步的结果。所以 1000 步必须串行，每步调用一次网络。batch 里的 16 张图在同一次调用里一起算，所以不是 16000 次。
+
+这就是 DDPM 采样慢的原因。第 9 天的 DDIM 只走其中几十步，就能快很多倍。
+
+@@ item d8-18
+type: code
+title: 闭卷：q_sample
+level: 2
+exam: yes
+cards: q_sample：一步跳到第 t 步，和 SNR; extract：每个样本取自己的系数
+targets: q_sample
+ref: day8
+--- context
+闭式加噪是扩散模型的地基，训练的每一步都在用它。面试里常让你当场写出来。
+--- prompt
+不看笔记，写出 `q_sample(x0, t, noise, sched)`：一步算出第 t 步的带噪图 x_t（不要逐步循环）。
+
+- `x0`、`noise`：`(B, C, H, W)`；`t`：`(B,)`，每个样本的 t 可以不同
+- `sched`：`linear_schedule` 返回的 dict，有 `"betas"`、`"alphas"`、`"alphas_cumprod"`
+- `extract` 可以直接用
+--- starter
+def q_sample(x0, t, noise, sched):
+    raise todo()
+--- solution
+def q_sample(x0, t, noise, sched):
+    ab = extract(sched["alphas_cumprod"], t, x0.shape)
+    return ab.sqrt() * x0 + (1 - ab).sqrt() * noise
+--- tests
+@check("q_sample 闭式")
+def t04():
+    seed(0)
+    s = linear_schedule(1000)
+    x0 = torch.randn(4, 3, 8, 8)
+    n = torch.randn_like(x0)
+    t0 = torch.zeros(4, dtype=torch.long)
+    xt = q_sample(x0, t0, n, s)
+    true((xt - x0).abs().mean() < 0.02, "t=0 时 x_t 应该几乎还是原图 x0")
+    tT = torch.full((4,), 999, dtype=torch.long)
+    xT = q_sample(x0, tT, n, s)
+    true((xT - n).abs().mean() < 0.1, "t=999 时 x_t 应该几乎就是纯噪声")
+    # 同一个 batch 里，每个样本可以有不同的 t
+    tm = torch.tensor([0, 500, 999, 250])
+    shape_is(q_sample(x0, tm, n, s), x0.shape, "每个样本的 t 不一样时，输出形状也要和 x0 一样")
+
+@check("闭式 == 逐步加噪")
+def t05():
+    seed(1)
+    T = 200
+    s = linear_schedule(T, 1e-4, 0.05)
+    N = 20000
+    x0 = torch.full((N, 1), 2.0)                 # 固定的信号，方便看统计量
+    step = 60
+
+    # 逐步加噪：x_t = sqrt(1-beta_t) * x_{t-1} + sqrt(beta_t) * eps
+    x = x0.clone()
+    for i in range(step + 1):
+        b = s["betas"][i]
+        x = (1 - b).sqrt() * x + b.sqrt() * torch.randn_like(x)
+
+    ab = s["alphas_cumprod"][step]
+    want_mean = (ab.sqrt() * 2.0).item()
+    want_std = (1 - ab).sqrt().item()
+    true(abs(x.mean().item() - want_mean) < 0.02,
+         f"逐步加噪的均值 {x.mean().item():.4f} 应该 ≈ sqrt(alpha_bar)*x0 = {want_mean:.4f}")
+    true(abs(x.std().item() - want_std) < 0.02,
+         f"逐步加噪的标准差 {x.std().item():.4f} 应该 ≈ sqrt(1-alpha_bar) = {want_std:.4f}")
+
+    # 你的 q_sample 必须给出同样的统计量
+    xt = q_sample(x0, torch.full((N,), step, dtype=torch.long), torch.randn(N, 1), s)
+    true(abs(xt.mean().item() - want_mean) < 0.02,
+         f"q_sample 的均值 {xt.mean().item():.4f} 和逐步加噪的 {want_mean:.4f} 对不上：信号的系数应该是 sqrt(alpha_bar)")
+    true(abs(xt.std().item() - want_std) < 0.02,
+         f"q_sample 的标准差 {xt.std().item():.4f} 和逐步加噪的 {want_std:.4f} 对不上：噪声的系数应该是 sqrt(1-alpha_bar)")
+--- hints
+- 系数表用累积的那张，取出来是 `(B, 1, 1, 1)`。
+- 信号和噪声的系数都要开根号，两个平方加起来是 1。
+
+@@ item d8-19
+type: code
+title: 闭卷：p_sample_step
+level: 3
+exam: yes
+cards: 训练目标和反向一步; extract：每个样本取自己的系数
+targets: p_sample_step
+ref: day8
+--- context
+采样循环的核心就是这一步，重复 T 次就生成一张图。能不看笔记写出均值公式，还记得「最后一步不加噪声」，说明你真懂了反向过程。
+--- prompt
+不看笔记，写出 `p_sample_step(x_t, t, eps_pred, sched, noise=None)`：DDPM 反向一步，从 x_t 算出 x_{t-1}。
+
+- `x_t`、`eps_pred`：`(B, C, H, W)`，`eps_pred` 是网络预测的噪声
+- `t`：`(B,)`，每个样本可以不同。t > 0 的样本加上 sqrt(beta_t) 倍的噪声，t = 0 的样本不加
+- `noise` 是 None 时自己采
+- `sched` 有 `"betas"`、`"alphas"`、`"alphas_cumprod"`；`extract` 可以直接用
+--- starter
+def p_sample_step(x_t, t, eps_pred, sched, noise=None):
+    raise todo()
+--- solution
+def p_sample_step(x_t, t, eps_pred, sched, noise=None):
+    beta = extract(sched["betas"], t, x_t.shape)
+    alpha = extract(sched["alphas"], t, x_t.shape)
+    ab = extract(sched["alphas_cumprod"], t, x_t.shape)
+    mean = (x_t - beta / (1 - ab).sqrt() * eps_pred) / alpha.sqrt()
+    if noise is None:
+        noise = torch.randn_like(x_t)
+    keep = (t > 0).float().reshape(-1, *([1] * (x_t.dim() - 1)))
+    return mean + keep * beta.sqrt() * noise    # t=0 时不加噪声
+--- tests
+@check("p_sample 一步")
+def t12():
+    seed(3)
+    s = linear_schedule(100)
+    x = torch.randn(4, 1, 4, 4)
+    eps = torch.randn_like(x)
+    n = torch.randn_like(x)
+    t50 = torch.full((4,), 50, dtype=torch.long)
+    a = p_sample_step(x, t50, eps, s, noise=n)
+    shape_is(a, x.shape)
+    b = p_sample_step(x, t50, eps, s, noise=torch.zeros_like(x))
+    true(not torch.allclose(a, b), "t > 0 时应该加上 sqrt(beta_t) * noise")
+    t0 = torch.zeros(4, dtype=torch.long)
+    c1 = p_sample_step(x, t0, eps, s, noise=n)
+    c2 = p_sample_step(x, t0, eps, s, noise=torch.randn_like(x))
+    eq(c1, c2, msg="最后一步（t=0）不能加噪声：它输出的就是成品图，换一个 noise 结果不该变")
+    # 喂进真实的噪声，反向一步应该回到 x0 附近
+    x0 = torch.ones(1, 1, 2, 2)
+    tt = torch.tensor([1])
+    xt = q_sample(x0, tt, eps[:1, :, :2, :2], s)
+    back = p_sample_step(xt, tt, eps[:1, :, :2, :2], s, noise=torch.zeros_like(xt))
+    true((back - x0).abs().mean() < 0.2, "喂进真实的噪声，反向一步应该回到 x0 附近：检查 mean 的公式")
+--- hints
+- 均值：从 x_t 减去 beta_t / sqrt(1 - alpha_bar_t) 倍的预测噪声，再除以 sqrt(alpha_t)。
+- 开关 `(t > 0).float()` reshape 成 `(B, 1, 1, 1)`，乘在噪声那一项上。

@@ -1,0 +1,950 @@
+@@ day 11
+title: The shape language of audio
+part: Audio
+hours: 3–4 hours
+--- goal
+After today you can turn a waveform, step by step, into the log-mel tensor a model eats. You can work out every shape in your head, and you can say why each step is there and what it throws away.
+--- checklist
+- Clear the review queue first (redo from scratch any item whose answer you looked at)
+- Run all 8 knowledge cards; change at least one number in each and run it again
+- Close the cards and write on paper every shape from waveform to log-mel for 1 second of 16 kHz audio
+- Pass every practice item, then do the closed-book items
+
+@@ concept
+title: Waveforms and sample rate: numbers per second
+--- body
+To a computer, a piece of audio is just a list of numbers called a **waveform**. Each number records how far the sound vibration is from rest at one instant. The values are roughly between -1 and 1.
+
+The **sample rate** (sr) is how many numbers are recorded per second. 16 kHz means 16,000 numbers per second.
+
+- number of samples = seconds × sr, rounded down. 2 seconds at 16 kHz → 32,000 samples
+- seconds = number of samples ÷ sr. 48,000 samples at 16 kHz → 3.0 seconds
+- one mono clip has shape `(T,)`; a batch has shape `(B, T)`
+
+Common sample rates: speech recognition often uses 16 kHz; TTS and audio codecs often use 22.05 kHz or 24 kHz; music CDs use 44.1 kHz.
+
+Models usually do not look at every sample. They cut the waveform into frames. The distance between the starts of two neighbouring frames is the **hop**. So:
+
+- frames per second (frame rate) = sr ÷ hop
+- 16 kHz with hop=160 → 100 frames per second (this is what Whisper uses)
+
+The frame rate plays the role of "how many characters per token" in an LLM: it decides how long a sequence a clip becomes, and so how much work the model has to do.
+--- code
+sr = 16000
+seconds = 2.5
+T = int(seconds * sr)
+wav = torch.zeros(T)                  # 2.5 seconds of silence
+print("shape:", tuple(wav.shape))
+print("duration:", wav.numel() / sr, "seconds")
+
+for sr_, hop in [(16000, 160), (22050, 256), (24000, 300)]:
+    print(f"sr={sr_}, hop={hop}: {sr_ / hop:.1f} frames per second")
+
+@@ concept
+title: Peak normalization: making volumes match
+--- body
+Recordings differ a lot in volume. Someone speaking right into the microphone has a **peak** (the sample with the largest absolute value) close to 1. Someone far away may peak at 0.05. Before training, a common step is to bring every clip to the same level.
+
+**Peak normalization** multiplies the whole waveform by one number so that the peak lands exactly on a target, for example 0.95.
+
+- peak = `wav.abs().max()` (take the absolute value: negative samples count too)
+- result = `wav * (target / peak)`
+- every sample is multiplied by the same number, so the shape of the wave stays the same; only the volume changes
+- the target is 0.95 rather than 1.0 to leave some headroom: if later processing pushes values past 1 they get clipped, which sounds like crackling
+
+The trap: a clip of pure silence has peak 0. `0.95 / 0` is inf, and `0 * inf` is nan. One silent file in the dataset is enough to put nan into training. So when the peak is 0, return the input unchanged.
+--- code
+wav = torch.tensor([0.05, -0.2, 0.1])
+peak = wav.abs().max()
+print("peak:", round(peak.item(), 3))
+out = wav * (0.95 / peak)
+print("normalized:", [round(v, 4) for v in out.tolist()])
+print("new peak:", round(out.abs().max().item(), 4))
+
+silence = torch.zeros(3)
+print("silence, divided anyway:", (silence * (0.95 / silence.abs().max())).tolist())
+
+@@ concept
+title: Framing: cutting a waveform into frames with unfold
+--- body
+Sound changes all the time, but over a very short stretch (20 to 60 milliseconds) it stays roughly the same. So the first step in audio processing is usually **framing**: a window of length `size` slides along the waveform, moving `step` samples each time (this step is the hop).
+
+`wav.unfold(0, size, step)` does it in one call: along dimension 0 it takes a piece of length `size` every `step` samples and stacks the pieces along a new dimension.
+
+- input `(T,)` → output `(n_frames, size)`
+- frame i is `wav[i*step : i*step + size]`
+- n_frames = `(T - size) // step + 1`; a tail too short for a full frame is dropped
+- the result is a view: no data is copied, so it is fast; cutting frames one by one in a Python loop is much slower on long audio
+
+Example: T=8, size=3, step=2 → (8 - 3) // 2 + 1 = 3 frames, starting at 0, 2 and 4. The last sample (7) is dropped.
+
+Remember this frame-count formula: it is exactly the STFT frame count with `center=False` on the next card.
+--- code
+wav = torch.arange(8.)
+frames = wav.unfold(0, 3, 2)
+print(frames)
+print("frame-count formula:", (8 - 3) // 2 + 1)
+
+big = torch.randn(16000).unfold(0, 400, 160)   # 16 kHz: 25 ms frames, 10 ms hop
+print(tuple(big.shape), "=", (16000 - 400) // 160 + 1, "frames")
+
+@@ concept
+title: STFT: frequency bins and frame count
+--- body
+After framing, run an FFT (fast Fourier transform) on each frame. That tells you how strong each frequency is inside that frame. Put all frames side by side and you have the **STFT** (short-time Fourier transform). `torch.stft` does the framing, the windowing and the FFT in one call.
+
+Three parameters:
+
+- `n_fft`: samples per frame, e.g. 1024
+- `hop_length`: samples between the starts of neighbouring frames, e.g. 256
+- `window`: each frame is first multiplied by a window that fades its edges to 0; the usual one is `torch.hann_window(n_fft)`
+
+The output shape is `(n_bins, n_frames)`, or `(B, n_bins, n_frames)` for a batch.
+
+- **number of frequency bins** = `n_fft // 2 + 1`. Each bin is `sr / n_fft` Hz wide; bin k stands for `k * sr / n_fft` Hz
+- **number of frames, center=True** (the default): pad `n_fft // 2` samples at both ends, then frame. n_frames = `T // hop + 1`
+- **number of frames, center=False**: no padding, same as unfold. n_frames = `(T - n_fft) // hop + 1`
+
+Example: T=16000, n_fft=512, hop=128 → 257 bins; 126 frames with center=True, 122 with center=False. Note that with center=True the frame count does not depend on n_fft at all, only on the hop.
+
+Pass `return_complex=True`: the output is a complex tensor (`complex64`). The absolute value `.abs()` of each complex number is how strong that frequency is. That gives the **magnitude spectrogram**, an ordinary real tensor.
+--- code
+sr = 16000
+t = torch.arange(sr) / sr                      # a 1-second time axis
+tone = torch.sin(2 * math.pi * 1000 * t)       # a pure 1000 Hz tone
+n_fft, hop = 512, 128
+spec = torch.stft(tone, n_fft, hop, window=torch.hann_window(n_fft), return_complex=True)
+print("complex spectrogram:", tuple(spec.shape), spec.dtype)
+mag = spec.abs()
+print("magnitude:", tuple(mag.shape), mag.dtype)
+print("strongest bin in frame 60:", mag[:, 60].argmax().item(), " expected 1000 * 512 / 16000 =", 1000 * n_fft / sr)
+
+nc = torch.stft(tone, n_fft, hop, window=torch.hann_window(n_fft), return_complex=True, center=False)
+print("center=False:", tuple(nc.shape))
+
+@@ concept
+title: Magnitude and phase: what the magnitude spectrogram loses
+--- body
+Each cell of the STFT output is a complex number `a + bi`. Picture it as an arrow in a plane:
+
+- **magnitude** = the arrow's length = `z.abs()` = √(a² + b²). How strong this frequency is. Always ≥ 0
+- **phase** = the arrow's angle = `z.angle()`. Where in its cycle this frequency's wave starts within the frame
+- `z.real` is only the real part a. It is neither the magnitude nor the phase, and it can be negative. Writing `.real` when you want the magnitude is a very common bug
+
+Magnitude + phase = the full information. `torch.polar(magnitude, phase)` rebuilds the complex numbers, and `torch.istft` (the inverse STFT) turns them back into a waveform with almost zero error.
+
+But mel spectrograms and log-mels are computed from the magnitude only; the phase is thrown away. The experiment below sets every phase to 0 and rebuilds the waveform. The relative error is about 1.0: the error is as large as the signal itself, and the waveform is unrecognisable. That is why a TTS model that predicts a mel spectrogram also needs a **vocoder**, which "guesses" the phase back to produce playable audio (you will meet it on Day 12).
+--- code
+torch.manual_seed(1)
+wav = torch.randn(4096)
+win = torch.hann_window(512)
+spec = torch.stft(wav, 512, 128, window=win, return_complex=True)
+mag, phase = spec.abs(), spec.angle()
+print("spec:", tuple(spec.shape), spec.dtype)
+
+z = torch.tensor(-3 + 4j)
+print("one cell -3+4j: real =", z.real.item(), " abs =", z.abs().item())
+
+def rel_err(x):
+    return (((x - wav) ** 2).mean() / (wav ** 2).mean()).item()
+
+full = torch.istft(torch.polar(mag, phase), 512, 128, window=win, length=4096)
+print(f"rebuilt from magnitude + phase, relative error: {rel_err(full):.1e}")
+
+no_phase = torch.istft(mag.to(torch.complex64), 512, 128, window=win, length=4096)
+print(f"rebuilt from magnitude only (phase = 0), relative error: {rel_err(no_phase):.2f}")
+
+@@ concept
+title: The mel scale and the mel filterbank
+--- body
+Our ears are very sensitive to changes at low frequencies: 100 Hz and 200 Hz sound very different, but 7900 Hz and 8000 Hz sound almost the same. The **mel scale** turns Hz into "perceived distance":
+
+`mel = 2595 * log10(1 + f / 700)`
+
+- 0 Hz → 0 mel; 1000 Hz → about 1000 mel
+- 100 → 200 Hz is 133 mel apart; 7900 → 8000 Hz is only 13 mel apart
+- low frequencies get stretched out, high frequencies get squeezed together
+
+A **mel filterbank** is a matrix `fb` of shape `(n_mels, n_freq)`, e.g. `(80, 513)`. Each row is one triangular filter. The 80 triangles are evenly spaced on the mel scale. Seen in Hz, the low triangles are narrow and packed tightly, the high ones are wide and spread out.
+
+Squeezing 513 frequency bins into 80 mel bands is a single matrix multiplication:
+
+- `fb @ mag`: `(80, 513) @ (513, 63)` → `(80, 63)`
+- with a batch: `(80, 513) @ (B, 513, 63)` → `(B, 80, 63)`; `@` broadcasts over the batch
+
+Real projects build fb with a library function (`torchaudio.functional.melscale_fbanks` or `librosa.filters.mel`). The code below builds one by hand so you can see what it looks like.
+--- code
+def hz_to_mel(f):
+    return 2595 * math.log10(1 + f / 700)
+
+for f in [100, 200, 1000, 7900, 8000]:
+    print(f, "Hz ->", round(hz_to_mel(f)), "mel")
+
+sr, n_fft, n_mels = 16000, 1024, 80
+edges_mel = torch.linspace(0, hz_to_mel(sr / 2), n_mels + 2)   # evenly spaced in mel
+edges_hz = 700 * (10 ** (edges_mel / 2595) - 1)                # back to Hz
+freqs = torch.linspace(0, sr / 2, n_fft // 2 + 1)              # the Hz of each of the 513 bins
+fb = torch.zeros(n_mels, freqs.numel())
+for i in range(n_mels):
+    lo, mid, hi = edges_hz[i], edges_hz[i + 1], edges_hz[i + 2]
+    rise = (freqs - lo) / (mid - lo)
+    fall = (hi - freqs) / (hi - mid)
+    fb[i] = torch.clamp(torch.minimum(rise, fall), min=0)      # a triangle
+
+print("fb:", tuple(fb.shape))
+print("bins covered by filter 0:", (fb[0] > 0).sum().item())
+print("bins covered by filter 79:", (fb[79] > 0).sum().item())
+mag = torch.rand(2, 513, 63)
+print("fb @ mag:", tuple((fb @ mag).shape))
+
+@@ concept
+title: Log-mel: take the log, add eps
+--- body
+Mel values cover a huge range: a quiet part may be 0.001 and a loud part 1000, a factor of a million. Fed in directly, the big numbers drown out everything else. Also, our sense of loudness is roughly logarithmic: ten times the energy sounds like just "one step louder".
+
+So almost every speech model uses the **log-mel**: the log of the mel spectrogram. After the log, a factor of a million becomes a difference of only 13.8.
+
+The trap: where there is total silence, mel = 0, and `log(0) = -inf`. One -inf inside the network and the loss becomes nan. So add a tiny number **eps**:
+
+`log_mel = log(fb @ mag + eps)`, usually with eps = 1e-5.
+
+With eps, total silence becomes log(1e-5) ≈ -11.5. This is the "silence floor" of a log-mel. The -11.5 used later for padding comes from here.
+
+The whole chain: waveform `(T,)` → magnitude `(n_freq, n_frames)` → `fb @` → mel `(n_mels, n_frames)` → `log(· + eps)` → log-mel `(n_mels, n_frames)`.
+--- code
+mel = torch.tensor([0.0, 0.001, 1.0, 1000.0])
+print("no eps  :", [round(v, 2) for v in torch.log(mel).tolist()])
+print("with eps:", [round(v, 2) for v in torch.log(mel + 1e-5).tolist()])
+print("silence floor log(1e-5) =", round(math.log(1e-5), 2))
+print("max / min (linear):", 1000.0 / 0.001)
+print("max - min (log)   :", round(math.log(1000.0) - math.log(0.001), 1))
+
+@@ concept
+title: Before the model: channel dim, padding and mask
+--- body
+**A mel spectrogram is a one-channel image**: height = n_mels, width = number of frames. Image models expect `(B, C, H, W)`, so for `(B, n_mels, n_frames)` you only add a channel dimension at position 1: `mel.unsqueeze(1)` → `(B, 1, n_mels, n_frames)`. After that the `nn.Conv2d` layers from Day 8 work unchanged.
+
+**Variable length**: the clips in a batch have different lengths, so different frame counts, but a tensor must be a neat box. The fix is the same padding you know from text:
+
+- find the longest frame count Tmax and create a `(B, n_mels, Tmax)` tensor filled with the pad value
+- copy each mel into the left part; whatever is left on the right is padding
+- use -11.5 (the log-mel silence floor) as the pad value, not 0: a log-mel value of 0 means energy 1, which is "sound", not silence
+- also build a **mask** of shape `(B, Tmax)`: 1 for real frames, 0 for padding. The loss and attention use it later to ignore the padding
+
+`F.pad(x, (left, right), value=v)` pads the last dimension on both sides; `arange < lengths` builds the whole mask in one go.
+
+The code below walks the whole shape chain for 0.5 seconds with n_fft=512, hop=128, n_mels=64.
+--- code
+wav = torch.randn(8000)                         # 0.5 seconds at 16 kHz
+mag = torch.stft(wav, 512, 128, window=torch.hann_window(512), return_complex=True).abs()
+fb = torch.rand(64, 257)                        # a fake filterbank, only the shape matters here
+log_mel = torch.log(fb @ mag + 1e-5)
+x = log_mel.unsqueeze(0).unsqueeze(0)           # add a batch dim and a channel dim
+print(tuple(wav.shape), "->", tuple(mag.shape), "->", tuple(log_mel.shape), "->", tuple(x.shape))
+print("Conv2d output:", tuple(nn.Conv2d(1, 8, 3, padding=1)(x).shape))
+
+short = torch.zeros(2, 3)                       # a mel with 3 frames (n_mels=2)
+print(F.pad(short, (0, 5 - 3), value=-11.5))    # pad 2 frames on the right
+lengths = torch.tensor([3, 5])
+print((torch.arange(5)[None, :] < lengths[:, None]).long())
+
+@@ item d11-01
+type: code
+title: Sample-rate arithmetic
+level: 1
+cards: Waveforms and sample rate: numbers per second
+targets: n_samples, duration, AUDIO_FACTS
+ref: day11
+--- context
+The sample rate decides how long a sequence a clip becomes. Preparing data, choosing the model's input length and estimating inference time all start with this arithmetic, and interviewers like to ask "how many frames are in 10 seconds of audio?" on the spot.
+--- prompt
+Write two functions and fill in one dictionary:
+
+- `n_samples(seconds, sr)`: duration in seconds → number of samples, as an `int`. Example: `n_samples(0.5, 24000) == 12000`
+- `duration(n, sr)`: number of samples → duration in seconds. Example: `duration(16000, 16000) == 1.0`
+- `AUDIO_FACTS`: replace the 4 `None`s with integers; mental arithmetic is enough. "Frames per second" = sr ÷ hop, rounded down
+--- starter
+def n_samples(seconds, sr):
+    """Duration in seconds -> number of samples (an int)."""
+    raise todo()
+
+
+def duration(n, sr):
+    """Number of samples -> duration in seconds."""
+    raise todo()
+
+
+AUDIO_FACTS = {
+    "samples in 1 s at 16 kHz": None,
+    "samples in 2.5 s at 24 kHz": None,
+    "frames per second, hop=256 at 16 kHz": None,
+    "frames per second, hop=320 at 24 kHz": None,
+}
+--- solution
+def n_samples(seconds, sr):
+    return int(seconds * sr)
+
+
+def duration(n, sr):
+    return n / sr
+
+
+AUDIO_FACTS = {
+    "samples in 1 s at 16 kHz": 16000,
+    "samples in 2.5 s at 24 kHz": 60000,
+    "frames per second, hop=256 at 16 kHz": 62,      # 16000 / 256 = 62.5 -> 62
+    "frames per second, hop=320 at 24 kHz": 75,
+}
+--- tests
+@check("sample-rate arithmetic")
+def t01():
+    true(n_samples(1.0, 16000) == 16000, "n_samples(1.0, 16000) should be 16000")
+    true(n_samples(0.5, 24000) == 12000, "n_samples(0.5, 24000) should be 12000")
+    true(close(duration(16000, 16000), 1.0), "duration(16000, 16000) should be 1.0 seconds")
+    want = {
+        "samples in 1 s at 16 kHz": 16000,
+        "samples in 2.5 s at 24 kHz": 60000,
+        "frames per second, hop=256 at 16 kHz": 62,      # 16000/256 = 62.5 -> rounded down to 62
+        "frames per second, hop=320 at 24 kHz": 75,
+    }
+    wrong = [f"{k}: you wrote {AUDIO_FACTS.get(k)}, expected {v}" for k, v in want.items()
+             if AUDIO_FACTS.get(k) is None or int(AUDIO_FACTS[k]) != v]
+    true(not wrong, "these AUDIO_FACTS are wrong:\n" + "\n".join(wrong))
+--- hints
+- The sample rate is "samples per second". Seconds × samples per second = samples; samples ÷ samples per second = seconds.
+- `n_samples` returns `int(seconds * sr)`; `duration` returns `n / sr`.
+- Frame rate: 16000 / 256 = 62.5, rounded down to 62; 24000 / 320 is exactly 75.
+
+@@ item d11-02
+type: code
+title: The STFT frame-count formula
+level: 2
+cards: Framing: cutting a waveform into frames with unfold; STFT: frequency bins and frame count
+targets: n_frames
+ref: day11
+--- context
+The sequence length the model sees is the STFT frame count. Get it wrong by one frame and the alignment between mel frames and text, or between mel frames and audio tokens, slips; concatenations may also fail with a shape mismatch.
+--- prompt
+Write `n_frames(n_sample, n_fft, hop_length, center=True)`. It returns the number of frames `torch.stft` would produce, as an int. Do not call `torch.stft`; use a formula.
+
+- `center=True`: first pad `n_fft // 2` samples at both ends of the waveform, then cut frames
+- `center=False`: no padding. The first frame starts at sample 0, each frame has `n_fft` samples, and a tail too short for a full frame is dropped
+
+The check compares your result with the real `torch.stft(...).shape[-1]` (every `n_fft` is even).
+--- starter
+def n_frames(n_sample, n_fft, hop_length, center=True):
+    """Return the number of frames torch.stft produces."""
+    raise todo()
+--- solution
+def n_frames(n_sample, n_fft, hop_length, center=True):
+    if center:
+        return n_sample // hop_length + 1
+    return (n_sample - n_fft) // hop_length + 1
+--- tests
+@check("STFT frame-count formula")
+def t02():
+    for n, nf, hop in [(16000, 1024, 256), (12345, 512, 128), (48000, 2048, 512)]:
+        real = torch.stft(torch.zeros(n), nf, hop, window=torch.hann_window(nf),
+                          return_complex=True, center=True).shape[-1]
+        true(n_frames(n, nf, hop, True) == real,
+             f"center=True, n={n}, n_fft={nf}, hop={hop}: you computed {n_frames(n, nf, hop, True)}, torch.stft gives {real}")
+        real2 = torch.stft(torch.zeros(n), nf, hop, window=torch.hann_window(nf),
+                           return_complex=True, center=False).shape[-1]
+        true(n_frames(n, nf, hop, False) == real2,
+             f"center=False, n={n}, n_fft={nf}, hop={hop}: you computed {n_frames(n, nf, hop, False)}, torch.stft gives {real2}")
+--- hints
+- center=False works exactly like unfold: frames start at 0, hop, 2·hop, …, and the last frame must fit completely.
+- center=False: `(n_sample - n_fft) // hop_length + 1`. With center=True the length becomes `n_sample + n_fft`; put that into the same formula and simplify.
+- center=True simplifies to `n_sample // hop_length + 1`.
+
+@@ item d11-03
+type: code
+title: STFT magnitude
+level: 2
+cards: STFT: frequency bins and frame count; Magnitude and phase: what the magnitude spectrogram loses
+targets: stft_mag
+ref: day11
+--- context
+The first step of almost every speech model is "waveform → magnitude spectrogram". This function must handle a single clip and a whole batch, and the window must live on the same device as the input, or it breaks as soon as you move to the GPU.
+--- prompt
+Write `stft_mag(wav, n_fft=1024, hop_length=256)`:
+
+- input `wav`: `(T,)` or `(B, T)`
+- use `torch.stft` with the window `torch.hann_window(n_fft)` (on `wav.device`), `center=True`, `return_complex=True`
+- return the magnitude (real, non-negative): `(n_fft//2 + 1, n_frames)` or `(B, n_fft//2 + 1, n_frames)`
+
+Example: 16000 samples → `(513, 63)`; `(2, 16000)` → `(2, 513, 63)`.
+--- starter
+def stft_mag(wav, n_fft=1024, hop_length=256):
+    """wav: (T,) or (B, T) -> magnitude (..., n_fft//2 + 1, n_frames)"""
+    raise todo()
+--- solution
+def stft_mag(wav, n_fft=1024, hop_length=256):
+    win = torch.hann_window(n_fft, device=wav.device)
+    return torch.stft(wav, n_fft, hop_length, window=win,
+                      center=True, return_complex=True).abs()
+--- tests
+@check("STFT magnitude")
+def t03():
+    seed(0)
+    w = torch.randn(16000)
+    m = stft_mag(w)
+    shape_is(m, (513, 63), "1024//2+1 = 513 frequency bins, 16000//256+1 = 63 frames")
+    true(not m.is_complex(), "should return a real tensor: take .abs() of the complex spectrogram")
+    true((m >= 0).all(), "a magnitude can never be negative (did you use .real instead of .abs()?)")
+    shape_is(stft_mag(torch.randn(2, 16000)), (2, 513, 63), "the batch dimension must be carried through")
+    # the energy of a pure tone should sit in one frequency bin
+    t = torch.arange(16000).float() / 16000
+    tone = torch.sin(2 * math.pi * 1000 * t)
+    peak = stft_mag(tone)[:, 30].argmax().item()
+    true(abs(peak - 1000 * 1024 / 16000) < 2, f"a 1000 Hz tone should peak near bin 64, got {peak}")
+--- hints
+- `torch.stft(wav, n_fft, hop_length, window=..., center=True, return_complex=True)` returns a complex tensor; it handles the batch dimension by itself.
+- The magnitude is the absolute value of the complex number: `.abs()`, not `.real`.
+- The window: `torch.hann_window(n_fft, device=wav.device)`.
+
+@@ item d11-04
+type: code
+title: Converting to and from mel
+level: 1
+cards: The mel scale and the mel filterbank
+targets: hz_to_mel, mel_to_hz
+ref: day11
+--- context
+The mel scale makes the frequency axis closer to how we hear, which is why speech models almost always use mel spectrograms. Building a filterbank, setting `f_min` / `f_max` or reading a spectrogram plot all mean converting between Hz and mel.
+--- prompt
+Write two functions. Inputs and outputs are plain Python numbers (`math` is enough):
+
+- `hz_to_mel(f)`: `2595 * log10(1 + f / 700)`
+- `mel_to_hz(m)`: its inverse, so that `mel_to_hz(hz_to_mel(f)) ≈ f`
+--- starter
+def hz_to_mel(f):
+    """Hz -> mel"""
+    raise todo()
+
+
+def mel_to_hz(m):
+    """mel -> Hz (the inverse of hz_to_mel)"""
+    raise todo()
+--- solution
+def hz_to_mel(f):
+    return 2595.0 * math.log10(1.0 + f / 700.0)
+
+
+def mel_to_hz(m):
+    return 700.0 * (10 ** (m / 2595.0) - 1.0)
+--- tests
+@check("mel conversion")
+def t04():
+    true(close(hz_to_mel(0), 0.0), f"hz_to_mel(0) should be 0, got {hz_to_mel(0)}")
+    true(close(hz_to_mel(700), 2595 * math.log10(2), 1e-3), "hz_to_mel(700) should be 2595 * log10(2) ≈ 781.2")
+    for f in [100.0, 1000.0, 8000.0]:
+        true(close(mel_to_hz(hz_to_mel(f)), f, 1e-2), f"{f} Hz to mel and back does not match: mel_to_hz is not the inverse of hz_to_mel")
+    # the mel scale stretches low frequencies
+    true(hz_to_mel(200) - hz_to_mel(100) > hz_to_mel(8100) - hz_to_mel(8000),
+         "a 100 Hz step at low frequencies should be larger in mel than the same 100 Hz step at high frequencies; that is the whole point of mel")
+--- hints
+- `math.log10(x)` is the base-10 log.
+- To invert, solve `m = 2595 * log10(1 + f/700)` for f: divide both sides by 2595, then raise 10 to the power of both sides.
+- `mel_to_hz(m) = 700 * (10 ** (m / 2595) - 1)`.
+
+@@ item d11-05
+type: code
+title: Log-mel
+level: 1
+cards: Log-mel: take the log, add eps; The mel scale and the mel filterbank
+targets: to_log_mel
+ref: day11
+--- context
+Log-mel is the standard input of speech models such as Whisper. The log shrinks huge volume differences; eps prevents log(0) = -inf in silent parts, otherwise one silent sample can turn a whole training run into nan.
+--- prompt
+Write `to_log_mel(mag, fb, eps=1e-5)`:
+
+- `mag`: a magnitude spectrogram, `(n_freq, n_frames)` or `(B, n_freq, n_frames)`
+- `fb`: a mel filterbank, `(n_mels, n_freq)`
+- return `log(fb @ mag + eps)`, with shape `(n_mels, n_frames)` or `(B, n_mels, n_frames)`
+--- starter
+def to_log_mel(mag, fb, eps=1e-5):
+    """mag: (..., n_freq, n_frames), fb: (n_mels, n_freq) -> (..., n_mels, n_frames)"""
+    raise todo()
+--- solution
+def to_log_mel(mag, fb, eps=1e-5):
+    return torch.log(fb @ mag + eps)
+--- tests
+@check("log-mel")
+def t05():
+    mag = torch.rand(513, 63) * 10
+    fb = torch.rand(80, 513)
+    lm = to_log_mel(mag, fb)
+    shape_is(lm, (80, 63))
+    eq(lm, (fb @ mag + 1e-5).log(), tol=1e-4)
+    # the batch dimension
+    shape_is(to_log_mel(torch.rand(4, 513, 63), fb), (4, 80, 63), "the batch dimension must be carried through")
+    # silence: eps is required
+    true(torch.isfinite(to_log_mel(torch.zeros(513, 2), fb)).all(),
+         "an all-zero (silent) input gave -inf: add eps inside the log")
+    # why the log: it compresses the dynamic range
+    loud, quiet = torch.full((513, 1), 100.0), torch.full((513, 1), 0.1)
+    ratio_lin = (fb @ loud).mean() / (fb @ quiet).mean()
+    ratio_log = to_log_mel(loud, fb).mean() / to_log_mel(quiet, fb).mean()
+    true(abs(ratio_log) < abs(ratio_lin) / 10, "after the log, the dynamic range should be much smaller")
+--- hints
+- `fb @ mag`: `(80, 513) @ (513, 63)` → `(80, 63)`. When mag has a batch dimension, `@` broadcasts over it.
+- One line is enough: `torch.log(fb @ mag + eps)`.
+
+@@ item d11-06
+type: code
+title: Peak normalization
+level: 1
+cards: Peak normalization: making volumes match
+targets: peak_normalize
+ref: day11
+--- context
+Recordings differ a lot in volume, so training data is often normalized first. Every dataset has a few completely silent files; if the normalization divides by zero on them, nan quietly spreads through the whole training run.
+--- prompt
+Write `peak_normalize(wav, target=0.95)`:
+
+- multiply the whole waveform by one number so that the sample with the largest absolute value becomes exactly `target`
+- return an all-zero input unchanged; no nan allowed
+
+Example: `[0.1, -0.4, 0.2]` has peak 0.4; times 0.95 / 0.4 it becomes `[0.2375, -0.95, 0.475]`.
+--- starter
+def peak_normalize(wav, target=0.95):
+    """Scale the waveform so its peak is target; return all-zero input unchanged."""
+    raise todo()
+--- solution
+def peak_normalize(wav, target=0.95):
+    peak = wav.abs().max()
+    if peak == 0:
+        return wav
+    return wav * (target / peak)
+--- tests
+@check("peak normalization")
+def t06():
+    w = torch.tensor([0.1, -0.4, 0.2])
+    o = peak_normalize(w)
+    true(close(o.abs().max().item(), 0.95), f"the peak should be 0.95, got {o.abs().max().item():.4f} (the peak uses absolute values)")
+    eq(o / o[0], w / w[0], msg="the shape of the wave must not change: multiply everything by the same number")
+    z = torch.zeros(5)
+    eq(peak_normalize(z), z, msg="an all-zero input must not be divided by 0 and turn into nan")
+--- hints
+- The peak is `wav.abs().max()`. Use the absolute value: -0.4 is "louder" than 0.2.
+- First `if peak == 0: return wav`; otherwise return `wav * (target / peak)`.
+
+@@ item d11-07
+type: code
+title: Framing with unfold
+level: 1
+cards: Framing: cutting a waveform into frames with unfold
+targets: frame
+ref: day11
+--- context
+Framing is the first step of the STFT, of per-frame loudness and of voice activity detection. `unfold` does it in one line without copying data; cutting frames one by one in a Python loop is much slower on long audio.
+--- prompt
+Write `frame(wav, frame_len, hop)`:
+
+- `wav`: `(T,)`
+- return `(n_frames, frame_len)`, where frame i is `wav[i*hop : i*hop + frame_len]`
+- drop a tail that is too short for a full frame
+- use `tensor.unfold`, no loops
+
+Example: `frame(torch.arange(10.), 4, 2)` has 4 frames, and frame 1 is `[2, 3, 4, 5]`.
+--- starter
+def frame(wav, frame_len, hop):
+    """(T,) -> (n_frames, frame_len)"""
+    raise todo()
+--- solution
+def frame(wav, frame_len, hop):
+    return wav.unfold(0, frame_len, hop)
+--- tests
+@check("framing with unfold")
+def t07():
+    w = torch.arange(10).float()
+    f = frame(w, 4, 2)
+    shape_is(f, (4, 4), "10 samples, frame length 4, hop 2 -> (10 - 4) // 2 + 1 = 4 frames")
+    eq(f[0], torch.tensor([0., 1., 2., 3.]), msg="frame 0 should be wav[0:4]")
+    eq(f[1], torch.tensor([2., 3., 4., 5.]), msg="frame 1 should start at hop=2")
+    eq(f[3], torch.tensor([6., 7., 8., 9.]), msg="the last frame should be wav[6:10]")
+--- hints
+- `x.unfold(dim, size, step)`: along dimension dim, take a piece of length size every step elements.
+- `wav.unfold(0, frame_len, hop)`.
+
+@@ item d11-08
+type: choice
+title: What the magnitude spectrogram loses
+level: 2
+cards: Magnitude and phase: what the magnitude spectrogram loses
+--- context
+A mel spectrogram keeps only the magnitude. Knowing what was thrown away explains why TTS needs a vocoder on top of the model that predicts mels. It is also the answer to the interview question "why can't you just play a mel spectrogram?".
+--- prompt
+Take the STFT of a waveform, keep only the magnitude (set every phase to 0), and turn it back into a waveform with `torch.istft`. Compared with the original waveform, what do you get?
+--- options
+- Almost the same: phase only affects fine details of the timbre
+- Unrecognisable: the relative error is large, because the phase decides how the frequency components add up
+- Exactly the same: istft computes the phase back automatically
+- An error: istft cannot run without phase
+answer: 2
+--- explain
+The magnitude says how strong each frequency is; the phase says where each frequency's wave starts. Set every phase to 0 and the way the components add up is scrambled. In the experiment on the knowledge card, the relative error is about 1.0: the error is as big as the signal itself. istft does not compute phase on its own; it uses whatever it is given, so it raises no error either. That is why TTS needs a vocoder: after the model predicts a mel spectrogram, a vocoder (Griffin-Lim or a neural network) "guesses" the phase back.
+--- hints
+- What happens when you add two sine waves of the same frequency whose phases differ by half a cycle? (They cancel out.)
+- Run the experiment on the card "Magnitude and phase" and look at the last line.
+
+@@ item d11-09
+type: code
+title: mel -> conv input
+level: 1
+cards: Before the model: channel dim, padding and mask
+targets: mel_to_image
+ref: day11
+--- context
+Many audio models (sound classification, speech enhancement, diffusion-based TTS) treat a mel spectrogram as an image and process it with the Conv2d / UNet layers from image models. The key step is adding the channel dimension.
+--- prompt
+Write `mel_to_image(mel)`: `(B, n_mels, n_frames)` → `(B, 1, n_mels, n_frames)`, i.e. insert a channel dimension of size 1 at position 1.
+
+The check feeds your result straight into `nn.Conv2d(1, 16, 3, 1, 1)`.
+--- starter
+def mel_to_image(mel):
+    """(B, n_mels, n_frames) -> (B, 1, n_mels, n_frames)"""
+    raise todo()
+--- solution
+def mel_to_image(mel):
+    return mel.unsqueeze(1)
+--- tests
+@check("mel -> conv input")
+def t09():
+    m = torch.randn(4, 80, 100)
+    x = mel_to_image(m)
+    shape_is(x, (4, 1, 80, 100), "the channel dimension goes at position 1 (right after the batch)")
+    conv = nn.Conv2d(1, 16, 3, 1, 1)          # the Day 8 building block works unchanged
+    shape_is(conv(x), (4, 16, 80, 100))
+--- hints
+- `unsqueeze(dim)` inserts a dimension of size 1 at position dim.
+- `mel.unsqueeze(1)`.
+
+@@ item d11-10
+type: code
+title: Padding variable-length mels
+level: 2
+cards: Before the model: channel dim, padding and mask; Log-mel: take the log, add eps
+targets: pad_mels
+ref: day11
+--- context
+In real data every clip has a different length. Stacking them into a batch and telling the model which frames are padding is a step in every speech training script. Get the mask wrong and the model learns from the padding.
+--- prompt
+Write `pad_mels(mels, pad_value=-11.5)`:
+
+- `mels`: a list whose elements have shape `(n_mels, T_i)`, with different `T_i`
+- return `(batch, mask)`
+- `batch`: `(B, n_mels, Tmax)`; each mel sits on the left, the empty space on the right is filled with `pad_value`
+- `mask`: `(B, Tmax)`, 1 for real frames and 0 for padding (dtype long)
+
+Example: three mels with 3, 5 and 1 frames → `batch` is `(3, n_mels, 5)` and the first row of the mask is `[1, 1, 1, 0, 0]`.
+--- starter
+def pad_mels(mels, pad_value=-11.5):
+    """mels: list of (n_mels, T_i) -> batch (B, n_mels, Tmax), mask (B, Tmax)"""
+    raise todo()
+--- solution
+def pad_mels(mels, pad_value=-11.5):
+    B = len(mels)
+    n_mels = mels[0].size(0)
+    Tmax = max(m.size(1) for m in mels)
+    batch = torch.full((B, n_mels, Tmax), pad_value)
+    mask = torch.zeros(B, Tmax, dtype=torch.long)
+    for i, m in enumerate(mels):
+        T = m.size(1)
+        batch[i, :, :T] = m
+        mask[i, :T] = 1
+    return batch, mask
+--- tests
+@check("padding variable-length mels")
+def t10():
+    ms = [torch.ones(4, 3), torch.ones(4, 5) * 2, torch.ones(4, 1) * 3]
+    b, mask = pad_mels(ms, pad_value=-11.5)
+    shape_is(b, (3, 4, 5), "batch should be (B, n_mels, Tmax)")
+    shape_is(mask, (3, 5), "mask should be (B, Tmax)")
+    eq(b[0, :, :3], torch.ones(4, 3), msg="the real frames must be copied unchanged to the left")
+    eq(b[0, :, 3:], torch.full((4, 2), -11.5), msg="the padding on the right must be pad_value")
+    eq(mask, torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1], [1, 0, 0, 0, 0]]), msg="mask: 1 for real frames, 0 for padding")
+--- hints
+- First compute `Tmax = max(m.size(1) for m in mels)`, then create the base with `torch.full((B, n_mels, Tmax), pad_value)`.
+- Create the mask with `torch.zeros(B, Tmax, dtype=torch.long)`; then for each mel: `batch[i, :, :T] = m` and `mask[i, :T] = 1`.
+- Another way: pad each mel with `F.pad(m, (0, Tmax - T), value=pad_value)`, then `torch.stack`.
+
+@@ item d11-11
+type: code
+title: Audio shape bookkeeping
+level: 2
+cards: STFT: frequency bins and frame count; The mel scale and the mel filterbank; Before the model: channel dim, padding and mask
+targets: AUDIO_SHAPES
+ref: day11
+--- context
+Most bugs in audio code are shape mix-ups. If you can work out every shape in your head without running anything, reading papers, debugging and interviews all get much faster.
+--- prompt
+One second of mono audio at 16 kHz, `n_fft=1024`, `hop=256` (center=True), `n_mels=80`.
+
+Replace each `None` in `AUDIO_SHAPES` with the shape of that tensor, written as a tuple such as `(3, 4)`.
+
+- "Conv2d input" means the 4-D tensor with batch size 1 and the channel dimension added
+- a one-element tuple needs a comma: `(16000,)`
+--- starter
+AUDIO_SHAPES = {
+    "waveform":                   None,
+    "complex spectrogram (STFT)": None,
+    "magnitude":                  None,
+    "log-mel":                    None,
+    "Conv2d input":               None,
+}
+--- solution
+AUDIO_SHAPES = {
+    "waveform": (16000,),
+    "complex spectrogram (STFT)": (513, 63),
+    "magnitude": (513, 63),
+    "log-mel": (80, 63),
+    "Conv2d input": (1, 1, 80, 63),
+}
+--- tests
+@check("audio shape bookkeeping")
+def t11():
+    want = {
+        "waveform": (16000,),
+        "complex spectrogram (STFT)": (513, 63),
+        "magnitude": (513, 63),
+        "log-mel": (80, 63),
+        "Conv2d input": (1, 1, 80, 63),
+    }
+    wrong = [f"{k!r}: you wrote {AUDIO_SHAPES.get(k)}, expected {v}" for k, v in want.items()
+             if AUDIO_SHAPES.get(k) is None or tuple(AUDIO_SHAPES[k]) != v]
+    true(not wrong, "these are wrong:\n" + "\n".join(wrong))
+--- hints
+- Number of frequency bins = n_fft // 2 + 1; number of frames (center=True) = T // hop + 1.
+- The magnitude is the complex spectrogram with .abs() applied element by element, so the shape stays the same; the log-mel replaces the frequency-bin dimension with n_mels.
+- Conv2d wants `(B, C, H, W)`: here B = 1 and C = 1.
+
+@@ item d11-12
+type: fix
+title: Find the bug: log_mel_buggy
+level: 2
+cards: Magnitude and phase: what the magnitude spectrogram loses; Log-mel: take the log, add eps
+targets: log_mel_buggy
+ref: day11
+--- context
+These are the two most common bugs in real audio code: using the real part of a complex number as the magnitude, and forgetting eps inside the log. They do not always raise an error; training just turns into nan at some step.
+--- prompt
+`log_mel_buggy(wav, fb)` is meant to compute a log-mel, but its output contains nan, and the values do not match the correct recipe (`stft_mag` from d11-03, then `to_log_mel` from d11-05, eps = 1e-5).
+
+Two lines are wrong. Fix them so the output matches the correct recipe (tolerance 1e-4). Keep the function name and arguments.
+--- starter
+def log_mel_buggy(wav, fb, n_fft=1024, hop=256):
+    spec = torch.stft(wav, n_fft, hop, window=torch.hann_window(n_fft), return_complex=True)
+    mag = spec.real
+    mel = fb @ mag
+    return torch.log(mel)
+--- solution
+def log_mel_buggy(wav, fb, n_fft=1024, hop=256):
+    spec = torch.stft(wav, n_fft, hop, window=torch.hann_window(n_fft), return_complex=True)
+    mag = spec.abs()                    # the magnitude is the absolute value, always >= 0; .real can be negative
+    mel = fb @ mag
+    return torch.log(mel + 1e-5)        # add eps so that log(0) cannot give -inf
+--- tests
+@check("find the bug: log_mel_buggy")
+def t12():
+    seed(2)
+    w = torch.randn(8000)
+    fb = torch.rand(80, 513)
+    got = log_mel_buggy(w, fb)
+    want = to_log_mel(stft_mag(w), fb)
+    shape_is(got, want.shape)
+    true(torch.isfinite(got).all(),
+         "the output contains nan or -inf: the log received negative numbers or 0. Use .abs() for the magnitude and add eps inside the log")
+    eq(got, want, tol=1e-4,
+       msg="the values do not match. Check two things: the magnitude is .abs() (the absolute value of the complex number), not .real; the log needs eps = 1e-5")
+--- hints
+- The magnitude is the absolute value of a complex number. `.real` is only the real part, which can be negative, and log(negative) = nan.
+- Even with a non-negative magnitude, silent parts give mel = 0, and log(0) = -inf.
+- Change them to `mag = spec.abs()` and `return torch.log(mel + 1e-5)`.
+
+@@ item d11-13
+type: predict
+title: Whisper's STFT settings
+level: 2
+cards: STFT: frequency bins and frame count
+--- context
+Whisper uses 16 kHz audio, n_fft=400 (25 ms frames) and hop=160 (10 ms hops). Reading those settings and immediately knowing the STFT's shape and dtype is a basic skill for reading speech-model code.
+--- prompt
+What does this code print? (three lines)
+--- code
+wav = torch.zeros(16000)                   # 1 second at 16 kHz
+spec = torch.stft(wav, n_fft=400, hop_length=160,
+                  window=torch.hann_window(400), return_complex=True)
+print(tuple(spec.shape))
+print(spec.dtype)
+print(spec.abs().dtype)
+--- explain
+Frequency bins = 400 // 2 + 1 = 201. Frames (center=True by default) = 16000 // 160 + 1 = 101. So the shape is `(201, 101)`.
+
+The STFT output is complex, with dtype `torch.complex64`; after `.abs()` it becomes the real dtype `torch.float32`. Whisper turns a spectrogram like this into mel bands and takes the log to build its input.
+--- hints
+- The number of bins depends only on n_fft; the number of frames (center=True) depends only on T and the hop.
+- `.abs()` turns each complex number into its absolute value, which is a real number.
+
+@@ item d11-14
+type: choice
+title: Doubling n_fft: what happens to the shape?
+level: 2
+cards: STFT: frequency bins and frame count
+--- context
+Choosing n_fft trades off how finely you resolve frequency against how finely you resolve time. Knowing which dimension it changes lets you edit a config without breaking the shapes downstream.
+--- prompt
+One second of 16 kHz audio, `hop=256`, `center=True`. With `n_fft=1024` the magnitude spectrogram is `(513, 63)`.
+
+Change `n_fft` to 2048 (same hop). What is the new shape?
+--- options
+- (513, 126)
+- (1025, 32)
+- (1025, 63)
+- (1025, 55)
+answer: 3
+--- explain
+Frequency bins = 2048 // 2 + 1 = 1025: a larger n_fft splits frequency more finely (each bin is 16000 / 2048 ≈ 7.8 Hz).
+
+With center=True, frames = 16000 // 256 + 1 = 63. That depends only on the hop, not on n_fft. (1025, 55) is the center=False answer: (16000 - 2048) // 256 + 1 = 55.
+
+The price: each frame now covers 2048 samples (128 ms), so the timing gets blurrier.
+--- hints
+- Think about the two dimensions separately: which one depends only on n_fft, and which one only on the hop?
+- With center=True, frames = T // hop + 1.
+
+@@ item d11-15
+type: predict
+title: The log-mel of silence
+level: 2
+cards: Log-mel: take the log, add eps
+--- context
+Silence is everywhere in audio data: at the start, at the end, in padding. Knowing what number silence becomes after the log-mel helps you pick the right padding value and recognise where a -inf in your logs comes from.
+--- prompt
+What does this code print? (three lines)
+--- code
+mag = torch.zeros(513, 10)                 # 10 frames of total silence
+fb = torch.rand(80, 513)
+log_mel = torch.log(fb @ mag + 1e-5)
+print(tuple(log_mel.shape))
+print(round(log_mel.min().item(), 1), round(log_mel.max().item(), 1))
+print(torch.isinf(torch.log(fb @ mag)).all().item())
+--- explain
+`fb @ mag`: `(80, 513) @ (513, 10)` → `(80, 10)`.
+
+mag is all zeros, so whatever fb is, the mel is all zeros. With eps every cell is log(1e-5) ≈ -11.5, so the minimum and the maximum are both -11.5. This is the "silence floor" of a log-mel, and the reason `pad_mels` pads with -11.5 by default.
+
+Without eps every cell is log(0) = -inf, so the last line is `True`.
+--- hints
+- fb is random, but mag is all zeros. What is the product?
+- log(1e-5) = -5 × ln(10) ≈ -11.5.
+
+@@ item d11-16
+type: choice
+title: A sample-rate mismatch
+level: 2
+cards: Waveforms and sample rate: numbers per second; STFT: frequency bins and frame count; The mel scale and the mel filterbank
+--- context
+Production audio comes from all kinds of devices: phones often record at 48 kHz, telephone lines carry 8 kHz, music is 44.1 kHz. A sample-rate mismatch raises no error; the model just gets quietly worse. It is a very common incident in speech services.
+--- prompt
+A model was trained on log-mels of 16 kHz audio (n_fft=1024, hop=256, mel filterbank built for sr=16000). In production someone uploads a 44.1 kHz file, and the code computes the log-mel directly, without resampling, and feeds it to the model. What happens?
+--- options
+- An error: the shapes do not match, so the model cannot run
+- No error, but each frame now covers about 5.8 ms (16 ms in training), and every frequency bin stands for different Hz. The model hears something like slowed-down, lower-pitched audio, and quietly gets worse
+- Nothing: mel spectrograms do not depend on the sample rate
+- Better results: a higher sample rate carries more information
+answer: 2
+--- explain
+The log-mel has shape `(80, n_frames)`, and the frame count varies with the clip length anyway, so nothing raises an error.
+
+But hop=256 at 44.1 kHz is only 256 / 44100 ≈ 5.8 ms. The same 3 seconds become 517 frames (188 at 16 kHz), so every sound is stretched out, as if slowed down.
+
+Bin k stands for k × sr / n_fft Hz: bin 64 is 1000 Hz at 16 kHz but 2756 Hz at 44.1 kHz. The model still treats it as 1000 Hz, so every mel filter sits in the wrong place.
+
+The fix: check the sample rate when loading audio and, if it differs, resample to 16 kHz first (for example with `torchaudio.functional.resample`).
+--- hints
+- Which dimension of the log-mel changes with the clip length anyway? Does a change there raise an error?
+- Work it out: how many milliseconds is hop=256 at 16 kHz and at 44.1 kHz? How many Hz does bin 64 stand for in each case?
+
+@@ item d11-17
+type: code
+title: Closed book: STFT magnitude
+level: 2
+exam: yes
+cards: STFT: frequency bins and frame count
+targets: stft_mag
+ref: day11
+--- context
+"Waveform → magnitude spectrogram" is the first step of every audio model. Writing it again from memory checks that you remember the torch.stft arguments and how to get the magnitude.
+--- prompt
+Write `stft_mag(wav, n_fft=1024, hop_length=256)`:
+
+- input `(T,)` or `(B, T)`
+- a Hann window (on the same device as wav), `center=True`
+- return the real, non-negative magnitude: `(n_fft//2 + 1, n_frames)` or `(B, n_fft//2 + 1, n_frames)`
+--- starter
+def stft_mag(wav, n_fft=1024, hop_length=256):
+    raise todo()
+--- solution
+def stft_mag(wav, n_fft=1024, hop_length=256):
+    win = torch.hann_window(n_fft, device=wav.device)
+    return torch.stft(wav, n_fft, hop_length, window=win,
+                      center=True, return_complex=True).abs()
+--- tests
+@check("STFT magnitude")
+def t03():
+    seed(0)
+    w = torch.randn(16000)
+    m = stft_mag(w)
+    shape_is(m, (513, 63), "1024//2+1 = 513 frequency bins, 16000//256+1 = 63 frames")
+    true(not m.is_complex(), "should return a real tensor: take .abs() of the complex spectrogram")
+    true((m >= 0).all(), "a magnitude can never be negative (did you use .real instead of .abs()?)")
+    shape_is(stft_mag(torch.randn(2, 16000)), (2, 513, 63), "the batch dimension must be carried through")
+    # the energy of a pure tone should sit in one frequency bin
+    t = torch.arange(16000).float() / 16000
+    tone = torch.sin(2 * math.pi * 1000 * t)
+    peak = stft_mag(tone)[:, 30].argmax().item()
+    true(abs(peak - 1000 * 1024 / 16000) < 2, f"a 1000 Hz tone should peak near bin 64, got {peak}")
+
+@@ item d11-18
+type: code
+title: Closed book: padding variable-length mels
+level: 2
+exam: yes
+cards: Before the model: channel dim, padding and mask
+targets: pad_mels
+ref: day11
+--- context
+Stacking clips of different lengths into a batch and building the mask is a step in every audio training script. Writing it from memory checks that you remember the shape and mask conventions.
+--- prompt
+Write `pad_mels(mels, pad_value=-11.5)`:
+
+- `mels`: a list whose elements have shape `(n_mels, T_i)`, with different lengths
+- return `(batch, mask)`: `batch` is `(B, n_mels, Tmax)` with each mel on the left and `pad_value` on the right; `mask` is `(B, Tmax)`, 1 for real frames and 0 for padding (dtype long)
+--- starter
+def pad_mels(mels, pad_value=-11.5):
+    raise todo()
+--- solution
+def pad_mels(mels, pad_value=-11.5):
+    B = len(mels)
+    n_mels = mels[0].size(0)
+    Tmax = max(m.size(1) for m in mels)
+    batch = torch.full((B, n_mels, Tmax), pad_value)
+    mask = torch.zeros(B, Tmax, dtype=torch.long)
+    for i, m in enumerate(mels):
+        T = m.size(1)
+        batch[i, :, :T] = m
+        mask[i, :T] = 1
+    return batch, mask
+--- tests
+@check("padding variable-length mels")
+def t10():
+    ms = [torch.ones(4, 3), torch.ones(4, 5) * 2, torch.ones(4, 1) * 3]
+    b, mask = pad_mels(ms, pad_value=-11.5)
+    shape_is(b, (3, 4, 5), "batch should be (B, n_mels, Tmax)")
+    shape_is(mask, (3, 5), "mask should be (B, Tmax)")
+    eq(b[0, :, :3], torch.ones(4, 3), msg="the real frames must be copied unchanged to the left")
+    eq(b[0, :, 3:], torch.full((4, 2), -11.5), msg="the padding on the right must be pad_value")
+    eq(mask, torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1], [1, 0, 0, 0, 0]]), msg="mask: 1 for real frames, 0 for padding")

@@ -1,11 +1,5 @@
-# imports of the drill file (the checks use them)
-import sys, os
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-"""Day 09 参考答案。"""
+# Day 9 reference module (hidden setup). Needs day 8's module loaded first (`ref: day8, day9`):
+# it uses linear_schedule, q_sample and extract from there.
 import math
 
 import torch
@@ -14,12 +8,12 @@ import torch.nn.functional as F
 
 
 LDM_SHAPES = {
-    "图像 x": (4, 3, 512, 512),
-    "VAE 编码后的 latent": (4, 4, 64, 64),
-    "latent 转成 token 序列": (4, 64 * 64, 320),
-    "CLIP 文本嵌入": (4, 77, 768),
-    "cross-attn 输出": (4, 64 * 64, 320),
-    "UNet 输出（预测的噪声）": (4, 4, 64, 64),
+    "image": (4, 3, 512, 512),
+    "latent": (4, 4, 64, 64),
+    "latent_tokens": (4, 64 * 64, 320),
+    "text_emb": (4, 77, 768),
+    "cross_attn_out": (4, 64 * 64, 320),
+    "unet_out": (4, 4, 64, 64),
 }
 
 
@@ -37,7 +31,7 @@ def cross_attention(x, ctx, wq, wk, wv, n_head):
     Tc = ctx.size(1)
     hd = C // n_head
     q = (x @ wq).view(B, Tx, n_head, hd).transpose(1, 2)
-    k = (ctx @ wk).view(B, Tc, n_head, hd).transpose(1, 2)     # KV 来自文本
+    k = (ctx @ wk).view(B, Tc, n_head, hd).transpose(1, 2)     # K/V come from the text
     v = (ctx @ wv).view(B, Tc, n_head, hd).transpose(1, 2)
     o = F.scaled_dot_product_attention(q, k, v)
     return o.transpose(1, 2).reshape(B, Tx, C)
@@ -61,14 +55,15 @@ def cfg_forward(model, x, t, cond, null_cond, scale):
     B = x.size(0)
     both_x = torch.cat([x, x])
     both_t = torch.cat([t, t])
-    both_c = torch.cat([null_cond.expand(B, -1), cond])       # 约定: 前 null 后 cond
+    both_c = torch.cat([null_cond.expand(B, -1), cond])       # convention: first half null, second half cond
     out = model(both_x, both_t, both_c)
     e_u, e_c = out.chunk(2)
     return cfg_combine(e_u, e_c, scale)
 
 
 def ddim_timesteps(T, steps):
-    return torch.arange(0, T, T // steps).flip(0).long()
+    # exactly `steps` values, also when T is not a multiple of steps
+    return (torch.arange(steps) * (T // steps)).flip(0).long()
 
 
 def ddim_step(x_t, t, t_prev, eps_pred, sched):
@@ -96,15 +91,16 @@ def ddim_sample(model, shape, sched, steps=10, device="cpu"):
 
 def cfg_sample_buggy(model, x, t, cond, null_cond, scale):
     both_x = torch.cat([x, x])
-    both_c = torch.cat([null_cond.expand(cond.size(0), -1), cond])   # 修 1: 顺序
+    both_c = torch.cat([null_cond.expand(cond.size(0), -1), cond])   # fix 1: order [null, cond]
     both_t = torch.cat([t, t])
     out = model(both_x, both_t, both_c)
     e_u, e_c = out.chunk(2)
-    return e_u + scale * (e_c - e_u)                                 # 修 2+3
+    return e_u + scale * (e_c - e_u)                                 # fix 2: direction (cond - uncond)
 
 
-# helpers the checks use (defined in the drill file)
+# helper the checks use
 class _FakeEps(nn.Module):
-    """给定的假模型: 输出 = x * 0 + 条件向量的均值，方便验证分支有没有拼对。"""
+    """Fake noise model: output = 0 * x + the mean of the condition vector, so the checks can see which
+    condition went into which half of the batch."""
     def forward(self, x, t, c):
         return torch.zeros_like(x) + c.mean(-1).reshape(-1, 1, 1, 1)

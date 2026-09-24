@@ -1,0 +1,1332 @@
+@@ day 23
+title: Deployment 3: serving generative models
+part: Deployment
+hours: 3–4 hours
+--- goal
+You can work out how much GPU memory an LLM service's KV cache needs; write a streaming generation loop with a generator ("prefill once, then decode one token per step") that handles eos, max_new_tokens and stop strings split across tokens; validate sampling parameters before a request reaches the GPU; simulate continuous batching and show with numbers why it beats static batching; pick a diffusion model's step count from a latency budget; and write a sound Dockerfile for a GPU inference image.
+--- checklist
+- Clear your Review list first (redo from blank anything you looked up yesterday)
+- Read the 8 knowledge cards; change one number in each example and run it again
+- Pass every practice exercise, and be able to do the KV cache arithmetic on paper without the code
+- Closed book: write both exam functions without looking at the answers
+
+@@ concept
+title: Two phases: prefill and decode
+ref: day23
+--- body
+An LLM writes its answer in two phases:
+
+1. **Prefill**: the whole prompt goes into the model at once, and one forward pass computes every position. On the way, the k and v of every layer are stored in the KV cache (day 5: the k/v of old tokens are kept, so they are never computed again). The logits at the last position give the first new token.
+2. **Decode**: each step feeds only the **one** token generated in the previous step, together with the KV cache, and gets the next token. For 100 new tokens you need 1 prefill (which gives the first one) plus 99 decode steps.
+
+The two phases hit different limits:
+
+- Prefill handles hundreds or thousands of tokens in one go. The matrix multiplications are big, so the limit is the GPU's compute (compute-bound).
+- Decode computes just 1 token per step, but it still has to read all the weights and the KV cache from GPU memory. Little compute, lots of reading: the limit is memory bandwidth (memory-bound). That is why it pays to decode many requests in the same step: the weights are read once and shared by all of them.
+
+Users feel two latencies:
+
+- **TTFT** (time to first token): mostly the prefill time. The longer the prompt, the slower.
+- **TPOT** (time per output token): the time of one decode step. It decides how fast the text "types itself out".
+
+Total time ≈ TTFT + (number of output tokens - 1) × TPOT.
+
+Today's tiny model `TinyLM` (random weights, a vocabulary of 32 tokens) is called as `logits, cache = model(ids, cache)`. Passing `cache=None` means prefill; passing back the cache from the previous call means decode. `model.calls` records how many tokens each call processed.
+--- code
+model = make_tiny_lm()
+prompt = torch.tensor([[12, 15, 21, 0, 3, 27]])          # a prompt of 6 tokens
+with torch.inference_mode():
+    logits, cache = model(prompt)                        # prefill: all 6 tokens in one call
+    tok = logits[0, -1].argmax().item()                  # last position -> first new token
+    out = [tok]
+    for _ in range(4):                                   # decode: feed only the 1 new token each step
+        logits, cache = model(torch.tensor([[tok]]), cache)
+        tok = logits[0, -1].argmax().item()
+        out.append(tok)
+print("tokens processed per call:", model.calls)
+print("the 5 generated tokens:", out)
+print("shape of k in layer 0's cache:", tuple(cache[0][0].shape), "= (B, KV heads, tokens so far, head_dim)")
+n = sum(p.numel() for p in model.parameters())
+print(f"every call reads all {n} parameters: prefill shares that among 6 tokens, decode spends it on 1 token")
+
+@@ concept
+title: The KV cache memory bill
+ref: day23
+--- body
+The KV cache stores one k vector and one v vector for every layer, every KV head and every token so far. So its size is just a product of a few numbers:
+
+```
+bytes = 2 × layers × KV heads × head_dim × sequence length × batch × bytes per number
+```
+
+- The 2 at the front: one copy for K and one for V.
+- KV heads: in a model with GQA (day 5: several q heads share one set of k/v), use the number of KV heads, not the number of q heads.
+- Bytes per number: 4 for fp32, 2 for fp16 / bf16, 1 for fp8 / int8. In PyTorch, `torch.float16.itemsize` gives you the 2 directly.
+
+Two real models (fp16, 2 bytes per number; 1 KiB = 1024 bytes, 1 GiB = 1024³ bytes):
+
+- Llama-2-7B: 32 layers, 32 KV heads, head_dim 128. One token takes 2 × 32 × 32 × 128 × 2 = 524,288 bytes = 512 KiB. One sequence of 4096 tokens is 2 GiB; serving 8 of them at once is 16 GiB.
+- Llama-3-8B: also 32 layers and head_dim 128, but only 8 KV heads (GQA). One token takes 128 KiB, a quarter of the above.
+
+This is why the KV cache often runs out of memory before the weights do: the weights have a fixed size, while the KV cache grows with "requests served at once × their length". How many sequences one GPU can serve at the same time is roughly "memory left after the weights ÷ KV cache per sequence".
+--- code
+def per_token_bytes(layers, kv_heads, head_dim, bytes_per_number):
+    return 2 * layers * kv_heads * head_dim * bytes_per_number
+
+llama2 = per_token_bytes(32, 32, 128, torch.float16.itemsize)
+llama3 = per_token_bytes(32, 8, 128, torch.float16.itemsize)
+print("Llama-2-7B:", llama2 // 1024, "KiB / token; 4096 tokens:", llama2 * 4096 / 1024**3, "GiB")
+print("Llama-3-8B:", llama3 // 1024, "KiB / token; 4096 tokens:", llama3 * 4096 / 1024**3, "GiB")
+
+model = make_tiny_lm()                                   # 2 layers, 2 KV heads, head_dim 8, fp32
+with torch.inference_mode():
+    _, cache = model(torch.randint(0, 32, (3, 5)))       # batch 3, 5 tokens each
+real = sum(k.numel() * k.element_size() + v.numel() * v.element_size() for k, v in cache)
+print("TinyLM's cache really holds:", real, "bytes; formula:", 2 * 2 * 2 * 8 * 5 * 3 * torch.float32.itemsize, "bytes")
+
+@@ concept
+title: Streaming: a generator that yields one token at a time
+--- body
+In a chat window the text appears word by word: the service sends each token to the user as soon as it is generated, instead of waiting for the whole answer. The user waits only the TTFT for the first word, not the time of the full answer.
+
+In Python you write this kind of "hand over as you go" function as a **generator**: if a function body contains `yield`, calling it does not run it. You get a generator object instead.
+
+- Each `next(gen)` (or each round of a `for` loop) resumes the function where it stopped. It runs to the next `yield`, hands over that value, and pauses again.
+- When the function `return`s (or reaches its end), the loop is over.
+- Nothing is computed until the caller asks for it. If the user disconnects and nobody asks any more, generation stops and no GPU time is wasted.
+
+FastAPI's `StreamingResponse` takes such a generator directly and sends each yielded piece to the browser (the service itself is day 22's topic).
+
+A generation loop always needs two stop conditions:
+
+1. **eos** (end of sequence): when the model generates this token, it means "I am done". The eos token itself is not sent to the user.
+2. **max_new_tokens**: the most new tokens to generate. It is a hard limit: even if the model never produces eos, one request must not hold the GPU forever.
+
+OpenAI-style APIs tell you which one ended the answer: `finish_reason` is `"stop"` (eos or a stop string) or `"length"` (max_new_tokens reached).
+
+One more detail: to turn off gradients in a generator, put `@torch.inference_mode()` above the function definition as a decorator. Do not write `with torch.inference_mode():` inside the body and yield from inside it: while the generator is paused, that mode "leaks" into the caller's code. The code below tries both.
+--- code
+def count_up(n):
+    print("  (the body starts running)")
+    for i in range(n):
+        print(f"  computed {i}")
+        yield i
+    print("  (the body is finished)")
+
+gen = count_up(3)
+print("after the call the body has not run yet; we got a:", type(gen).__name__)
+print("take the first one:", next(gen))
+for x in gen:                                            # carries on where it stopped
+    print("for got:", x)
+
+@torch.inference_mode()
+def good():
+    yield torch.is_grad_enabled()
+
+def leaky():
+    with torch.inference_mode():
+        yield torch.is_grad_enabled()
+
+for name, make in [("decorator", good), ("with inside the body", leaky)]:
+    g = make()
+    inside = next(g)
+    print(f"{name}: gradients inside the generator? {inside}; in the caller while it is paused? {torch.is_grad_enabled()}")
+    g.close()                                            # close the generator; only now does the with block exit
+
+@@ concept
+title: Stop strings span tokens
+--- body
+The third stop condition is a **stop string**: "stop when you reach `\nUser:`", for example (in a chat template this starts the user's next turn; without the stop, the model would start speaking for the user).
+
+The hard part: the model produces tokens, not characters. A stop string is often split over several tokens, such as `"\n"`, `"User"` and `":"`. So checking "is this one token the stop string?" will never catch it.
+
+The right way: join the text generated so far and search for the stop in the **joined text**. When you find it, keep only the part before it; the stop itself is dropped. With several stop strings, cut at whichever appears first in the text.
+
+Streaming adds one more problem: text that was sent cannot be taken back. Say you already sent `"Bye.\n"`, and then `"User"` and `":"` arrive. Only now do you see that the `\n` was the start of the stop, but it is already on the user's screen.
+
+The fix is to **hold back a little**: each time you join the text, check whether its end could be the start of some stop string. If so, hold that part back and send everything before it. When the next piece of text arrives, look again:
+
+- It completes a stop string: drop what you held back and finish.
+- It can no longer become a stop string (say `"\n"` is followed by `"Thanks"`): send the held-back text together with the new text.
+- The stream ends while you still hold something: it was not a stop, so send it.
+
+You hold back at most "length of the stop - 1" characters, so users hardly notice. In the code below, `held(text, stop)` computes "how many characters at the end to hold back".
+--- code
+pieces = ["Sure", "!", " Bye", ".\n", "User", ":", " next"]
+stop = "\nUser:"
+print("is any single piece equal to the stop:", any(p == stop for p in pieces))
+
+def held(text, stop):
+    """how many characters at the end of text could be the start of stop (the longest such end)"""
+    for k in range(min(len(stop) - 1, len(text)), 0, -1):
+        if text.endswith(stop[:k]):
+            return k
+    return 0
+
+text = ""
+for p in pieces:
+    text += p
+    if stop in text:
+        print(f"after adding {p!r} the stop is found; the result is {text[:text.find(stop)]!r}")
+        break
+    print(f"after adding {p!r:8} hold back {held(text, stop)} characters at the end")
+
+@@ concept
+title: Sampling parameters: validate before the GPU
+--- body
+What temperature, top-k and top-p do was day 5. A service has one more job: **check the parameters in each request before it reaches the GPU**. Bad parameters rarely crash the service. More often they quietly produce strange output, or keep a request on the GPU far too long:
+
+- `temperature = 0` used directly to divide the logits gives inf and nan. Treat 0 as a special case, "greedy" (just take the argmax). Negative values and very large values make no sense either; a common valid range is 0 to 2.
+- `top_p` must be in (0, 1]. `top_p = 0` filters out every token.
+- `top_k` is a non-negative integer; 0 means "no top-k".
+- `max_new_tokens` is a positive integer, and "prompt length + max_new_tokens" must fit in the model's context length. Otherwise generation fails or gets cut off halfway.
+
+Two Python traps:
+
+1. **NaN**: Python's `json.loads` happily reads `NaN` and `Infinity`. Every comparison with NaN is False, so `if t < 0 or t > 2` lets it through. Rule out NaN and inf first with `math.isfinite(t)` (or write the "valid" condition, `if not (0 <= t <= 2)`: NaN makes the whole condition False, so it is rejected too).
+2. **bool is an int**: `isinstance(True, int)` is True, so a JSON `true` counts as 1. Write `isinstance(x, int) and not isinstance(x, bool)`.
+
+One more: a misspelled parameter name (`"temprature": 0.2`) that is silently ignored makes the user think they set the temperature, while the default was used. Unknown names must be errors.
+
+When validation fails, report all the errors at once (HTTP 400 or 422), not just the first. Otherwise the user fixes one, hits the next, and so on.
+--- code
+import json
+t = json.loads('{"temperature": NaN}')["temperature"]
+print("json.loads read:", t)
+print("nan < 0:", t < 0, "  nan > 2:", t > 2, "  -> t < 0 or t > 2 lets it through")
+print("math.isfinite(nan):", math.isfinite(t))
+print("isinstance(True, int):", isinstance(True, int))
+logits = torch.tensor([2.0, 1.0, 0.5])
+print("temperature=0, divide and softmax:", (logits / 0.0).softmax(-1).tolist())
+print("temperature=0 treated as greedy:", logits.argmax().item())
+
+@@ concept
+title: Continuous batching: leave as soon as you are done
+ref: day23
+--- body
+A GPU can only decode a limited number of sequences at the same time (KV cache memory is limited). Call these places **slots**. With many requests waiting, how do you schedule them?
+
+**Static batching**: collect a batch (say 4 requests) and generate them together. The batch returns when its longest request is done, and only then does the next batch start. The problems:
+
+- A batch takes as long as its longest request. A short request that needs 3 tokens waits for a long one that needs 500.
+- When a short one finishes, its slot sits idle while other requests are still waiting in the queue.
+
+**Continuous batching** (also called iteration-level scheduling; inference engines such as vLLM and TGI use it) schedules at every decode step:
+
+1. At the start of each step, if a slot is free and someone is waiting, the request at the front of the queue joins.
+2. During the step, every request in a slot generates 1 token.
+3. A request that has all its tokens leaves right away and returns its result; its slot is free for someone else from the next step on.
+
+The result: short requests come back quickly, slots are almost never idle, and the total number of steps goes down.
+
+Today's simulation makes two simplifications. Time is counted in decode steps, and each step costs 1 unit no matter how many requests are in the slots (decode is limited by memory bandwidth, so this is a fair approximation). The prefill of a joining request costs nothing.
+
+Below, `continuous_timeline` prints who is in the slots at each step; `simulate_continuous` and `simulate_static` return the step at which each request finishes.
+--- code
+lengths = [4, 1, 1, 3]                                   # how many tokens each request needs
+for step, running, waiting, finished in continuous_timeline(lengths, n_slots=2):
+    print(f"step {step}: in slots {running}  waiting {waiting}  finished {finished}")
+print("continuous: step at which each request returns:", simulate_continuous(lengths, 2))
+print("static batching: step at which each request returns:", simulate_static(lengths, 2))
+
+@@ concept
+title: Diffusion: steps are latency
+ref: day23
+--- body
+A diffusion model (days 8 and 9) calls its denoising network many times to make one image: once per sampling step. So the latency is roughly:
+
+```
+total time ≈ fixed overhead + steps × time per step × (another × 2 with CFG)
+```
+
+- **Fixed overhead**: the part that does not depend on the steps, such as the text encoder reading the prompt and the VAE decoding the latent into an image.
+- **Time per step**: one forward pass of the denoising network. Higher resolution and bigger batches make it slower.
+- **CFG** (classifier-free guidance, day 9): every step computes the "conditional" and the "unconditional" prediction (twice, or once as a batch of 2). Estimate it as roughly 2×.
+
+When the service has a latency budget ("return an image within 2 seconds"), work backwards: subtract the fixed overhead from the budget and divide by the time per step. That is the most steps you can afford. Fewer steps lower the image quality, so pair this with a sampler that does well in few steps (such as DDIM from day 9). If not even 1 step fits, the only options are a smaller resolution, a smaller model, or rejecting the request.
+
+The code below really measures time. Each step of the tiny network is fast and the numbers change a little from run to run, but you can see that twice the steps take about twice the time. The CFG column may add far less than 2×: the network is so small that the fixed cost of each call dominates, and going from batch 1 to batch 2 adds little. With a big model at high resolution it gets close to 2×.
+--- code
+import time
+torch.manual_seed(0)
+net = TinyDenoiser().eval()
+x = torch.randn(1, 4, 32, 32)
+
+def sample_ms(steps, cfg):
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        z = x
+        for _ in range(steps):
+            if cfg:                                      # conditional + unconditional as a batch of 2 (this tiny net has no condition input; timing only)
+                e = net(torch.cat([z, z]))
+                eps = e[1:] + 3.0 * (e[:1] - e[1:])
+            else:
+                eps = net(z)
+            z = z - 0.1 * eps
+    return (time.perf_counter() - t0) * 1000
+
+sample_ms(5, False)                                      # warm up once: the first call is always slower
+for steps in (10, 20, 40):
+    print(f"{steps:2d} steps: {sample_ms(steps, False):6.1f} ms    with CFG: {sample_ms(steps, True):6.1f} ms")
+
+@@ concept
+title: A Dockerfile for a GPU inference image
+--- body
+Docker packs "code + dependencies + system libraries" into an **image** that runs exactly the same on any machine with Docker. A running image is a **container**. An image is described by a text file called `Dockerfile`, one instruction per line:
+
+- `FROM`: the existing image to start from, such as an official image with PyTorch and CUDA installed.
+- `WORKDIR`: the folder the following commands run in.
+- `COPY`: copies files from your machine into the image. `RUN`: runs a command at build time, such as `pip install`.
+- `ENV`: sets an environment variable. `USER`: the user that runs everything after it.
+- `EXPOSE`: documents the port the service uses. `CMD`: the command the container runs when it starts.
+
+Four rules for a GPU inference image:
+
+1. **Pin versions.** `FROM pytorch/pytorch:latest` may be one image today and a different one next month. A new CUDA version may not match the GPU driver on the machine; a new PyTorch may change the numbers. Use an exact tag such as `pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime`, and write `==version` for every package in `requirements.txt`.
+2. **Keep model files out of the image.** Copying gigabytes of weights into the image makes it big and slow, and every model change means a new build and a new push. The code goes into the image; the weights are mounted when the container runs, with `docker run -v host_folder:/models:ro`. `:ro` means read-only: the service cannot change or delete the model files.
+3. **Do not run as root.** Inside a container you are root by default. If the service is ever broken into, root can do far more damage. Create a normal user (`RUN useradd ...`) and switch to it with `USER`.
+4. **One worker per GPU.** `uvicorn --workers 4` starts 4 processes. Each loads its own full copy of the model and keeps its own KV cache memory, and all 4 fight over the same GPU. Instead: one process per container (`--workers 1`), given exactly one GPU with `docker run --gpus device=0`. Concurrency comes from batching inside the process (for example today's continuous batching). For two GPUs, start two containers.
+
+The code below checks a "what not to do" Dockerfile and points out the lines that break the rules.
+--- code
+dockerfile = """FROM pytorch/pytorch:latest
+WORKDIR /app
+COPY requirements.txt server.py ./
+COPY weights/ /app/weights/
+RUN pip install -r requirements.txt
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--workers", "4"]"""
+
+lines = dockerfile.splitlines()
+for line in lines:
+    if line.startswith("FROM") and (":" not in line or line.endswith(":latest")):
+        print("version not pinned      ->", line)
+    if line.startswith("COPY") and "weights" in line:
+        print("weights inside image    ->", line)
+    if '"--workers", "4"' in line:
+        print("4 processes on one GPU  ->", line)
+print("is there a USER line:", any(l.startswith("USER") for l in lines), "-> without one, the container runs as root")
+
+@@ item d23-01
+type: code
+title: How many bytes the KV cache takes
+level: 1
+cards: The KV cache memory bill
+targets: kv_cache_bytes
+ref: day23
+--- context
+"How many users can this 24 GB GPU serve at once?" is the most common question in LLM deployment interviews and in capacity planning. Half of the answer is the KV cache bill: how much memory each sequence takes.
+--- prompt
+Write `kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype)`. It returns the number of **bytes** the KV cache takes (a Python int).
+
+- `dtype` is a PyTorch data type such as `torch.float16`. Get the bytes per number from `dtype.itemsize` (float32 → 4, bfloat16 → 2, float8 → 1).
+- Do not forget that K and V are stored separately.
+
+The tests check real model configurations (Llama-2-7B: 32 layers, 32 KV heads, head_dim 128) and compare with the bytes `TinyLM`'s cache really holds.
+--- starter
+def kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype):
+    bytes_per_number = dtype.itemsize
+    raise todo()
+--- solution
+def kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype):
+    bytes_per_number = dtype.itemsize                    # fp16 / bf16 -> 2, fp32 -> 4
+    return 2 * n_layers * n_kv_heads * head_dim * seq_len * batch * bytes_per_number   # 2 = K and V
+--- tests
+GiB = 1024 ** 3
+
+@check("Llama-2-7B: one sequence of 4096 tokens takes 2 GiB")
+def _():
+    got = kv_cache_bytes(32, 32, 128, 4096, 1, torch.float16)
+    true(isinstance(got, int), f"return a Python int; you returned a {type(got).__name__}")
+    true(got != GiB, "you got 1 GiB, exactly half: K and V are stored separately, so multiply by 2")
+    true(got == 2 * GiB, f"expected 2 GiB = {2 * GiB} bytes, you got {got} ({got / GiB:.3g} GiB)")
+
+@check("GQA: count KV heads, not q heads")
+def _():
+    got = kv_cache_bytes(32, 8, 128, 8192, 1, torch.bfloat16)     # Llama-3-8B: 8 KV heads
+    true(got == GiB, f"8192 tokens of Llama-3-8B should take 1 GiB, you got {got / GiB:.3g} GiB")
+
+@check("batch and dtype both count")
+def _():
+    base = kv_cache_bytes(4, 2, 64, 100, 1, torch.float16)
+    true(base == 204800, f"4 layers, 2 KV heads, head_dim 64, 100 tokens, fp16: expected 204800 bytes, you got {base}")
+    true(kv_cache_bytes(4, 2, 64, 100, 8, torch.float16) == 8 * base, "going from batch 1 to batch 8 should give 8 times the bytes")
+    true(kv_cache_bytes(4, 2, 64, 100, 1, torch.float32) == 2 * base, "fp32 uses 4 bytes per number: twice fp16")
+    true(kv_cache_bytes(4, 2, 64, 100, 1, torch.float8_e4m3fn) == base // 2,
+         "fp8 uses 1 byte per number: half of fp16. Use dtype.itemsize instead of hard-coding the bytes")
+
+@check("matches the real size of TinyLM's cache")
+def _():
+    model = make_tiny_lm().to(torch.bfloat16)
+    with torch.inference_mode():
+        _, cache = model(torch.randint(0, 32, (3, 5)))            # batch 3, prefill 5 tokens
+        _, cache = model(torch.randint(0, 32, (3, 2)), cache)     # feed 2 more: 7 in total
+    real = cache_bytes(cache)
+    want = kv_cache_bytes(model.n_layers, model.n_kv_heads, model.head_dim, 7, 3, torch.bfloat16)
+    true(want == real, f"TinyLM's cache really holds {real} bytes, your formula gives {want}")
+--- hints
+- The formula is a product of a few numbers: layers, KV heads, head_dim, sequence length, batch, bytes per number. Which factor is still missing?
+- Multiply by 2 at the front (K and V): `return 2 * n_layers * n_kv_heads * head_dim * seq_len * batch * bytes_per_number`.
+
+@@ item d23-02
+type: predict
+title: How many long sequences fit on one GPU
+level: 2
+cards: The KV cache memory bill
+ref: day23
+--- context
+In capacity planning you need to do this in your head: how much GQA saves, and how many long sequences fit in the memory that is left. Work it out on paper first, then check.
+--- prompt
+`kv_cache_bytes` is the function from the previous exercise (the reference answer is already loaded). Write the 3 lines this code prints.
+--- code
+KiB, GiB = 1024, 1024 ** 3
+mha = kv_cache_bytes(32, 32, 128, 1, 1, torch.float16)     # Llama-2-7B, 1 token
+gqa = kv_cache_bytes(32, 8, 128, 1, 1, torch.float16)      # Llama-3-8B, 1 token
+print(mha // KiB, gqa // KiB)
+free = 8 * GiB                                             # 8 GiB left after the weights
+print(free // kv_cache_bytes(32, 8, 128, 4096, 1, torch.float16))
+print(free // kv_cache_bytes(32, 8, 128, 4096, 1, torch.float32))
+--- explain
+Line 1: one token is 2 × 32 × 32 × 128 × 2 = 524,288 bytes = 512 KiB. With GQA there are only 8 KV heads, a quarter of that: 128 KiB. So it prints `512 128`.
+
+Line 2: one sequence of 4096 tokens is 128 KiB × 4096 = 512 MiB, half a GiB. 8 GiB holds 16 of them.
+
+Line 3: in fp32 every number takes 4 bytes, so each sequence takes 1 GiB and only 8 fit.
+
+A real service also needs some room for activations and memory fragmentation, so a little less fits in practice.
+--- hints
+- 1 KiB = 1024 bytes. Start with one token: 2 × layers × KV heads × head_dim × 2 bytes.
+- 128 KiB × 4096 = 512 MiB, which is half a GiB.
+
+@@ item d23-03
+type: choice
+title: Prefill and decode: which statements are true
+level: 2
+cards: Two phases: prefill and decode
+--- context
+Before you speed up an LLM service, you need to know which phase is slow. Prefill and decode hit different limits, so they need different fixes.
+--- prompt
+Which statements about prefill and decode are **true**? (Pick all that apply.)
+--- options
+- Prefill handles the whole prompt at once; the matrix multiplications are big, so the limit is usually the GPU's compute
+- Decode computes only 1 token per step but has to read all the weights and the KV cache, so the limit is usually memory bandwidth
+- The time a user waits for the first word (TTFT) is mostly set by max_new_tokens
+- Decoding many requests together in the same step pays off: the weights are read once and shared by all of them
+- With a KV cache, the time of one decode step does not depend at all on how long the sequence already is
+answer: 1,2,4
+--- explain
+Statements 1 and 2 are the core difference between the two phases. Statement 4 is exactly the idea behind continuous batching.
+
+Statement 3 is false: TTFT is mostly prefill time, which depends on the prompt length. max_new_tokens changes the total time (how many decode steps run), not when the first word shows up.
+
+Statement 5 is false: the KV cache saves recomputing the k and v of old tokens, but the new token's attention still has to work with the k and v of every old token, and read them all from memory. The longer the sequence, the slower each step, just far less slow than without a cache.
+--- hints
+- Which phase has to finish before the first word can appear?
+- What does one decode step read from GPU memory? Does the KV cache grow with the length?
+
+@@ item d23-04
+type: code
+title: Streaming generation: prefill once, then one token per step
+level: 2
+cards: Two phases: prefill and decode; Streaming: a generator that yields one token at a time
+targets: stream_tokens
+ref: day23
+--- context
+Every LLM inference service is built around this loop: prefill once, then decode one token at a time, hand each token to the user right away, and stop at eos or at the limit. Get it right and you see how TTFT, the KV cache and streaming fit together.
+--- prompt
+Write the **generator** `stream_tokens(model, prompt_ids, max_new_tokens, eos_id)`. It decodes greedily (each step takes the token with the largest logit) and yields the new tokens one by one.
+
+- `prompt_ids`: a (1, T) long tensor. `model` works like `TinyLM`: `logits, cache = model(ids, cache)`, where logits has shape (1, tokens fed in this call, V).
+- First call: feed the whole prompt with `cache=None` (prefill). After that, feed only the 1 token generated in the previous step (shape (1, 1)) together with the cache (decode).
+- The next token comes from `logits[0, -1]` (the last position). Yield a Python int (use `.item()`), because it will be turned into JSON for the user.
+- Stop when `eos_id` is generated; do not yield the eos itself. Yield at most `max_new_tokens` tokens.
+- No wasted forward passes: after the last token is yielded, do not call the model again. With `max_new_tokens=0`, do not call it at all.
+--- starter
+def stream_tokens(model, prompt_ids, max_new_tokens, eos_id):
+    ids, cache = prompt_ids, None
+    for _ in range(max_new_tokens):
+        raise todo()
+--- solution
+@torch.inference_mode()                                  # decorator form: does not affect the caller while paused
+def stream_tokens(model, prompt_ids, max_new_tokens, eos_id):
+    ids, cache = prompt_ids, None
+    for _ in range(max_new_tokens):
+        logits, cache = model(ids, cache)                # first call: prefill the prompt; then: decode 1 token
+        tok = logits[0, -1].argmax().item()              # greedy: take the largest; .item() gives a Python int
+        if tok == eos_id:
+            return                                       # eos is not sent to the user
+        yield tok
+        ids = torch.tensor([[tok]], device=prompt_ids.device)   # the next step feeds only this 1 new token
+--- tests
+import inspect
+PROMPT = torch.tensor([[12, 15, 21, 0, 3, 27]])
+
+@check("a generator: when the first token arrives, only the prefill has run")
+def _():
+    model = make_tiny_lm()
+    gen = stream_tokens(model, PROMPT, 5, eos_id=-1)
+    true(inspect.isgenerator(gen), "write stream_tokens as a generator with yield, not a function that computes everything and returns a list")
+    true(model.calls == [], f"the model was called before any token was requested: {model.calls}")
+    first = next(gen, None)
+    true(first is not None, "max_new_tokens=5 and no eos, but the generator gave no token at all")
+    true(model.calls == [6], f"when the first token arrives, the call record should be [6] (one prefill with all 6 tokens); yours is {model.calls}")
+    true(type(first) is int, f"yield a Python int (use .item()); you yielded a {type(first).__name__}")
+
+@check("one prefill, then 1 token per step, nothing extra")
+def _():
+    model = make_tiny_lm()
+    out = list(stream_tokens(model, PROMPT, 5, eos_id=-1))
+    true(len(out) == 5, f"max_new_tokens=5 and no eos: expected exactly 5 tokens, you gave {len(out)}")
+    calls = model.calls
+    true(calls[:1] == [6], f"the first call must feed the whole prompt (6 tokens); your call record is {calls}")
+    true(all(c == 1 for c in calls[1:]),
+         f"call record {calls}: each decode step should feed only 1 new token. Feeding the whole sequence every step means the KV cache is not used")
+    true(len(calls) == 5,
+         f"{len(calls)} calls, expected 5 (1 prefill + 4 decodes). After the last token is sent, no more forward passes are needed")
+
+@check("same result as recomputing from scratch every step")
+def _():
+    for prompt in (PROMPT, torch.tensor([[5, 11, 12, 8, 31, 9, 2]])):
+        want = greedy_no_cache(make_tiny_lm(), prompt, 8)
+        got = list(stream_tokens(make_tiny_lm(), prompt, 8, eos_id=-1))
+        true(got == want, f"prompt {prompt.tolist()}: expected {want}, you generated {got}. When decoding, pass back the cache from the previous call")
+
+@check("stops at eos and does not send it")
+def _():
+    model = ScriptedLM([5, 7, 0, 9])                     # the 3rd call generates eos (id 0)
+    out = list(stream_tokens(model, PROMPT, 10, eos_id=0))
+    true(out == [5, 7], f"the script is 5, 7, eos, 9: expected [5, 7], you got {out}")
+    true(len(model.calls) == 3, f"stop right after the step that generated eos: expected 3 model calls, you made {len(model.calls)}")
+    out = list(stream_tokens(ScriptedLM([0, 4]), PROMPT, 10, eos_id=0))
+    true(out == [], f"when the very first token is eos, send nothing; you got {out}")
+
+@check("max_new_tokens is a hard limit")
+def _():
+    model = ScriptedLM([3])                              # never generates eos
+    out = list(stream_tokens(model, PROMPT, 4, eos_id=0))
+    true(out == [3, 3, 3, 3], f"max_new_tokens=4: expected exactly 4 tokens, you got {out}")
+    model = ScriptedLM([3])
+    out = list(stream_tokens(model, PROMPT, 0, eos_id=0))
+    true(out == [] and model.calls == [], f"max_new_tokens=0: generate nothing and do not call the model. You got {out}, call record {model.calls}")
+--- hints
+- The loop has just one kind of call: `logits, cache = model(ids, cache)`. The first time, ids is the whole prompt and cache is None; after that, ids becomes the new token.
+- The order: call the model → `tok = logits[0, -1].argmax().item()` → `return` if it is eos → `yield tok` → `ids = torch.tensor([[tok]])`.
+- Put "call the model" at the top of the loop body, and after the yield only prepare the next input. Then, once the last token is sent, the loop ends without an extra step.
+
+@@ item d23-05
+type: fix
+title: A stop string split over several tokens
+level: 2
+cards: Stop strings span tokens
+targets: text_until_stop
+ref: day23
+--- context
+Chat services often use a stop string (such as `\nUser:`) to keep the model from speaking for the user. Code that checks single tokens passes the tests when the stop happens to be one token. In production the stop gets split, and the model starts talking to itself.
+--- prompt
+`text_until_stop(pieces, stops)`: `pieces` is the text the model produces, piece by piece (each piece is the string decoded from one token). `stops` is a list of stop strings.
+
+Return all the text before the first stop string (without the stop itself):
+
+- With several stop strings, cut at whichever appears first in the text.
+- If no stop string appears, return all the text.
+- Return as soon as you find a stop and read no more pieces (in a real service, every extra piece is another GPU step).
+
+The current code only checks "is this piece a stop string". Fix it.
+--- starter
+def text_until_stop(pieces, stops):
+    text = ""
+    for piece in pieces:
+        if piece in stops:                               # is this piece exactly a stop string?
+            break
+        text += piece
+    return text
+--- solution
+def text_until_stop(pieces, stops):
+    text = ""
+    for piece in pieces:
+        text += piece
+        hits = [text.find(s) for s in stops if s in text]    # search the joined text
+        if hits:
+            return text[:min(hits)]                      # the part before the stop that appears first
+    return text
+--- tests
+@check("a stop split over several pieces")
+def _():
+    pieces = ["Sure", "!", " Bye", ".\n", "User", ":", " next"]
+    got = text_until_stop(pieces, ["\nUser:"])
+    true(got == "Sure! Bye.", f"expected 'Sure! Bye.', you returned {got!r}. The stop is split into '.\\n', 'User' and ':'; no single piece equals it")
+
+@check("a stop inside a piece with other text")
+def _():
+    got = text_until_stop(["Hi", " there\nUser: more"], ["\nUser:"])
+    true(got == "Hi there", f"expected 'Hi there', you returned {got!r}. Keep the ' there' before the stop")
+    got = text_until_stop(["Hi", "\nUser:"], ["\nUser:"])
+    true(got == "Hi", f"expected 'Hi', you returned {got!r}")
+
+@check("several stops: cut at the first one in the text")
+def _():
+    got = text_until_stop(["a\nUs", "er:", " b###"], ["###", "\nUser:"])
+    true(got == "a", f"expected 'a', you returned {got!r}")
+    got = text_until_stop(["x#", "#", "#\nUser:"], ["\nUser:", "###"])
+    true(got == "x", f"'###' appears in the text before '\\nUser:', so expected 'x'; you returned {got!r}")
+
+@check("no stop: return all the text")
+def _():
+    got = text_until_stop(["a", "\nUs", "b"], ["\nUser:"])
+    true(got == "a\nUsb", f"there is no complete stop, so return all the text 'a\\nUsb'; you returned {got!r}")
+    got = text_until_stop(["a", "\nUser:"], [])
+    true(got == "a\nUser:", f"stops is empty, so return all the text; you returned {got!r}")
+
+@check("stop reading once the stop is found")
+def _():
+    pieces = CountingIter(["Hi", "\n", "User", ":", " a", " b", " c"])
+    got = text_until_stop(pieces, ["\nUser:"])
+    true(got == "Hi", f"expected 'Hi', you returned {got!r}")
+    true(pieces.taken == 4, f"the stop is complete after piece 4, so read only 4 pieces; you read {pieces.taken}. Every extra piece is one more GPU step in a real service")
+--- hints
+- A stop string can span several pieces. Where should you search for it: in this piece, or in all the text joined so far?
+- For each piece, first add it to `text`, then call `text.find(s)` for every stop. Take the smallest position found and return `text[:position]`.
+
+@@ item d23-06
+type: code
+title: While streaming, hold back what might start a stop string
+level: 3
+cards: Stop strings span tokens; Streaming: a generator that yields one token at a time
+targets: stream_until_stop
+ref: day23
+--- context
+When you stream, text that was sent cannot be taken back. Inference engines such as vLLM hold back the last few characters that might start a stop string until they are sure they do not. Without this, half a stop string flashes on the user's screen.
+--- prompt
+Write the **generator** `stream_until_stop(pieces, stops)`. It reads `pieces` one at a time, yields text as soon as it is certain to be safe, and stops at any stop string.
+
+Requirements:
+
+1. All the yielded text joined together equals all the text before the first stop string (the same result as `text_until_stop` in the previous exercise). No part of a stop string may be sent.
+2. No delays: after a piece is read, the part that cannot be the start of a stop string must be sent right away.
+3. Stop once a stop string is found and read no more pieces. If the stream ends while you still hold some text, send it.
+4. Never yield an empty string.
+
+`held(text, stop)` on the card computes "how many characters at the end to hold back". Here there are several stop strings: compute it for each one and take the largest.
+--- starter
+def stream_until_stop(pieces, stops):
+    buf = ""                                             # text not sent yet
+    for piece in pieces:
+        buf += piece
+        raise todo()
+    if buf:
+        yield buf                                        # the stream ended: what we held was not a stop, send it
+--- solution
+def stream_until_stop(pieces, stops):
+    buf = ""                                             # text not sent yet
+    for piece in pieces:
+        buf += piece
+        hits = [buf.find(s) for s in stops if s in buf]
+        if hits:                                         # a complete stop: send what comes before it, then finish
+            if buf[:min(hits)]:
+                yield buf[:min(hits)]
+            return
+        keep = 0                                         # the longest end that could start some stop string
+        for s in stops:
+            for k in range(min(len(s) - 1, len(buf)), 0, -1):
+                if buf.endswith(s[:k]):
+                    keep = max(keep, k)
+                    break
+        if len(buf) > keep:                              # everything before it is safe: send it
+            yield buf[:len(buf) - keep]
+            buf = buf[len(buf) - keep:]
+    if buf:
+        yield buf                                        # the stream ended: what we held was not a stop, send it
+--- tests
+import inspect
+
+def _run(pieces, stops):
+    """Run the generator to the end, recording how many pieces had been read at each yield."""
+    it = CountingIter(pieces)
+    gen = stream_until_stop(it, stops)
+    true(inspect.isgenerator(gen), "write stream_until_stop as a generator (with yield)")
+    return [(chunk, it.taken) for chunk in gen], it
+
+CASES = [
+    (["Hello", " world"], ["\nUser:"], "Hello world"),
+    (["Hi", "\n", "there"], ["\nUser:"], "Hi\nthere"),
+    (["Sure", "!", " Bye", ".\n", "User", ":", " next"], ["\nUser:"], "Sure! Bye."),
+    (["Hi", "\nUs"], ["\nUser:"], "Hi\nUs"),
+    (["a#", "#b", "##", "#", "c"], ["###", "\nUser:"], "a##b"),
+    (["ok\nUser: hi"], ["\nUser:"], "ok"),
+]
+
+@check("joined, it equals the text before the stop, and no part of the stop leaks")
+def _():
+    for pieces, stops, want in CASES:
+        out, _ = _run(pieces, stops)
+        got = "".join(c for c, _ in out)
+        true(got == want, f"pieces={pieces}: the sent text joined should be {want!r}, yours is {got!r}")
+        true(all(isinstance(c, str) and c for c, _ in out), f"pieces={pieces}: do not yield empty strings or other types: {[c for c, _ in out]}")
+
+@check("safe text is sent as soon as it is read")
+def _():
+    out, _ = _run(["Hello", " world", "!"], ["\nUser:"])
+    true(out == [("Hello", 1), (" world", 2), ("!", 3)],
+         f"none of these 3 pieces can start a stop string, so each should be sent right after it is read. Your (text sent, pieces read at that moment) is {out}")
+    out, _ = _run(["Hi", "\n", "there"], ["\nUser:"])
+    true(out[:1] == [("Hi", 1)], f"'Hi' cannot start a stop string, so send it right after reading piece 1. Your record is {out}")
+
+@check("text that might start a stop is held back")
+def _():
+    out, _ = _run(["Hi", "\n", "there"], ["\nUser:"])
+    early = "".join(c for c, t in out if t <= 2)
+    true("\n" not in early, f"after reading piece 2, '\\n', you cannot know yet whether it starts the stop, so do not send it. Your record is {out}")
+    true("".join(c for c, _ in out) == "Hi\nthere", f"it turned out not to be a stop, so send '\\n' together with 'there'. Your record is {out}")
+
+@check("stop at the stop string and read no further")
+def _():
+    out, it = _run(["Hi", "\n", "User", ":", " a", " b"], ["\nUser:"])
+    true("".join(c for c, _ in out) == "Hi", f"only 'Hi' should be sent; your record is {out}")
+    true(it.taken == 4, f"piece 4 completes the stop, so read only 4 pieces; you read {it.taken}")
+--- hints
+- After each piece, first look for a complete stop string in `buf`, as in the previous exercise. If there is one: send the part before it (only if it is not empty), then `return`.
+- Otherwise, for each stop `s`, try `k` from `len(s) - 1` down to 1 and check `buf.endswith(s[:k])`. The largest k over all stop strings is the number of characters to hold back, keep.
+- Send `buf[:len(buf) - keep]` (only if it is not empty), then keep only the last keep characters in `buf`.
+
+@@ item d23-07
+type: code
+title: Validate sampling parameters before the GPU
+level: 2
+cards: Sampling parameters: validate before the GPU
+targets: validate_sampling
+ref: day23
+--- context
+Bad parameters do not crash the service; they quietly produce strange results. A NaN temperature gives garbage text, a misspelled parameter name is ignored, and a max_new_tokens beyond the context length fails halfway through generation. Stop them before the GPU, and tell the user about all the errors at once.
+--- prompt
+Write `validate_sampling(params, prompt_len, context_len)`. `params` is the dict read from the request JSON; it may contain only some of the parameters (the missing ones get the service's defaults and need no checking).
+
+Return a **list** of error messages. Each error starts with the parameter name, for example `"temperature: must be a number from 0 to 2"`. If everything is valid, return an empty list `[]`.
+
+Rules:
+
+- Only 4 names are known: `temperature`, `top_p`, `top_k`, `max_new_tokens`. Any other name (such as the misspelled `temprature`) is an error that starts with that name.
+- `temperature`: a number (int or float, not a bool), finite (not NaN or inf), 0 ≤ t ≤ 2.
+- `top_p`: a number, finite, 0 < p ≤ 1.
+- `top_k`: an integer (not a bool, and not a float such as 5.0), ≥ 0.
+- `max_new_tokens`: an integer (not a bool), ≥ 1, and `prompt_len + max_new_tokens <= context_len`.
+- At most one error per parameter; report every parameter that has a problem.
+--- starter
+def validate_sampling(params, prompt_len, context_len):
+    errors = []
+    if "temperature" in params:
+        t = params["temperature"]
+        if t < 0 or t > 2:
+            errors.append(f"temperature: must be a number from 0 to 2, got {t!r}")
+    raise todo()
+--- solution
+def validate_sampling(params, prompt_len, context_len):
+    def is_number(x):                                    # bool is an int too, so rule it out
+        return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+    def is_int(x):
+        return isinstance(x, int) and not isinstance(x, bool)
+
+    errors = []
+    for key in params:
+        if key not in ("temperature", "top_p", "top_k", "max_new_tokens"):
+            errors.append(f"{key}: unknown parameter")
+    if "temperature" in params:
+        t = params["temperature"]
+        if not (is_number(t) and math.isfinite(t) and 0 <= t <= 2):     # isfinite rules out NaN and inf
+            errors.append(f"temperature: must be a number from 0 to 2, got {t!r}")
+    if "top_p" in params:
+        p = params["top_p"]
+        if not (is_number(p) and math.isfinite(p) and 0 < p <= 1):
+            errors.append(f"top_p: must be a number in (0, 1], got {p!r}")
+    if "top_k" in params:
+        k = params["top_k"]
+        if not (is_int(k) and k >= 0):
+            errors.append(f"top_k: must be an integer >= 0, got {k!r}")
+    if "max_new_tokens" in params:
+        n = params["max_new_tokens"]
+        if not (is_int(n) and n >= 1):
+            errors.append(f"max_new_tokens: must be an integer >= 1, got {n!r}")
+        elif prompt_len + n > context_len:
+            errors.append(f"max_new_tokens: prompt ({prompt_len}) + {n} > context length {context_len}")
+    return errors
+--- tests
+GOOD = [{}, {"temperature": 0}, {"temperature": 0.7, "top_p": 0.9, "top_k": 50, "max_new_tokens": 100},
+        {"temperature": 2, "top_p": 1, "top_k": 0, "max_new_tokens": 1}]
+
+def _errs(params, prompt_len=10, context_len=2048):
+    errors = validate_sampling(dict(params), prompt_len, context_len)
+    true(isinstance(errors, list), f"return a list; you returned a {type(errors).__name__}")
+    return errors
+
+def _must_flag(params, field, why, **kw):
+    errors = _errs(params, **kw)
+    true(any(isinstance(e, str) and e.startswith(field) for e in errors),
+         f"{params}: {why}. Expected an error starting with {field!r}, you returned {errors}")
+
+@check("valid parameters: no errors at all")
+def _():
+    for p in GOOD:
+        errors = _errs(p)
+        true(errors == [], f"{p} is valid, but you returned {errors}")
+    _must_flag({"temperature": -0.5}, "temperature", "a negative temperature is not valid")
+
+@check("out-of-range values are errors")
+def _():
+    for p, field, why in [
+        ({"temperature": -0.1}, "temperature", "the temperature cannot be negative"),
+        ({"temperature": 2.5}, "temperature", "the temperature is at most 2"),
+        ({"top_p": 0}, "top_p", "top_p=0 filters out every token"),
+        ({"top_p": 1.5}, "top_p", "top_p is at most 1"),
+        ({"top_k": -1}, "top_k", "top_k cannot be negative"),
+        ({"max_new_tokens": 0}, "max_new_tokens", "at least 1 token must be generated"),
+    ]:
+        _must_flag(p, field, why)
+
+@check("NaN, inf, bools, strings and floats are stopped too")
+def _():
+    for p, field, why in [
+        ({"temperature": float("nan")}, "temperature", "every comparison with NaN is False, so t < 0 or t > 2 lets it through; use math.isfinite"),
+        ({"temperature": float("inf")}, "temperature", "inf is not a finite number"),
+        ({"temperature": "0.7"}, "temperature", "a string is not a number (and comparing '0.7' with 0 raises TypeError)"),
+        ({"top_p": float("nan")}, "top_p", "NaN is not valid"),
+        ({"top_k": 5.0}, "top_k", "top_k must be an integer"),
+        ({"max_new_tokens": True}, "max_new_tokens", "a bool is an int: isinstance(True, int) is True, so rule it out separately"),
+        ({"max_new_tokens": 10.0}, "max_new_tokens", "max_new_tokens must be an integer"),
+    ]:
+        _must_flag(p, field, why)
+
+@check("prompt + max_new_tokens must fit in the context")
+def _():
+    errors = _errs({"max_new_tokens": 48}, prompt_len=2000, context_len=2048)
+    true(errors == [], f"2000 + 48 = 2048 fits exactly, so no error; you returned {errors}")
+    _must_flag({"max_new_tokens": 49}, "max_new_tokens", "2000 + 49 > 2048 does not fit", prompt_len=2000, context_len=2048)
+
+@check("misspelled names are errors, and all errors are reported at once")
+def _():
+    _must_flag({"temprature": 0.2}, "temprature", "if a misspelled name is ignored, the user thinks they set the temperature but did not")
+    errors = _errs({"temperature": -1, "top_p": 2, "top_k": 3})
+    true(len(errors) == 2, f"temperature and top_p are wrong (top_k=3 is valid), so expected exactly 2 errors; you returned {errors}")
+--- hints
+- Start with two small helpers: `is_number(x)` is `isinstance(x, (int, float)) and not isinstance(x, bool)`; `is_int(x)` is the same without float.
+- Write the "valid" condition: `if not (is_number(t) and math.isfinite(t) and 0 <= t <= 2): errors.append(...)`. `and` short-circuits: if it is not a number, the comparisons never run, so no TypeError.
+- Unknown names: `for key in params: if key not in (...)`. For max_new_tokens, check the type and range first, and only when they are valid use `elif` to check the context length.
+
+@@ item d23-08
+type: code
+title: Simulate a continuous batching scheduler
+level: 3
+cards: Continuous batching: leave as soon as you are done
+targets: simulate_continuous
+ref: day23
+--- context
+Continuous batching is one of the main reasons engines like vLLM reach high throughput, and interviews often ask how it differs from static batching. Write the scheduler simulation yourself and you can show with numbers why short requests no longer wait for long ones.
+--- prompt
+Write `simulate_continuous(lengths, n_slots)`. `lengths[i]` is the number of tokens request i needs (≥ 1). All requests are in the queue from the start, in the order 0, 1, 2, … The GPU has `n_slots` slots.
+
+Return a list: `finish[i]` is the step at which request i is done (generates its last token).
+
+Time is counted in decode steps, starting at step 1. In each step:
+
+1. While a slot is free and someone is waiting, put the next request from the queue into a slot (until the slots are full or the queue is empty).
+2. Every request in a slot generates 1 token.
+3. A request that now has `lengths[i]` tokens is done at this step and leaves its slot. The freed slot can be used from the next step on.
+
+Example: `lengths = [8, 2, 3, 2, 6, 1]` with 2 slots → `[8, 2, 5, 7, 13, 9]`. (Static batching gives `[8, 8, 11, 11, 17, 17]`, 17 steps in total.)
+--- starter
+def simulate_continuous(lengths, n_slots):
+    queue = list(range(len(lengths)))                    # waiting requests (in order)
+    slots = []                                           # requests being generated
+    made = [0] * len(lengths)                            # tokens generated so far per request
+    finish = [0] * len(lengths)
+    step = 0
+    while queue or slots:
+        step += 1
+        raise todo()
+    return finish
+--- solution
+def simulate_continuous(lengths, n_slots):
+    queue = list(range(len(lengths)))                    # waiting requests (in order)
+    slots = []                                           # requests being generated
+    made = [0] * len(lengths)                            # tokens generated so far per request
+    finish = [0] * len(lengths)
+    step = 0
+    while queue or slots:
+        step += 1
+        while queue and len(slots) < n_slots:            # 1. fill the free slots
+            slots.append(queue.pop(0))
+        for i in slots:                                  # 2. every request generates 1 token
+            made[i] += 1
+        done = [i for i in slots if made[i] == lengths[i]]
+        for i in done:                                   # 3. finished requests leave at this step
+            finish[i] = step
+        slots = [i for i in slots if i not in done]
+    return finish
+--- tests
+EXAMPLE = [8, 2, 3, 2, 6, 1]
+
+@check("the example from the prompt")
+def _():
+    got = simulate_continuous(list(EXAMPLE), 2)
+    true(got == [8, 2, 5, 7, 13, 9], f"expected [8, 2, 5, 7, 13, 9], you returned {got}")
+
+@check("plenty of slots, or just 1 slot")
+def _():
+    got = simulate_continuous(list(EXAMPLE), 10)
+    true(got == EXAMPLE, f"with more slots than requests nobody waits, so finish equals lengths {EXAMPLE}; you returned {got}")
+    got = simulate_continuous(list(EXAMPLE), 1)
+    true(got == [8, 10, 13, 15, 21, 22], f"with 1 slot the requests run one after another: expected [8, 10, 13, 15, 21, 22], you returned {got}")
+
+@check("never over the slot count, first come first served, no waiting while a slot is free")
+def _():
+    lengths, n_slots = [3, 1, 4, 1, 5, 9, 2, 6], 3
+    finish = simulate_continuous(list(lengths), n_slots)
+    true(isinstance(finish, list) and len(finish) == len(lengths), f"return a list of length {len(lengths)}; yours is {finish}")
+    spans = [(f - n, f) for n, f in zip(lengths, finish)]    # request i generates during steps start+1 .. finish
+    starts = [s for s, _ in spans]
+    true(all(s >= 0 for s in starts), f"some request started before step 1: {finish}")
+    true(starts == sorted(starts), f"requests should start in queue order (first come, first served); the steps before each start are {starts}")
+    for step in range(1, max(finish) + 1):
+        busy = sum(s < step <= f for s, f in spans)
+        true(busy <= n_slots, f"at step {step}, {busy} requests are generating: more than the {n_slots} slots")
+        waiting = sum(s >= step for s, _ in spans)
+        true(busy == n_slots or waiting == 0, f"at step {step} only {busy} slots are used, while {waiting} requests are waiting")
+    true(finish == [3, 1, 4, 2, 7, 12, 6, 12], f"expected [3, 1, 4, 2, 7, 12, 6, 12], you returned {finish}")
+
+@check("against static batching: short ones return first, fewer steps in total")
+def _():
+    cont = simulate_continuous(list(EXAMPLE), 2)
+    stat = simulate_static(list(EXAMPLE), 2)
+    true(isinstance(cont, list) and len(cont) == len(EXAMPLE), f"return a list of length {len(EXAMPLE)}; yours is {cont}")
+    order = sorted(range(len(EXAMPLE)), key=lambda i: (cont[i], i))
+    true(order == [1, 2, 3, 0, 5, 4], f"the finishing order should be [1, 2, 3, 0, 5, 4] (short ones first); yours is {order}")
+    true(max(cont) < max(stat), f"continuous takes {max(cont)} steps in total; it should be fewer than static batching's {max(stat)}")
+--- hints
+- Each step has three parts: fill the slots (`while queue and len(slots) < n_slots`), `made[i] += 1` for everyone in a slot, then record `finish[i] = step` for those with `made[i] == lengths[i]` and remove them from the slots.
+- Remove finished requests after this step's tokens are generated, so the freed slot is used from the next step on. Do not delete from `slots` while looping over it: collect the finished ones in a list first, then rebuild `slots`.
+
+@@ item d23-09
+type: predict
+title: Static vs continuous: who comes back first
+level: 2
+cards: Continuous batching: leave as soon as you are done
+ref: day23
+--- context
+Compare the two schedulers with numbers: how long requests wait on average, and how many steps it all takes. If you can draw this timeline on a whiteboard, the interviewer knows you really understand it.
+--- prompt
+`simulate_static` and `simulate_continuous` are the two simulations from the card (they return the step at which each request finishes). Write the 2 lines this code prints.
+--- code
+lengths = [5, 1, 2, 1]
+for name, sim in [("static", simulate_static), ("continuous", simulate_continuous)]:
+    finish = sim(lengths, 2)
+    print(name, finish, "total", max(finish), "mean", sum(finish) / len(finish))
+--- explain
+Static: requests 0 and 1 are the first batch. The longest needs 5 steps, so both return at step 5. Requests 2 and 3 are the second batch; it starts at step 6, the longest needs 2 steps, so both return at step 7.
+
+Continuous: at step 1, requests 0 and 1 take the slots. Request 1 needs only 1 token and is done at step 1. At step 2, request 2 joins; it needs 2 steps and is done at step 3. At step 4, request 3 joins and is done in that same step. Request 0 runs the whole time and is done at step 5.
+
+The total goes from 7 steps to 5, and the average return time from 6.0 to 3.25: short requests no longer wait for long ones.
+--- hints
+- Static: a batch returns at (the step the previous batch ended) + (the steps its longest request needs).
+- Continuous: draw who is in the two slots, step by step. A slot freed at step s can take the next request at step s+1.
+
+@@ item d23-10
+type: code
+title: Pick a diffusion step count from a latency budget
+level: 1
+cards: Diffusion: steps are latency
+targets: pick_steps
+ref: day23
+--- context
+Image generation services often promise a latency (say, an image within 2 seconds). The step count is the most direct knob: one more step means slightly better quality and slightly slower. Knowing the most steps that fit in the budget lets you trade quality for latency on solid ground.
+--- prompt
+Write `pick_steps(budget_ms, step_ms, overhead_ms, cfg, max_steps=50)`. It returns the **largest number of steps** (an int) that fits in the budget:
+
+- Total time = `overhead_ms + steps × step_ms × (2 if cfg else 1)`, and it must be ≤ `budget_ms` (exactly equal still fits).
+- No more than `max_steps` (more steps would not improve the image).
+- If not even 1 step fits, return 0 (never a negative number). A 0 tells the caller to lower the resolution or reject the request.
+--- starter
+def pick_steps(budget_ms, step_ms, overhead_ms, cfg, max_steps=50):
+    per_step = step_ms * (2 if cfg else 1)
+    raise todo()
+--- solution
+def pick_steps(budget_ms, step_ms, overhead_ms, cfg, max_steps=50):
+    per_step = step_ms * (2 if cfg else 1)                     # CFG: two passes per step
+    steps = math.floor((budget_ms - overhead_ms) / per_step)   # how many steps fit in the rest (round down)
+    return int(max(0, min(max_steps, steps)))                  # at most max_steps, never negative
+--- tests
+@check("a 2-second budget, with and without CFG")
+def _():
+    got = pick_steps(2000, 30, 400, cfg=True)
+    true(got == 26, f"(2000 - 400) / (30 × 2) = 26.7, rounded down 26; you returned {got}")
+    got = pick_steps(2000, 30, 400, cfg=False, max_steps=100)
+    true(got == 53, f"without CFG: (2000 - 400) / 30 = 53.3, rounded down 53; you returned {got}")
+    true(type(got) is int, f"return an int; you returned a {type(got).__name__}")
+
+@check("never more than max_steps")
+def _():
+    got = pick_steps(2000, 30, 400, cfg=False)
+    true(got == 50, f"the budget allows 53 steps but max_steps=50, so expected 50; you returned {got}")
+    got = pick_steps(10000, 5, 0, cfg=True, max_steps=20)
+    true(got == 20, f"the budget allows 1000 steps, so expected max_steps=20; you returned {got}")
+
+@check("exactly on budget still fits")
+def _():
+    got = pick_steps(1000, 40, 200, cfg=False)
+    true(got == 20, f"200 + 20 × 40 = 1000 fits exactly: 20 steps; you returned {got}")
+    got = pick_steps(1000, 40, 200, cfg=True)
+    true(got == 10, f"with CFG: 200 + 10 × 80 = 1000, so expected 10; you returned {got}")
+
+@check("0 when not even one step fits")
+def _():
+    for budget, want in [(300, 0), (450, 0), (460, 1)]:
+        got = pick_steps(budget, 30, 400, cfg=True)
+        true(got == want, f"budget {budget} ms, fixed overhead 400 ms, 60 ms per step: expected {want}, you returned {got}")
+--- hints
+- The time left is `budget_ms - overhead_ms`; each step takes `per_step`. Divide, then round down with `math.floor(...)`.
+- Finally clamp it: `max(0, min(max_steps, steps))`.
+
+@@ item d23-11
+type: fill
+title: Fill in the Dockerfile of a GPU inference image
+level: 2
+cards: A Dockerfile for a GPU inference image
+targets: DOCKERFILE, REQUIREMENTS, RUN_COMMAND
+--- context
+"It works on my machine but not on the server" usually means the environments differ. An image with pinned versions, mounted model files, a non-root user and one process per GPU runs the same on every machine, and when something breaks it is easy to track down.
+--- prompt
+Below are the `Dockerfile`, `requirements.txt` and start command of an LLM inference service (all written as Python strings; the tests check the text). Fill in the blanks so that:
+
+1. The base image version is pinned: not `latest`, and the tag contains a version number.
+2. Every package in `requirements.txt` is pinned with `==`.
+3. Model files stay out of the image: `MODEL_DIR` is an absolute path inside the container, and `docker run` uses `-v` to mount the model folder from the host at that same path, **read-only**.
+4. It runs as the normal user created by `useradd`, not as root.
+5. One worker per container, and only one GPU (write `--gpus` as `device=0`, not `all`).
+--- template
+DOCKERFILE = """
+# 1. Base image: the tag pins the PyTorch / CUDA / cuDNN versions
+FROM pytorch/pytorch:[[2.7.0-cuda12.8-cudnn9-runtime]]
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY server.py .
+
+# 2. Model files are not copied in: they are mounted at this folder when the container runs
+ENV MODEL_DIR=[[/models]]
+
+# 3. Create a normal user and run as it
+RUN useradd --create-home app
+USER [[app]]
+
+EXPOSE 8000
+# 4. One container starts one worker process
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "[[1]]"]
+"""
+
+REQUIREMENTS = """
+fastapi[[==0.115.6]]
+uvicorn[[==0.32.1]]
+safetensors[[==0.4.5]]
+"""
+
+RUN_COMMAND = "docker run --gpus [[device=0]] -v /srv/models/tiny-lm:[[/models:ro]] -p 8000:8000 tiny-lm:0.1"
+--- tests
+import re
+
+def _lines(text):
+    return [l.strip() for l in text.strip().splitlines() if l.strip() and not l.strip().startswith("#")]
+
+@check("the base image version is pinned")
+def _():
+    froms = [l for l in _lines(DOCKERFILE) if l.startswith("FROM")]
+    true(len(froms) == 1, f"there should be exactly one FROM line; yours: {froms}")
+    image = froms[0].split()[1] if len(froms[0].split()) > 1 else ""
+    true(":" in image, f"{image!r} has no tag, which means latest")
+    tag = image.split(":", 1)[1]
+    true(tag != "latest", "latest is not a version: a build today and a build next month may give two different images")
+    true(re.search(r"\d+\.\d+", tag) is not None, f"the tag {tag!r} needs a version number, such as 2.7.0-cuda12.8-cudnn9-runtime")
+
+@check("every requirement is pinned with ==")
+def _():
+    reqs = _lines(REQUIREMENTS)
+    true(len(reqs) == 3, f"there should be 3 packages; yours: {reqs}")
+    for r in reqs:
+        true(re.fullmatch(r"[A-Za-z0-9_.\-\[\]]+==\d+(\.\d+)*", r) is not None, f"{r!r} is not pinned with ==; it should look like fastapi==0.115.6")
+
+@check("model files are mounted, read-only")
+def _():
+    lines = _lines(DOCKERFILE)
+    copies = [l for l in lines if l.split()[0] in ("COPY", "ADD")]
+    true(not any(re.search(r"model|weight|\.safetensors|\.bin|\.pt\b", l, re.I) for l in copies), f"model files must not be copied into the image: {copies}")
+    env = [l for l in lines if l.startswith("ENV MODEL_DIR=")]
+    true(len(env) == 1, "there should be one line ENV MODEL_DIR=...")
+    model_dir = env[0].split("=", 1)[1].strip()
+    true(model_dir.startswith("/") and len(model_dir) > 1, f"MODEL_DIR must be an absolute path inside the container (such as /models); yours is {model_dir!r}")
+    m = re.search(r"-v\s+(\S+)", RUN_COMMAND)
+    true(m is not None, "docker run needs -v host_folder:container_folder:ro")
+    parts = m.group(1).split(":")
+    true(len(parts) == 3 and parts[2] == "ro", f"the mount {m.group(1)!r} must end with :ro (read-only): the service should never change the model files")
+    true(parts[1] == model_dir, f"it is mounted at {parts[1]!r}, but MODEL_DIR is {model_dir!r}: the service would look for the model in an empty folder")
+
+@check("not running as root")
+def _():
+    users = [l.split(None, 1)[1].strip() if len(l.split()) > 1 else "" for l in _lines(DOCKERFILE) if l.split()[0] == "USER"]
+    true(len(users) == 1 and users[0] != "", "there should be one line USER username")
+    true(users[0] not in ("root", "0"), "USER root switches nothing: if the service is broken into, the attacker gets root")
+    created = re.findall(r"useradd\b.*?\s(\w+)\s*$", DOCKERFILE, flags=re.M)
+    true(users[0] in created, f"user {users[0]} does not exist: useradd created {created}")
+
+@check("one worker and one GPU per container")
+def _():
+    cmd = [l for l in _lines(DOCKERFILE) if l.startswith("CMD")]
+    true(len(cmd) == 1, "there should be one CMD line")
+    m = re.search(r'"--workers",\s*"(\d+)"', cmd[0])
+    true(m is not None, f"CMD needs a number after --workers: {cmd[0]}")
+    true(m.group(1) == "1", f"--workers {m.group(1)}: every worker loads its own copy of the model and its own KV cache memory, all fighting over one GPU. One process per GPU")
+    g = re.search(r"--gpus\s+(\S+)", RUN_COMMAND)
+    gpus = g.group(1) if g else None
+    true(gpus is not None and re.fullmatch(r'"?device=\d+"?', gpus) is not None,
+         f"write --gpus as device=0 so this container gets exactly one GPU; you wrote {gpus!r}")
+--- hints
+- A base image tag looks like `2.7.0-cuda12.8-cudnn9-runtime`; a package version looks like `==0.115.6`.
+- `MODEL_DIR` and the container path after the colon in `-v` must be the same, followed by `:ro`; after `USER` write the name `useradd` created.
+- `--workers` is 1; `--gpus` is `device=0`.
+
+@@ item d23-12
+type: choice
+title: Images and worker counts: which statements are true
+level: 1
+cards: A Dockerfile for a GPU inference image; The KV cache memory bill
+--- context
+These come up in every deployment review. Each one has burned someone: a driver mismatch, a 20 GB image, 4 workers on one GPU and an instant OOM.
+--- prompt
+A machine has one 24 GB GPU and the model weights take 14 GB. Which statements are **true**? (Pick all that apply.)
+--- options
+- Switching uvicorn to `--workers 4` makes the throughput 4 times higher
+- Keeping the weights out of the image and mounting them at run time: changing the model needs no new build, and the image is small, so pushing and pulling are fast
+- `FROM pytorch/pytorch:latest` is the least hassle: always the newest version, never a compatibility problem
+- Running as a normal user in the container: if the service is ever broken into, the attacker can do less
+answer: 2,4
+--- explain
+Statement 1 is false: each worker is a separate process, and each one loads its own 14 GB copy of the weights. Four copies are 56 GB, so this 24 GB GPU runs out of memory right away. Even if they fit, each process would have very little memory left for its KV cache, and they would all fight over the same GPU. The right way is one process per GPU, with concurrency from batching inside that process.
+
+Statement 3 is false: `latest` changes. Rebuild next month and the CUDA or PyTorch version may be different: it may not match the driver, the numbers may change, and the problem is hard to track down.
+
+Statements 2 and 4 are today's rules.
+--- hints
+- Each worker is a separate process. Do they share one copy of the weights on the GPU?
+- Is the image that `latest` points to still the same one next month?
+
+@@ item d23-13
+type: local
+title: Build and run the image on your machine (needs Docker Desktop)
+level: 2
+cards: A Dockerfile for a GPU inference image
+verify: user=app[\s\S]*files=\[[^\]]*'tiny\.safetensors'[\s\S]*can write to MODEL_DIR: no
+placeholder: Paste the 3 lines docker run printed
+--- context
+The Dockerfile in the previous exercise is only text. Build and run one yourself, and see the read-only mount and the non-root user actually work. Next time you write deployment files, you will know what they do.
+--- prompt
+Do this one on your own computer. You first need to install and start **Docker Desktop** (Windows / macOS; on Linux, Docker Engine). If you do not have Docker, skip this exercise for now.
+
+To keep the download small, this uses the tiny `python:3.12.7-slim` image instead of a PyTorch image of several GB. The rules are the same as in the previous exercise: pinned version, mounted model files, no root.
+
+1. Create a folder `tiny-serve` with two files in it.
+
+`Dockerfile`:
+
+```
+FROM python:3.12.7-slim
+WORKDIR /app
+COPY check.py .
+ENV MODEL_DIR=/models
+RUN useradd --create-home app
+USER app
+CMD ["python", "check.py"]
+```
+
+`check.py`:
+
+```
+import os, pwd
+d = os.environ["MODEL_DIR"]
+print(f"user={pwd.getpwuid(os.getuid()).pw_name} uid={os.getuid()}")
+print(f"MODEL_DIR={d} files={sorted(os.listdir(d))}")
+try:
+    open(os.path.join(d, "hack.txt"), "w").close()
+    print("can write to MODEL_DIR: yes (mount it with :ro)")
+except OSError as e:
+    print(f"can write to MODEL_DIR: no ({e.strerror})")
+```
+
+2. Inside `tiny-serve`, create a `models` folder with a fake model file:
+
+```
+python -c "import os; os.makedirs('models', exist_ok=True); open('models/tiny.safetensors', 'wb').write(b'0')"
+```
+
+3. Build the image inside `tiny-serve`:
+
+```
+docker build -t tiny-check:0.1 .
+```
+
+4. Run it, mounting `models` read-only at `/models`. Windows PowerShell:
+
+```
+docker run --rm -v "${PWD}\models:/models:ro" tiny-check:0.1
+```
+
+macOS / Linux:
+
+```
+docker run --rm -v "$PWD/models:/models:ro" tiny-check:0.1
+```
+
+5. Paste the 3 printed lines below. You should see: the user is `app`, `tiny.safetensors` is visible, and writing fails (Read-only file system).
+
+Optional: if you have an NVIDIA GPU and Docker's GPU support is set up, also try `docker run --rm --gpus device=0 tiny-check:0.1 nvidia-smi -L`. If it lists your GPU, the container can use it. If it fails, that does not affect this exercise.
+--- hints
+- The `.` at the end of `docker build` means "use the current folder", so run it inside `tiny-serve`.
+- If you see `files=[]`, the host path is wrong: check that the path before the colon in `-v` really points to the `models` folder.
+- If you see `can write to MODEL_DIR: yes`, you forgot the `:ro` at the end of `-v`.
+
+@@ item d23-14
+type: code
+title: Closed book: KV cache bytes
+level: 1
+exam: yes
+cards: The KV cache memory bill
+targets: kv_cache_bytes
+ref: day23
+--- context
+The KV cache formula is the calculation that comes up most often in LLM deployment interviews. If you can write it with no references and explain every factor, you can estimate on the spot how many requests a GPU can serve.
+--- prompt
+Write `kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype)`. It returns the number of bytes the KV cache takes (a Python int). `dtype` is a PyTorch data type such as `torch.float16`.
+--- starter
+def kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype):
+    raise todo()
+--- solution
+def kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype):
+    bytes_per_number = dtype.itemsize                    # fp16 / bf16 -> 2, fp32 -> 4
+    return 2 * n_layers * n_kv_heads * head_dim * seq_len * batch * bytes_per_number   # 2 = K and V
+--- tests
+GiB = 1024 ** 3
+
+@check("Llama-2-7B: one sequence of 4096 tokens takes 2 GiB")
+def _():
+    got = kv_cache_bytes(32, 32, 128, 4096, 1, torch.float16)
+    true(isinstance(got, int), f"return a Python int; you returned a {type(got).__name__}")
+    true(got != GiB, "you got 1 GiB, exactly half: K and V are stored separately, so multiply by 2")
+    true(got == 2 * GiB, f"expected 2 GiB = {2 * GiB} bytes, you got {got} ({got / GiB:.3g} GiB)")
+
+@check("GQA: count KV heads, not q heads")
+def _():
+    got = kv_cache_bytes(32, 8, 128, 8192, 1, torch.bfloat16)     # Llama-3-8B: 8 KV heads
+    true(got == GiB, f"8192 tokens of Llama-3-8B should take 1 GiB, you got {got / GiB:.3g} GiB")
+
+@check("batch and dtype both count")
+def _():
+    base = kv_cache_bytes(4, 2, 64, 100, 1, torch.float16)
+    true(base == 204800, f"4 layers, 2 KV heads, head_dim 64, 100 tokens, fp16: expected 204800 bytes, you got {base}")
+    true(kv_cache_bytes(4, 2, 64, 100, 8, torch.float16) == 8 * base, "going from batch 1 to batch 8 should give 8 times the bytes")
+    true(kv_cache_bytes(4, 2, 64, 100, 1, torch.float32) == 2 * base, "fp32 uses 4 bytes per number: twice fp16")
+    true(kv_cache_bytes(4, 2, 64, 100, 1, torch.float8_e4m3fn) == base // 2,
+         "fp8 uses 1 byte per number: half of fp16. Use dtype.itemsize instead of hard-coding the bytes")
+
+@check("matches the real size of TinyLM's cache")
+def _():
+    model = make_tiny_lm().to(torch.bfloat16)
+    with torch.inference_mode():
+        _, cache = model(torch.randint(0, 32, (3, 5)))            # batch 3, prefill 5 tokens
+        _, cache = model(torch.randint(0, 32, (3, 2)), cache)     # feed 2 more: 7 in total
+    real = cache_bytes(cache)
+    want = kv_cache_bytes(model.n_layers, model.n_kv_heads, model.head_dim, 7, 3, torch.bfloat16)
+    true(want == real, f"TinyLM's cache really holds {real} bytes, your formula gives {want}")
+--- hints
+- Every layer, every KV head and every token stores one k vector and one v vector, each with head_dim numbers.
+- Get the bytes per number from `dtype.itemsize`.
+
+@@ item d23-15
+type: code
+title: Closed book: the streaming generation loop
+level: 2
+exam: yes
+cards: Two phases: prefill and decode; Streaming: a generator that yields one token at a time
+targets: stream_tokens
+ref: day23
+--- context
+Prefill + decode + streaming + stop conditions is the skeleton of every LLM inference service. Write it without the answer, and you can read the generation loop of any inference engine, and write one on the spot in an interview.
+--- prompt
+Write the generator `stream_tokens(model, prompt_ids, max_new_tokens, eos_id)`: greedy decoding that yields the new tokens (Python ints) one at a time.
+
+- `prompt_ids`: (1, T) long. The model is called as `logits, cache = model(ids, cache)`.
+- The first call feeds the whole prompt (cache is `None`); after that, each call feeds only the previous new token (shape (1, 1)) together with the cache.
+- Stop when `eos_id` is generated, without yielding it; yield at most `max_new_tokens` tokens; do not call the model after the last token.
+--- starter
+def stream_tokens(model, prompt_ids, max_new_tokens, eos_id):
+    raise todo()
+--- solution
+@torch.inference_mode()                                  # decorator form: does not affect the caller while paused
+def stream_tokens(model, prompt_ids, max_new_tokens, eos_id):
+    ids, cache = prompt_ids, None
+    for _ in range(max_new_tokens):
+        logits, cache = model(ids, cache)                # first call: prefill the prompt; then: decode 1 token
+        tok = logits[0, -1].argmax().item()              # greedy: take the largest; .item() gives a Python int
+        if tok == eos_id:
+            return                                       # eos is not sent to the user
+        yield tok
+        ids = torch.tensor([[tok]], device=prompt_ids.device)   # the next step feeds only this 1 new token
+--- tests
+import inspect
+PROMPT = torch.tensor([[12, 15, 21, 0, 3, 27]])
+
+@check("a generator: when the first token arrives, only the prefill has run")
+def _():
+    model = make_tiny_lm()
+    gen = stream_tokens(model, PROMPT, 5, eos_id=-1)
+    true(inspect.isgenerator(gen), "write stream_tokens as a generator with yield, not a function that computes everything and returns a list")
+    true(model.calls == [], f"the model was called before any token was requested: {model.calls}")
+    first = next(gen, None)
+    true(first is not None, "max_new_tokens=5 and no eos, but the generator gave no token at all")
+    true(model.calls == [6], f"when the first token arrives, the call record should be [6] (one prefill with all 6 tokens); yours is {model.calls}")
+    true(type(first) is int, f"yield a Python int (use .item()); you yielded a {type(first).__name__}")
+
+@check("one prefill, then 1 token per step, nothing extra")
+def _():
+    model = make_tiny_lm()
+    out = list(stream_tokens(model, PROMPT, 5, eos_id=-1))
+    true(len(out) == 5, f"max_new_tokens=5 and no eos: expected exactly 5 tokens, you gave {len(out)}")
+    calls = model.calls
+    true(calls[:1] == [6], f"the first call must feed the whole prompt (6 tokens); your call record is {calls}")
+    true(all(c == 1 for c in calls[1:]),
+         f"call record {calls}: each decode step should feed only 1 new token. Feeding the whole sequence every step means the KV cache is not used")
+    true(len(calls) == 5,
+         f"{len(calls)} calls, expected 5 (1 prefill + 4 decodes). After the last token is sent, no more forward passes are needed")
+
+@check("same result as recomputing from scratch every step")
+def _():
+    for prompt in (PROMPT, torch.tensor([[5, 11, 12, 8, 31, 9, 2]])):
+        want = greedy_no_cache(make_tiny_lm(), prompt, 8)
+        got = list(stream_tokens(make_tiny_lm(), prompt, 8, eos_id=-1))
+        true(got == want, f"prompt {prompt.tolist()}: expected {want}, you generated {got}. When decoding, pass back the cache from the previous call")
+
+@check("stops at eos and does not send it")
+def _():
+    model = ScriptedLM([5, 7, 0, 9])                     # the 3rd call generates eos (id 0)
+    out = list(stream_tokens(model, PROMPT, 10, eos_id=0))
+    true(out == [5, 7], f"the script is 5, 7, eos, 9: expected [5, 7], you got {out}")
+    true(len(model.calls) == 3, f"stop right after the step that generated eos: expected 3 model calls, you made {len(model.calls)}")
+    out = list(stream_tokens(ScriptedLM([0, 4]), PROMPT, 10, eos_id=0))
+    true(out == [], f"when the very first token is eos, send nothing; you got {out}")
+
+@check("max_new_tokens is a hard limit")
+def _():
+    model = ScriptedLM([3])                              # never generates eos
+    out = list(stream_tokens(model, PROMPT, 4, eos_id=0))
+    true(out == [3, 3, 3, 3], f"max_new_tokens=4: expected exactly 4 tokens, you got {out}")
+    model = ScriptedLM([3])
+    out = list(stream_tokens(model, PROMPT, 0, eos_id=0))
+    true(out == [] and model.calls == [], f"max_new_tokens=0: generate nothing and do not call the model. You got {out}, call record {model.calls}")
+--- hints
+- Loop `max_new_tokens` times and call the model once at the top of each round; ids is the whole prompt the first time, then `torch.tensor([[tok]])`.
+- Check for eos before the yield.

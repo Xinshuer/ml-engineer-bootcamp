@@ -1,11 +1,9 @@
-# imports of the drill file (the checks use them)
-import sys, os
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+"""Day 2 reference implementations.
 
-"""Day 02 参考答案。"""
+Loaded as hidden setup before every day-2 exercise; the names an exercise asks for (its `targets:`) are
+removed again, so the learner's own version is the one the checks see.
+"""
+import contextlib
 import math
 
 import torch
@@ -40,7 +38,7 @@ def split_heads(qkv, n_head):
 
 def flatten_heads(x):
     B, nh, T, hs = x.shape
-    # transpose 之后内存不连续，view 会报 "view size is not compatible..."
+    # after transpose the memory is no longer contiguous, so a plain view would fail
     return x.transpose(1, 2).contiguous().view(B, T, nh * hs)
 
 
@@ -121,13 +119,42 @@ def collate(samples, pad_id=0):
 
 
 def train_one_epoch(model, xs, ys, lr=0.1, steps=200):
-    opt = torch.optim.SGD(model.parameters(), lr=lr)   # 修 1: 少了括号
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
     losses = []
     for _ in range(steps):
         logits = model(xs)
-        loss = F.cross_entropy(logits, ys)             # 修 2: 分类标签必须是 int64
-        opt.zero_grad(set_to_none=True)                # 修 3: 不清零梯度会一直累加
+        loss = F.cross_entropy(logits, ys)
+        opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
-        losses.append(loss.item())                     # 修 4: 存 tensor 会留住整张计算图
+        losses.append(loss.item())
     return losses
+
+
+# ---------------------------------------------------------------- test helpers (not part of the lesson)
+# Some exercises say "do not use F.softmax" and the like. The checks enforce it: while the learner's function
+# runs, those functions are swapped for one that fails with a clear message, and restored afterwards.
+_SOFTMAX_FUNCS = [(F, "softmax"), (F, "log_softmax"), (torch, "softmax"), (torch, "log_softmax"),
+                  (torch.Tensor, "softmax"), (torch.Tensor, "log_softmax"),
+                  (torch.special, "softmax"), (torch.special, "log_softmax")]
+_CE_FUNCS = [(F, "cross_entropy"), (F, "nll_loss")]
+
+
+@contextlib.contextmanager
+def _banned(targets, msg):
+    def _stop(*args, **kwargs):
+        raise AssertionError(msg)
+
+    saved = []
+    try:
+        for owner, name in targets:
+            own = vars(owner)
+            saved.append((owner, name, name in own, own.get(name)))
+            setattr(owner, name, _stop)
+        yield
+    finally:
+        for owner, name, had, old in reversed(saved):
+            if had:
+                setattr(owner, name, old)
+            else:
+                delattr(owner, name)

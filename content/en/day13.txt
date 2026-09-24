@@ -1,0 +1,996 @@
+@@ day 13
+title: Where the three lines meet: audio codec + LM
+part: Audio
+hours: 3–4 hours
+--- goal
+After today you can read a clip of audio as the (n_q, T) integer matrix a codec produces and work out its bitrate and token count; lay several codebooks out with the delay pattern so a language model can predict them step by step; and turn the day-4 GPT into an audio language model that computes a loss and generates, by changing only its input and its output.
+--- checklist
+- Clear the review queue first (redo from a blank page any item where you looked at the answer yesterday)
+- Read the 8 cards; press Run on every example, change one number, run it again
+- Pass every practice item; say each line of the d13-11 checklist in your own words
+- In the closed-book tab, write build_delay and AudioLM from a blank page
+
+@@ concept
+title: Neural codecs: audio becomes a matrix of integers
+--- body
+Day 11 showed that audio is a long row of samples. At 24 kHz, one second is 24,000 floating-point numbers. Asking a language model to predict those floats one by one gives far too long a sequence, and it does not fit the "pick the next token from a vocabulary" way of learning.
+
+A neural audio codec (EnCodec, SoundStream and DAC are examples) first turns audio into integers:
+
+1. The encoder squeezes the waveform into "frames". The 24 kHz EnCodec turns every 320 samples into 1 frame, so one second is 24000 / 320 = 75 frames. That is frame_rate = 75.
+2. Each frame is described by n_q integers. Each integer is a row number in a "codebook" (a table of 1024 vectors), so it is between 0 and 1023.
+3. The decoder turns those integers back into a waveform.
+
+So a clip becomes a matrix of integers with shape (n_q, T): one row per codebook, one column per frame, and T = int(seconds × frame_rate). With a batch it is (B, n_q, T).
+
+The n_q codebooks are not equal. Codebook 0 captures the rough shape of the frame, codebook 1 adds what codebook 0 got wrong, codebook 2 adds what was still missing, and so on. (This is called residual quantization. How a codebook picks its integer comes on day 14.) For today, remember one sentence: **later codebooks depend on earlier ones**.
+
+### Bitrate: bits per second
+
+A code has 1024 possible values, so storing it takes log2(1024) = 10 bits. So bitrate = frame_rate × n_q × log2(codebook_size). The 24 kHz EnCodec with 8 codebooks: 75 × 8 × 10 = 6000 bps (6 kbps). With only 2 codebooks it is 1500 bps: a smaller file, but worse sound.
+
+### The token budget: tokens per second
+
+For a language model, one code is one token: tokens_per_second = frame_rate × n_q. With 8 codebooks that is 600 tokens per second, so 10 seconds is 6000 tokens. One second of speech written down is only 2–3 words. That is why audio LMs care so much about how many codes one step produces and how many steps generation takes.
+--- code
+frame_rate, n_q, K = 75, 8, 1024           # 24 kHz EnCodec: 75 frames/s, 8 codebooks of 1024 entries
+seconds = 2.0
+T = int(seconds * frame_rate)
+codes = torch.randint(0, K, (n_q, T))      # pretend this came out of the codec encoder
+print("codes:", tuple(codes.shape), codes.dtype)
+print("frame 0:", codes[:, 0].tolist())    # one frame = n_q integers
+print("bits per code:", math.log2(K))
+for nq in [2, 4, 8, 16]:
+    print(f"n_q={nq:2d}   bitrate={frame_rate * nq * math.log2(K):6.0f} bps   tokens/s={frame_rate * nq}")
+
+@@ concept
+title: The delay pattern: each codebook waits one more step
+--- body
+A language model moves forward one position per step. But every audio frame has n_q codes. How do you line them up? There are three options:
+
+- **Flatten**: put all n_q × T codes in one long queue (the 8 codes of frame 0, then the 8 codes of frame 1, ...). The most detailed option, but 10 seconds of audio takes 750 × 8 = 6000 steps. Too slow.
+- **Parallel**: predict all n_q codes of a frame in the same step. Only T steps, but codebook 1 cannot see what codebook 0 chose for the same frame, even though it depends on it.
+- **The delay pattern** (what MusicGen uses): shift codebook k to the right by k positions and fill the gaps with pad (a special placeholder id).
+
+An example with n_q = 3 and T = 4 (P is the pad):
+
+```
+original (n_q, T)      delayed (n_q, T + n_q - 1)
+[1, 2, 3, 4]           [1, 2, 3, 4, P, P]
+[5, 6, 7, 8]     ->    [P, 5, 6, 7, 8, P]
+[9,10,11,12]           [P, P, 9,10,11,12]
+```
+
+The model generates one column of the new sequence per step. Look at column 2: 3 (codebook 0, frame 2), 6 (codebook 1, frame 1) and 9 (codebook 2, frame 0). When 6 is generated, codebook 0 of frame 1 (the 2) sits in column 1, which was generated in the previous step, so the model can see it. Later codebooks always see the earlier codebooks of the same frame. The price is only n_q − 1 extra steps: T + n_q − 1 steps in total, instead of n_q × T.
+
+Undoing it works the other way round: row k starts at column k and is T long, i.e. `delayed[:, k, k:k + T]`. The round trip must not lose a single code, or the codec decodes misaligned sound.
+--- code
+codes = torch.tensor([[1, 2, 3, 4],
+                      [5, 6, 7, 8],
+                      [9, 10, 11, 12]])     # (n_q=3, T=4)
+n_q, T = codes.shape
+P = 0                                     # pad id
+delayed = torch.full((n_q, T + n_q - 1), P)
+delayed[0, 0:4] = codes[0]                # codebook 0: no shift
+delayed[1, 1:5] = codes[1]                # codebook 1: shift right by 1
+delayed[2, 2:6] = codes[2]                # codebook 2: shift right by 2
+print(delayed)
+print("row 1 back:", delayed[1, 1:1 + T].tolist())
+
+@@ concept
+title: Codebook embeddings: one table each, then add
+--- body
+In GPT every position holds 1 token, which looks up 1 table (wte) and gives (B, T, dim). In audio every time step holds n_q codes. How do they become one vector?
+
+- Each codebook gets its own nn.Embedding(vocab, dim). A 3 in codebook 0 and a 3 in codebook 1 are two completely different codes, so they cannot share a table.
+- The codes of codebook k are codes[:, k], shape (B, T). Looking them up in table k gives (B, T, dim).
+- Add the n_q results of shape (B, T, dim). The sum is still (B, T, dim), exactly the shape of GPT's wte(idx), so the Blocks after it need no change.
+
+Why add and not concatenate? Adding keeps the size at dim. Concatenating gives n_q × dim, and every later layer would have to change.
+
+Put the n_q tables in an **nn.ModuleList**. In a plain Python list PyTorch cannot see them: they are missing from parameters(), the optimizer never updates them, and .to(device) does not move them.
+--- code
+torch.manual_seed(0)
+n_q, V, dim = 2, 10, 4
+tables = nn.ModuleList([nn.Embedding(V, dim) for _ in range(n_q)])
+codes = torch.tensor([[[3, 3, 7],
+                       [3, 1, 1]]])              # (B=1, n_q=2, T=3)
+e0 = tables[0](codes[:, 0])                      # codebook 0: (1, 3) -> (1, 3, 4)
+e1 = tables[1](codes[:, 1])                      # codebook 1: (1, 3) -> (1, 3, 4)
+x = e0 + e1
+print("codes[:, 0]:", tuple(codes[:, 0].shape), "-> e0:", tuple(e0.shape))
+print("x:", tuple(x.shape))
+print("same vector for id 3?", torch.equal(tables[0].weight[3], tables[1].weight[3]))
+print("params (ModuleList):", sum(p.numel() for p in tables.parameters()))
+
+class PlainList(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.tables = [nn.Embedding(V, dim) for _ in range(n_q)]   # plain list: PyTorch cannot see these
+
+print("params (plain list):", sum(p.numel() for p in PlainList().parameters()))
+
+@@ concept
+title: n_q output heads: view, then permute
+--- body
+GPT's final lm_head turns (B, T, dim) into (B, T, V): at each position, one score for every token in the vocabulary (logits: raw scores before softmax). In audio, every time step must predict n_q codes, and each code needs V scores.
+
+The simplest way is one nn.Linear(dim, n_q * V), which outputs (B, T, n_q·V). In the long strip of n_q·V numbers at each time step, the first V belong to codebook 0, the next V to codebook 1, and so on. Getting to (B, n_q, T, V) takes two steps:
+
+1. `.view(B, T, n_q, V)`: cut each time step's strip into n_q pieces. The data does not move; you only look at it differently.
+2. `.permute(0, 2, 1, 3)`: swap the T and n_q axes, giving (B, n_q, T, V).
+
+The trap: `.view(B, n_q, T, V)` straight away also has the right shape and raises no error, but the content is scrambled. It cuts the numbers in memory order, so the numbers of the first few time steps become "codebook 0". **The right shape does not mean the right answer.**
+
+One more thing: after permute the tensor is not contiguous in memory. To flatten it later, use .reshape; .view raises an error.
+--- code
+# pretend this is the Linear output: B=1, T=3, n_q=2, V=2, so 4 numbers per frame
+# hundreds digit = frame, tens digit = codebook, ones digit = vocabulary entry
+y = torch.tensor([[[  0,   1,  10,  11],
+                   [100, 101, 110, 111],
+                   [200, 201, 210, 211]]])
+out = y.view(1, 3, 2, 2).permute(0, 2, 1, 3)    # (B, n_q, T, V)
+print("out:", tuple(out.shape))
+print("codebook 1, every frame:", out[0, 1].tolist())
+bad = y.view(1, 2, 3, 2)                         # same shape, wrong content
+print("bad 'codebook 1':", bad[0, 1].tolist())
+print("contiguous after permute?", out.is_contiguous())
+
+@@ concept
+title: Multi-codebook loss: flatten + ignore_index
+--- body
+logits is (B, n_q, T, V) and targets is (B, n_q, T). F.cross_entropy wants (N, V) and (N,). So flatten the first three axes:
+
+- `logits.reshape(-1, V)` gives (B·n_q·T, V)
+- `targets.reshape(-1)` gives (B·n_q·T,)
+
+The cross-entropy is then averaged over all codebooks and all time steps together.
+
+**ignore_index**: the pads added by the delay pattern are not real codes and should not count in the loss. Set the target at those positions to -100 (F.cross_entropy's default ignore_index). They are then skipped, and they do not count in the average's denominator either. If you leave them in, the model spends effort learning to "predict pad": the loss goes down but the sound does not get better.
+
+A handy check: a freshly initialised model predicts roughly uniform probabilities for every code, so the loss should be near ln(V). For V = 1024 that is about 6.93. If the first loss is far from it, check the initialisation and the flattening first.
+--- code
+torch.manual_seed(0)
+B, n_q, T, V = 1, 2, 3, 5
+logits = torch.randn(B, n_q, T, V) * 0.01   # all close to 0: roughly what a fresh model gives
+targets = torch.tensor([[[1, 2, -100],
+                         [-100, 4, 0]]])    # a delayed (n_q=2, T=2) target, pads written as -100
+flat_logits = logits.reshape(-1, V)
+flat_targets = targets.reshape(-1)
+print(tuple(flat_logits.shape), tuple(flat_targets.shape))
+loss = F.cross_entropy(flat_logits, flat_targets, ignore_index=-100)
+keep = flat_targets != -100                   # drop the pads by hand and compute again
+manual = F.cross_entropy(flat_logits[keep], flat_targets[keep])
+print(round(loss.item(), 4), round(manual.item(), 4))
+print("ln(V) =", round(math.log(V), 4))
+
+@@ concept
+title: AudioLM: the day-4 GPT with a new input and output
+ref: day13
+--- body
+Put the day-4 GPT next to today's audio LM:
+
+- GPT: idx (B, T) → wte + wpe → n Blocks → ln_f → lm_head → (B, T, V)
+- AudioLM: codes (B, n_q, T) → CodeEmbedding (n_q tables, summed) + pos → n Blocks → ln_f → MultiHead → (B, n_q, T, V)
+
+Only the input layer and the output layer change. The Blocks in the middle are untouched. Today's exercises already have a Block in their hidden setup, so you can simply write `Block(dim, n_head)`. It is the day-4 pre-LN Block with attention and MLP written in one class; the attention uses `F.scaled_dot_product_attention(..., is_causal=True)`:
+
+```
+class Block(nn.Module):
+    def __init__(self, dim, n_head):
+        super().__init__()
+        self.ln1, self.ln2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+        self.n_head = n_head
+
+    def forward(self, x):
+        B, T, C = x.shape
+        h = self.ln1(x)
+        q, k, v = self.qkv(h).split(C, dim=-1)
+        q, k, v = (t.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) for t in (q, k, v))
+        a = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        x = x + self.proj(a.transpose(1, 2).reshape(B, T, C))
+        return x + self.mlp(self.ln2(x))
+```
+
+Three things to watch when you assemble it:
+
+- Positions count time steps: `self.pos(torch.arange(T, device=codes.device))` is (T, dim) and broadcasts onto (B, T, dim). T is the last dimension of codes.
+- Causality comes from is_causal=True inside the Block: the output at step t only looks at steps 0 to t. Changing later codes does not change earlier predictions.
+- A text LLM and an audio LM differ only in the way in (how tokens become vectors) and the way out (how vectors become logits).
+--- code
+torch.manual_seed(0)
+blk = Block(64, 4)                        # the Block from the hidden setup
+x = torch.randn(1, 6, 64)
+x2 = x.clone()
+x2[:, 3:] = torch.randn(1, 3, 64)         # change steps 3, 4 and 5 only
+y, y2 = blk(x), blk(x2)
+print("shape:", tuple(y.shape))
+print("steps 0-2 unchanged:", torch.allclose(y[:, :3], y2[:, :3], atol=1e-5))
+print("steps 3-5 unchanged:", torch.allclose(y[:, 3:], y2[:, 3:], atol=1e-5))
+print("params per Block:", sum(p.numel() for p in blk.parameters()))
+
+@@ concept
+title: Text conditioning: cross-attention again
+--- body
+A text-to-audio model (MusicGen, for example: in goes "a cheerful piano piece", out comes music) must make the audio follow a text description. The method is exactly the one from day 9's text-to-image: cross-attention.
+
+- Q comes from the audio being generated: `audio_h @ wq`, where audio_h is (B, Ta, C)
+- K and V come from the text encoder's output: `text_emb @ wk` and `text_emb @ wv`, where text_emb is (B, Tt, C)
+- Split into heads: (B, T, C) → `.view(B, T, n_head, hd)` → `.transpose(1, 2)` → (B, n_head, T, hd), with hd = C // n_head. Q uses Ta; K and V use Tt.
+- `F.scaled_dot_product_attention(q, k, v)` **without** a causal mask: the whole text is known from the start, so every audio position may look at all of it.
+- Merge the heads: `.transpose(1, 2)` → `.reshape(B, Ta, C)`
+
+The output length follows Q (the audio): (B, Ta, C). The text can have any length. The attention weights are (B, n_head, Ta, Tt): each audio position spreads its attention over the Tt text tokens, and each row sums to 1. In a real model this layer sits inside every Block, between self-attention and the MLP, again with pre-LN and a residual.
+--- code
+torch.manual_seed(0)
+B, Ta, Tt, C, n_head = 1, 6, 3, 8, 2
+hd = C // n_head
+audio_h = torch.randn(B, Ta, C)
+text_emb = torch.randn(B, Tt, C)
+# the wq / wk projections are skipped to keep this short
+q = audio_h.view(B, Ta, n_head, hd).transpose(1, 2)     # (1, 2, 6, 4)
+k = text_emb.view(B, Tt, n_head, hd).transpose(1, 2)    # (1, 2, 3, 4)
+att = (q @ k.transpose(-2, -1) / math.sqrt(hd)).softmax(-1)
+print("q:", tuple(q.shape), " k:", tuple(k.shape))
+print("attention weights:", tuple(att.shape))           # each audio position x 3 text tokens
+print("row sums:", att[0, 0].sum(-1))
+
+@@ concept
+title: Generation: n_q codes per step
+--- body
+Generation is the same loop as day 4's greedy generation, except that each step produces n_q codes:
+
+1. `logits = model(seq)`: seq is (1, n_q, T) and logits is (1, n_q, T, V)
+2. Keep only the last time step: `logits[:, :, -1]` gives (1, n_q, V)
+3. Take the highest score for each codebook: `.argmax(-1)` gives (1, n_q)
+4. Add a time axis with `.unsqueeze(-1)`, giving (1, n_q, 1), then `torch.cat` it onto the end of seq along the last dimension
+
+Repeat n_new times to get (1, n_q, T0 + n_new).
+
+- Use `@torch.no_grad()` and `model.eval()`: generation needs no gradients, which saves memory and time.
+- argmax is greedy: the same input always gives the same result. Real systems sample with a temperature and top-k (day 5).
+- Here every step runs the whole sequence again. Simple but slow; real systems use a KV cache (day 5).
+- If training used the delay pattern, the generated sequence is delayed too: undo_delay it first, then give it to the codec's decoder to get a waveform.
+--- code
+torch.manual_seed(0)
+seq = torch.randint(0, 50, (1, 4, 5))          # (1, n_q=4, T=5)
+logits = torch.randn(1, 4, 5, 50)              # pretend model(seq) returned this
+last = logits[:, :, -1]
+nxt = last.argmax(-1)
+print("last:", tuple(last.shape))
+print("next codes:", tuple(nxt.shape), nxt.tolist())
+seq = torch.cat([seq, nxt.unsqueeze(-1)], dim=-1)
+print("seq:", tuple(seq.shape))
+
+@@ item d13-01
+type: code
+title: Codec bitrate
+level: 1
+cards: Neural codecs: audio becomes a matrix of integers
+targets: codec_bitrate, tokens_per_second
+ref: day13
+--- context
+When you choose a codec, the bitrate decides sound quality and file size, and the token count decides how many seconds fit in the language model's context and how many steps generation takes. "How many tokens is one second of EnCodec audio?" is a common estimation question in interviews.
+--- prompt
+Write two functions:
+
+- `codec_bitrate(frame_rate, n_q, codebook_size)`: how many bits one second of audio takes. The formula is frame_rate × n_q × log2(codebook_size).
+- `tokens_per_second(frame_rate, n_q)`: how many tokens one second of audio is for a language model (one code = one token).
+
+Example: 24 kHz EnCodec, frame_rate = 75, n_q = 8, codebook_size = 1024 gives 6000.0 bps and 600 tokens per second.
+--- starter
+def codec_bitrate(frame_rate, n_q, codebook_size):
+    """bits per second = frame_rate * n_q * log2(codebook_size)"""
+    raise todo()
+
+def tokens_per_second(frame_rate, n_q):
+    """The LM's view: how many tokens one second of audio is."""
+    raise todo()
+--- solution
+def codec_bitrate(frame_rate, n_q, codebook_size):
+    return frame_rate * n_q * math.log2(codebook_size)
+
+def tokens_per_second(frame_rate, n_q):
+    return frame_rate * n_q
+--- tests
+@check("codec bitrate")
+def t01():
+    # 24kHz EnCodec: 75 frames/s, 8 codebooks, 1024 entries each
+    true(close(codec_bitrate(75, 8, 1024), 6000.0),
+         f"expected 6000 bps, you computed {codec_bitrate(75, 8, 1024)}. Hint: log2(1024) = 10")
+    true(tokens_per_second(75, 8) == 600,
+         f"tokens_per_second(75, 8) should be 600, you computed {tokens_per_second(75, 8)}. "
+         "One second of audio = 600 tokens, while one second of speech is only 2-3 written words: "
+         "that is why audio LMs run out of context so fast")
+--- hints
+- A code with K possible values takes log2(K) bits to store. math.log2 is available.
+- One second has frame_rate frames, and each frame has n_q codes. Bitrate = number of codes × bits per code; the token count is just the number of codes.
+- `return frame_rate * n_q * math.log2(codebook_size)`; for the token count, drop the last factor.
+
+@@ item d13-02
+type: code
+title: The shape of the codes
+level: 1
+cards: Neural codecs: audio becomes a matrix of integers
+targets: code_shape
+ref: day13
+--- context
+The first job of a data pipeline is working out shapes: how many seconds, how many frames, how many codebooks. Get this wrong and the batching, the padding and the length of the position embedding are all wrong after it.
+--- prompt
+Write `code_shape(seconds, frame_rate, n_q)`. It returns the shape of the code matrix the codec produces for a clip: a tuple `(n_q, T)` with T = int(seconds × frame_rate).
+
+Example: 2 seconds, 75 frames per second, 8 codebooks gives (8, 150).
+
+Return a plain Python tuple, not a tensor.
+--- starter
+def code_shape(seconds, frame_rate, n_q):
+    """Return the tuple (n_q, T) with T = int(seconds * frame_rate)."""
+    raise todo()
+--- solution
+def code_shape(seconds, frame_rate, n_q):
+    return (n_q, int(seconds * frame_rate))
+--- tests
+@check("the shape of the codes")
+def t02():
+    true(code_shape(2.0, 75, 8) == (8, 150),
+         f"2 s, 75 frames/s, 8 codebooks should give (8, 150); you returned {code_shape(2.0, 75, 8)!r}. Rows are codebooks, columns are frames")
+    true(code_shape(0.5, 50, 4) == (4, 25),
+         f"0.5 s, 50 frames/s, 4 codebooks should give (4, 25); you returned {code_shape(0.5, 50, 4)!r}. Round T with int(...)")
+--- hints
+- Rows are codebooks (n_q rows); columns are frames (T columns).
+- T = int(seconds * frame_rate), then `return (n_q, T)`.
+
+@@ item d13-03
+type: code
+title: Build the delay pattern
+level: 2
+cards: The delay pattern: each codebook waits one more step
+targets: build_delay
+ref: day13
+--- context
+Models like MusicGen train their multi-codebook LM on the delay pattern: only n_q − 1 extra steps, and later codebooks get to see the earlier ones. Get this preprocessing step wrong and the model learns misaligned sound.
+--- prompt
+Write `build_delay(codes, pad_id)`:
+
+- Input codes: an integer tensor of shape (B, n_q, T)
+- Output: (B, n_q, T + n_q − 1). Fill it with pad_id, then shift codebook k to the right by k: its T codes go in columns k to k + T − 1
+- The output has the same dtype and device as the input
+
+Example (B = 1, n_q = 2, T = 3, pad_id = 0):
+
+```
+[[1, 2, 3],        [[1, 2, 3, 0],
+ [4, 5, 6]]   ->    [0, 4, 5, 6]]
+```
+--- starter
+def build_delay(codes, pad_id):
+    """codes: (B, n_q, T) -> (B, n_q, T + n_q - 1)
+    Shift codebook k right by k steps and fill the gaps with pad_id.
+    Then, when predicting step t, codebook k can see codebook k-1's code for the same frame.
+    """
+    raise todo()
+--- solution
+def build_delay(codes, pad_id):
+    B, n_q, T = codes.shape
+    out = torch.full((B, n_q, T + n_q - 1), pad_id, dtype=codes.dtype, device=codes.device)
+    for k in range(n_q):
+        out[:, k, k:k + T] = codes[:, k]
+    return out
+--- tests
+@check("build the delay pattern")
+def t03():
+    c = torch.tensor([[[1, 2, 3], [4, 5, 6]]])       # (1, 2, 3)
+    d = build_delay(c, pad_id=0)
+    shape_is(d, (1, 2, 4))
+    eq(d[0, 0], torch.tensor([1, 2, 3, 0]), msg="codebook 0 does not move; the pad goes at the end")
+    eq(d[0, 1], torch.tensor([0, 4, 5, 6]), msg="codebook 1 shifts right by 1; the pad goes at the start")
+--- hints
+- Start with a result full of pads: `torch.full((B, n_q, T + n_q - 1), pad_id, dtype=codes.dtype, device=codes.device)`.
+- Loop over k and write codes[:, k] (shape (B, T)) into row k of the result, in the T columns that start at column k.
+- `out[:, k, k:k + T] = codes[:, k]`
+
+@@ item d13-04
+type: code
+title: Delay pattern round trip
+level: 2
+cards: The delay pattern: each codebook waits one more step
+targets: undo_delay
+ref: day13
+--- context
+The model generates a delayed sequence, but the codec's decoder wants the aligned (n_q, T). Undo must match build exactly: one position off and the sound is misaligned and muddy. A round-trip test (transform, transform back, demand an exact match) is the most reliable way to check this kind of transform.
+--- prompt
+Write `undo_delay(delayed, T)`, the inverse of build_delay:
+
+- Input delayed: (B, n_q, T + n_q − 1)
+- Output: (B, n_q, T). Row k starts at column k and is T long
+- Requirement: for any codes, `undo_delay(build_delay(codes, pad_id), T)` equals codes exactly
+
+build_delay is already in the hidden setup (the reference version); the check uses it for the round trip.
+--- starter
+def undo_delay(delayed, T):
+    """The inverse of build_delay: (B, n_q, T + n_q - 1) -> (B, n_q, T)"""
+    raise todo()
+--- solution
+def undo_delay(delayed, T):
+    n_q = delayed.size(1)
+    return torch.stack([delayed[:, k, k:k + T] for k in range(n_q)], dim=1)
+--- tests
+@check("delay pattern round trip")
+def t04():
+    seed(0)
+    for n_q in [1, 2, 4, 8]:
+        c = torch.randint(1, 100, (3, n_q, 20))
+        eq(undo_delay(build_delay(c, 0), 20), c, msg=f"with n_q={n_q} the round trip does not match")
+--- hints
+- You can get n_q from delayed.size(1).
+- Each codebook comes out as (B, T). torch.stack n_q of them on dim=1 to get (B, n_q, T).
+- `torch.stack([delayed[:, k, k:k + T] for k in range(n_q)], dim=1)`
+
+@@ item d13-05
+type: code
+title: Summed codebook embeddings
+level: 2
+cards: Codebook embeddings: one table each, then add
+targets: CodeEmbedding
+ref: day13
+--- context
+An audio LM gets n_q codes per step. Look each codebook up in its own table and add the results: you get (B, T, dim), just like text tokens, and the Transformer after it needs no change. MusicGen's input layer does exactly this.
+--- prompt
+Write `CodeEmbedding(n_q, vocab, dim)`:
+
+- `__init__`: n_q separate `nn.Embedding(vocab, dim)` tables in an nn.ModuleList
+- `forward(codes)`: codes is (B, n_q, T). Look up codes[:, k] in table k, which gives n_q results of shape (B, T, dim); add them all and return (B, T, dim)
+- The parameter count must be exactly n_q × vocab × dim
+
+The check changes the codes of each codebook in turn: whichever codebook changes, the output must change too (proof that every table is used).
+--- starter
+class CodeEmbedding(nn.Module):
+    """n_q nn.Embedding(vocab, dim) tables; forward(codes) looks up each codebook and **adds** the results.
+    codes: (B, n_q, T) -> (B, T, dim)
+    """
+
+    def __init__(self, n_q, vocab, dim):
+        super().__init__()
+        raise todo()
+
+    def forward(self, codes):
+        raise todo()
+--- solution
+class CodeEmbedding(nn.Module):
+    def __init__(self, n_q, vocab, dim):
+        super().__init__()
+        self.tables = nn.ModuleList([nn.Embedding(vocab, dim) for _ in range(n_q)])
+
+    def forward(self, codes):
+        return sum(tab(codes[:, k]) for k, tab in enumerate(self.tables))
+--- tests
+@check("summed codebook embeddings")
+def t05():
+    seed(1)
+    m = CodeEmbedding(4, 50, 32)
+    codes = torch.randint(0, 50, (2, 4, 9))
+    out = m(codes)
+    shape_is(out, (2, 9, 32))
+    true(params(m) == 4 * 50 * 32,
+         f"the parameter count is {params(m)}, expected 4 x 50 x 32 = 6400 (4 separate tables). "
+         "If it is 0, you put the tables in a plain list; use nn.ModuleList")
+    # change any one codebook's codes: the output must change
+    for k in range(4):
+        c2 = codes.clone()
+        c2[:, k] = (c2[:, k] + 1) % 50
+        true(not torch.allclose(m(c2), out), f"changing codebook {k} did not change the output: that table is not used")
+--- hints
+- `self.tables = nn.ModuleList([nn.Embedding(vocab, dim) for _ in range(n_q)])`
+- codes[:, k] has shape (B, T); table k turns it into (B, T, dim).
+- forward is one line: `return sum(tab(codes[:, k]) for k, tab in enumerate(self.tables))`
+
+@@ item d13-06
+type: code
+title: n_q output heads
+level: 2
+cards: n_q output heads: view, then permute
+targets: MultiHead
+ref: day13
+--- context
+Every time step must score n_q codebooks at once. One big Linear, cut into pieces, is a single matrix multiply, faster than n_q small Linears. But cutting it the wrong way raises no error and the loss still falls; the model just learns badly. That is the hardest kind of bug to find.
+--- prompt
+Write `MultiHead(dim, n_q, vocab)`:
+
+- `__init__`: exactly **one** `nn.Linear(dim, n_q * vocab)`
+- `forward(h)`: h is (B, T, dim). The Linear gives (B, T, n_q·vocab); turn that into (B, n_q, T, vocab)
+- Of the n_q·vocab numbers at each time step, piece k (numbers k·vocab to (k+1)·vocab − 1) holds the logits of codebook k
+
+The check does not only look at the shape: it also verifies that out[:, k, t] really is piece k of frame t.
+--- starter
+class MultiHead(nn.Module):
+    """One Linear(dim, n_q * vocab); the output becomes (B, n_q, T, vocab)."""
+
+    def __init__(self, dim, n_q, vocab):
+        super().__init__()
+        raise todo()
+
+    def forward(self, h):
+        raise todo()
+--- solution
+class MultiHead(nn.Module):
+    def __init__(self, dim, n_q, vocab):
+        super().__init__()
+        self.n_q, self.vocab = n_q, vocab
+        self.lin = nn.Linear(dim, n_q * vocab)
+
+    def forward(self, h):
+        B, T, _ = h.shape
+        return self.lin(h).view(B, T, self.n_q, self.vocab).permute(0, 2, 1, 3)
+--- tests
+@check("n_q output heads")
+def t06():
+    m = MultiHead(32, 4, 50)
+    h = torch.randn(2, 9, 32)
+    out = m(h)
+    shape_is(out, (2, 4, 9, 50))
+    lins = [x for x in m.modules() if isinstance(x, nn.Linear)]
+    true(len(lins) == 1 and lins[0].out_features == 4 * 50, "use exactly one nn.Linear(dim, n_q * vocab)")
+    y = lins[0](h)                                     # (2, 9, 200): 200 numbers per frame, pieces of 50
+    want = torch.stack([y[:, :, k * 50:(k + 1) * 50] for k in range(4)], dim=1)   # (2, 4, 9, 50)
+    eq(out, want,
+       msg="right shape, wrong content: out[:, k, t] should be the 50 numbers of piece k in frame t. "
+           "A direct view to (B, n_q, T, V) mixes up time and codebooks; view(B, T, n_q, V) first, then permute(0, 2, 1, 3)")
+--- hints
+- Store n_q and vocab in `__init__` (e.g. `self.n_q, self.vocab = n_q, vocab`); forward needs them.
+- First `.view(B, T, self.n_q, self.vocab)`, then swap the T and n_q axes.
+- `return self.lin(h).view(B, T, self.n_q, self.vocab).permute(0, 2, 1, 3)`
+
+@@ item d13-07
+type: code
+title: Multi-codebook loss
+level: 2
+cards: Multi-codebook loss: flatten + ignore_index
+targets: codebook_loss
+ref: day13
+--- context
+The loss of a multi-codebook LM is the cross-entropy averaged over all codebooks and all time steps. The pads from the delay pattern are not real data and must be left out with ignore_index; otherwise the model learns to "predict pad", and the loss falls while the sound does not improve.
+--- prompt
+Write `codebook_loss(logits, targets, ignore_index=-100)`:
+
+- logits is (B, n_q, T, V); targets is (B, n_q, T) with integers
+- Flatten them to (B·n_q·T, V) and (B·n_q·T,), call F.cross_entropy, and pass ignore_index on
+- Return a scalar (a 0-dimensional tensor)
+
+Positions whose target equals ignore_index do not count in the loss, nor in the average's denominator.
+--- starter
+def codebook_loss(logits, targets, ignore_index=-100):
+    """logits: (B, n_q, T, V)   targets: (B, n_q, T)
+    Cross-entropy over all codebooks at once (flatten to (B*n_q*T, V) first); ignore_index skips the delay pads.
+    """
+    raise todo()
+--- solution
+def codebook_loss(logits, targets, ignore_index=-100):
+    V = logits.size(-1)
+    return F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1), ignore_index=ignore_index)
+--- tests
+@check("multi-codebook loss")
+def t07():
+    seed(2)
+    logits = torch.randn(2, 4, 5, 50)
+    tgt = torch.randint(0, 50, (2, 4, 5))
+    ref = F.cross_entropy(logits.reshape(-1, 50), tgt.reshape(-1))
+    eq(codebook_loss(logits, tgt), ref)
+    # ignored positions must not count
+    tgt2 = tgt.clone()
+    tgt2[:, :, 0] = -100
+    ref2 = F.cross_entropy(logits[:, :, 1:].reshape(-1, 50), tgt[:, :, 1:].reshape(-1))
+    eq(codebook_loss(logits, tgt2), ref2, msg="ignore_index has no effect")
+--- hints
+- The vocabulary size is V = logits.size(-1).
+- Use .reshape, not .view: logits coming out of MultiHead went through permute and are not contiguous, so .view raises an error.
+- `return F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1), ignore_index=ignore_index)`
+
+@@ item d13-08
+type: code
+title: AudioLM forward
+level: 3
+cards: AudioLM: the day-4 GPT with a new input and output; Codebook embeddings: one table each, then add; n_q output heads: view, then permute
+targets: AudioLM
+ref: day13
+--- context
+This is today's core: an audio language model is the day-4 GPT with its input and output layers swapped. If you can say what changed and what did not, you can talk about models like MusicGen in an interview with confidence.
+--- prompt
+Write `AudioLM(n_q=4, vocab=50, dim=64, n_layer=2, n_head=4, max_len=256)`:
+
+- `self.emb = CodeEmbedding(n_q, vocab, dim)`
+- `self.pos = nn.Embedding(max_len, dim)`
+- `self.h`: an nn.ModuleList of n_layer `Block(dim, n_head)`
+- `self.ln_f = nn.LayerNorm(dim)`
+- `self.head = MultiHead(dim, n_q, vocab)`
+
+`forward(codes)`: codes is (B, n_q, T). Embedding + position embedding → each Block in turn → ln_f → head; return (B, n_q, T, vocab).
+
+CodeEmbedding, MultiHead and Block are already in the hidden setup (reference versions); just use them. The check looks at three things: the output shape; causality (changing later codes does not change earlier predictions); and a freshly initialised loss near ln(50) ≈ 3.91.
+--- starter
+class AudioLM(nn.Module):
+    """Structure:
+        emb  = CodeEmbedding(n_q, vocab, dim)
+        pos  = nn.Embedding(max_len, dim)
+        h    = n_layer Block(dim, n_head)       <-- the day-4 Block, not a single character changed
+        ln_f = LayerNorm(dim)
+        head = MultiHead(dim, n_q, vocab)
+    forward(codes) -> (B, n_q, T, vocab)
+    """
+
+    def __init__(self, n_q=4, vocab=50, dim=64, n_layer=2, n_head=4, max_len=256):
+        super().__init__()
+        raise todo()
+
+    def forward(self, codes):
+        raise todo()
+--- solution
+class AudioLM(nn.Module):
+    def __init__(self, n_q=4, vocab=50, dim=64, n_layer=2, n_head=4, max_len=256):
+        super().__init__()
+        self.emb = CodeEmbedding(n_q, vocab, dim)
+        self.pos = nn.Embedding(max_len, dim)
+        self.h = nn.ModuleList([Block(dim, n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(dim)
+        self.head = MultiHead(dim, n_q, vocab)
+
+    def forward(self, codes):
+        T = codes.size(-1)
+        x = self.emb(codes) + self.pos(torch.arange(T, device=codes.device))
+        for b in self.h:
+            x = b(x)
+        return self.head(self.ln_f(x))
+--- tests
+@check("AudioLM forward")
+def t08():
+    seed(3)
+    m = AudioLM(n_q=4, vocab=50, dim=64, n_layer=2)
+    codes = torch.randint(0, 50, (2, 4, 16))
+    out = m(codes)
+    shape_is(out, (2, 4, 16, 50))
+    # causality: changing later tokens must not change earlier predictions
+    c2 = codes.clone()
+    c2[:, :, 8:] = torch.randint(0, 50, (2, 4, 8))
+    eq(m(codes)[:, :, :8], m(c2)[:, :, :8], tol=1e-4,
+       msg="causality is broken: earlier predictions depend on later codes. Use the Block from the setup (it has is_causal=True)")
+    # the initial loss should be near ln(V)
+    loss = codebook_loss(out, codes)
+    true(abs(loss.item() - math.log(50)) < 1.5,
+         f"initial loss={loss.item():.2f}, it should be near ln(50)={math.log(50):.2f}")
+--- hints
+- Positions: `T = codes.size(-1)`; `self.pos(torch.arange(T, device=codes.device))` is (T, dim) and broadcasts onto (B, T, dim).
+- forward is a few lines: `x = self.emb(codes) + position embedding`; `for b in self.h: x = b(x)`; `return self.head(self.ln_f(x))`.
+- Write it next to the day-4 GPT's forward: wte becomes self.emb, lm_head becomes self.head, the rest is copied.
+
+@@ item d13-09
+type: code
+title: Text conditioning with cross-attention
+level: 2
+cards: Text conditioning: cross-attention again
+targets: text_cross_attn
+ref: day13
+--- context
+A text-to-audio model (MusicGen, for example) must make the audio follow a text description. It does this the same way text-to-image does: cross-attention, with Q from the audio and K, V from the text. The same code keeps showing up in LLMs, image models and audio models.
+--- prompt
+Write `text_cross_attn(audio_h, text_emb, wq, wk, wv, n_head)`:
+
+- audio_h is (B, Ta, C): the audio's hidden states. text_emb is (B, Tt, C): the text encoder's output. Ta and Tt are unrelated.
+- wq, wk and wv are (C, C) matrices: q = audio_h @ wq, k = text_emb @ wk, v = text_emb @ wv
+- Split into n_head heads (hd = C // n_head) and use F.scaled_dot_product_attention **without** a causal mask
+- Merge the heads and return (B, Ta, C)
+
+Compare it with day 9's cross_attention: apart from the variable names, the code is the same.
+--- starter
+def text_cross_attn(audio_h, text_emb, wq, wk, wv, n_head):
+    """audio_h: (B, Ta, C)   text_emb: (B, Tt, C)
+    Q comes from the audio, K and V from the text. Returns (B, Ta, C).
+    """
+    raise todo()
+--- solution
+def text_cross_attn(audio_h, text_emb, wq, wk, wv, n_head):
+    B, Ta, C = audio_h.shape
+    Tt = text_emb.size(1)
+    hd = C // n_head
+    q = (audio_h @ wq).view(B, Ta, n_head, hd).transpose(1, 2)
+    k = (text_emb @ wk).view(B, Tt, n_head, hd).transpose(1, 2)
+    v = (text_emb @ wv).view(B, Tt, n_head, hd).transpose(1, 2)
+    o = F.scaled_dot_product_attention(q, k, v)
+    return o.transpose(1, 2).reshape(B, Ta, C)
+--- tests
+@check("text conditioning with cross-attention")
+def t09():
+    seed(4)
+    B, Ta, Tt, C, nh = 2, 12, 5, 32, 4
+    a, t = torch.randn(B, Ta, C), torch.randn(B, Tt, C)
+    wq, wk, wv = (torch.randn(C, C) * .1 for _ in range(3))
+    out = text_cross_attn(a, t, wq, wk, wv, nh)
+    shape_is(out, (B, Ta, C), "the length follows the audio")
+    q = (a @ wq).view(B, Ta, nh, C // nh).transpose(1, 2)
+    k = (t @ wk).view(B, Tt, nh, C // nh).transpose(1, 2)
+    v = (t @ wv).view(B, Tt, nh, C // nh).transpose(1, 2)
+    ref = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, Ta, C)
+    eq(out, ref, tol=1e-4)
+--- hints
+- Splitting heads: (B, T, C) → `.view(B, T, n_head, hd)` → `.transpose(1, 2)` → (B, n_head, T, hd). q uses Ta; k and v use Tt.
+- SDPA returns (B, n_head, Ta, hd): `.transpose(1, 2)` back to (B, Ta, n_head, hd), then `.reshape(B, Ta, C)`.
+- The whole text is known from the start and every audio position may see all of it, so do not pass is_causal=True.
+
+@@ item d13-10
+type: code
+title: Multi-codebook generation
+level: 2
+cards: Generation: n_q codes per step
+targets: generate_codes
+ref: day13
+--- context
+This loop is how a trained audio LM makes sound: each step produces n_q codes, which are appended and fed back in. The shapes change at every step of the loop, and the usual mistakes are picking the wrong axis and concatenating along the wrong dimension.
+--- prompt
+Write `generate_codes(model, prompt, n_new, vocab)` (greedy generation):
+
+- prompt is (1, n_q, T0), the codes so far. model(seq) returns (1, n_q, T, vocab)
+- Loop n_new times: take the logits of the last time step, (1, n_q, vocab) → argmax for each codebook, giving (1, n_q) → append to the end of the sequence
+- Return (1, n_q, T0 + n_new); the first T0 time steps are the prompt, unchanged
+- Keep the `@torch.no_grad()` above the function
+
+The check's model is the reference AudioLM. The vocab argument is not needed here; just leave it in the signature.
+--- starter
+@torch.no_grad()
+def generate_codes(model, prompt, n_new, vocab):
+    """prompt: (1, n_q, T0), the codes so far. Each step:
+        1) logits = model(current sequence)
+        2) take the logits of the last time step: (1, n_q, vocab)
+        3) argmax for each codebook
+        4) append to the end of the sequence
+    Returns (1, n_q, T0 + n_new).
+    """
+    raise todo()
+--- solution
+@torch.no_grad()
+def generate_codes(model, prompt, n_new, vocab):
+    seq = prompt
+    for _ in range(n_new):
+        logits = model(seq)                 # (1, n_q, T, V)
+        nxt = logits[:, :, -1].argmax(-1)   # (1, n_q)
+        seq = torch.cat([seq, nxt.unsqueeze(-1)], dim=-1)
+    return seq
+--- tests
+@check("multi-codebook generation")
+def t10():
+    seed(5)
+    m = AudioLM(n_q=4, vocab=50, dim=64, n_layer=1).eval()
+    p = torch.randint(0, 50, (1, 4, 6))
+    out = generate_codes(m, p, 5, 50)
+    shape_is(out, (1, 4, 11))
+    eq(out[:, :, :6], p, msg="the prompt was changed")
+    true(out.dtype == torch.long and out.max() < 50 and out.min() >= 0,
+         f"generated codes should be integers from 0 to 49 (torch.long); your dtype is {out.dtype}")
+    eq(out, generate_codes(m, p, 5, 50), msg="greedy generation must be deterministic")
+--- hints
+- `logits[:, :, -1]` takes the last time step: (1, n_q, vocab).
+- `.argmax(-1)` gives (1, n_q); `.unsqueeze(-1)` makes it (1, n_q, 1) so that torch.cat on dim=-1 works.
+- The loop body is two lines: `nxt = model(seq)[:, :, -1].argmax(-1)`, then `seq = torch.cat([seq, nxt.unsqueeze(-1)], dim=-1)`.
+
+@@ item d13-11
+type: self
+title: Three lines meet (self-check)
+level: 1
+cards: AudioLM: the day-4 GPT with a new input and output; Text conditioning: cross-attention again
+--- context
+Over these two weeks you followed three lines: text LLMs, text-to-image and text-to-audio. An interviewer does not want to hear about three separate things; they want to hear that you see one shared kind of Block. This item checks that you really see it.
+--- prompt
+Close the answers and go through the list. Tick a line only when you can explain it in your own words. These sentences are the conclusion of days 4 to 13.
+--- checklist
+- Today's Block and day 4's Block are the same thing: pre-LN, causal self-attention, residual, MLP, residual; it is just written more compactly
+- AudioLM differs from GPT only at the two ends: the input is n_q embedding tables looked up and added, the output is n_q heads; the Blocks in the middle are unchanged
+- text_cross_attn and day 9's cross_attention are identical apart from the variable names: Q comes from what is being generated, K and V from the text
+- So LLMs, text-to-image and text-to-audio come down to the same kind of Block in code, with only the way in and the way out changed
+- Without looking, I can write AudioLM's shape flow on paper: (B, n_q, T) → (B, T, dim) → n Blocks → (B, n_q, T, V)
+--- hints
+- Put the two-line comparison from the "AudioLM: the day-4 GPT with a new input and output" card next to the day-4 GPT.
+- Put your d13-09 answer next to day 9's cross_attention and compare them line by line.
+
+@@ item d13-12
+type: predict
+title: What the delayed codes look like
+level: 2
+cards: The delay pattern: each codebook waits one more step
+ref: day13
+--- context
+Printing the processed data before training is the fastest way to catch a preprocessing bug. If you can run the delay pattern in your head, you can spot a misalignment at a glance while debugging.
+--- prompt
+The code below uses the reference build_delay. Write all 7 lines it prints.
+--- code
+codes = torch.tensor([[[1, 2],
+                       [3, 4],
+                       [5, 6],
+                       [7, 8]]])            # (B=1, n_q=4, T=2)
+d = build_delay(codes, pad_id=-1)
+print(tuple(d.shape))
+for row in d[0].tolist():
+    print(row)
+print(d[0, :, 3].tolist())                  # the 4 codes generated together at time step 3
+print((d == -1).sum().item())
+--- explain
+- The length is T + n_q − 1 = 2 + 4 − 1 = 5, so the shape is (1, 4, 5).
+- Row k shifts right by k: k pads (-1) first, then the 2 codes, then pads up to 5 positions.
+- Column 3 holds the codes generated together at time step 3. Codebooks 0 and 1 are already finished there (-1); codebook 2 gives its frame 1 (6) and codebook 3 its frame 0 (7).
+- Every row has exactly n_q − 1 = 3 pads, so 4 rows have 12. In training, the targets at these 12 positions become -100 and do not count in the loss.
+--- hints
+- Work out the length first: T + n_q − 1.
+- Row k starts with k pads (-1); every row has n_q − 1 of them in total.
+
+@@ item d13-13
+type: choice
+title: Why shift the codebooks?
+level: 2
+cards: The delay pattern: each codebook waits one more step
+--- context
+When a multi-codebook audio LM comes up in an interview, you will almost certainly be asked how the model handles the dependency between codebooks. The delay pattern is MusicGen's answer; you should be able to say what it buys and what it costs.
+--- prompt
+The simplest multi-codebook audio LM is "parallel": each step predicts all n_q codes of the same frame. The delay pattern instead shifts codebook k right by k steps. What problem does the delay pattern mainly solve?
+--- options
+- It makes the sequence shorter and saves memory
+- When codebook k of a frame is predicted, codebook k − 1 of the same frame was already generated in an earlier step, so the model can see it; the only cost is n_q − 1 extra steps
+- The codec's decoder only accepts shifted input
+- It lets all codebooks share one embedding table
+answer: 2
+--- explain
+The problem with "parallel": the n_q codes of a frame are predicted in the same step, so codebook 1 cannot see what codebook 0 chose for that frame, although later codebooks exist precisely to refine the earlier ones. With the delay, codebook k of frame t is generated at step t + k, and codebook k − 1 of frame t was already generated at step t + k − 1, where causal attention can see it.
+
+The other options: the sequence actually gets n_q − 1 positions longer (option 1 is wrong); the decoder needs aligned codes, so you must undo_delay after generating (option 3 is wrong); each codebook still has its own table (option 4 is wrong).
+--- hints
+- In "parallel", at the moment codebook 1 predicts frame t, can it see codebook 0 of frame t?
+- Does the delay make the sequence longer or shorter?
+
+@@ item d13-14
+type: choice
+title: How many steps for 10 seconds?
+level: 2
+cards: The delay pattern: each codebook waits one more step; Neural codecs: audio becomes a matrix of integers
+--- context
+Generation latency mostly depends on how many forward steps the language model takes. With the same codec, the layout alone can change the step count by a factor of almost 8. This arithmetic decides whether an audio model can run in real time.
+--- prompt
+24 kHz EnCodec: 75 frames per second, n_q = 8. With the delay pattern, how many steps does the model take to generate 10 seconds of audio (not counting the prompt)?
+--- options
+- 750
+- 757
+- 6000
+- 6007
+answer: 2
+--- explain
+10 seconds = 10 × 75 = 750 frames. The delay pattern needs T + n_q − 1 = 750 + 7 = 757 steps, each producing 8 codes (some of them pads at the start and the end).
+
+For comparison: "parallel" needs only 750 steps, but codebooks of the same frame cannot see each other; flattening the 8 codebooks into one queue needs 750 × 8 = 6000 steps, almost 8 times the delay pattern.
+--- hints
+- First the number of frames: seconds × frame_rate.
+- The delay pattern's length is T + n_q − 1.
+
+@@ item d13-15
+type: predict
+title: view or permute?
+level: 2
+cards: n_q output heads: view, then permute
+--- context
+"Right shape, wrong values" is the hardest bug in deep learning: no error, the loss falls, and the model just learns badly. If you can work out on paper how view and permute differ, you can reshape with confidence.
+--- prompt
+Pretend y is a Linear output: 1 example, 3 frames, 4 numbers per frame (n_q = 2 codebooks with V = 2 logits each; the first 2 belong to codebook 0, the last 2 to codebook 1). Write the 3 lines it prints.
+--- code
+y = torch.arange(12).view(1, 3, 4)                  # (B=1, T=3, n_q*V=4)
+right = y.view(1, 3, 2, 2).permute(0, 2, 1, 3)      # (B, n_q, T, V)
+wrong = y.view(1, 2, 3, 2)                          # the same shape
+print(tuple(right.shape), tuple(wrong.shape))
+print(right[0, 1].tolist())
+print(wrong[0, 1].tolist())
+--- explain
+The three rows of y[0] are the three frames: [0, 1, 2, 3], [4, 5, 6, 7] and [8, 9, 10, 11]. In each frame the first 2 numbers belong to codebook 0 and the last 2 to codebook 1.
+
+- right[0, 1] is codebook 1's piece of every frame: [2, 3], [6, 7], [10, 11].
+- wrong cuts the 12 numbers in memory order into 2 blocks of 6. The second block, 6 to 11, is treated as "codebook 1", but it mixes codebook 1 of frame 1 (6, 7), codebook 0 of frame 2 (8, 9) and codebook 1 of frame 2 (10, 11).
+
+Both have exactly the same shape and nothing raises an error. That is why the d13-06 check compares the values.
+--- hints
+- Write y[0] as 3 rows of 4 numbers; the last 2 numbers of each row belong to codebook 1.
+- view only regroups numbers in memory order and never moves data; only permute swaps axes.
+
+@@ item d13-16
+type: code
+title: Closed book: build_delay
+level: 2
+exam: yes
+cards: The delay pattern: each codebook waits one more step
+targets: build_delay
+ref: day13
+--- context
+The delay pattern is the signature data step of a multi-codebook audio LM. Writing it closed-book shows you really know where every code ends up.
+--- prompt
+Without looking at the cards, write `build_delay(codes, pad_id)`:
+
+- codes is an integer tensor of shape (B, n_q, T)
+- Return (B, n_q, T + n_q − 1): codebook k shifted right by k, the gaps filled with pad_id
+- Same dtype and device as the input
+--- starter
+def build_delay(codes, pad_id):
+    raise todo()
+--- solution
+def build_delay(codes, pad_id):
+    B, n_q, T = codes.shape
+    out = torch.full((B, n_q, T + n_q - 1), pad_id, dtype=codes.dtype, device=codes.device)
+    for k in range(n_q):
+        out[:, k, k:k + T] = codes[:, k]
+    return out
+--- tests
+@check("build the delay pattern")
+def t03():
+    c = torch.tensor([[[1, 2, 3], [4, 5, 6]]])       # (1, 2, 3)
+    d = build_delay(c, pad_id=0)
+    shape_is(d, (1, 2, 4))
+    eq(d[0, 0], torch.tensor([1, 2, 3, 0]), msg="codebook 0 does not move; the pad goes at the end")
+    eq(d[0, 1], torch.tensor([0, 4, 5, 6]), msg="codebook 1 shifts right by 1; the pad goes at the start")
+--- hints
+- Start with a result full of pad_id, of length T + n_q − 1.
+- Row k gets its T codes starting at column k.
+
+@@ item d13-17
+type: code
+title: Closed book: AudioLM
+level: 3
+exam: yes
+cards: AudioLM: the day-4 GPT with a new input and output
+targets: AudioLM
+ref: day13
+--- context
+"An audio LM is a GPT with a new input and output" is today's most important sentence. If you can write AudioLM from a blank page, you have both the day-4 GPT and today's multi-codebook input and output.
+--- prompt
+Without looking at the cards, write `AudioLM(n_q=4, vocab=50, dim=64, n_layer=2, n_head=4, max_len=256)`:
+
+- `forward(codes)`: codes is (B, n_q, T); return (B, n_q, T, vocab)
+- You may use CodeEmbedding(n_q, vocab, dim), MultiHead(dim, n_q, vocab) and Block(dim, n_head) from the setup
+- Include a position embedding (up to max_len positions), n_layer Blocks and a final LayerNorm
+
+Same check as d13-08: output shape, causality, and an initial loss near ln(50).
+--- starter
+class AudioLM(nn.Module):
+    def __init__(self, n_q=4, vocab=50, dim=64, n_layer=2, n_head=4, max_len=256):
+        super().__init__()
+        raise todo()
+
+    def forward(self, codes):
+        raise todo()
+--- solution
+class AudioLM(nn.Module):
+    def __init__(self, n_q=4, vocab=50, dim=64, n_layer=2, n_head=4, max_len=256):
+        super().__init__()
+        self.emb = CodeEmbedding(n_q, vocab, dim)
+        self.pos = nn.Embedding(max_len, dim)
+        self.h = nn.ModuleList([Block(dim, n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(dim)
+        self.head = MultiHead(dim, n_q, vocab)
+
+    def forward(self, codes):
+        T = codes.size(-1)
+        x = self.emb(codes) + self.pos(torch.arange(T, device=codes.device))
+        for b in self.h:
+            x = b(x)
+        return self.head(self.ln_f(x))
+--- tests
+@check("AudioLM forward")
+def t08():
+    seed(3)
+    m = AudioLM(n_q=4, vocab=50, dim=64, n_layer=2)
+    codes = torch.randint(0, 50, (2, 4, 16))
+    out = m(codes)
+    shape_is(out, (2, 4, 16, 50))
+    # causality: changing later tokens must not change earlier predictions
+    c2 = codes.clone()
+    c2[:, :, 8:] = torch.randint(0, 50, (2, 4, 8))
+    eq(m(codes)[:, :, :8], m(c2)[:, :, :8], tol=1e-4,
+       msg="causality is broken: earlier predictions depend on later codes. Use the Block from the setup (it has is_causal=True)")
+    # the initial loss should be near ln(V)
+    loss = codebook_loss(out, codes)
+    true(abs(loss.item() - math.log(50)) < 1.5,
+         f"initial loss={loss.item():.2f}, it should be near ln(50)={math.log(50):.2f}")
+--- hints
+- Five parts: CodeEmbedding, a position embedding, n_layer Blocks (in an nn.ModuleList), a LayerNorm, MultiHead.
+- forward: embedding + position embedding → each Block → ln_f → head.

@@ -1,0 +1,1188 @@
+@@ day 2
+title: PyTorch speaks in shapes
+part: Foundations
+hours: 3–4 hours
+--- goal
+Look at a line of tensor code and say the shape of the result before you run it. Write Linear, softmax, cross_entropy, LayerNorm and RMSNorm by hand and check them against PyTorch's own versions. Split and merge attention heads, take a masked mean, and write a training loop without bugs.
+--- checklist
+- Empty the review list first (redo from blank every exercise where you looked at the answer)
+- Read all 8 cards; in each one change a number, run it again and watch the output change
+- Exercise 1: work out every shape on paper first, then run it to check
+- Pass every practice exercise before you start the closed-book ones
+
+@@ concept
+title: Shapes and dims: read the tensor first
+--- body
+A tensor is a multi-dimensional array. `x.shape` tells you how long each dimension is. Most bugs in model code are shapes that do not fit together. So build one habit: after every line you write, say the shape of the result in your head before you go on.
+
+In language-model code you will see these three letters everywhere:
+- `B`: batch, how many samples go into the model at once
+- `T`: time, how many tokens each sample has
+- `C`: channels, how long the vector for each token is
+
+`(B, T, C) = (2, 5, 4)` reads: 2 samples, 5 tokens each, and every token is a vector of 4 numbers.
+
+`dim` means "which dimension". Counting starts at 0, and you can also count from the end: `dim=-1` is the last dimension. Here is what common operations do to the shape (x is `(2, 5, 4)`):
+- `x.sum(dim=-1)`, `x.mean(dim=-1)`: sum or average along the last dim; that dim disappears → `(2, 5)`
+- add `keepdim=True`: the dim stays, with length 1 → `(2, 5, 1)`. Use this when you still want to add it to or subtract it from x
+- `x.unsqueeze(1)`: insert a dim of length 1 at position 1 → `(2, 1, 5, 4)`. `squeeze(1)` does the opposite
+- `torch.cat([x, x], dim=0)`: join along dim 0, which gets longer → `(4, 5, 4)`
+- `x.transpose(0, 1)`: swap two dims → `(5, 2, 4)`. `x.permute(2, 0, 1)` puts all dims in a new order at once → `(4, 2, 5)`
+- `x.flatten(1)`: merge dim 1 through the last dim into one → `(2, 20)`
+- `x @ W`: matrix multiply. Only the last two dims take part, and the last dim of x must equal the second-to-last dim of W. With W of shape `(4, 3)` → `(2, 5, 3)`; the leading dims stay as they are
+--- code
+x = torch.randn(2, 5, 4)             # (B, T, C)
+W = torch.randn(4, 3)
+print("x                    ", tuple(x.shape))
+print("x.mean(dim=-1)       ", tuple(x.mean(dim=-1).shape))
+print("x.mean(-1, keepdim)  ", tuple(x.mean(dim=-1, keepdim=True).shape))
+print("x.unsqueeze(1)       ", tuple(x.unsqueeze(1).shape))
+print("torch.cat([x, x], 0) ", tuple(torch.cat([x, x], dim=0).shape))
+print("x.transpose(0, 1)    ", tuple(x.transpose(0, 1).shape))
+print("x.permute(2, 0, 1)   ", tuple(x.permute(2, 0, 1).shape))
+print("x.flatten(1)         ", tuple(x.flatten(1).shape))
+print("x @ W                ", tuple((x @ W).shape))
+
+@@ concept
+title: Broadcasting: line up from the right
+--- body
+When you use `+ - * /` on two tensors with different shapes, PyTorch **broadcasts** them automatically: it stretches the smaller one until it matches the bigger one, then works element by element. (No memory is really copied, but you can think of it that way.)
+
+There is only one rule: **line the two shapes up on the right and compare them pair by pair, starting from the last dim**. Every pair must be one of these:
+- the two lengths are equal
+- one of them is 1 (it gets stretched to the other length)
+- one tensor does not have this dim at all (it counts as 1)
+
+Examples:
+- `(2, 3, 4) + (4,)`: `(4,)` is treated as `(1, 1, 4)`, result `(2, 3, 4)`. This is how you add the same bias to every token
+- `(2, 1, 4) + (3, 1)`: lined up, that is `(2, 1, 4)` and `(1, 3, 1)`. Each dim takes the bigger length, result `(2, 3, 4)`. Both sides were stretched
+- `(2, 3, 4) + (3,)`: the last pair is 4 and 3, neither is 1 → error
+
+The dangerous part of broadcasting is **a wrong result with no error**. A model often outputs `(B, 1)` while the labels are `(B,)`. Subtracting them gives `(B, B)`: every prediction minus every label. The loss still comes out as a number; it is just completely wrong. Fix it with `squeeze(-1)` first, so the output becomes `(B,)`.
+
+Broadcasting is also very handy: multiply a `(B, T, C)` feature tensor by a `(B, T, 1)` mask, and whole vectors at some positions become zero (card 7 uses this).
+--- code
+x = torch.ones(2, 3, 4)
+bias = torch.tensor([0., 10., 20., 30.])        # (4,)
+print("(2,3,4) + (4,)  ->", tuple((x + bias).shape))
+print("first token     :", (x + bias)[0, 0].tolist())   # every token got the same bias
+a = torch.zeros(2, 1, 4)
+b = torch.zeros(3, 1)
+print("(2,1,4) + (3,1) ->", tuple((a + b).shape))
+pred = torch.tensor([[1.0], [2.0], [3.0]])      # (3, 1)
+y = torch.tensor([1.0, 2.0, 3.0])               # (3,)
+print("(3,1) - (3,)    ->", tuple((pred - y).shape), " no error, but already wrong")
+print("after squeeze   ->", tuple((pred.squeeze(-1) - y).shape))
+try:
+    x + torch.ones(3)
+except RuntimeError as e:
+    print("(2,3,4) + (3,) fails:", e)
+
+@@ concept
+title: Splitting and merging heads: view, transpose, contiguous
+--- body
+Multi-head attention (day 4 covers it in detail) cuts each token's C-dim vector into `nh` pieces (nh is the number of heads). Each piece has length `hs = C / nh` (the head size), and every head does its own work.
+
+Usually one Linear computes q, k and v in one go, stuck together as `(B, T, 3C)`. `qkv.split(C, dim=-1)` cuts the last dim into blocks of C and gives three `(B, T, C)` tensors.
+
+Then each of them is split into heads. The shape goes like this:
+
+`(B, T, C)` → `view(B, T, nh, hs)` → `(B, T, nh, hs)` → `transpose(1, 2)` → `(B, nh, T, hs)`
+
+Why the transpose? The matrix multiplies that come next only look at the last two dims. With the heads moved to the front, the last two dims are `(T, hs)`: each head holds a small "T tokens × hs numbers" matrix.
+
+How the three tools differ:
+- `view(new shape)`: copies nothing; it reads the same memory in a different shape. The number of elements must stay the same. It cuts in memory order: splitting the last dim C into `(nh, hs)` gives head 0 exactly the first hs numbers
+- `transpose(i, j)`: swaps two dims. It copies nothing either, it only changes the order in which memory is read. The result is **not contiguous** any more (contiguous: elements stored row by row, right next to each other)
+- `.contiguous()`: really makes a copy in the current order, so it is contiguous again
+
+Merging heads is the reverse: `(B, nh, T, hs)` → `transpose(1, 2)` → `(B, T, nh, hs)` → `(B, T, C)`. A plain `view` right after the transpose fails with `view size is not compatible with input tensor's size and stride`, because view needs contiguous memory. The fix: `.contiguous().view(...)`, or use `.reshape(...)` instead (it copies when it has to).
+
+Careful: you cannot skip the transpose and view `(B, nh, T, hs)` straight into `(B, T, C)`. The shape looks right and nothing fails, but the numbers end up in the wrong order.
+--- code
+B, T, nh, hs = 1, 3, 2, 2
+C = nh * hs
+x = torch.arange(B * T * C).view(B, T, C)   # 3 tokens, 4 numbers each; each number = its place in memory
+print("x[0]      :", x[0].tolist())
+h = x.view(B, T, nh, hs).transpose(1, 2)    # split heads -> (B, nh, T, hs)
+print("split     :", tuple(h.shape))
+print("head 0    :", h[0, 0].tolist())       # the first 2 numbers of every token
+print("head 1    :", h[0, 1].tolist())       # the last 2 numbers of every token
+y = h.contiguous()                          # pretend this is a fresh attention output
+t = y.transpose(1, 2)                       # (B, T, nh, hs)
+print("contiguous after transpose?", t.is_contiguous())
+try:
+    t.view(B, T, C)
+except RuntimeError as e:
+    print("plain view fails:", str(e)[:48], "...")
+back = t.contiguous().view(B, T, C)
+print("contiguous().view gives x back?", torch.equal(back, x))
+
+@@ concept
+title: Matrix multiply: Linear, attention scores, einsum
+--- body
+`nn.Linear(in, out)` holds two parameters: `weight` with shape `(out, in)` (not `(in, out)`!), and `bias` with shape `(out,)`. All it does is one line:
+
+`y = x @ W.T + b`
+
+`x` can be `(N, in)` or `(B, T, in)`. `@` multiplies using only the last two dims and keeps the leading dims as they are, so the output is `(..., out)`. The bias is broadcast onto every row.
+
+Attention scores (day 4 covers them in detail): every query takes a dot product with every key, divided by `sqrt(hs)`. q and k are both `(B, nh, T, hs)`. Swap the last two dims of k and you can multiply directly:
+
+`q @ k.transpose(-2, -1)`: `(B, nh, T, hs) @ (B, nh, hs, T)` → `(B, nh, T, T)`
+
+Row i, column j of the result is the dot product of query i and key j.
+
+`torch.einsum` is another way to write this. You give every dim a letter, and you can see at a glance which dims are multiplied and which are summed. The rules:
+- commas separate the dim names of each input; the names after the arrow are the output dims
+- a letter that appears in the inputs but not in the output is multiplied and summed over
+- a letter in both the inputs and the output is kept as it is
+
+For example, the plain matrix product `a @ b` is `torch.einsum("ik,kj->ij", a, b)`: k is not in the output, so it is multiplied and summed over. `"btc,btc->bt"` is the dot product of two vectors at every token.
+--- code
+lin = nn.Linear(4, 3)
+print("weight", tuple(lin.weight.shape), " bias", tuple(lin.bias.shape))
+x = torch.randn(2, 5, 4)                                  # (B, T, in)
+mine = x @ lin.weight.T + lin.bias
+print("by hand:", tuple(mine.shape), " same as nn.Linear?", torch.allclose(mine, lin(x), atol=1e-6))
+a, b = torch.randn(3, 4), torch.randn(4, 2)
+print("einsum ik,kj->ij equals a @ b?", torch.allclose(torch.einsum("ik,kj->ij", a, b), a @ b, atol=1e-6))
+u, v = torch.randn(2, 5, 4), torch.randn(2, 5, 4)
+dots = torch.einsum("btc,btc->bt", u, v)                  # one dot product per token
+print("per-token dot products:", tuple(dots.shape), torch.allclose(dots, (u * v).sum(-1), atol=1e-6))
+
+@@ concept
+title: Along the last dim: softmax, LayerNorm, RMSNorm
+--- body
+These three follow the same pattern: **each vector is handled on its own** (along the last dim). First compute one statistic per vector with `keepdim=True` (the max, the mean, the variance), with shape `(..., 1)`. Then broadcasting applies it to every element of that vector.
+
+**softmax** turns a list of any real numbers into probabilities that add up to 1:
+
+`softmax(x)_i = exp(x_i) / (exp(x_1) + ... + exp(x_n))`
+
+Computing it directly has a trap: `exp(1000)` is `inf` in float32, and `inf / inf = nan`. The fix is to subtract the largest value m first. Top and bottom are both multiplied by `exp(-m)`, so the result does not change; but the largest number becomes 0, so `exp` is at most 1 and cannot overflow.
+
+**LayerNorm**: subtract each vector's own mean, divide by its own standard deviation, then multiply by a learned `g` (gain, a scale) and add a learned `b` (bias, a shift):
+
+`y = (x - mean) / sqrt(var + eps) * g + b`
+
+Here `var` divides by N: `x.var(-1, keepdim=True, unbiased=False)`. The default `unbiased=True` divides by N-1 and will not match PyTorch's LayerNorm. `eps` is a tiny number that prevents dividing by 0.
+
+**RMSNorm** (Llama uses it; you will need it on day 5) is simpler: no mean subtraction and no b, only a division by the root mean square:
+
+`y = x / sqrt(mean(x²) + eps) * g`
+
+`torch.rsqrt(t)` is `1 / sqrt(t)`. With g all ones, every vector has `mean(y²)` close to 1 after RMSNorm.
+--- code
+x = torch.tensor([1000.0, 1001.0, 1002.0])
+print("direct      :", (x.exp() / x.exp().sum()).tolist())
+e = (x - x.max()).exp()                     # subtract the max first
+print("minus max   :", [round(v, 4) for v in (e / e.sum()).tolist()])
+print("F.softmax   :", [round(v, 4) for v in F.softmax(x, dim=0).tolist()])
+
+h = torch.tensor([[1.0, 2.0, 3.0, 6.0]])
+mu = h.mean(-1, keepdim=True)
+var = h.var(-1, keepdim=True, unbiased=False)
+print("mean", mu.item(), " var", var.item(), " shape of the statistic", tuple(mu.shape))
+z = (h - mu) / torch.sqrt(var + 1e-5)
+print("normalised  :", [round(v, 3) for v in z[0].tolist()])
+print("new mean %.3f  new var %.3f" % (abs(z.mean().item()), z.var(unbiased=False).item()))
+
+@@ concept
+title: cross_entropy: log_softmax plus gather
+--- body
+A classifier outputs V **logits** per sample (raw scores, before softmax), where V is the number of classes (for a language model, the vocabulary size). **cross_entropy** cares about one thing: how much probability p the model gives to the correct answer. The loss of one sample is `-log(p)`, averaged over all samples. The closer p is to 1, the closer the loss is to 0.
+
+By hand it takes three steps:
+1. Log probabilities: `logp = logits - logits.logsumexp(dim=-1, keepdim=True)`. This is exactly `F.log_softmax`. `logsumexp` computes `log(exp(x_1) + ... + exp(x_n))` and already subtracts the max inside, so it cannot overflow. Do not write `softmax(...).log()`: when a probability is so small that it becomes 0, `log(0) = -inf`
+2. Use `gather` to pick each sample's log probability for the correct class
+3. Negate and take the mean
+
+`input.gather(dim, index)` picks values along `dim` at the positions listed in `index`. `index` must have the same number of dims as `input`. The labels are `(N,)`, so `unsqueeze(-1)` them to `(N, 1)` first; the result is `(N, 1)`, and `squeeze(-1)` brings it back to `(N,)`.
+
+A number to remember: if all logits are equal (the model guesses uniformly), every class gets probability `1/V`, and the loss is `-log(1/V) = ln V`. A freshly initialised model should start with a loss close to this.
+
+A language model's logits are `(B, T, V)` and its labels are `(B, T)`. `F.cross_entropy` wants the classes in dim 1: `(N, V)` with `(N,)`. The easiest way is to merge B and T into one dim: `logits.reshape(-1, V)` with `targets.reshape(-1)`. That is `B*T` separate "pick 1 of V" questions.
+--- code
+logits = torch.tensor([[2.0, 0.0, -1.0],
+                       [0.0, 3.0,  0.0]])        # N=2 samples, V=3 classes
+y = torch.tensor([0, 2])                         # index of the correct class
+logp = F.log_softmax(logits, dim=-1)
+print("log probs   :", [[round(v, 3) for v in row] for row in logp.tolist()])
+picked = logp.gather(-1, y.unsqueeze(-1))        # index (2, 1) -> result (2, 1)
+print("gathered    :", [round(v, 3) for v in picked.squeeze(-1).tolist()])
+print("minus mean  :", round(-picked.mean().item(), 4))
+print("F.cross_entropy:", round(F.cross_entropy(logits, y).item(), 4))
+V = 3
+flat = F.cross_entropy(torch.zeros(1, V), torch.tensor([1]))
+print("equal logits:", round(flat.item(), 4), "  ln 3 =", round(math.log(V), 4))
+
+@@ concept
+title: Variable-length sequences: padding and masks
+--- body
+The sentences in a batch have different lengths, but a tensor must be a neat box. The answer is **padding**: add a special `pad_id` to the right of each short sample until it is as long as the longest one, `Tmax`. At the same time, build a **mask** with the same shape: 1 where there is a real token, 0 where padding was added.
+
+The function a DataLoader uses to stack samples into a batch is called `collate_fn`, and padding usually happens there. Useful tools:
+- `torch.full((B, Tmax), pad_id, dtype=torch.long)`: make a tensor full of pad_id first, then fill in the real tokens
+- `x[i, :n] = s`: put sample s (length n) into the first n positions of row i
+- token ids must be `int64` (that is `torch.long`), because `nn.Embedding` only accepts integer ids
+
+Once there is padding, every statistic must respect the mask. For example, the average vector of each sample: padded positions must not count in the sum, and the divisor counts only real tokens:
+
+`average = sum(x * mask) / sum(mask)`
+
+x is `(B, T, C)` and the mask is `(B, T)`. `mask.unsqueeze(-1)` makes it `(B, T, 1)`, and broadcasting multiplies it into every channel. If the mask holds integers, turn it into floats with `.to(x.dtype)`.
+--- code
+seqs = [torch.tensor([5, 6, 7]), torch.tensor([8])]
+x = torch.full((2, 3), 0, dtype=torch.long)       # pad_id = 0
+x[0, :3] = seqs[0]
+x[1, :1] = seqs[1]
+print("padded     :", x.tolist())
+
+feat = torch.tensor([[[1.0], [3.0], [8.0]],      # sample 0: 2 real tokens + 1 pad
+                     [[2.0], [8.0], [8.0]]])     # sample 1: 1 real token + 2 pads   (B=2, T=3, C=1)
+mask = torch.tensor([[1, 1, 0],
+                     [1, 0, 0]])                 # the 8.0 at pad positions is meaningless
+print("plain mean :", feat.mean(1).squeeze(-1).tolist())    # the pads were counted too
+m = mask.unsqueeze(-1).to(feat.dtype)                      # (2, 3, 1)
+print("masked mean:", ((feat * m).sum(1) / m.sum(1)).squeeze(-1).tolist())
+
+@@ concept
+title: Parameters, buffers and autograd
+--- body
+Your own models subclass `nn.Module`. There are three ways to keep a tensor in `__init__`, and they behave very differently:
+- `self.w = nn.Parameter(t)`: a **learnable parameter**. It shows up in `model.parameters()`, the optimizer updates it, and it is saved in `state_dict()` (the saved weights)
+- `self.register_buffer("name", t)`: a **buffer**. Not learned, but part of the model's state: it is saved in `state_dict()` and moves along with `model.to("cuda")`. It is not in `parameters()`, so the optimizer leaves it alone. Examples: BatchNorm's running averages, a fixed causal mask
+- `self.t = torch.zeros(3)`: a plain attribute. It is neither: it is lost when you save, and it stays behind on `.to()`, so on a GPU you get a "different devices" error
+
+To update a buffer, do it inside `with torch.no_grad():` with the in-place `self.name.copy_(new_value)`, so it does not become part of the graph.
+
+**autograd** (automatic differentiation): when you compute with tensors that have `requires_grad=True`, PyTorch records the computation graph. After `loss.backward()` on a scalar, each of those tensors has `d loss / d itself` in its `.grad`. You can check it with a formula you work out by hand. For example, with `loss = sum(x³)` the derivative for each element is `3x²`. If the loss contains a `mean`, remember that a mean divides by the number of elements N, so the derivative is divided by N too.
+
+Each step of a training loop does four things:
+1. forward: compute the loss
+2. `opt.zero_grad()`: clear last step's gradients. `.grad` **adds up** by default; without clearing it keeps growing
+3. `loss.backward()`: compute the gradients
+4. `opt.step()`: update the parameters with the gradients
+
+`zero_grad` just has to come before `backward`. Record the loss with `loss.item()`, which returns a plain Python number; putting the `loss` tensor itself into a list keeps its whole computation graph in memory.
+--- code
+class Tiny(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w = nn.Parameter(torch.ones(2))
+        self.register_buffer("count", torch.zeros(()))
+        self.plain = torch.zeros(2)                    # a plain attribute
+m = Tiny()
+print("parameters:", [n for n, _ in m.named_parameters()])
+print("state_dict:", list(m.state_dict().keys()), " <- no plain")
+
+x = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+loss = (x ** 3).sum()
+loss.backward()
+print("autograd  :", x.grad.tolist())
+print("3x² by hand:", (3 * x.detach() ** 2).tolist())
+
+w = torch.tensor(1.0, requires_grad=True)
+for step in range(3):
+    (2 * w).backward()                                 # d(2w)/dw = 2
+    print("step", step, "without zero_grad, w.grad =", w.grad.item())
+
+@@ item d2-01
+type: code
+title: Shape quiz (guess first, then run)
+level: 2
+cards: Shapes and dims: read the tensor first; Broadcasting: line up from the right; Splitting and merging heads: view, transpose, contiguous
+targets: SHAPES
+ref: day2
+--- context
+Writing model code, you spend most of your time working out in your head what shape each line produces. In an interview where you write attention by hand, the interviewer will point at a line and ask for its shape. Guessing first and checking after is the fastest way to build that instinct.
+--- prompt
+**Guess first, then run.** Do not run any code yet. Work out the shape of every expression on paper or in your head, fill them all in, and only then press "Run & check".
+
+The five tensors:
+```
+a: (8, 16, 64)    b: (64, 32)    c: (8, 1, 64)
+d: (4, 6, 8, 8)   e: (64,)
+```
+Replace every `None` in `SHAPES` with the shape of the result, written as a tuple such as `(8, 16)`.
+
+When you check, every wrong answer is listed with its real shape. Work out which step you got wrong: that is where all the value of this exercise is. Wrong guesses are fine; copying without guessing is the only way to waste it.
+--- starter
+SHAPES = {
+    "a @ b":                                None,   # matrix multiply: only the last two dims
+    "a + c":                                None,   # broadcasting
+    "a.transpose(0, 1)":                    None,
+    "a.view(8, 16, 4, 16)":                 None,
+    "a.view(8, 16, 4, 16).transpose(1, 2)": None,
+    "a.mean(dim=-1)":                       None,
+    "a.mean(dim=-1, keepdim=True)":         None,
+    "d.permute(0, 2, 1, 3)":                None,
+    "d.flatten(2)":                         None,
+    "a * e":                                None,   # broadcasting: line up from the right
+    "c + torch.zeros(16, 1)":               None,   # both sides get stretched
+    "a.unsqueeze(1)":                       None,
+    "torch.cat([a, a], dim=-1)":            None,
+}
+--- solution
+SHAPES = {
+    "a @ b":                                (8, 16, 32),
+    "a + c":                                (8, 16, 64),
+    "a.transpose(0, 1)":                    (16, 8, 64),
+    "a.view(8, 16, 4, 16)":                 (8, 16, 4, 16),
+    "a.view(8, 16, 4, 16).transpose(1, 2)": (8, 4, 16, 16),
+    "a.mean(dim=-1)":                       (8, 16),
+    "a.mean(dim=-1, keepdim=True)":         (8, 16, 1),
+    "d.permute(0, 2, 1, 3)":                (4, 8, 6, 8),
+    "d.flatten(2)":                         (4, 6, 64),
+    "a * e":                                (8, 16, 64),
+    "c + torch.zeros(16, 1)":               (8, 16, 64),
+    "a.unsqueeze(1)":                       (8, 1, 16, 64),
+    "torch.cat([a, a], dim=-1)":            (8, 16, 128),
+}
+--- tests
+@check("the shapes of all 13 expressions")
+def t01():
+    a = torch.zeros(8, 16, 64)
+    b = torch.zeros(64, 32)
+    c = torch.zeros(8, 1, 64)
+    d = torch.zeros(4, 6, 8, 8)
+    e = torch.zeros(64)
+    env = dict(a=a, b=b, c=c, d=d, e=e, torch=torch)
+    exprs = ["a @ b", "a + c", "a.transpose(0, 1)", "a.view(8, 16, 4, 16)",
+             "a.view(8, 16, 4, 16).transpose(1, 2)", "a.mean(dim=-1)", "a.mean(dim=-1, keepdim=True)",
+             "d.permute(0, 2, 1, 3)", "d.flatten(2)", "a * e", "c + torch.zeros(16, 1)",
+             "a.unsqueeze(1)", "torch.cat([a, a], dim=-1)"]
+    wrong = []
+    for expr in exprs:
+        real = tuple(eval(expr, env).shape)
+        guess = SHAPES.get(expr)
+        if guess is None:
+            wrong.append(f"{expr}: not filled in yet")
+        elif tuple(guess) != real:
+            wrong.append(f"{expr}: you wrote {tuple(guess)}, the real shape is {real}")
+    true(not wrong, "Not right yet:\n" + "\n".join(wrong))
+--- hints
+- `@` only looks at the last two dims: `(..., n, k) @ (k, m)` → `(..., n, m)`. Broadcasting lines shapes up from the rightmost dim; dims of length 1 or missing dims get stretched
+- `view` can change the shape as long as the number of elements stays the same; `transpose(1, 2)` swaps dims 1 and 2; `flatten(2)` multiplies dim 2 through the last dim together; `keepdim=True` leaves a dim of length 1
+- `c + torch.zeros(16, 1)`: lined up on the right, that is `(8, 1, 64)` and `(1, 16, 1)`; each dim takes the bigger length
+
+@@ item d2-02
+type: code
+title: Split qkv into heads: (B, T, 3C) → 3 × (B, nh, T, hs)
+level: 2
+cards: Splitting and merging heads: view, transpose, contiguous; Shapes and dims: read the tensor first
+targets: split_heads
+ref: day2
+--- context
+In GPT, one Linear usually computes q, k and v in one go, stuck together as (B, T, 3C). Splitting that into heads is the first step of writing attention. On day 4 you will use these exact lines in your hand-written nanoGPT.
+--- prompt
+Write `split_heads(qkv, n_head)`:
+- input `qkv`: shape `(B, T, 3*C)`. Along the last dim come q, then k, then v, C columns each
+- return three tensors `q, k, v`, each with shape `(B, n_head, T, hs)`, where `hs = C // n_head`
+- each head gets one contiguous slice of the C dims: head 0 gets dims 0 to hs-1, head 1 the next hs dims, and so on
+
+Example: with `B, T, C, n_head = 2, 5, 12, 3`, q, k and v are all `(2, 3, 5, 4)`. The check tests the shapes, and also that q, k and v come from the right columns.
+--- starter
+def split_heads(qkv, n_head):
+    """qkv: (B, T, 3*C)  ->  q, k, v, each (B, n_head, T, head_dim)
+    The order is q first, then k, then v (three equal parts along the last dim).
+    """
+    raise todo()
+--- solution
+def split_heads(qkv, n_head):
+    B, T, C3 = qkv.shape
+    C = C3 // 3
+    hs = C // n_head
+    q, k, v = qkv.split(C, dim=-1)
+    out = [t.view(B, T, n_head, hs).transpose(1, 2) for t in (q, k, v)]
+    return out[0], out[1], out[2]
+--- tests
+@check("shapes and contents of q, k, v")
+def t02():
+    B, T, C, nh = 2, 5, 12, 3
+    qkv = torch.randn(B, T, 3 * C)
+    q, k, v = split_heads(qkv, nh)
+    for name, t in [("q", q), ("k", k), ("v", v)]:
+        shape_is(t, (B, nh, T, C // nh), f"{name} has the wrong shape")
+    # the contents must be right too: q comes from the first C columns, k from the middle C, v from the last C
+    for i, (name, t) in enumerate([("q", q), ("k", k), ("v", v)]):
+        want = qkv[..., i * C:(i + 1) * C].view(B, T, nh, C // nh).transpose(1, 2)
+        eq(t, want, msg=f"{name} has the wrong contents: check the split order (q, k, v), and view first, then transpose")
+--- hints
+- Take `B, T, C3` from the shape and set `C = C3 // 3`. `qkv.split(C, dim=-1)` gives three `(B, T, C)` tensors
+- For each one: first `view(B, T, n_head, hs)` to cut C into heads, then `transpose(1, 2)` to move the heads in front of T
+- Each tensor becomes `t.view(B, T, n_head, hs).transpose(1, 2)`; the order matters: view first, then transpose
+
+@@ item d2-03
+type: code
+title: Merge the heads, and the contiguous error
+level: 2
+cards: Splitting and merging heads: view, transpose, contiguous
+targets: flatten_heads
+ref: day2
+--- context
+After each head has done its attention, the nh heads must be joined back into (B, T, C) before the next Linear. Almost everyone hits the view error here once; if you know why it happens, you fix it in 10 seconds.
+--- prompt
+Write `flatten_heads(x)`, the reverse of splitting heads:
+- input `x`: `(B, n_head, T, hs)`
+- return `(B, T, n_head * hs)`: at each time step, the vectors of all heads placed end to end, in head order
+
+Example: input `(2, 3, 5, 4)`, output `(2, 5, 12)`. The output's `y[0, 1]` must equal `x[0, 0, 1]`, `x[0, 1, 1]` and `x[0, 2, 1]` joined together.
+
+Think first: why does a plain `view` right after the transpose fail?
+--- starter
+def flatten_heads(x):
+    """x: (B, n_head, T, head_dim)  ->  (B, T, n_head * head_dim)
+    This is the step that merges the attention output back together.
+    """
+    raise todo()
+--- solution
+def flatten_heads(x):
+    B, nh, T, hs = x.shape
+    # after transpose the memory is not contiguous, so a plain view fails with "view size is not compatible..."
+    return x.transpose(1, 2).contiguous().view(B, T, nh * hs)
+--- tests
+@check("merged shape and element order")
+def t03():
+    B, nh, T, hs = 2, 3, 5, 4
+    x = torch.randn(B, nh, T, hs)
+    y = flatten_heads(x)
+    shape_is(y, (B, T, nh * hs))
+    eq(y[0, 1], torch.cat([x[0, h, 1] for h in range(nh)]),
+       msg="wrong element order: the heads of the same time step must be joined together. Did you skip the transpose?")
+--- hints
+- First `transpose(1, 2)` back to `(B, T, n_head, hs)`, then merge the last two dims into one
+- After a transpose the memory is not contiguous, and `view` refuses it. Add `.contiguous()` before the view, or use `.reshape(...)`
+- `x.transpose(1, 2).contiguous().view(B, T, nh * hs)`
+
+@@ item d2-04
+type: code
+title: Write Linear by hand and compare with nn.Linear
+level: 1
+cards: Matrix multiply: Linear, attention scores, einsum
+targets: my_linear
+ref: day2
+--- context
+nn.Linear is the most common layer in any model. Loading someone else's weights, writing LoRA, or counting parameters all need you to know that its weight is (out, in). Interviewers ask about it too.
+--- prompt
+Write `my_linear(x, W, b)` so that the result is exactly what `nn.Linear` gives:
+- `x`: `(..., in)`, with any number of leading dims, for example `(B, T, in)`
+- `W`: `(out, in)`, like `nn.Linear.weight` (note: not `(in, out)`)
+- `b`: `(out,)`
+- return `(..., out)`
+
+Use `@`; do not call `nn.Linear` or `F.linear`.
+--- starter
+def my_linear(x, W, b):
+    """x: (..., in)   W: (out, in)   b: (out,)   ->  (..., out)"""
+    raise todo()
+--- solution
+def my_linear(x, W, b):
+    return x @ W.T + b
+--- tests
+@check("same output as nn.Linear")
+def t04():
+    seed(0)
+    lin = nn.Linear(7, 3)
+    x = torch.randn(2, 5, 7)
+    eq(my_linear(x, lin.weight, lin.bias), lin(x), msg="hint: W is (out, in), transpose it first")
+--- hints
+- `x @ W` does not fit: the last dim of x is in, but the second-to-last dim of W is out
+- Transpose W to `(in, out)` first: `W.T`
+- `x @ W.T + b`; b is broadcast onto every row
+
+@@ item d2-05
+type: code
+title: A numerically stable softmax
+level: 2
+cards: Along the last dim: softmax, LayerNorm, RMSNorm; Broadcasting: line up from the right
+targets: my_softmax
+ref: day2
+--- context
+softmax is inside attention and every classification head. With large logits, a direct exp overflows to inf, the loss becomes nan, and training is ruined. "Subtract the max" is the numerical-stability trick interviewers ask about most.
+--- prompt
+Write `my_softmax(x, dim=-1)`: softmax along `dim`; the output has the same shape as `x`.
+- Do not use `F.softmax`, `torch.softmax`, `x.softmax` or any `log_softmax`. Calling them makes the check fail
+- It must be numerically stable: the input `[[1000., 1001., 1002.]]` must give the right answer, with no inf or nan
+- Really use the `dim` argument: the check also tests `dim=1`
+--- starter
+def my_softmax(x, dim=-1):
+    """softmax along dim. Subtract the max first, or large numbers overflow."""
+    raise todo()
+--- solution
+def my_softmax(x, dim=-1):
+    m = x.max(dim=dim, keepdim=True).values
+    e = (x - m).exp()
+    return e / e.sum(dim=dim, keepdim=True)
+--- tests
+@check("matches F.softmax, and large numbers do not overflow")
+def t05():
+    x = torch.randn(3, 4, 5)
+    big = torch.tensor([[1000.0, 1001.0, 1002.0]])
+    want_last, want_1, want_big = F.softmax(x, -1), F.softmax(x, 1), F.softmax(big, -1)
+    with _banned(_SOFTMAX_FUNCS, "write softmax yourself here: the built-in softmax / log_softmax functions are not allowed"):
+        got_last, got_1, got_big = my_softmax(x, -1), my_softmax(x, 1), my_softmax(big, -1)
+    eq(got_last, want_last)
+    eq(got_1, want_1, msg="the dim argument is not used")
+    true(torch.isfinite(got_big).all(), "large numbers overflowed: you forgot to subtract the max")
+    eq(got_big, want_big)
+--- hints
+- Take the max along dim with `keepdim=True`, so it can be broadcast against x. `x.max(dim=...)` returns (values, indices); you want `.values`
+- `e = (x - m).exp()`, then divide by `e.sum(dim=dim, keepdim=True)`
+- `m = x.max(dim=dim, keepdim=True).values`, then `e = (x - m).exp()`, and finally `return e / e.sum(dim=dim, keepdim=True)`
+
+@@ item d2-06
+type: code
+title: Write cross_entropy by hand
+level: 3
+cards: cross_entropy: log_softmax plus gather; Along the last dim: softmax, LayerNorm, RMSNorm
+targets: my_cross_entropy
+ref: day2
+--- context
+Every step of training an LLM computes cross-entropy. Once you have written it yourself, the loss numbers start to mean something: a fresh model starts near ln V, and when the loss turns into nan you know where to look.
+--- prompt
+Write `my_cross_entropy(logits, target)` so that it gives the same result as `F.cross_entropy(logits, target)`:
+- `logits`: `(N, V)`, raw scores (not normalised)
+- `target`: `(N,)`, int64, the index of each sample's correct class (0 to V-1)
+- return a scalar: the average over samples of `-log p(correct class)`
+- do not use `F.cross_entropy` or `F.nll_loss`; calling them makes the check fail
+- it must be numerically stable: do not write `softmax(...).log()`
+
+The check tests two more things: with all logits 0 (a uniform guess) the loss must be exactly `ln V`; with logits `[[0., 200.]]` and class 0 correct, the loss must be 200, not inf.
+--- starter
+def my_cross_entropy(logits, target):
+    """logits: (N, V), not normalised; target: (N,) int64 class indices.
+    Returns a scalar (the mean over N).
+    """
+    raise todo()
+--- solution
+def my_cross_entropy(logits, target):
+    logp = logits - logits.logsumexp(dim=-1, keepdim=True)
+    picked = logp.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    return -picked.mean()
+--- tests
+@check("matches F.cross_entropy; ln V for a uniform guess; no overflow")
+def t06():
+    seed(1)
+    logits = torch.randn(6, 10)
+    y = torch.randint(0, 10, (6,))
+    want = F.cross_entropy(logits, y)
+    flat = torch.zeros(4, 10)
+    with _banned(_CE_FUNCS, "write it yourself here: F.cross_entropy / F.nll_loss are not allowed"):
+        got = my_cross_entropy(logits, y)
+        got_flat = my_cross_entropy(flat, torch.zeros(4, dtype=torch.long))
+        got_big = my_cross_entropy(torch.tensor([[0.0, 200.0]]), torch.tensor([0]))
+    eq(got, want)
+    # with a uniform guess the loss must be ln(V)
+    eq(got_flat, torch.tensor(math.log(10)),
+       msg="with all logits equal the loss must be exactly ln(V); remember this number")
+    # large gaps between logits must work too: the correct class has probability about exp(-200), so the loss is 200
+    true(torch.isfinite(got_big).all(), "the loss became inf for widely spread logits: softmax followed by log gives log(0); use logsumexp")
+    eq(got_big, torch.tensor(200.0), msg="wrong result for widely spread logits")
+--- hints
+- Log probabilities: `logp = logits - logits.logsumexp(dim=-1, keepdim=True)` (this is log_softmax)
+- Pick the correct class in each row: `logp.gather(-1, target.unsqueeze(-1))` gives `(N, 1)`; `.squeeze(-1)` makes it `(N,)`
+- Finally return `-picked.mean()`
+
+@@ item d2-07
+type: code
+title: Sequence loss: flatten (B, T, V) first
+level: 1
+cards: cross_entropy: log_softmax plus gather; Shapes and dims: read the tensor first
+targets: seq_loss
+ref: day2
+--- context
+A language model predicts the next token at every position, so its logits are (B, T, V). Handing them to cross_entropy correctly is the line of a training script that goes wrong most often. If the two sides are flattened in different orders, you may get no error at all, just a loss that measures something else.
+--- prompt
+Write `seq_loss(logits, targets)`:
+- `logits`: `(B, T, V)`
+- `targets`: `(B, T)`, int64
+- return a scalar: the mean cross-entropy over all `B*T` positions
+
+You may use `F.cross_entropy` here. But it wants the classes in dim 1: input `(N, V)` with labels `(N,)`. Passing `(B, T, V)` directly raises an error.
+--- starter
+def seq_loss(logits, targets):
+    """logits: (B, T, V)   targets: (B, T) int64  ->  scalar loss"""
+    raise todo()
+--- solution
+def seq_loss(logits, targets):
+    V = logits.size(-1)
+    return F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1))
+--- tests
+@check("mean cross-entropy over all positions, as a scalar")
+def t07():
+    seed(2)
+    B, T, V = 3, 4, 7
+    logits = torch.randn(B, T, V)
+    y = torch.randint(0, V, (B, T))
+    ref = F.cross_entropy(logits.reshape(-1, V), y.reshape(-1))
+    eq(seq_loss(logits, y), ref)
+    # the loss must be a 0-dim scalar, not one number per position
+    true(seq_loss(logits, y).dim() == 0, "the loss must be a scalar")
+--- hints
+- Merge B and T into one dim: there are `B*T` positions, and each one is a "pick 1 of V" question
+- `logits.reshape(-1, V)` is `(B*T, V)` and `targets.reshape(-1)` is `(B*T,)`. Flatten both in the same order so they line up one to one
+- `V = logits.size(-1)`, then `return F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1))`
+
+@@ item d2-08
+type: code
+title: Write LayerNorm and RMSNorm by hand
+level: 2
+cards: Along the last dim: softmax, LayerNorm, RMSNorm; Broadcasting: line up from the right
+targets: my_layernorm, my_rmsnorm
+ref: day2
+--- context
+Every Transformer block has two normalisation layers. GPT-2 uses LayerNorm; Llama switched to the cheaper RMSNorm. Write them once and you will see they are just a few lines of arithmetic along the last dim.
+--- prompt
+Write two functions. Both normalise along the last dim, each vector on its own. `x` is `(..., C)`, `g` and `b` are both `(C,)`, and the output has the same shape as `x`.
+- `my_layernorm(x, g, b, eps=1e-5)`: `(x - mean) / sqrt(var + eps) * g + b`. Use the variance that divides by N (`unbiased=False`). The result must match `F.layer_norm(x, (C,), g, b)`
+- `my_rmsnorm(x, g, eps=1e-6)`: no mean subtraction and no b: `x / sqrt(mean(x²) + eps) * g`
+
+Build them from basic operations (mean, var, sqrt); do not call `F.layer_norm` or `F.rms_norm`. The check also tests that with g all ones, every vector has a mean square close to 1 after RMSNorm.
+--- starter
+def my_layernorm(x, g, b, eps=1e-5):
+    """Normalise over the last dim. g and b both have shape (C,)."""
+    raise todo()
+
+def my_rmsnorm(x, g, eps=1e-6):
+    """RMSNorm: no mean subtraction, just divide by sqrt(mean(x^2) + eps), then multiply by g. Needed on day 5."""
+    raise todo()
+--- solution
+def my_layernorm(x, g, b, eps=1e-5):
+    mu = x.mean(-1, keepdim=True)
+    var = x.var(-1, keepdim=True, unbiased=False)
+    return (x - mu) / torch.sqrt(var + eps) * g + b
+
+def my_rmsnorm(x, g, eps=1e-6):
+    rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    return x * rms * g
+--- tests
+@check("LayerNorm matches F.layer_norm; mean square ≈ 1 after RMSNorm")
+def t08():
+    seed(3)
+    x = torch.randn(2, 5, 8)
+    g, b = torch.randn(8), torch.randn(8)
+    eq(my_layernorm(x, g, b), F.layer_norm(x, (8,), g, b),
+       msg="LayerNorm is wrong: the mean and the variance both need keepdim=True, and the variance needs unbiased=False")
+    r = my_rmsnorm(x, torch.ones(8))
+    eq(r.pow(2).mean(-1), torch.ones(2, 5), tol=1e-3,
+       msg="after RMSNorm every vector's mean square should be ≈ 1")
+--- hints
+- Compute the mean and the variance with `dim=-1, keepdim=True`; the results are `(..., 1)` and broadcast against x
+- Variance: `x.var(-1, keepdim=True, unbiased=False)`, then `torch.sqrt(var + eps)`. g and b are `(C,)`; multiplying and adding them broadcasts onto every vector
+- RMSNorm: `x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * g`
+
+@@ item d2-09
+type: code
+title: Attention scores two ways: matmul and einsum
+level: 2
+cards: Matrix multiply: Linear, attention scores, einsum; Splitting and merging heads: view, transpose, contiguous
+targets: attn_scores_matmul, attn_scores_einsum
+ref: day2
+--- context
+The core of attention is a dot product between every query and every key. Papers and open-source code use both notations, so you need to read einsum and also be able to translate it back to matmul.
+--- prompt
+Write two functions that compute the same attention scores:
+- inputs `q`, `k`: both `(B, nh, T, hs)`
+- output `(B, nh, T, T)`: `out[b, h, i, j]` is the dot product of query i and key j, divided by `sqrt(hs)`
+- `attn_scores_matmul(q, k)`: use `@`
+- `attn_scores_einsum(q, k)`: must use `torch.einsum` (the check looks for an einsum call in the function)
+
+Both functions must give exactly the same result.
+--- starter
+def attn_scores_matmul(q, k):
+    """q, k: (B, nh, T, hs) -> (B, nh, T, T), using @. Do not forget to divide by sqrt(hs)"""
+    raise todo()
+
+def attn_scores_einsum(q, k):
+    """The same, but written with torch.einsum"""
+    raise todo()
+--- solution
+def attn_scores_matmul(q, k):
+    return q @ k.transpose(-2, -1) / math.sqrt(q.size(-1))
+
+def attn_scores_einsum(q, k):
+    return torch.einsum("bhqd,bhkd->bhqk", q, k) / math.sqrt(q.size(-1))
+--- tests
+@check("both versions agree, with the right scaling")
+def t09():
+    seed(4)
+    q, k = torch.randn(2, 3, 5, 4), torch.randn(2, 3, 5, 4)
+    a, b = attn_scores_matmul(q, k), attn_scores_einsum(q, k)
+    true("einsum" in attn_scores_einsum.__code__.co_names,
+         "attn_scores_einsum must be written with torch.einsum")
+    shape_is(a, (2, 3, 5, 5))
+    eq(a, b, msg="the two versions should give exactly the same result")
+    eq(a[0, 0, 1, 2], (q[0, 0, 1] * k[0, 0, 2]).sum() / math.sqrt(4),
+       msg="the scale 1/sqrt(head_dim) is missing or wrong")
+--- hints
+- matmul: swap the last two dims of k to get `(B, nh, hs, T)`; then it can be multiplied with q. Scale with `math.sqrt(q.size(-1))`
+- `q @ k.transpose(-2, -1) / math.sqrt(q.size(-1))`
+- einsum: call q's dims `bhqd` and k's dims `bhkd`; the output is `bhqk`. `d` is not in the output, so it is multiplied and summed: `torch.einsum("bhqd,bhkd->bhqk", q, k)`, and divide by sqrt(hs) here too
+
+@@ item d2-10
+type: code
+title: masked_mean: average without the padding
+level: 2
+cards: Variable-length sequences: padding and masks; Broadcasting: line up from the right
+targets: masked_mean
+ref: day2
+--- context
+The sentences in a batch have different lengths, and the short ones are padded. When you average vectors (for example to get a sentence embedding), the pad positions must be left out, and the divisor must count only real tokens. Forget this and nothing fails; the results are just pulled off by the padding.
+--- prompt
+Write `masked_mean(x, mask)`:
+- `x`: `(B, T, C)`, floats
+- `mask`: `(B, T)`, integer 0/1. 1 is a real token, 0 is padding
+- return `(B, C)`: for each sample, the average of the C-dim vectors at the positions where the mask is 1
+
+Example: a sample whose mask is `[1, 1, 0]` gets the average of its first two vectors.
+
+No for loops. You may assume every sample has at least one real token.
+--- starter
+def masked_mean(x, mask):
+    """x: (B, T, C)   mask: (B, T), 0/1, 1 means valid
+    For each sample, average the C-dim vectors at the valid positions -> (B, C). No loops.
+    """
+    raise todo()
+--- solution
+def masked_mean(x, mask):
+    m = mask.unsqueeze(-1).to(x.dtype)          # (B, T, 1)
+    return (x * m).sum(1) / m.sum(1).clamp(min=1e-9)
+--- tests
+@check("average over valid positions only")
+def t10():
+    x = torch.arange(2 * 3 * 2, dtype=torch.float).reshape(2, 3, 2)
+    mask = torch.tensor([[1, 1, 0], [0, 1, 1]])
+    got = masked_mean(x, mask)
+    want = torch.stack([x[0, :2].mean(0), x[1, 1:].mean(0)])
+    eq(got, want, msg="masked positions must not count in the average, and the divisor must change with them")
+--- hints
+- First turn the mask into floats of shape `(B, T, 1)`: `mask.unsqueeze(-1).to(x.dtype)`, so it broadcasts against x
+- Top: `(x * m).sum(1)` sums over T and gives `(B, C)`. Bottom: `m.sum(1)` is `(B, 1)`, the number of valid positions per sample
+- `return (x * m).sum(1) / m.sum(1).clamp(min=1e-9)`. The clamp avoids dividing by 0 when a row is all padding
+
+@@ item d2-11
+type: code
+title: torch.gather: pick the logit of the correct answer
+level: 2
+cards: cross_entropy: log_softmax plus gather
+targets: pick_target_logits
+ref: day2
+--- context
+Computing a loss, or the log probability of every token (for perplexity, or RLHF and DPO training), always means "pick the entry of the correct answer". gather does it in one line, with no loop.
+--- prompt
+Write `pick_target_logits(logits, targets)`:
+- `logits`: `(B, T, V)`
+- `targets`: `(B, T)`, int64
+- return `(B, T)`: `out[b, t] = logits[b, t, targets[b, t]]`
+
+Use `torch.gather`, not a loop.
+--- starter
+def pick_target_logits(logits, targets):
+    """logits: (B, T, V)   targets: (B, T)  ->  (B, T)
+    At every (b, t), pick the logit at index targets[b, t].
+    """
+    raise todo()
+--- solution
+def pick_target_logits(logits, targets):
+    return logits.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+--- tests
+@check("the correct answer's logit at every position")
+def t11():
+    seed(5)
+    logits = torch.randn(2, 3, 6)
+    y = torch.randint(0, 6, (2, 3))
+    got = pick_target_logits(logits, y)
+    shape_is(got, (2, 3))
+    want = torch.stack([torch.stack([logits[b, t, y[b, t]] for t in range(3)]) for b in range(2)])
+    eq(got, want)
+--- hints
+- gather needs the index to have as many dims as the input: `unsqueeze(-1)` the targets to `(B, T, 1)` first
+- `logits.gather(-1, index)` gives `(B, T, 1)`; finish with `squeeze(-1)`
+- `return logits.gather(-1, targets.unsqueeze(-1)).squeeze(-1)`
+
+@@ item d2-12
+type: code
+title: nn.Module: parameters and buffers
+level: 3
+cards: Parameters, buffers and autograd
+targets: Scaler
+ref: day2
+--- context
+When you save weights or move a model to a GPU, only parameters and buffers come along. Keep a statistic as a plain attribute and you get a device error on the GPU; make it a parameter and the optimizer will change it.
+--- prompt
+Write an `nn.Module` subclass `Scaler(dim)`:
+- `weight`: a learnable parameter, shape `(dim,)`, all ones at the start
+- `running_max`: a buffer (not learned, but saved in `state_dict` and moved by `.to()`), shape `(dim,)`, all zeros at the start
+- `forward(x)`: `x` is `(N, dim)`. First update `running_max` to the element-wise larger of itself and "the max of x along dim 0"; this update must stay out of the computation graph. Then return `x * weight`
+
+The check tests: `state_dict()` holds exactly `weight` and `running_max`; `named_parameters()` has only `weight`; the buffer does not require gradients; and running_max has the right value after one forward.
+--- starter
+class Scaler(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        raise todo()
+
+    def forward(self, x):
+        raise todo()
+--- solution
+class Scaler(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.register_buffer("running_max", torch.zeros(dim))
+
+    def forward(self, x):
+        with torch.no_grad():
+            self.running_max.copy_(torch.maximum(self.running_max, x.detach().max(0).values))
+        return x * self.weight
+--- tests
+@check("parameter, buffer and forward")
+def t12():
+    m = Scaler(4)
+    keys = set(m.state_dict().keys())
+    true(keys == {"weight", "running_max"}, f"wrong state_dict keys: {keys} (register running_max with register_buffer)")
+    true([n for n, _ in m.named_parameters()] == ["weight"],
+         "running_max must not be a Parameter (the optimizer must not update it)")
+    x = torch.randn(8, 4)
+    out = m(x)
+    eq(out, x, msg="weight starts as all ones, so forward should return x unchanged")
+    eq(m.running_max, x.max(0).values.clamp(min=0), msg="running_max was not updated correctly")
+    true(not m.running_max.requires_grad, "a buffer should not require gradients")
+--- hints
+- In `__init__`: `self.weight = nn.Parameter(torch.ones(dim))` and `self.register_buffer("running_max", torch.zeros(dim))`
+- The max along the batch dim: `x.max(0).values`; the element-wise larger of two tensors: `torch.maximum(a, b)`
+- In forward: under `with torch.no_grad():` write `self.running_max.copy_(torch.maximum(self.running_max, x.max(0).values))`, then `return x * self.weight`
+
+@@ item d2-13
+type: code
+title: Derive a gradient by hand and compare with autograd
+level: 2
+cards: Parameters, buffers and autograd
+targets: manual_grad_mse
+ref: day2
+--- context
+backward computes derivatives for you, but you need to be able to derive simple gradients by hand to check it: when you write a custom layer, or hunt an exploding gradient. Interviews often ask for the gradient of MSE or softmax.
+--- prompt
+`loss = mean((x - target)²)`, averaged over all elements.
+
+Write `manual_grad_mse(x, target)`: compute `d loss / d x` from the formula and return it, with the same shape as `x`. Do not call `backward` or `torch.autograd`.
+
+The check first gets the true gradient with autograd, then compares your formula with it.
+--- starter
+def manual_grad_mse(x, target):
+    """loss = mean((x - target)^2); return the formula for d loss / d x (no backward)."""
+    raise todo()
+--- solution
+def manual_grad_mse(x, target):
+    return 2 * (x - target) / x.numel()
+--- tests
+@check("matches the gradient from autograd")
+def t13():
+    seed(6)
+    x = torch.randn(3, 4, requires_grad=True)
+    t = torch.randn(3, 4)
+    loss = ((x - t) ** 2).mean()
+    loss.backward()
+    eq(manual_grad_mse(x.detach(), t), x.grad,
+       msg="remember that the mean brings a factor of 1/N")
+--- hints
+- Look at one element first: the derivative of `(x_i - t_i)²` with respect to `x_i` is `2 (x_i - t_i)`
+- The mean divides by the number of elements N, so each derivative is divided by N too. Get N with `x.numel()`
+- `return 2 * (x - target) / x.numel()`
+
+@@ item d2-14
+type: code
+title: collate_fn: pad samples of different lengths into one batch
+level: 1
+cards: Variable-length sequences: padding and masks
+targets: collate
+ref: day2
+--- context
+By default a DataLoader needs every sample to have the same length. Text and audio come in all lengths, so almost every training script has its own collate_fn: it pads a group of samples into one batch and returns a mask with it.
+--- prompt
+Write `collate(samples, pad_id=0)`:
+- `samples`: a list of 1-D LongTensors of different lengths
+- return `(x, mask)`, both int64 tensors of shape `(B, Tmax)`, where `Tmax` is the length of the longest sample
+- `x`: one sample per row, filled up on the right with `pad_id`
+- `mask`: 1 at real tokens, 0 at padded positions
+
+Example: samples `[1, 2, 3]`, `[4]`, `[5, 6]` with `pad_id=99` give:
+```
+x    = [[1, 2, 3], [4, 99, 99], [5, 6, 99]]
+mask = [[1, 1, 1], [1, 0, 0],   [1, 1, 0]]
+```
+A for loop is fine here.
+--- starter
+def collate(samples, pad_id=0):
+    """samples: list of 1D LongTensors of different lengths.
+    Returns (x, mask), both (B, Tmax) int64.
+    """
+    raise todo()
+--- solution
+def collate(samples, pad_id=0):
+    B = len(samples)
+    Tmax = max(s.numel() for s in samples)
+    x = torch.full((B, Tmax), pad_id, dtype=torch.long)
+    mask = torch.zeros(B, Tmax, dtype=torch.long)
+    for i, s in enumerate(samples):
+        x[i, :s.numel()] = s
+        mask[i, :s.numel()] = 1
+    return x, mask
+--- tests
+@check("padded on the right, correct mask, dtype int64")
+def t14():
+    s = [torch.tensor([1, 2, 3]), torch.tensor([4]), torch.tensor([5, 6])]
+    x, mask = collate(s, pad_id=99)
+    shape_is(x, (3, 3))
+    eq(x, torch.tensor([[1, 2, 3], [4, 99, 99], [5, 6, 99]]))
+    eq(mask, torch.tensor([[1, 1, 1], [1, 0, 0], [1, 1, 0]]))
+    true(x.dtype == torch.long, "x must be int64: embedding layers only accept that")
+--- hints
+- `Tmax = max(s.numel() for s in samples)`; `torch.full((B, Tmax), pad_id, dtype=torch.long)` makes a tensor full of padding to start from
+- Start the mask as `torch.zeros(B, Tmax, dtype=torch.long)`, then fill it row by row
+- In the loop, with `n = s.numel()`: `x[i, :n] = s` and `mask[i, :n] = 1`
+
+@@ item d2-15
+type: fix
+title: Find the bugs: 4 mistakes in a training loop
+level: 2
+cards: Parameters, buffers and autograd; cross_entropy: log_softmax plus gather
+targets: train_one_epoch
+ref: day2
+--- context
+A training loop is only a few lines, but each wrong line has its own symptom: an error, a loss that does not go down, memory that keeps growing. Spotting the mistake at a glance is worth a lot, in interviews and at work.
+--- prompt
+This training loop has **4 mistakes**. Fix all of them so that the loss really goes down.
+- `model` is a classifier (the check uses `nn.Linear(5, 3)`), `xs` is `(64, 5)`, `ys` is `(64,)` with int64 class indices
+- return `losses`: the loss of every step, as Python floats
+- the check runs 200 steps and wants the last loss to be more than 10% below the first
+
+Some mistakes raise an error; others raise nothing and just give a wrong result. Run it once and start from the error.
+--- starter
+def train_one_epoch(model, xs, ys, lr=0.1, steps=200):
+    opt = torch.optim.SGD(model.parameters, lr=lr)
+    losses = []
+    for _ in range(steps):
+        logits = model(xs)
+        loss = F.cross_entropy(logits, ys.float())
+        loss.backward()
+        opt.step()
+        losses.append(loss)
+    return losses
+--- solution
+def train_one_epoch(model, xs, ys, lr=0.1, steps=200):
+    opt = torch.optim.SGD(model.parameters(), lr=lr)   # fix 1: parameters is a method, call it
+    losses = []
+    for _ in range(steps):
+        logits = model(xs)
+        loss = F.cross_entropy(logits, ys)             # fix 2: class labels must be int64
+        opt.zero_grad(set_to_none=True)                # fix 3: without this the gradients keep adding up
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())                     # fix 4: storing the tensor keeps its whole graph in memory
+    return losses
+--- tests
+@check("losses are floats and the loss really goes down")
+def t15():
+    seed(7)
+    model = nn.Linear(5, 3)
+    xs, ys = torch.randn(64, 5), torch.randint(0, 3, (64,))
+    losses = train_one_epoch(model, xs, ys)
+    true(isinstance(losses[0], float),
+         "losses holds tensors, which keeps the whole computation graph in memory: store .item()")
+    true(losses[-1] < losses[0] * 0.9,
+         f"the loss did not go down: {losses[0]:.4f} -> {losses[-1]:.4f}. Is a step missing?")
+--- hints
+- The first error is `'method' object is not iterable`: what is missing after `model.parameters`? And what dtype should the labels of cross_entropy have?
+- `.grad` adds up by default: what must happen before every backward?
+- The list should get `loss.item()`, not `loss` itself
+
+@@ item d2-16
+type: predict
+title: A broadcasting bug with no error
+level: 1
+cards: Broadcasting: line up from the right
+--- context
+The classic silent bug in regression: the model outputs (B, 1), the labels are (B,). Nothing fails and the loss still comes out, but it is not measuring what you think.
+--- prompt
+Without running it, write the 3 lines this code prints. Note that the predictions and the labels are actually identical.
+--- code
+pred = torch.tensor([[0.0], [2.0]])    # model output (2, 1)
+y = torch.tensor([0.0, 2.0])           # labels (2,)
+diff = pred - y
+print(tuple(diff.shape))
+print(diff.pow(2).mean().item())
+print((pred.squeeze(-1) - y).pow(2).mean().item())
+--- explain
+`(2, 1) - (2,)`: `(2,)` is treated as `(1, 2)`, both sides are stretched to `(2, 2)`, and every prediction is compared with every label: `[[0-0, 0-2], [2-0, 2-2]] = [[0, -2], [2, 0]]`. Square and average: `(0 + 4 + 4 + 0) / 4 = 2.0`. The model is perfect, yet the loss is 2.0.
+
+After `squeeze(-1)` the predictions are `(2,)`, each one is compared with its own label, and the loss is 0.0. `F.mse_loss` warns you about mismatched shapes like this; with a loss you write yourself, checking shapes is up to you.
+--- hints
+- First find the shape of `pred - y`: line up `(2, 1)` and `(2,)` on the right
+- The result is 2×2: row i, column j is `pred[i] - y[j]`
+
+@@ item d2-17
+type: predict
+title: dim and keepdim
+level: 1
+cards: Shapes and dims: read the tensor first; Broadcasting: line up from the right
+--- context
+dim=0 or dim=1, keepdim or not: you choose this every day when writing softmax, LayerNorm or a loss. A wrong choice often raises no error; it just sums in the wrong direction.
+--- prompt
+Without running it, write the 5 lines this code prints. `.tolist()` turns a tensor into a Python list; floats are written like `3.0`.
+--- code
+x = torch.arange(6.0).reshape(2, 3)
+print(x.tolist())
+print(x.sum(dim=0).tolist())
+print(x.sum(dim=1).tolist())
+print(tuple(x.sum(dim=1, keepdim=True).shape))
+print((x - x.mean(dim=1, keepdim=True)).tolist())
+--- explain
+x has 2 rows and 3 columns: `[[0, 1, 2], [3, 4, 5]]`.
+
+`sum(dim=0)` makes dim 0 (the rows) disappear: the two rows are added, one number per column: `[0+3, 1+4, 2+5] = [3, 5, 7]`. `sum(dim=1)` makes dim 1 (the columns) disappear: one number per row: `[0+1+2, 3+4+5] = [3, 12]`. The way to remember it: `dim=k` means "dim k disappears".
+
+`keepdim=True` keeps that dim with length 1, so the shape is `(2, 1)`. That still broadcasts against `(2, 3)`: each row minus its own mean (1.0 for the first row, 4.0 for the second), and both rows become `[-1, 0, 1]`.
+--- hints
+- `dim=k` means "sum along dim k; dim k disappears". x has 2 rows and 3 columns
+- `dim=0` adds the two rows and leaves 3 numbers; `dim=1` adds the 3 numbers of each row and leaves 2 numbers
+
+@@ item d2-18
+type: choice
+title: Four ways to merge heads
+level: 2
+cards: Splitting and merging heads: view, transpose, contiguous
+--- context
+This line ends every multi-head attention. Get it wrong and one of two things happens: an error, or worse, no error and scrambled numbers.
+--- prompt
+`y` is a fresh attention output with shape `(B, nh, T, hs)`, stored contiguously. You want `(B, T, nh*hs)`, with the vectors of all heads at each time step placed end to end.
+
+Which of these **raise no error and give the right result**? (Choose all that apply.)
+--- options
+- `y.transpose(1, 2).view(B, T, nh * hs)`
+- `y.transpose(1, 2).contiguous().view(B, T, nh * hs)`
+- `y.transpose(1, 2).reshape(B, T, nh * hs)`
+- `y.view(B, T, nh * hs)`
+answer: 2,3
+--- explain
+Option 1 raises an error: after the transpose the memory is not contiguous, and `view` needs contiguous memory, so you get `view size is not compatible with input tensor's size and stride`.
+
+Option 2 first copies into contiguous memory, then views: correct. Option 3's `reshape` copies when it has to, so it gives the same result as option 2.
+
+Option 4 raises no error (the number of elements matches), but it skips the transpose. It cuts in memory order, so one output vector gets several time steps of the same head. The numbers are scrambled, and that is the most dangerous kind of bug, because nothing tells you.
+--- hints
+- transpose copies nothing, it only changes the reading order; `view` needs contiguous memory
+- Option 4's shape looks right. Think about which numbers time step 0 would get
+
+@@ item d2-19
+type: choice
+title: The first loss is 10.8. Is that normal?
+level: 1
+cards: cross_entropy: log_softmax plus gather
+--- context
+The loss at the first training step is the first diagnostic signal you get. If you know what it should be, you can spot a broken initialisation or a broken loss at a glance.
+--- prompt
+You train a freshly initialised small language model with GPT-2's vocabulary (V = 50257). The loss printed at the first step is 10.8. What does that tell you?
+--- options
+- Something is wrong: a normal loss starts below 1
+- It is normal: the model guesses roughly uniformly over 50257 tokens, and ln(50257) ≈ 10.8
+- The learning rate is too high and training diverged in the first step
+- The labels are not aligned with the inputs
+answer: 2
+--- explain
+Right after initialisation the logits are all close to 0, so after softmax every token has probability about `1/V`. The cross-entropy is `-log(1/V) = ln V = ln 50257 ≈ 10.82`. So 10.8 is exactly the normal starting point of a model that has learned nothing yet.
+
+The first loss is computed before any update, so the learning rate has not done anything yet; and whether the labels are aligned does not change the loss of a model that guesses uniformly. On the other hand, a first loss far above ln V (say 50) means the initialisation made the logits too large: the model is confidently wrong. Day 15 shows how to read a whole loss curve.
+--- hints
+- With a uniform guess over V classes, what probability does the correct answer get?
+- cross_entropy = -log(probability of the correct answer); ln(50000) is about 10.8
+
+@@ item d2-20
+type: code
+title: From scratch: split_heads
+level: 2
+exam: yes
+cards: Splitting and merging heads: view, transpose, contiguous
+targets: split_heads
+ref: day2
+--- context
+Splitting heads is a few lines found in every Transformer, and it is the first step when you write attention by hand in an interview. You only really know it once you can write it without looking anything up.
+--- prompt
+Without notes, write `split_heads(qkv, n_head)`:
+- input `qkv`: `(B, T, 3*C)`; along the last dim come q, then k, then v, C columns each
+- return `q, k, v`, each `(B, n_head, T, C // n_head)`
+- each head gets one contiguous slice of the C dims
+--- starter
+def split_heads(qkv, n_head):
+    raise todo()
+--- solution
+def split_heads(qkv, n_head):
+    B, T, C3 = qkv.shape
+    C = C3 // 3
+    hs = C // n_head
+    q, k, v = qkv.split(C, dim=-1)
+    out = [t.view(B, T, n_head, hs).transpose(1, 2) for t in (q, k, v)]
+    return out[0], out[1], out[2]
+--- tests
+@check("shapes and contents of q, k, v")
+def t02():
+    B, T, C, nh = 2, 5, 12, 3
+    qkv = torch.randn(B, T, 3 * C)
+    q, k, v = split_heads(qkv, nh)
+    for name, t in [("q", q), ("k", k), ("v", v)]:
+        shape_is(t, (B, nh, T, C // nh), f"{name} has the wrong shape")
+    # the contents must be right too: q comes from the first C columns, k from the middle C, v from the last C
+    for i, (name, t) in enumerate([("q", q), ("k", k), ("v", v)]):
+        want = qkv[..., i * C:(i + 1) * C].view(B, T, nh, C // nh).transpose(1, 2)
+        eq(t, want, msg=f"{name} has the wrong contents: check the split order (q, k, v), and view first, then transpose")
+--- hints
+- `qkv.split(C, dim=-1)` gives three parts; each one gets `view(B, T, n_head, hs)`, then `transpose(1, 2)`
+- view first, then transpose; the order matters
+
+@@ item d2-21
+type: code
+title: From scratch: cross_entropy
+level: 3
+exam: yes
+cards: cross_entropy: log_softmax plus gather
+targets: my_cross_entropy
+ref: day2
+--- context
+Cross-entropy is the loss behind almost every classifier and language model. If you can write it from memory, numerically stable, any interview question about losses stands on solid ground.
+--- prompt
+Without notes, write `my_cross_entropy(logits, target)`, giving the same result as `F.cross_entropy`:
+- `logits`: `(N, V)`; `target`: `(N,)`, int64
+- return a scalar: the average over samples of `-log p(correct class)`
+- do not use `F.cross_entropy` or `F.nll_loss`; keep it numerically stable (no inf, even for widely spread logits)
+--- starter
+def my_cross_entropy(logits, target):
+    raise todo()
+--- solution
+def my_cross_entropy(logits, target):
+    logp = logits - logits.logsumexp(dim=-1, keepdim=True)
+    picked = logp.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    return -picked.mean()
+--- tests
+@check("matches F.cross_entropy; ln V for a uniform guess; no overflow")
+def t06():
+    seed(1)
+    logits = torch.randn(6, 10)
+    y = torch.randint(0, 10, (6,))
+    want = F.cross_entropy(logits, y)
+    flat = torch.zeros(4, 10)
+    with _banned(_CE_FUNCS, "write it yourself here: F.cross_entropy / F.nll_loss are not allowed"):
+        got = my_cross_entropy(logits, y)
+        got_flat = my_cross_entropy(flat, torch.zeros(4, dtype=torch.long))
+        got_big = my_cross_entropy(torch.tensor([[0.0, 200.0]]), torch.tensor([0]))
+    eq(got, want)
+    # with a uniform guess the loss must be ln(V)
+    eq(got_flat, torch.tensor(math.log(10)),
+       msg="with all logits equal the loss must be exactly ln(V); remember this number")
+    # large gaps between logits must work too: the correct class has probability about exp(-200), so the loss is 200
+    true(torch.isfinite(got_big).all(), "the loss became inf for widely spread logits: softmax followed by log gives log(0); use logsumexp")
+    eq(got_big, torch.tensor(200.0), msg="wrong result for widely spread logits")
+--- hints
+- `logp = logits - logits.logsumexp(dim=-1, keepdim=True)`
+- `logp.gather(-1, target.unsqueeze(-1)).squeeze(-1)` picks the correct classes; then negate and take the mean

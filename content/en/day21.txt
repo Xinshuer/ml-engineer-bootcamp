@@ -1,0 +1,1256 @@
+@@ day 21
+title: Deployment 1: export and compress
+part: Deployment
+hours: 3–4 hours
+--- goal
+After today you can export a trained PyTorch model to an ONNX file that accepts any batch size, prove with onnxruntime that the export is correct, spot and fix the most common export failure (a Python if on a tensor's value), and shrink a model about 4× with dynamic int8 quantization while measuring what it costs in accuracy and speed.
+--- checklist
+- Empty your Review list first (redo from blank anything where you saw the answer yesterday)
+- Read all 8 cards; press Run on each code example, change one number and run it again
+- Pass every practice exercise (d21-01 to d21-12)
+- Finish with the closed-book part: write the dynamic-batch export and verify_export without the cards
+
+@@ concept
+title: The inference checklist
+ref: day21
+--- body
+The same model runs differently in training and in production. Before you serve a model (run inference), go through this checklist:
+
+1. **`model.eval()`** switches to inference mode. Dropout stops dropping values at random. BatchNorm uses the statistics it collected during training (`running_mean` / `running_var`) and stops updating them. Forget this, and the same input gives a different prediction every time.
+2. **`with torch.inference_mode():`** tells PyTorch not to record a computation graph (the graph is only needed for backward, to compute gradients). It saves memory and is faster. The output has `requires_grad == False`.
+3. **The same preprocessing as in training**: the same normalisation statistics, the same tokenizer version (day 18 covers this in detail).
+
+Today's exercises all use this small model `Net`. It is already defined in the hidden setup code:
+
+```
+class Net(nn.Module):              # 8 features -> 3 classes
+    def __init__(self, hidden=16, p_drop=0.5):
+        super().__init__()
+        self.fc1 = nn.Linear(8, hidden)
+        self.bn = nn.BatchNorm1d(hidden)
+        self.drop = nn.Dropout(p_drop)
+        self.fc2 = nn.Linear(hidden, 3)
+
+    def forward(self, x):
+        return self.fc2(self.drop(F.relu(self.bn(self.fc1(x)))))
+```
+
+`trained_net()` returns a "trained" Net: its BatchNorm statistics are already filled in, and it is still in train mode, just like a model that has just finished training.
+
+In the code below, `num_batches_tracked` counts how many times BatchNorm was updated in train mode.
+--- code
+torch.manual_seed(0)
+net = trained_net()               # train mode
+x = torch.randn(3, 8)
+
+print("train mode, same result twice:", torch.equal(net(x), net(x)))
+print("BatchNorm updates so far:", net.bn.num_batches_tracked.item())
+
+net.eval()
+with torch.inference_mode():
+    a, b = net(x), net(x)
+print("eval mode, same result twice:", torch.equal(a, b))
+print("BatchNorm updates so far:", net.bn.num_batches_tracked.item())
+print("output requires grad:", a.requires_grad)
+
+@@ concept
+title: Export: turning a Python model into a fixed graph
+ref: day21
+--- body
+PyTorch is convenient for training, but the production machine may not have Python or PyTorch at all: it may be a C++ service, a phone, or a dedicated inference engine (onnxruntime, TensorRT). So you first "export" the model into a computation graph: a fixed list of operations, where every step and every shape is written down.
+
+`torch.export.export(model, (x,))` works like this:
+
+1. It runs `forward` once, with the example input `x` you give it.
+2. While it runs, it records every tensor operation (linear, relu, ...). What it records is the graph.
+3. Plain Python does not go into the graph: a `print` runs only once, during the export; a `for` loop is unrolled (3 iterations give 3 copies of the operations); an `if self.use_relu:` that looks at a Python variable is decided during the export.
+
+Two consequences to remember:
+
+- Shapes in the graph are **fixed** by default: export with a `(2, 4)` example, and the graph only accepts `(2, 4)`. The card "A dynamic batch dimension" shows how to make the batch size variable.
+- The graph records whatever the model does in its current mode. Export with `torch.export` in train mode, and the Dropout in the graph is switched on (the last two lines of the code below). So always call `model.eval()` before exporting. `torch.onnx.export` also warns you when the model is in train mode: `Exporting a model while it is in training mode`.
+
+The first call to `torch.export` takes 1–2 seconds (it is loading things); later calls are fast.
+--- code
+class Tiny(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(4, 4)
+
+    def forward(self, x):
+        print("forward is running, x has shape", tuple(x.shape))
+        for _ in range(3):                    # a Python loop: unrolled into 3 copies
+            x = torch.relu(self.fc(x))
+        return x
+
+ep = torch.export.export(Tiny(), (torch.randn(2, 4),))
+print("operations in the graph:", [n.target.__name__ for n in ep.graph.nodes if n.op == "call_function"])
+
+net = Net()
+for mode in ("train", "eval"):
+    getattr(net, mode)()                      # the same as net.train() or net.eval()
+    ep = torch.export.export(net, (torch.randn(2, 8),))
+    drop = [n.args[2] for n in ep.graph.nodes if n.op == "call_function" and "dropout" in n.target.__name__]
+    print("exported in", mode, "mode, dropout switched on in the graph:", drop)
+
+@@ concept
+title: Export to ONNX, then check it with onnxruntime
+ref: day21
+--- body
+ONNX is a common file format for models: one `.onnx` file holds the computation graph and the weights. onnxruntime is an inference engine made to run ONNX files. It does not need PyTorch and runs on CPUs and GPUs.
+
+To export (`dynamo=True` selects the new exporter: it captures the graph with `torch.export`, then translates it to ONNX):
+
+```
+model.eval()
+prog = torch.onnx.export(model, (example,), dynamo=True, verbose=False)
+prog.save(path)                    # write the .onnx file
+```
+
+- The second argument is a **tuple**: `(example,)`. Do not forget the comma.
+- `verbose=False` turns off the progress messages.
+- The returned `prog` is an `ONNXProgram`; `.save(path)` writes it to a file. Today every file goes into a temporary folder made by `tempfile.TemporaryDirectory()`, which is deleted automatically afterwards.
+- One export takes 1–3 seconds.
+
+To run it with onnxruntime:
+
+```
+sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+name = sess.get_inputs()[0].name              # read the input's name from the file
+out = sess.run(None, {name: x.numpy()})[0]    # None = all outputs; it returns a list
+```
+
+onnxruntime takes numpy arrays and returns numpy arrays.
+
+**Always compare after exporting**: run the same input through PyTorch and through onnxruntime, and look at the largest difference, `np.abs(a - b).max()`. The two will not be exactly equal. Different libraries add numbers in a different order, and with floating-point numbers `(a + b) + c` and `a + (b + c)` can differ in the last digit. In fp32, differences of 1e-7 to 1e-5 are normal, and 1e-4 is a common tolerance. A difference of 1e-2 or more is a real bug: wrong weights in the export, PyTorch not in `eval()` mode, different preprocessing, ...
+--- code
+import os, tempfile
+import numpy as np
+import onnxruntime as ort
+
+torch.manual_seed(0)
+net = trained_net().eval()
+x = torch.randn(2, 8)
+prog = torch.onnx.export(net, (x,), dynamo=True, verbose=False)
+
+with tempfile.TemporaryDirectory() as folder:
+    path = os.path.join(folder, "net.onnx")
+    prog.save(path)
+    print("file size:", os.path.getsize(path), "bytes")
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    inp = sess.get_inputs()[0]
+    print("input:", inp.name, inp.shape)
+    got = sess.run(None, {inp.name: x.numpy()})[0]
+    del sess                                  # close the session first, so the folder can be deleted
+
+with torch.inference_mode():
+    want = net(x).numpy()
+print("onnxruntime, row 1:", got.round(4)[0])
+print("PyTorch,     row 1:", want.round(4)[0])
+print("largest difference:", np.abs(got - want).max())
+
+@@ concept
+title: A dynamic batch dimension: say which dimension can change
+ref: day21
+--- body
+The previous card exported with a `(2, 8)` example, so the input shape in the file is `[2, 8]`: it only accepts batch = 2. Feed it 5 samples and onnxruntime fails:
+
+```
+INVALID_ARGUMENT : Got invalid dimensions for input: x for the following indices
+ index: 0 Got: 5 Expected: 2
+```
+
+In production, every request has a different number of samples. So when you export, say that dimension 0 (the batch) can change:
+
+```
+prog = torch.onnx.export(
+    model, (example,), dynamo=True, verbose=False,
+    input_names=["x"], output_names=["logits"],     # names of the input and output in the file
+    dynamic_shapes={"x": {0: "batch"}},             # dimension 0 of argument x can change; call it batch
+)
+```
+
+- The keys of `dynamic_shapes` are **the names of forward's arguments**. `Net.forward(self, x)` has an argument called `x`; `nn.Sequential`'s argument is called `input`, and a wrong name raises `its top-level keys must be the arg names`. You can also skip the names and give a tuple, by position: `dynamic_shapes=({0: "batch"},)`.
+- `input_names` / `output_names` are the names stored in the file. Without them, the input is named after the argument and the output gets an automatic name (such as `linear_1`), which is awkward for whoever calls the model.
+- After the export, the input shape is `['batch', 8]`: a string means "this dimension can change".
+- After exporting, compare with PyTorch at a few different batch sizes (1, medium, large).
+--- code
+import os, tempfile
+import numpy as np
+import onnxruntime as ort
+
+torch.manual_seed(0)
+net = trained_net().eval()
+prog = torch.onnx.export(net, (torch.randn(2, 8),), dynamo=True, verbose=False,
+                         input_names=["x"], output_names=["logits"],
+                         dynamic_shapes={"x": {0: "batch"}})
+
+with tempfile.TemporaryDirectory() as folder:
+    path = os.path.join(folder, "net.onnx")
+    prog.save(path)
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    print("input:", sess.get_inputs()[0].name, sess.get_inputs()[0].shape)
+    print("output:", sess.get_outputs()[0].name, sess.get_outputs()[0].shape)
+    for b in (1, 7, 64):
+        x = torch.randn(b, 8)
+        got = sess.run(None, {"x": x.numpy()})[0]
+        with torch.inference_mode():
+            diff = np.abs(got - net(x).numpy()).max()
+        print(f"batch = {b}: output shape {got.shape}, largest difference {diff:.1e}")
+    del sess
+
+@@ concept
+title: Export failure no. 1: a Python if on a tensor's value
+ref: day21
+--- body
+During an export, forward runs once and the graph records only tensor operations. A Python `if` has to pick a branch right there:
+
+- `if x.shape[1] != 8:` or `if self.use_relu:` is fine: the answer (a shape, a Python variable) is known during the export. Whichever branch runs is the one that gets recorded.
+- `if x.mean() > 0:` depends on the **values in the input**. Today's input takes one branch; tomorrow's may take the other. A fixed graph cannot hold a Python branch like this, so the export fails:
+
+```
+GuardOnDataDependentSymNode: Could not guard on data-dependent expression Eq(u0, 1)
+```
+
+"Data-dependent" means "depends on the values of the data". With `torch.onnx.export(dynamo=True)`, this error is wrapped in `TorchExportError: Failed to export the model with torch.export. This is step 1/3 ...`, and the real reason is further down, under `Exception summary`.
+
+A row-by-row `for row in x:` loop with an `if row.sum() > 0:` inside has the same problem.
+
+**The fix: compute both branches, then pick with `torch.where`.** `torch.where(cond, a, b)` takes a where cond is True and b everywhere else. It is an ordinary tensor operation, so it goes into the graph. cond can be smaller than a and b; it is broadcast:
+
+- one condition for the whole input: `torch.where(x.mean() > 0, x * 2, -x)`
+- one condition per row: `n = x.norm(dim=1, keepdim=True)` has shape `(B, 1)`; `torch.where(n > 1, x / n, x)` picks separately for each row.
+
+Some branches already have an operation for them: `x.clamp(max=10)`, `torch.maximum(x, y)`, `F.relu(x)`.
+
+The code below uses a small helper from the setup code, `export_error(model, x)`: it calls `torch.export.export` quietly and returns None if the export works, or the one-line reason if it fails.
+--- code
+class Bad(nn.Module):
+    def forward(self, x):
+        if x.mean() > 0:                      # needs the values in x to pick a branch
+            return x * 2
+        return -x
+
+class Good(nn.Module):
+    def forward(self, x):
+        return torch.where(x.mean() > 0, x * 2, -x)   # compute both, pick by the condition
+
+x = torch.randn(3, 4)
+print("Bad :", export_error(Bad(), x))
+print("Good:", export_error(Good(), x))       # None = the export works
+for inp in (x.abs(), -x.abs()):               # try each branch once
+    print("same result:", torch.equal(Bad()(inp), Good()(inp)))
+
+@@ concept
+title: int8 quantization: one byte per weight
+--- body
+An fp32 weight takes 4 bytes. Quantization means storing numbers with fewer bytes. int8 numbers are whole numbers from -128 to 127 and take 1 byte each.
+
+How to turn decimals into integers (symmetric quantization):
+
+```
+scale = max(|w|) / 127                   # the largest |w| maps to 127
+q = round(w / scale), kept in [-127, 127] # stored as int8
+w ≈ q * scale                            # multiply back when you use it (dequantize)
+```
+
+- You store `q` (1 byte per number) and `scale` (one decimal number). The weights get about 4× smaller.
+- Rounding adds an error: each number is off by at most `scale / 2`.
+- Weights smaller than `scale / 2` become exactly 0.
+- With one scale for the whole matrix (per-tensor), one very large number makes the scale large, so the small numbers only get a few integers and a bigger error (see row 2 in the code below). That is why, in practice, each row (each output channel) often gets its own scale (per-channel).
+
+The "dynamic" in "dynamic quantization" is about the activations (the inputs of each layer): the weights are quantized ahead of time and stored as int8; the activations are quantized on the fly, at every inference, from the range of the current batch. So it needs no extra calibration data and takes one line of code. PyTorch's dynamic quantization runs only on the CPU and mainly replaces `nn.Linear` (next card).
+--- code
+w = torch.tensor([[0.50, -0.20, 0.01],
+                  [0.02, 0.03, -0.04]])
+scale = w.abs().max() / 127                  # one scale for the whole matrix
+q = torch.round(w / scale).clamp(-127, 127).to(torch.int8)
+w_back = q.float() * scale                   # dequantize
+
+print("scale:", round(scale.item(), 5))
+print("q:", q.tolist(), q.dtype)
+print("every error <= scale / 2:", bool(((w - w_back).abs() <= scale / 2 + 1e-7).all()))
+print("row 2 before:", [round(v, 4) for v in w[1].tolist()])
+print("row 2 after: ", [round(v, 4) for v in w_back[1].tolist()])
+
+@@ concept
+title: Dynamic quantization: size, accuracy, speed
+ref: day21
+--- body
+One line of PyTorch replaces every `nn.Linear` in a model with an int8 version:
+
+```
+q = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+```
+
+- It returns a **new model** and leaves the original alone (it makes a copy first).
+- `{nn.Linear}`: only layers of these types are replaced.
+- The new layers print as `DynamicQuantizedLinear`.
+
+Quantization is not free. Before you ship, check all three costs:
+
+1. **Size**: measure "how big is it when saved". Save the `state_dict` with `torch.save` into an in-memory `io.BytesIO()` and count the bytes. **Do not count `parameters()`**: the quantized weights are packed in a special format and are no longer `nn.Parameter`s, so `parameters()` is empty.
+2. **Accuracy**: run the same batch through both models and compare the outputs. The largest difference is one hint; more useful is "the share of predictions (argmax) that stay the same". In a real project, recompute your metric (accuracy, ...) on the validation set.
+3. **Speed**: depends on the CPU model, the compute backend and the batch size. On some machines it is a lot faster; on others it is even slower. Always measure on the machine you will serve on (warm up first, time many runs, take the median; see day 19).
+
+For large language models on GPUs, other quantization methods are common (weight-only int8 / int4, for example bitsandbytes, GPTQ, AWQ). The idea is the same: store the weights in fewer bytes and pay with a little accuracy.
+
+`make_mlp()` below comes from the setup code: `Linear(256, 512) -> ReLU -> Linear(512, 10)`.
+--- code
+import io, time
+
+torch.manual_seed(0)
+model = make_mlp().eval()
+q = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+print(q[0])
+
+def size_bytes(m):
+    buf = io.BytesIO()
+    torch.save(m.state_dict(), buf)
+    return buf.getbuffer().nbytes
+
+print("numbers in parameters():", sum(p.numel() for p in model.parameters()), "->", sum(p.numel() for p in q.parameters()))
+print("bytes when saved:", size_bytes(model), "->", size_bytes(q))
+
+x = torch.randn(256, 256)
+with torch.inference_mode():
+    a, b = model(x), q(x)
+print("largest difference:", round((a - b).abs().max().item(), 4))
+print("share of equal argmax:", (a.argmax(1) == b.argmax(1)).float().mean().item())
+
+def median_ms(m, n=30):
+    ts = []
+    with torch.inference_mode():
+        for i in range(n + 5):
+            t0 = time.perf_counter()
+            m(x)
+            if i >= 5:                        # the first 5 runs are warm-up and do not count
+                ts.append(time.perf_counter() - t0)
+    return sorted(ts)[n // 2] * 1000
+
+print(f"fp32 {median_ms(model):.2f} ms, int8 {median_ms(q):.2f} ms (different on every machine)")
+
+@@ concept
+title: fp16 and bf16 inference
+ref: day21
+--- body
+Another way to compress: store each number in 2 bytes (half precision) instead of 4. It halves memory and bandwidth, and on GPUs that support it, it is much faster (it uses the Tensor Cores). There are two half-precision types:
+
+- **fp16**: the largest number it can hold is 65504. Anything larger becomes `inf`, and a few operations later, `nan`. In exchange, it keeps a few more significant digits (a bit over 3).
+- **bf16**: the same range as fp32 (largest about 3.4e38), so it rarely overflows. The price: only 2–3 significant digits. 70000 becomes 70144, and 1.001 becomes 1.0.
+
+Which one: on recent NVIDIA GPUs (A100, RTX 30 series and later), prefer bf16; almost all large language models use it. With fp16, watch out for overflow: attention scores and large activations can exceed 65504.
+
+How: `model.to(torch.bfloat16)`, and **convert the inputs too**: `x.to(torch.bfloat16)`. Convert only the model and you get `mat1 and mat2 must have the same dtype`. You can also use `torch.autocast` and let PyTorch choose which operations run in half precision.
+
+When you compare with fp32, use a looser tolerance: bf16 differences are often 1e-3 to 1e-2. Day 18 covers precision and tolerances in detail.
+--- code
+for dt in (torch.float32, torch.float16, torch.bfloat16):
+    fi = torch.finfo(dt)
+    print(f"{str(dt):15} {torch.tensor([], dtype=dt).element_size()} bytes per number, largest {fi.max:.3g}, precision eps {fi.eps:.3g}")
+
+big = torch.tensor([70000.0, 1.001])
+print("fp16:", big.half().tolist())
+print("bf16:", big.bfloat16().tolist())
+
+torch.manual_seed(0)
+net = trained_net().eval()
+x = torch.randn(4, 8)
+with torch.inference_mode():
+    want = net(x)
+    out = net.to(torch.bfloat16)(x.to(torch.bfloat16))
+print(f"bf16 output: {out.dtype}, largest difference from fp32: {(out.float() - want).abs().max().item():.4f}")
+
+@@ item d21-01
+type: code
+title: A predict function for production
+level: 1
+cards: The inference checklist
+targets: predict
+ref: day21
+--- context
+One of the most common production incidents: the model was never switched to eval mode, so the same request gets two different answers, and live traffic quietly overwrites the BatchNorm statistics. Every inference entry point should go through this checklist.
+--- prompt
+Write `predict(model, x)`: one prediction in production.
+
+- First `model.eval()`: Dropout off, BatchNorm uses its stored statistics
+- Run `model(x)` inside `with torch.inference_mode():`, so no computation graph is built
+- Return the model's output (shape `(B, 3)`)
+
+The tests pass in a `trained_net()`, which is in train mode.
+--- starter
+def predict(model, x):
+    """One prediction in production. The model passed in may still be in train mode."""
+    # 1) switch to inference mode
+    # 2) run the model without building a graph; return the output
+    raise todo()
+--- solution
+def predict(model, x):
+    model.eval()
+    with torch.inference_mode():
+        return model(x)
+--- tests
+@check("same input, same result twice")
+def _():
+    net = trained_net()
+    x = torch.randn(4, FEATURES)
+    a = predict(net, x)
+    b = predict(net, x)
+    shape_is(a, (4, CLASSES), "the output should be (batch, 3)")
+    eq(a, b, tol=0, msg="two predictions differ: Dropout is still on. Call model.eval() first")
+
+@check("BatchNorm statistics unchanged")
+def _():
+    net = trained_net()
+    before = net.bn.running_mean.clone()
+    predict(net, torch.randn(4, FEATURES) + 5)
+    eq(net.bn.running_mean, before, tol=0,
+       msg="one prediction changed BatchNorm's running_mean: the model is still in train mode, and every forward updates the statistics with live data")
+
+@check("no computation graph on the output")
+def _():
+    net = trained_net()
+    out = predict(net, torch.randn(2, FEATURES))
+    true(not out.requires_grad,
+         "the output has requires_grad == True: PyTorch built a graph for it, which wastes memory. Put model(x) inside with torch.inference_mode():")
+--- hints
+- Two steps: `model.eval()`, then `with torch.inference_mode():`.
+- Inside the `with`, just `return model(x)`.
+
+@@ item d21-02
+type: code
+title: Export to an ONNX file
+level: 2
+cards: Export: turning a Python model into a fixed graph; Export to ONNX, then check it with onnxruntime
+targets: export_onnx
+ref: day21
+timeout: 120
+--- context
+When you hand a model to another team or another inference engine, ONNX is the most common format. An export is only a few lines, but each one matters: eval() first, the example input as a tuple, the file at the given path.
+--- prompt
+Write `export_onnx(model, example, path)`:
+
+- First `model.eval()`
+- Export with `torch.onnx.export(model, (example,), dynamo=True, verbose=False)` (the second argument is a tuple)
+- Write the file with `.save(path)` on the returned object
+- Return `path`
+
+The tests pass in a `trained_net()` in train mode, a `(2, 8)` example input, and a path inside a temporary folder. An export takes 1–3 seconds.
+--- starter
+def export_onnx(model, example, path):
+    """Export model to one .onnx file at path; return path."""
+    # 1) switch to inference mode
+    # 2) torch.onnx.export(..., dynamo=True, verbose=False)
+    # 3) save to path, return path
+    raise todo()
+--- solution
+def export_onnx(model, example, path):
+    model.eval()
+    prog = torch.onnx.export(model, (example,), dynamo=True, verbose=False)
+    prog.save(path)
+    return path
+--- tests
+import os, tempfile
+
+_got = {}
+
+def _export():
+    """Export once and record what the checks need (the temporary folder is deleted right away)."""
+    if not _got:
+        net = trained_net()
+        example = torch.randn(2, FEATURES)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+            path = os.path.join(folder, "net.onnx")
+            ret = export_onnx(net, example, path)
+            facts = {"net": net, "example": example, "ret": ret, "path": path, "exists": os.path.isfile(path)}
+            if facts["exists"]:
+                facts["out"] = run_onnx(path, example)
+        _got.update(facts)
+    return _got
+
+@check("the file was written and path is returned")
+def _():
+    f = _export()
+    true(f["exists"], "there is no file at path: did you call prog.save(path)?")
+    true(str(f["ret"]) == f["path"], f"return path; you returned {f['ret']!r}")
+
+@check("switched to eval mode before exporting")
+def _():
+    f = _export()
+    true(not f["net"].training, "the model is still in train mode after the export: call model.eval() before exporting (torch.onnx.export warns about it too)")
+
+@check("onnxruntime gives the same output as PyTorch")
+def _():
+    f = _export()
+    true(f["exists"], "no file, nothing to compare")
+    net = f["net"].eval()
+    with torch.inference_mode():
+        want = net(f["example"])
+    eq(torch.from_numpy(f["out"]), want, tol=1e-4, msg="the ONNX output does not match PyTorch")
+--- hints
+- The second argument must be a tuple: `(example,)`, with the comma.
+- `prog = torch.onnx.export(model, (example,), dynamo=True, verbose=False)`, then `prog.save(path)`, then `return path`.
+
+@@ item d21-03
+type: choice
+title: How big a difference is normal?
+level: 1
+cards: Export to ONNX, then check it with onnxruntime
+--- context
+Comparing two implementations on the same input is the most important habit in deployment. But first you need to know what difference is normal: a tolerance that is too strict raises false alarms every day; one that is too loose lets real bugs through.
+--- prompt
+You export an fp32 model to ONNX. On the same input, the largest difference between the onnxruntime and PyTorch outputs is `3e-7`. What does that tell you?
+--- options
+- The export has a bug: the two should be exactly equal, the difference must be 0
+- It is normal: the two libraries add numbers in a different order; in fp32 a difference this small is common, so compare with a tolerance around 1e-4
+- onnxruntime is secretly computing in fp16
+- PyTorch was not switched to model.eval()
+answer: 2
+--- explain
+Floating-point addition is not associative: `(a + b) + c` and `a + (b + c)` can differ in the last digit. PyTorch and onnxruntime use different kernels: they add in a different order, and they may fuse several steps into one. So the results differ a tiny bit. fp32 has about 7 significant digits, so differences from 1e-7 to 1e-5 are normal.
+
+Real bugs give much larger differences: forgetting `eval()` lets Dropout drop half of the values, and the difference often reaches 0.1 or even 1; wrong weights do the same. Even if onnxruntime really computed in fp16, the difference would usually be 1e-4 to 1e-3, far above 3e-7.
+--- hints
+- About how many significant digits does fp32 keep?
+- Would a forgotten eval() (Dropout dropping half the values) give a difference as small as 3e-7?
+
+@@ item d21-04
+type: code
+title: Export with a variable batch size
+level: 2
+cards: A dynamic batch dimension: say which dimension can change; Export to ONNX, then check it with onnxruntime
+targets: export_onnx_dynamic
+ref: day21
+timeout: 120
+--- context
+In production, every request has a different number of samples. If the export does not say the batch dimension can change, the file only accepts the example's size, and the first request with another batch size fails. This is the trap beginners fall into most often when exporting.
+--- prompt
+The `export_onnx_dynamic` below already exports, but the batch dimension is fixed to the example's size (2). Fix it:
+
+- Input name `"x"`, output name `"logits"` (already there)
+- Dimension 0 (the batch) can change and is called `"batch"`: add `dynamic_shapes`
+- `model.eval()` before exporting, write to `path`, return `path`
+
+The tests run the exported file with batch = 1, 5 and 64 and compare with PyTorch. The argument of `Net.forward` is called `x`.
+--- starter
+def export_onnx_dynamic(model, example, path):
+    """Export an ONNX file whose batch size can change: the input is x, the output is logits."""
+    model.eval()
+    prog = torch.onnx.export(model, (example,), dynamo=True, verbose=False,
+                             input_names=["x"], output_names=["logits"])
+    prog.save(path)
+    return path
+--- solution
+def export_onnx_dynamic(model, example, path):
+    model.eval()
+    prog = torch.onnx.export(model, (example,), dynamo=True, verbose=False,
+                             input_names=["x"], output_names=["logits"],
+                             dynamic_shapes={"x": {0: "batch"}})
+    prog.save(path)
+    return path
+--- tests
+import os, tempfile
+
+_got = {}
+
+def _export():
+    """Export once, run batch = 1, 5 and 64, record the results (the temporary folder is deleted right away)."""
+    if not _got:
+        net = trained_net()
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+            path = os.path.join(folder, "net.onnx")
+            export_onnx_dynamic(net, torch.randn(2, FEATURES), path)
+            sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+            name = sess.get_inputs()[0].name
+            facts = {"net": net, "inputs": [(i.name, i.shape) for i in sess.get_inputs()],
+                     "outputs": [o.name for o in sess.get_outputs()], "runs": {}}
+            for b in (1, 5, 64):
+                x = torch.randn(b, FEATURES)
+                try:
+                    facts["runs"][b] = (x, sess.run(None, {name: x.numpy()})[0])
+                except Exception as e:
+                    facts["runs"][b] = (x, e)
+            del sess
+        _got.update(facts)
+    return _got
+
+@check("the input is x, the output is logits")
+def _():
+    f = _export()
+    true(f["inputs"][0][0] == "x", f"the input is named {f['inputs'][0][0]!r}; it should be 'x' (input_names)")
+    true(f["outputs"] == ["logits"], f"the outputs are named {f['outputs']}; they should be ['logits'] (output_names)")
+
+@check("the batch dimension can change")
+def _():
+    shape = _export()["inputs"][0][1]
+    true(isinstance(shape[0], str),
+         f"the input shape in the file is {shape}: the batch size is fixed. Add dynamic_shapes={{'x': {{0: 'batch'}}}}")
+
+@check("batch = 1, 5 and 64 all run and match PyTorch")
+def _():
+    f = _export()
+    net = f["net"].eval()
+    for b, (x, got) in f["runs"].items():
+        if isinstance(got, Exception):
+            true(False, f"batch = {b} does not run: {' '.join(str(got).strip().splitlines()[:2])[:200]}")
+        with torch.inference_mode():
+            want = net(x)
+        eq(torch.from_numpy(got), want, tol=1e-4, msg=f"with batch = {b}, ONNX and PyTorch disagree")
+--- hints
+- Add one more argument to `torch.onnx.export(...)`: `dynamic_shapes`.
+- `dynamic_shapes={"x": {0: "batch"}}`: the key is forward's argument name `x`; inside is "dimension number → the name you give it".
+
+@@ item d21-05
+type: code
+title: verify_export: compare automatically after every export
+level: 2
+cards: Export to ONNX, then check it with onnxruntime; A dynamic batch dimension: say which dimension can change; The inference checklist
+targets: verify_export
+ref: day21
+timeout: 120
+--- context
+"The export ran" is not the same as "the export is correct". Good teams turn the comparison into a function that runs after every export, in their tests and in the release pipeline: if the difference is too large, it fails and the model does not ship.
+--- prompt
+Write `verify_export(model, path, example, batch_sizes=(1, 4, 16), tol=1e-4)`:
+
+- First `model.eval()` (the model passed in may still be in train mode)
+- Open `path` with onnxruntime (`providers=["CPUExecutionProvider"]`); read the input name from `sess.get_inputs()[0].name`
+- For each b in `batch_sizes`: make a random input `torch.randn(b, *example.shape[1:])`, run it through PyTorch (inside `torch.inference_mode()`) and through onnxruntime, and compute the largest absolute difference
+- If the largest difference over all batches is above `tol`: `raise AssertionError(...)` with the difference in the message
+- Otherwise return that largest difference (a Python float)
+
+The tests give you a file that is already exported (with a variable batch size).
+--- starter
+import numpy as np
+import onnxruntime as ort
+
+def verify_export(model, path, example, batch_sizes=(1, 4, 16), tol=1e-4):
+    """Compare the ONNX file with the PyTorch model at several batch sizes. Return the largest difference;
+    raise AssertionError if it is above tol."""
+    raise todo()
+--- solution
+import numpy as np
+import onnxruntime as ort
+
+def verify_export(model, path, example, batch_sizes=(1, 4, 16), tol=1e-4):
+    model.eval()
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    name = sess.get_inputs()[0].name
+    worst = 0.0
+    for b in batch_sizes:
+        x = torch.randn(b, *example.shape[1:])
+        with torch.inference_mode():
+            want = model(x).numpy()
+        got = sess.run(None, {name: x.numpy()})[0]
+        worst = max(worst, float(np.abs(got - want).max()))
+    if worst > tol:
+        raise AssertionError(f"ONNX and PyTorch differ by {worst:.2e}, more than the tolerance {tol}")
+    return worst
+--- tests
+_cache = {}
+
+def _net_and_file():
+    """Export only once (variable batch size); every check gets a fresh copy of the model."""
+    if not _cache:
+        net = trained_net().eval()
+        _cache["net"] = net
+        _cache["data"] = onnx_bytes(net, torch.randn(2, FEATURES))
+    return copy.deepcopy(_cache["net"]), _cache["data"]
+
+@check("a correct export returns a tiny difference")
+def _():
+    net, data = _net_and_file()
+    with onnx_file(data) as path:
+        d = verify_export(net, path, torch.randn(2, FEATURES))
+    true(isinstance(d, float), f"return a Python float; you returned a {type(d).__name__} (convert it with float(...))")
+    true(0 <= d < 1e-4, f"the export is correct, so the difference should be below 1e-4; you returned {d}")
+
+@check("works when the model is still in train mode")
+def _():
+    net, data = _net_and_file()
+    net.train()
+    try:
+        with onnx_file(data) as path:
+            verify_export(net, path, torch.randn(2, FEATURES))
+    except AssertionError as e:
+        true(False, f"the export is fine, but your function says the difference is too large ({e}). The model passed in is in train mode, so Dropout is on on the PyTorch side: call model.eval() first")
+
+@check("raises when the weights differ; not with a looser tol")
+def _():
+    net, data = _net_and_file()
+    with torch.no_grad():
+        net.fc2.bias += 0.5                   # simulate "the file was exported from an old checkpoint"
+    with onnx_file(data) as path:
+        raised = False
+        try:
+            verify_export(net, path, torch.randn(2, FEATURES))
+        except AssertionError:
+            raised = True
+        true(raised, "the model and the file differ by 0.5; verify_export should raise AssertionError, but it returned normally")
+        d = verify_export(net, path, torch.randn(2, FEATURES), tol=1.0)
+    true(0.4 < d < 0.6, f"with tol=1.0 it should return the difference (about 0.5); you returned {d}")
+
+@check("every size in batch_sizes is tried")
+def _():
+    net, data = _net_and_file()
+
+    class Spy(nn.Module):                     # records which batch sizes ran through PyTorch
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+            self.seen = []
+
+        def forward(self, x):
+            self.seen.append(x.shape[0])
+            return self.inner(x)
+
+    spy = Spy(net)
+    with onnx_file(data) as path:
+        verify_export(spy, path, torch.randn(2, FEATURES), batch_sizes=(1, 3, 7))
+    true(sorted(set(spy.seen)) == [1, 3, 7], f"PyTorch ran these batch sizes: {spy.seen}; it should try all of 1, 3 and 7")
+--- hints
+- Structure: `model.eval()` → create the session and read the input name → in `for b in batch_sizes:` make an input, run both, update `worst` → after the loop, compare `worst > tol`.
+- PyTorch side: `with torch.inference_mode(): want = model(x).numpy()` (a tensor that requires grad cannot call `.numpy()` directly). The difference: `float(np.abs(got - want).max())`.
+- At the end: `if worst > tol: raise AssertionError(f"difference {worst:.2e} is above {tol}")`, otherwise `return worst`.
+
+@@ item d21-06
+type: choice
+title: Which line breaks the export?
+level: 1
+cards: Export failure no. 1: a Python if on a tensor's value; Export: turning a Python model into a fixed graph
+--- context
+When an export fails, the error message is long and scary. Learn to spot "a Python decision on a tensor's values" at a glance, and you can locate most export problems in seconds.
+--- prompt
+Each of these four lines is written inside `forward(self, x)` (`x` has shape `(B, 8)`, `self.layers` is an `nn.ModuleList`). Which one makes `torch.export` (the first step of `torch.onnx.export(dynamo=True)`) fail?
+--- options
+- `if x.shape[1] != 8: raise ValueError("need 8 features")`
+- `if x.max() > 100: x = x / 100`
+- `x = torch.where(x > 100, x / 100, x)`
+- `for layer in self.layers: x = layer(x)`
+answer: 2
+--- explain
+- `x.shape[1]` is a shape. It is known during the export (8), so Python decides right there and nothing goes into the graph. Fine.
+- `x.max() > 100` depends on the **values** in the input. During the export there is no way to know which branch future inputs take, and a fixed graph cannot hold this Python branch: `Could not guard on data-dependent expression`.
+- `torch.where` is a tensor operation: it computes both sides and picks by the condition, so it goes into the graph. It is exactly the fix for line 2.
+- Looping over a `ModuleList`: the number of layers is fixed, so the loop is unrolled during the export and every layer is recorded. Fine.
+--- hints
+- During the export, what is already known (shapes, number of layers), and what is only known once a real input arrives?
+- Look for the `if` that needs the **actual numbers** inside x to pick a branch.
+
+@@ item d21-07
+type: fix
+title: Find the bug: ClipNorm does not export
+level: 2
+cards: Export failure no. 1: a Python if on a tensor's value; Export to ONNX, then check it with onnxruntime
+targets: ClipNorm
+ref: day21
+timeout: 120
+--- context
+Code that decides "row by row" is common in research code (limit a vector's length, treat special samples specially). It works fine in PyTorch and fails as soon as you export it. Rewriting it with tensor operations before shipping is everyday work for a deployment engineer.
+--- prompt
+`ClipNorm` limits the length of every row (every sample's vector) to `max_norm`: a row whose length (L2 norm) is above `max_norm` is scaled down so its length is exactly `max_norm`; the other rows stay as they are.
+
+Its results in PyTorch are correct, but `torch.onnx.export(dynamo=True)` fails on it. Rewrite `forward`:
+
+- No Python `for` or `if`; use tensor operations (`torch.where`)
+- The same results as before
+- The input has shape `(B, D)`, and B can change
+
+Do not change the class name or `__init__`.
+--- starter
+class ClipNorm(nn.Module):
+    def __init__(self, max_norm=1.0):
+        super().__init__()
+        self.max_norm = max_norm
+
+    def forward(self, x):                     # x: (B, D)
+        rows = []
+        for row in x:
+            n = row.norm()
+            if n > self.max_norm:
+                row = row * (self.max_norm / n)
+            rows.append(row)
+        return torch.stack(rows)
+--- solution
+class ClipNorm(nn.Module):
+    def __init__(self, max_norm=1.0):
+        super().__init__()
+        self.max_norm = max_norm
+
+    def forward(self, x):                     # x: (B, D)
+        n = x.norm(dim=1, keepdim=True)       # (B, 1): the length of each row
+        return torch.where(n > self.max_norm, x * (self.max_norm / n), x)
+--- tests
+def _clip_ref(x, max_norm):
+    """The original row-by-row version (used only in PyTorch, to check answers)."""
+    out = x.clone()
+    for i in range(len(x)):
+        n = x[i].norm()
+        if n > max_norm:
+            out[i] = x[i] * (max_norm / n)
+    return out
+
+_got = {}
+
+def _export():
+    """Export once with torch.onnx.export(dynamo=True) (variable batch size); record the result or the error."""
+    if not _got:
+        try:
+            _got["data"] = onnx_bytes(ClipNorm(1.0), torch.randn(4, 2) * 2)
+        except NameError:
+            raise
+        except Exception as e:
+            _got["error"] = short_error(e)
+    return _got
+
+@check("same results as before in PyTorch")
+def _():
+    x = torch.tensor([[3.0, 4.0], [0.3, 0.4], [0.0, 0.0], [-6.0, 8.0]])
+    eq(ClipNorm(1.0)(x), _clip_ref(x, 1.0), msg="rows longer than 1 must be scaled to length exactly 1; the other rows (including all-zero rows) stay the same")
+    y = torch.randn(6, 5) * 2
+    eq(ClipNorm(2.0)(y), _clip_ref(y, 2.0), msg="wrong result with max_norm = 2.0: use self.max_norm both in the test and in the scaling")
+
+@check("torch.onnx.export(dynamo=True) works")
+def _():
+    f = _export()
+    true("error" not in f, f"the export failed: {f.get('error')}. Python if / for on a tensor's values must become tensor operations (torch.where)")
+
+@check("onnxruntime results are correct, with a variable batch size")
+def _():
+    f = _export()
+    true("data" in f, "the export failed; make the previous check pass first")
+    with onnx_file(f["data"]) as path:
+        for x in (torch.tensor([[3.0, 4.0], [0.3, 0.4], [0.0, 0.0], [-6.0, 8.0]]), torch.randn(9, 2) * 2):
+            got = torch.from_numpy(run_onnx(path, x))
+            eq(got, _clip_ref(x, 1.0), tol=1e-5, msg=f"wrong ONNX result with batch = {len(x)}")
+--- hints
+- First compute every row's length in one go: `n = x.norm(dim=1, keepdim=True)`, shape `(B, 1)`, which broadcasts against x of shape `(B, D)`.
+- Compute both branches, then pick by the condition: `torch.where(n > self.max_norm, x * (self.max_norm / n), x)`.
+
+@@ item d21-08
+type: predict
+title: Quantize to int8 by hand
+level: 1
+cards: int8 quantization: one byte per weight
+--- context
+Interviews often ask you to quantize a few numbers by hand: what is the scale, which integer does each weight become. Do it once and you know where the quantization error comes from, and why very small weights become exactly 0.
+--- prompt
+What does this code print? Each print is one line.
+--- code
+w = torch.tensor([0.5, -1.27, 0.02, 0.004])
+scale = w.abs().max() / 127
+q = torch.round(w / scale).to(torch.int8)
+print(q.tolist())
+print(q.dtype, q.element_size())
+--- explain
+- The largest |w| is 1.27, so scale = 1.27 / 127 = 0.01.
+- Divide each number by 0.01 and round: 0.5 → 50, -1.27 → -127, 0.02 → 2, 0.004 → 0.4 → 0.
+- 0.004 is smaller than scale / 2 = 0.005, so it becomes 0 and that weight's information is lost.
+- `q` has type `torch.int8`: 1 byte per number (fp32 takes 4 bytes).
+--- hints
+- Start with the scale: the largest |w| divided by 127.
+- 0.004 / 0.01 = 0.4. What does that round to?
+
+@@ item d21-09
+type: code
+title: int8 quantization with one scale per row
+level: 2
+cards: int8 quantization: one byte per weight
+targets: quantize_int8
+ref: day21
+--- context
+Real int8 quantization almost always uses one scale per output channel (per-channel): some rows of a weight matrix hold large numbers, others small ones, and with a shared scale the small rows turn almost entirely into 0. Write it once and you know what quantize_dynamic stores.
+--- prompt
+Write `quantize_int8(w)`: symmetric int8 quantization of an `(out, in)` weight matrix, with **one scale per row**:
+
+- `scale`: the largest |w| of each row divided by 127, shape `(out, 1)` (use `amax(dim=1, keepdim=True)`). Then `clamp_min(1e-8)`, so an all-zero row does not divide by 0
+- `q = round(w / scale)`, kept in `[-127, 127]`, converted to `torch.int8`
+- Return `(q, scale)`
+
+To use the weights, `q.float() * scale` brings them back (dequantization); each number is off by at most its row's `scale / 2`.
+--- starter
+def quantize_int8(w):
+    """w: (out, in) decimals -> (q: (out, in) int8, scale: (out, 1) decimals), one scale per row."""
+    raise todo()
+--- solution
+def quantize_int8(w):
+    scale = (w.abs().amax(dim=1, keepdim=True) / 127).clamp_min(1e-8)   # (out, 1)
+    q = torch.round(w / scale).clamp(-127, 127).to(torch.int8)
+    return q, scale
+--- tests
+@check("shapes and dtypes")
+def _():
+    q, scale = quantize_int8(torch.randn(5, 7))
+    true(q.dtype == torch.int8, f"q must be torch.int8; yours is {q.dtype}")
+    shape_is(q, (5, 7), "q has the same shape as w")
+    shape_is(scale, (5, 1), "one scale per row, shape (out, 1). Use amax(dim=1, keepdim=True)")
+    true(scale.dtype == torch.float32, f"scale must be a decimal type (float32); yours is {scale.dtype}")
+
+@check("each row's largest number becomes ±127; error at most scale / 2")
+def _():
+    w = torch.randn(6, 10) * torch.tensor([[0.01], [0.1], [1.0], [3.0], [10.0], [0.5]])
+    q, scale = quantize_int8(w)
+    eq(q.abs().amax(dim=1).float(), torch.full((6,), 127.0), tol=0, msg="in every row, the number with the largest |w| should become ±127")
+    err = (w - q.float() * scale).abs()
+    true(bool((err <= scale / 2 + 1e-6).all()), f"the dequantization error is above scale / 2 (largest {err.max().item():.3g}). Check round and scale")
+
+@check("one scale per row: small rows are not dragged down by big ones")
+def _():
+    w = torch.tensor([[100.0, -50.0, 1.0],
+                      [0.01, -0.02, 0.005]])
+    q, scale = quantize_int8(w)
+    err = (w[1] - q[1].float() * scale[1]).abs().max().item()
+    true(err < 1e-4, f"row 2 has an error of {err:.3g}: its numbers are small, but it used row 1's large scale, so it turned almost entirely into 0. Each row needs its own scale")
+
+@check("an all-zero row gives no NaN")
+def _():
+    w = torch.tensor([[0.0, 0.0, 0.0], [0.3, -0.6, 0.9]])
+    q, scale = quantize_int8(w)
+    true(bool(torch.isfinite(scale).all()) and bool((scale > 0).all()),
+         f"scale contains 0, inf or nan: {scale.flatten().tolist()}. Use clamp_min(1e-8)")
+    true(q[0].tolist() == [0, 0, 0], f"an all-zero row should quantize to [0, 0, 0]; yours is {q[0].tolist()}")
+--- hints
+- The largest |w| of each row: `w.abs().amax(dim=1, keepdim=True)`, shape `(out, 1)`; dividing w by it broadcasts automatically.
+- `scale = (w.abs().amax(dim=1, keepdim=True) / 127).clamp_min(1e-8)`, `q = torch.round(w / scale).clamp(-127, 127).to(torch.int8)`.
+
+@@ item d21-10
+type: code
+title: How big is the model when saved?
+level: 1
+cards: Dynamic quantization: size, accuracy, speed
+targets: model_size_bytes
+ref: day21
+--- context
+"How much smaller did quantization make it?" needs the same ruler for both models. The most reliable ruler is "how many bytes the saved state_dict takes": those bytes are what deployment actually copies and loads. Counting parameters() misses buffers, and for a quantized model it counts nothing at all.
+--- prompt
+Write `model_size_bytes(model)`: save `model.state_dict()` with `torch.save` into an `io.BytesIO()` (an in-memory "file") and return how many bytes were written (an int).
+
+Both `buf.getbuffer().nbytes` and `len(buf.getvalue())` give you the byte count.
+
+The tests measure an fp32 model and its int8-quantized version.
+--- starter
+import io
+
+def model_size_bytes(model):
+    """How many bytes the saved state_dict takes."""
+    raise todo()
+--- solution
+import io
+
+def model_size_bytes(model):
+    buf = io.BytesIO()
+    torch.save(model.state_dict(), buf)
+    return buf.getbuffer().nbytes
+--- tests
+@check("fp32 model: about (number of parameters × 4) bytes")
+def _():
+    model = make_mlp()
+    n = sum(p.numel() for p in model.parameters())
+    s = model_size_bytes(model)
+    true(isinstance(s, int), f"return an int; you returned a {type(s).__name__}")
+    true(n * 4 <= s <= n * 4 * 1.05, f"{n} fp32 parameters need at least {n * 4} bytes (plus a little file-format overhead); you measured {s}")
+
+@check("the int8 model is measured correctly too (its parameters() is empty)")
+def _():
+    model = make_mlp().eval()
+    q = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+    s_fp32, s_int8 = model_size_bytes(model), model_size_bytes(q)
+    true(s_int8 > 0, "the quantized model measures 0: its weights are not nn.Parameters, so parameters() is empty. Measure the bytes of the saved state_dict")
+    true(s_fp32 / 4.5 < s_int8 < s_fp32 / 3, f"the int8 version should be 3 to 4.5 times smaller than the fp32 one ({s_fp32} bytes); you measured {s_int8}")
+--- hints
+- `buf = io.BytesIO()`, then `torch.save(model.state_dict(), buf)`.
+- Finally `return buf.getbuffer().nbytes`.
+
+@@ item d21-11
+type: code
+title: A quantization report
+level: 2
+cards: Dynamic quantization: size, accuracy, speed; int8 quantization: one byte per weight
+targets: quantize_report
+ref: day21
+--- context
+Whether to ship a quantized model is not a gut decision. A common team practice is a small report for every compression: how many times smaller, how much the outputs moved, how many predictions changed. With the numbers on the table, the decision is easy.
+--- prompt
+Write `quantize_report(model, x)`:
+
+- Get the quantized model `q` with `torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)` (the original model must not change)
+- Put both models in `eval()` and run the same `x` through each inside `torch.inference_mode()`: call the original's output `a` and the quantized one's `b`
+- Return a dict with 4 keys (the last three are Python floats):
+
+1. `"model"`: the quantized model `q`
+2. `"size_ratio"`: `model_size_bytes(model) / model_size_bytes(q)` (`model_size_bytes` is provided)
+3. `"max_diff"`: `(a - b).abs().max()`
+4. `"agree"`: the share of rows where the argmax is the same (0 to 1)
+--- starter
+def quantize_report(model, x):
+    """Dynamic int8 quantization of model; return {"model", "size_ratio", "max_diff", "agree"}."""
+    raise todo()
+--- solution
+def quantize_report(model, x):
+    model.eval()
+    q = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+    q.eval()
+    with torch.inference_mode():
+        a, b = model(x), q(x)
+    return {
+        "model": q,
+        "size_ratio": model_size_bytes(model) / model_size_bytes(q),
+        "max_diff": (a - b).abs().max().item(),
+        "agree": (a.argmax(dim=1) == b.argmax(dim=1)).float().mean().item(),
+    }
+--- tests
+def _case():
+    model = make_mlp().eval()
+    x = torch.randn(128, 256)
+    return model, x
+
+@check("the original model is unchanged")
+def _():
+    model, x = _case()
+    with torch.inference_mode():
+        before = model(x)
+    quantize_report(model, x)
+    true(type(model[0]) is nn.Linear and type(model[2]) is nn.Linear,
+         "the Linear layers of the original model were replaced: do not use inplace=True; quantize_dynamic returns a new model by default")
+    with torch.inference_mode():
+        eq(model(x), before, tol=0, msg="the original model's output changed")
+
+@check("the returned model is int8")
+def _():
+    model, x = _case()
+    r = quantize_report(model, x)
+    true(isinstance(r, dict), f"return a dict; you returned a {type(r).__name__}")
+    q = r.get("model")
+    true(isinstance(q, nn.Module), "r['model'] should be the quantized model")
+    true(not any(type(m) is nn.Linear for m in q.modules()),
+         f"the quantized model still has plain nn.Linear layers: {[type(m).__name__ for m in q.modules()]}")
+
+@check("size ratio, largest difference and agreement are right")
+def _():
+    model, x = _case()
+    r = quantize_report(model, x)
+    q = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+    with torch.inference_mode():
+        a, b = model(x), q(x)
+    for k in ("size_ratio", "max_diff", "agree"):
+        true(isinstance(r.get(k), float), f"r[{k!r}] must be a Python float; yours is a {type(r.get(k)).__name__} (use .item() on a tensor)")
+    ratio = model_size_bytes(model) / model_size_bytes(q)
+    true(close(r["size_ratio"], ratio, 1e-6), f"size_ratio should be about {ratio:.2f} (original bytes / quantized bytes); yours is {r['size_ratio']:.3f}")
+    diff = (a - b).abs().max().item()
+    true(close(r["max_diff"], diff, 1e-6), f"max_diff should be {diff:.4f}; yours is {r['max_diff']:.4f}")
+    agree = (a.argmax(1) == b.argmax(1)).float().mean().item()
+    true(close(r["agree"], agree, 1e-6), f"agree should be {agree:.4f} (the share of equal argmax); yours is {r['agree']:.4f}")
+--- hints
+- First `q = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)`, then inside `with torch.inference_mode():` compute `a, b = model(x), q(x)`.
+- Agreement: `(a.argmax(dim=1) == b.argmax(dim=1)).float().mean().item()`; the largest difference also needs `.item()` to become a Python float.
+
+@@ item d21-12
+type: predict
+title: fp16 or bf16: which one overflows?
+level: 1
+cards: fp16 and bf16 inference
+--- context
+Converting a model to half precision is the fastest way to save memory in production. Before you convert, know the difference between fp16 and bf16: pick the wrong one and inf and NaN show up in production, only for some inputs, which makes them hard to track down.
+--- prompt
+What does this code print? Each print is one line.
+--- code
+x = torch.tensor([1000.0, 70000.0])
+print(torch.isinf(x.half()).tolist())
+print(torch.isinf(x.bfloat16()).tolist())
+print(x.element_size(), x.half().element_size(), x.bfloat16().element_size())
+--- explain
+- The largest number fp16 can hold is 65504. 70000 is above it and becomes `inf`; 1000 is fine. So: `[False, True]`.
+- bf16 has the same range as fp32 (largest about 3.4e38), so neither number overflows: `[False, False]`. The price is precision: 70000 is actually stored as 70144.
+- Bytes per number: 4 for fp32, 2 for both fp16 and bf16.
+--- hints
+- What is the largest number fp16 can hold?
+- bf16 also uses 2 bytes but has the same range as fp32. What does it give up?
+
+@@ item d21-13
+type: code
+title: Closed book: export ONNX with a variable batch size
+level: 2
+exam: yes
+cards: A dynamic batch dimension: say which dimension can change; Export to ONNX, then check it with onnxruntime
+targets: export_onnx_dynamic
+ref: day21
+timeout: 120
+--- context
+The export is today's most important step, and interviews often ask you to write it on the spot. Without the cards, write an export function that is ready for production, from blank.
+--- prompt
+Write `export_onnx_dynamic(model, example, path)` from blank:
+
+- Switch to inference mode before exporting
+- Export with `torch.onnx.export` (`dynamo=True`, `verbose=False`), with `example` as the example input
+- Input name `"x"`, output name `"logits"`; dimension 0 (the batch) can change and is called `"batch"` (forward's argument is called `x`)
+- Write to `path`, return `path`
+--- starter
+def export_onnx_dynamic(model, example, path):
+    raise todo()
+--- solution
+def export_onnx_dynamic(model, example, path):
+    model.eval()
+    prog = torch.onnx.export(model, (example,), dynamo=True, verbose=False,
+                             input_names=["x"], output_names=["logits"],
+                             dynamic_shapes={"x": {0: "batch"}})
+    prog.save(path)
+    return path
+--- tests
+import os, tempfile
+
+_got = {}
+
+def _export():
+    """Export once, run batch = 1, 5 and 64, record the results (the temporary folder is deleted right away)."""
+    if not _got:
+        net = trained_net()
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+            path = os.path.join(folder, "net.onnx")
+            export_onnx_dynamic(net, torch.randn(2, FEATURES), path)
+            sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+            name = sess.get_inputs()[0].name
+            facts = {"net": net, "inputs": [(i.name, i.shape) for i in sess.get_inputs()],
+                     "outputs": [o.name for o in sess.get_outputs()], "runs": {}}
+            for b in (1, 5, 64):
+                x = torch.randn(b, FEATURES)
+                try:
+                    facts["runs"][b] = (x, sess.run(None, {name: x.numpy()})[0])
+                except Exception as e:
+                    facts["runs"][b] = (x, e)
+            del sess
+        _got.update(facts)
+    return _got
+
+@check("the input is x, the output is logits")
+def _():
+    f = _export()
+    true(f["inputs"][0][0] == "x", f"the input is named {f['inputs'][0][0]!r}; it should be 'x' (input_names)")
+    true(f["outputs"] == ["logits"], f"the outputs are named {f['outputs']}; they should be ['logits'] (output_names)")
+
+@check("the batch dimension can change")
+def _():
+    shape = _export()["inputs"][0][1]
+    true(isinstance(shape[0], str),
+         f"the input shape in the file is {shape}: the batch size is fixed. Add dynamic_shapes={{'x': {{0: 'batch'}}}}")
+
+@check("batch = 1, 5 and 64 all run and match PyTorch")
+def _():
+    f = _export()
+    net = f["net"].eval()
+    for b, (x, got) in f["runs"].items():
+        if isinstance(got, Exception):
+            true(False, f"batch = {b} does not run: {' '.join(str(got).strip().splitlines()[:2])[:200]}")
+        with torch.inference_mode():
+            want = net(x)
+        eq(torch.from_numpy(got), want, tol=1e-4, msg=f"with batch = {b}, ONNX and PyTorch disagree")
+--- hints
+- Four steps in total: eval, export, save, return.
+- The keyword arguments export needs: `dynamo`, `verbose`, `input_names`, `output_names`, `dynamic_shapes`.
+
+@@ item d21-14
+type: code
+title: Closed book: verify_export
+level: 2
+exam: yes
+cards: Export to ONNX, then check it with onnxruntime; A dynamic batch dimension: say which dimension can change; The inference checklist
+targets: verify_export
+ref: day21
+timeout: 120
+--- context
+The comparison after an export is what tells you whether you can ship. Without the cards, write from blank the check that runs before every release.
+--- prompt
+Write `verify_export(model, path, example, batch_sizes=(1, 4, 16), tol=1e-4)` from blank:
+
+- The model passed in may be in train mode: switch to inference mode first
+- Open `path` with onnxruntime (CPU) and read the input name from the file
+- For each batch size b, make an input with `torch.randn(b, *example.shape[1:])`, run it through PyTorch (without building a graph) and through onnxruntime, and compute the largest absolute difference
+- If the largest difference is above `tol`, `raise AssertionError`; otherwise return it (a Python float)
+--- starter
+import numpy as np
+import onnxruntime as ort
+
+def verify_export(model, path, example, batch_sizes=(1, 4, 16), tol=1e-4):
+    raise todo()
+--- solution
+import numpy as np
+import onnxruntime as ort
+
+def verify_export(model, path, example, batch_sizes=(1, 4, 16), tol=1e-4):
+    model.eval()
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    name = sess.get_inputs()[0].name
+    worst = 0.0
+    for b in batch_sizes:
+        x = torch.randn(b, *example.shape[1:])
+        with torch.inference_mode():
+            want = model(x).numpy()
+        got = sess.run(None, {name: x.numpy()})[0]
+        worst = max(worst, float(np.abs(got - want).max()))
+    if worst > tol:
+        raise AssertionError(f"ONNX and PyTorch differ by {worst:.2e}, more than the tolerance {tol}")
+    return worst
+--- tests
+_cache = {}
+
+def _net_and_file():
+    """Export only once (variable batch size); every check gets a fresh copy of the model."""
+    if not _cache:
+        net = trained_net().eval()
+        _cache["net"] = net
+        _cache["data"] = onnx_bytes(net, torch.randn(2, FEATURES))
+    return copy.deepcopy(_cache["net"]), _cache["data"]
+
+@check("a correct export returns a tiny difference")
+def _():
+    net, data = _net_and_file()
+    with onnx_file(data) as path:
+        d = verify_export(net, path, torch.randn(2, FEATURES))
+    true(isinstance(d, float), f"return a Python float; you returned a {type(d).__name__} (convert it with float(...))")
+    true(0 <= d < 1e-4, f"the export is correct, so the difference should be below 1e-4; you returned {d}")
+
+@check("works when the model is still in train mode")
+def _():
+    net, data = _net_and_file()
+    net.train()
+    try:
+        with onnx_file(data) as path:
+            verify_export(net, path, torch.randn(2, FEATURES))
+    except AssertionError as e:
+        true(False, f"the export is fine, but your function says the difference is too large ({e}). The model passed in is in train mode, so Dropout is on on the PyTorch side: call model.eval() first")
+
+@check("raises when the weights differ; not with a looser tol")
+def _():
+    net, data = _net_and_file()
+    with torch.no_grad():
+        net.fc2.bias += 0.5                   # simulate "the file was exported from an old checkpoint"
+    with onnx_file(data) as path:
+        raised = False
+        try:
+            verify_export(net, path, torch.randn(2, FEATURES))
+        except AssertionError:
+            raised = True
+        true(raised, "the model and the file differ by 0.5; verify_export should raise AssertionError, but it returned normally")
+        d = verify_export(net, path, torch.randn(2, FEATURES), tol=1.0)
+    true(0.4 < d < 0.6, f"with tol=1.0 it should return the difference (about 0.5); you returned {d}")
+
+@check("every size in batch_sizes is tried")
+def _():
+    net, data = _net_and_file()
+
+    class Spy(nn.Module):                     # records which batch sizes ran through PyTorch
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+            self.seen = []
+
+        def forward(self, x):
+            self.seen.append(x.shape[0])
+            return self.inner(x)
+
+    spy = Spy(net)
+    with onnx_file(data) as path:
+        verify_export(spy, path, torch.randn(2, FEATURES), batch_sizes=(1, 3, 7))
+    true(sorted(set(spy.seen)) == [1, 3, 7], f"PyTorch ran these batch sizes: {spy.seen}; it should try all of 1, 3 and 7")
+--- hints
+- Order: eval → create the session, read the input name → loop over the batch sizes, run both, keep the largest difference → compare with tol.
+- On the PyTorch side, call `.numpy()` inside `with torch.inference_mode():`; the difference is `float(np.abs(got - want).max())`.

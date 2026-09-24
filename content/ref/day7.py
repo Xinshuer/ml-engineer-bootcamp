@@ -1,11 +1,5 @@
-# imports of the drill file (the checks use them)
-import sys, os
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-"""Day 07 参考答案。"""
+"""Day 7 reference module (latent space and the VAE). Loaded as hidden setup by the day-7 items;
+the names an item asks the learner to write are removed again before the learner's code runs."""
 import math
 
 import torch
@@ -84,8 +78,8 @@ def collapsed_dims(mu, logvar, thresh=0.01):
 
 
 def vae_step_buggy(x, x_hat, mu, logvar, beta=1.0):
-    std = torch.exp(0.5 * logvar)                                       # 修 1
+    std = torch.exp(0.5 * logvar)                                              # fix 1
     z = mu + std * torch.randn_like(std)
     recon = F.mse_loss(x_hat, x, reduction="sum") / x.size(0)
-    kl = 0.5 * (mu ** 2 + torch.exp(logvar) - 1 - logvar).sum() / x.size(0)   # 修 2
-    return recon + beta * kl, z                                         # 修 3
+    kl = 0.5 * (mu ** 2 + torch.exp(logvar) - 1 - logvar).sum() / x.size(0)   # fix 2
+    return recon + beta * kl, z                                                # fix 3

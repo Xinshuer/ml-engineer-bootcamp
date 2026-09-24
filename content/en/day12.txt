@@ -1,0 +1,1010 @@
+@@ day 12
+title: TTS: text -> mel -> waveform
+part: Audio
+hours: 3–4 hours
+--- goal
+Follow the shapes of a TTS (text-to-speech) model from text to waveform, and write its key parts yourself: the length regulator, durations and alignment, the right shift for teacher forcing, stop tokens, a masked loss, duration regression in the log domain, and the autoregressive decoding loop.
+--- checklist
+- Empty the Review list first (redo from blank any exercise where you saw the answer)
+- Read the 7 knowledge cards; in each one change a number, run it again and watch the output change
+- Pass every practice exercise, d12-01 to d12-15
+- Finish with the closed-book exam: write the length regulator and the autoregressive decoding loop without the cards
+
+@@ concept
+title: The TTS pipeline: text → mel → waveform
+--- body
+A TTS (text-to-speech) model usually has two stages. The **acoustic model** turns text into a mel spectrogram (Day 11: each frame is a vector of n_mels numbers). The **vocoder** (for example HiFi-GAN) turns the mel into a waveform.
+
+For a sentence of 20 characters, the shapes change like this (B = batch size):
+
+1. Text token ids: (B, 20). One integer per character or phoneme (the smallest unit of sound).
+2. Text encoder output: (B, 20, C). One C-dimensional vector per character.
+3. Durations: (B, 20). How many mel frames each character lasts.
+4. After the length regulator: (B, Tm, C). Each character's vector is copied as many times as its duration; Tm = the sum of the durations.
+5. Decoder output mel: (B, Tm, n_mels).
+6. Vocoder output waveform: (B, Tm × hop). Each mel frame becomes hop audio samples.
+
+Step 4 is the hard part: there are only 20 characters but hundreds of mel frames. How do the two line up? There are two main approaches:
+
+- **Autoregressive**, for example Tacotron 2: the decoder makes the mel one frame at a time, and at each step attention works out "which character am I reading now". It does not know how many frames it needs, so at each step it also predicts a **stop token** (stop now or not).
+- **Non-autoregressive**, for example FastSpeech 2: a small network first predicts each character's duration, then the length regulator stretches the text to the mel length. The number of frames = the sum of the durations, all frames are made **in parallel** in one pass, and no stop token is needed. The duration labels for training come from a forced-alignment tool (for example the Montreal Forced Aligner).
+
+The example below uses the simplest possible layers in place of real networks. Only the shapes matter here.
+--- code
+torch.manual_seed(0)
+B, Tt, C, n_mels, hop = 2, 5, 16, 80, 256
+ids = torch.randint(0, 40, (B, Tt))          # 2 sentences, 5 characters each
+h = nn.Embedding(40, C)(ids)                 # text encoder (just one Embedding layer here)
+dur = torch.full((B, Tt), 3)                 # pretend every character lasts 3 frames
+h_long = h.repeat_interleave(3, dim=1)       # length regulator: copy each character 3 times
+mel = nn.Linear(C, n_mels)(h_long)           # decoder (just one Linear layer here)
+n_samples = mel.size(1) * hop                # vocoder: each frame becomes hop samples
+print("text ids       ", tuple(ids.shape))
+print("encoder output ", tuple(h.shape))
+print("durations      ", tuple(dur.shape))
+print("after length reg", tuple(h_long.shape))
+print("mel            ", tuple(mel.shape))
+print("waveform       ", (B, n_samples), f"about {n_samples / 22050:.2f} s @22050Hz")
+
+@@ concept
+title: The length regulator: copy by duration
+--- body
+The length regulator is the heart of the FastSpeech family, and what it does is very simple: if character i has duration d, copy its feature vector d times.
+
+One PyTorch function does it: `x.repeat_interleave(repeats, dim=0)`. `repeats` is an integer tensor; element i is repeated `repeats[i]` times.
+
+- A character with duration 0 disappears: it takes no frames at all. This is how punctuation and silent symbols are handled.
+- Durations must be integers and must not be negative, or you get an error.
+- Want slower speech? Multiply all durations by 1.2 and round. That is how FastSpeech controls the speaking rate.
+
+Each sentence in a batch has a different total number of frames, so you copy one sentence at a time, then pad the shorter ones with zeros on the right to build one (B, Tm, C) tensor. `x.new_zeros(...)` makes a zero tensor with the same dtype and device as x.
+--- code
+x = torch.tensor([[10., 11.], [20., 21.], [30., 31.]])   # 3 characters, C=2 each
+d = torch.tensor([2, 0, 3])
+print(x.repeat_interleave(d, dim=0))    # character 2 (20, 21) is gone
+
+# a batch: the two sentences have 2 and 5 frames in total; pad the shorter one with 0
+xb = torch.ones(2, 2, 1)
+db = torch.tensor([[1, 1], [3, 2]])
+outs = [xb[b].repeat_interleave(db[b], dim=0) for b in range(2)]
+print([o.size(0) for o in outs])
+out = xb.new_zeros(2, 5, 1)
+for b, o in enumerate(outs):
+    out[b, :o.size(0)] = o
+print(out[..., 0])
+
+@@ concept
+title: Alignment: boundaries, frame owners, the matrix
+--- body
+There are three common ways to look at the same durations. Take durations = [2, 0, 3]:
+
+1. **Boundaries**: which frames each character covers, written as a half-open range [start, end): the start frame is included, the end frame is not. The end frames are the running sum of the durations, `cumsum`: [2, 2, 5]. The start frames are end − duration: [0, 2, 2]. Character 1 is [2, 2), which is empty.
+2. **Frame owners**: which character each frame belongs to. Repeat the character indices [0, 1, 2] by the durations: [0, 0, 2, 2, 2].
+3. **Alignment matrix**: a 0/1 matrix of shape (frames, characters). `A[f, i] = 1` means frame f comes from character i. Each row has exactly one 1, and each column sums to that character's duration.
+
+An alignment is always **monotonic**: as the frame index goes up, the character index stays the same or goes up, never back (people do not read backwards). Drawn as a picture, the matrix is a staircase from top left to bottom right that never turns back. This is the "alignment plot" everyone checks when training TTS: if the staircase breaks, jumps or turns back, the model is skipping or repeating words.
+
+To set many entries to 1 at once, index with two index tensors: `A[rows, cols] = 1.0` sets every position (rows[k], cols[k]) to 1.
+--- code
+d = torch.tensor([2, 0, 3])
+ends = d.cumsum(0)
+starts = ends - d
+print(torch.stack([starts, ends], dim=-1))   # each row is [start, end)
+
+idx = torch.arange(3).repeat_interleave(d)   # which character each frame belongs to
+print(idx)
+
+A = torch.zeros(5, 3)
+A[torch.arange(5), idx] = 1.0                # row f gets its 1 in column idx[f]
+print(A)
+print(A.sum(0))                              # column sums = durations
+
+@@ concept
+title: Teacher forcing: shift the input right by one
+--- body
+An autoregressive decoder (like Tacotron 2's) looks at frames 0 to t−1 when it makes frame t.
+
+At **inference** time it has to go one frame at a time. At **training** time we have the whole real mel, so we feed the real previous frame as the input. This is called **teacher forcing**. The whole sequence can then be computed in one pass, which makes training much faster.
+
+How: shift the target mel **right by one** along the time axis, put an all-zero **go frame** (the "start" signal) at the front, and drop the last target frame. If the targets are [a, b, c], the inputs are [0, a, b]: step 0 sees the go frame and must predict a; step 1 sees a and must predict b.
+
+This is the same idea as the language model on Day 4: "the input is x[:-1], the labels are x[1:]".
+
+If you forget the shift and feed the target itself, step t can see the answer for frame t, and the model only has to learn to copy. The training loss becomes suspiciously low, and at inference time (with no answer to copy) the model only produces mush.
+--- code
+mel = torch.arange(1, 7.).reshape(1, 3, 2)   # target: 3 frames, 2 mel values each
+go = torch.zeros_like(mel[:, :1])            # an all-zero go frame, shape (1, 1, 2)
+dec_in = torch.cat([go, mel[:, :-1]], dim=1)
+print("target:\n", mel[0])
+print("decoder input:\n", dec_in[0])        # everything moved down one row
+
+@@ concept
+title: Stop tokens and the autoregressive loop
+--- body
+An autoregressive model does not know how many frames a sentence needs. So at each step, besides one mel frame, it also outputs a **stop logit** (a raw score before sigmoid). `sigmoid(stop_logit)` is the probability of "stop now"; above a threshold (usually 0.5) the model stops.
+
+**Training labels**: one row of 0/1 per sample. Only the last real frame (index `length − 1`) is 1; everything else is 0. They are trained with BCE (binary cross-entropy), so the labels must be float. The classes are very unbalanced: a 200-frame sentence has one 1, so some implementations give the positive class more weight (`pos_weight` in `BCEWithLogitsLoss`).
+
+**The parts of the inference loop**:
+
+- At the start there is only the go frame: `prev` has shape (1, 1, n_mels).
+- At each step the decoder looks at `prev` and outputs a new frame (1, n_mels) and a stop logit.
+- The new frame needs `unsqueeze(1)` to become (1, 1, n_mels); then `torch.cat(..., dim=1)` appends it to `prev`, so the next step can see it.
+- Keep the generated frames in a Python list and stack them at the end with `torch.stack(frames, dim=1)` into (1, T, n_mels).
+- Always have a maximum number of steps, `max_steps`: an undertrained model may never say stop, and without a limit the service hangs.
+- Use `@torch.no_grad()` at inference time: no gradients are recorded, which saves memory.
+--- code
+lengths = torch.tensor([3, 5])
+pos = torch.arange(5)
+stop = (pos[None, :] == (lengths - 1)[:, None]).float()   # compare indices: 1 only at length-1
+print(stop)
+
+prev = torch.zeros(1, 1, 2)            # only the go frame
+new = torch.tensor([[0.5, 0.7]])       # the frame made at this step: (1, n_mels)
+prev = torch.cat([prev, new.unsqueeze(1)], dim=1)
+print(prev.shape)                      # 2 frames after appending
+
+frames = [new, new * 2, new * 3]
+print(torch.stack(frames, dim=1).shape)
+
+for logit in [-3.0, 0.0, 2.0]:
+    p = torch.sigmoid(torch.tensor(logit)).item()
+    print(logit, round(p, 3), "stop" if p > 0.5 else "go on")
+
+@@ concept
+title: Masked loss: padding does not count
+--- body
+Sentences in a batch have different lengths, so their mels have different numbers of frames. To build one tensor, the shorter ones are padded on the right (Day 11). Padding frames are not real sound and must **not** count in the loss. Otherwise:
+
+- the model spends effort fitting meaningless values;
+- the loss depends on how much padding there is, so the same model gets a different loss with a different batch mix.
+
+Three steps:
+
+1. Build the mask from the real lengths: `torch.arange(T)[None, :] < lengths[:, None]` gives (B, T), True on real frames.
+2. The mask is (B, T) but the error is (B, T, n_mels). `mask.unsqueeze(-1)` makes it (B, T, 1), which broadcasts over every mel value when you multiply.
+3. When you average, divide by **the number of elements that really count** = real frames × n_mels, not by the number of all elements.
+
+`F.l1_loss(pred, target)` averages over every position by default, padding included, so you cannot use it directly here.
+--- code
+lengths = torch.tensor([4, 2])
+mask = torch.arange(4)[None, :] < lengths[:, None]
+print(mask.long())
+
+pred = torch.zeros(2, 4, 3)
+target = torch.ones(2, 4, 3)
+target[1, 2:] = 50.0                  # sample 2 has junk values in its padding
+print("without mask:", F.l1_loss(pred, target).item())
+
+m = mask.unsqueeze(-1).float()        # (2, 4, 1)
+print("with mask:   ", ((pred - target).abs() * m).sum().item() / (m.sum().item() * 3))
+
+@@ concept
+title: Durations are regressed in the log domain
+--- body
+The duration predictor in FastSpeech 2 does not output frame counts directly. It outputs values in the **log domain**. Why?
+
+Durations have a **long tail**: most phonemes last 3–10 frames, but a pause at the end of a sentence can last 40 frames or more. With MSE on raw frame counts, the errors on a few long pauses (20 frames off is 400 when squared) drown out all the normal phonemes. After a log, the values are squeezed into roughly 0 to 4, and every phoneme's error matters about equally.
+
+- **Training**: the target is `log(d + 1)`. The +1 is needed because a duration can be 0, and log(0) = −∞. An integer tensor needs `.float()` before you can take its log. The loss only counts real text positions (padding does not count, as in the previous card).
+- **Inference**: undo it with `exp(prediction) − 1`, round to an integer, turn negatives into 0 (`clamp(min=0)`), and convert to int64 (`.long()`). Without the clamp, a negative duration makes `repeat_interleave` raise an error.
+- **Total frames**: the number of mel frames to make for a sentence = the sum of the durations over the real text positions. Predictions on padding positions are arbitrary, so zero them with the mask before adding.
+
+PyTorch also has `torch.log1p(x)` = log(1 + x) and `torch.expm1(x)` = exp(x) − 1, which do the same thing.
+--- code
+d = torch.tensor([0, 1, 3, 10, 40])
+t = torch.log(d.float() + 1)
+print(t)                                                   # between 0 and 3.7
+print((t.exp() - 1).round().clamp(min=0).long())           # and back
+print((torch.tensor([-0.3, 0.2, 1.5]).exp() - 1).round().clamp(min=0).long())
+try:
+    torch.arange(3).repeat_interleave(torch.tensor([1, -1, 2]))
+except RuntimeError as e:
+    print("negative duration:", e)
+
+@@ item d12-01
+type: code
+title: The length regulator
+level: 2
+cards: The length regulator: copy by duration; The TTS pipeline: text → mel → waveform
+targets: length_regulator
+ref: day12
+--- context
+This step is the core of non-autoregressive TTS such as FastSpeech 2. The text has 20 characters but the mel has 160 frames; copying each character's features by its duration makes the two lengths match. Speaking-rate control also works by changing the durations here.
+--- prompt
+Write `length_regulator(x, durations, max_len=None)`.
+
+- `x`: (B, Tt, C), the text-side features (Tt = text length, C = channels)
+- `durations`: (B, Tt) int64, how many mel frames character i of sentence b lasts
+- Return (B, Tm, C): each character's feature vector repeated by its duration; characters with duration 0 are skipped
+- Tm: if `max_len` is given, Tm = `max_len` (cut what is longer, pad what is shorter); otherwise Tm = the largest duration sum in the batch
+- Sentences with fewer than Tm frames are padded with 0 on the right
+
+Example: the 3 characters' features are [1], [2], [3] and durations = [2, 0, 3] → [1, 1, 3, 3, 3].
+
+You can use `repeat_interleave`; a Python loop over the batch is fine.
+--- starter
+def length_regulator(x, durations, max_len=None):
+    """x: (B, Tt, C)   durations: (B, Tt) int64
+    -> (B, Tm, C), Tm = max_len or the largest duration sum in the batch; pad with 0 on the right.
+    """
+    raise todo()
+--- solution
+def length_regulator(x, durations, max_len=None):
+    outs = [x[b].repeat_interleave(durations[b], dim=0) for b in range(x.size(0))]
+    Tm = max_len or max(o.size(0) for o in outs)
+    out = x.new_zeros(x.size(0), Tm, x.size(2))
+    for b, o in enumerate(outs):
+        n = min(o.size(0), Tm)
+        out[b, :n] = o[:n]
+    return out
+--- tests
+@check("copies by duration, skips duration-0 characters")
+def t01():
+    x = torch.tensor([[[1.], [2.], [3.]]])            # (1, 3, 1)
+    d = torch.tensor([[2, 0, 3]])
+    o = length_regulator(x, d)
+    shape_is(o, (1, 5, 1))
+    eq(o[0, :, 0], torch.tensor([1., 1., 3., 3., 3.]),
+       msg="a character with duration 0 must be skipped completely (that is how the model learns 'this symbol is silent')")
+
+@check("shorter sentences in the batch are padded with 0")
+def t01b():
+    x2 = torch.ones(2, 2, 3)
+    d2 = torch.tensor([[1, 1], [3, 2]])
+    o2 = length_regulator(x2, d2)
+    shape_is(o2, (2, 5, 3), "Tm should be the largest duration sum in the batch (3+2=5)")
+    eq(o2[0, 2:], torch.zeros(3, 3), msg="sentence 0 has only 2 frames; the 3 frames after them must be 0")
+
+@check("max_len, when given, is the output length")
+def t01c():
+    x = torch.tensor([[[1.], [2.], [3.]]])
+    d = torch.tensor([[2, 0, 3]])
+    o = length_regulator(x, d, max_len=7)
+    shape_is(o, (1, 7, 1), "with max_len=7 the output should have 7 frames")
+    eq(o[0, :, 0], torch.tensor([1., 1., 3., 3., 3., 0., 0.]), msg="the part short of max_len must be 0")
+    o = length_regulator(x, d, max_len=4)
+    eq(o[0, :, 0], torch.tensor([1., 1., 3., 3.]), msg="frames beyond max_len must be cut off")
+--- hints
+- Start with one sentence: `x[b].repeat_interleave(durations[b], dim=0)` gives (this sentence's frames, C).
+- Put the B results in a list; Tm = `max_len`, or the longest result if it is not given; make an all-zero output with `x.new_zeros(B, Tm, C)`.
+- Loop again: for each sentence take `n = min(length, Tm)` and write `out[b, :n] = o[:n]`.
+
+@@ item d12-02
+type: code
+title: Durations and alignment boundaries
+level: 2
+cards: Alignment: boundaries, frame owners, the matrix; The length regulator: copy by duration
+targets: duration_to_boundaries, frame_to_text_index
+ref: day12
+--- context
+Training durations usually come from a forced-alignment tool such as the Montreal Forced Aligner. You then often need "which frames belong to which phoneme": to average pitch and energy per phoneme, to cut out the audio of one word, or to plot and check an alignment.
+--- prompt
+Write two functions. Both handle one sentence, with no batch dimension.
+
+1. `duration_to_boundaries(durations)`: (Tt,) → (Tt, 2). Row i is character i's [start frame, end frame), half-open: the start is included, the end is not. Example: [2, 0, 3] → [[0, 2], [2, 2], [2, 5]] (a character with duration 0 has start == end).
+2. `frame_to_text_index(durations, n_frames)`: returns (n_frames,); number f is "which character frame f belongs to". Example: [2, 0, 3], n_frames=5 → [0, 0, 2, 2, 2]. `n_frames` is never more than the sum of the durations; when it is smaller, keep only the first `n_frames`.
+--- starter
+def duration_to_boundaries(durations):
+    """(Tt,) -> (Tt, 2), each row is [start frame, end frame).
+    [2, 0, 3] -> [[0, 2], [2, 2], [2, 5]]
+    """
+    raise todo()
+
+def frame_to_text_index(durations, n_frames):
+    """-> (n_frames,), which character each frame belongs to.
+    [2, 0, 3], 5 -> [0, 0, 2, 2, 2]
+    """
+    raise todo()
+--- solution
+def duration_to_boundaries(durations):
+    ends = durations.cumsum(0)
+    starts = ends - durations
+    return torch.stack([starts, ends], dim=-1)
+
+def frame_to_text_index(durations, n_frames):
+    idx = torch.arange(durations.numel(), device=durations.device).repeat_interleave(durations)
+    return idx[:n_frames]
+--- tests
+@check("boundaries and frame owners")
+def t02():
+    d = torch.tensor([2, 0, 3])
+    eq(duration_to_boundaries(d), torch.tensor([[0, 2], [2, 2], [2, 5]]),
+       msg="the end frames are the running sum of the durations; start = end - duration")
+    eq(frame_to_text_index(d, 5), torch.tensor([0, 0, 2, 2, 2]),
+       msg="the character with duration 0 (index 1) must not appear")
+    # monotonic: as frames go forward, the character index never goes back
+    idx = frame_to_text_index(torch.tensor([1, 2, 1, 3]), 7)
+    true((idx[1:] >= idx[:-1]).all(), "an alignment must be monotonic: people do not read backwards")
+--- hints
+- The end frames are the running sum of the durations: `durations.cumsum(0)`; start = end − duration.
+- `torch.stack([starts, ends], dim=-1)` builds the (Tt, 2) result.
+- Frame owners: repeat the character indices `torch.arange(Tt)` by the durations (`.repeat_interleave(durations)`), then slice `[:n_frames]`.
+
+@@ item d12-03
+type: code
+title: The right shift for teacher forcing
+level: 1
+cards: Teacher forcing: shift the input right by one
+targets: make_decoder_inputs
+ref: day12
+--- context
+Autoregressive models like Tacotron 2 make the mel one frame at a time. In training we feed the real previous frame (teacher forcing), so a whole sentence is computed in one pass. Get the shift wrong and the model can peek at the answer: the training loss looks amazing and inference produces mush.
+--- prompt
+Write `make_decoder_inputs(mel)`.
+
+- `mel`: (B, Tm, n_mels), the **target** the decoder must predict
+- Return the decoder input with the same shape: frame 0 is an all-zero go frame (the "start" signal); frame t (t ≥ 1) is target frame t−1
+- In other words, shift everything right by one along the time axis (dim=1); the last target frame drops off
+
+Example: target frames [a, b, c] → inputs [0, a, b].
+--- starter
+def make_decoder_inputs(mel):
+    """mel: (B, Tm, n_mels) is the target.
+    Return (B, Tm, n_mels): an all-zero go frame first, then the target shifted right by one.
+    """
+    raise todo()
+--- solution
+def make_decoder_inputs(mel):
+    go = torch.zeros_like(mel[:, :1])
+    return torch.cat([go, mel[:, :-1]], dim=1)
+--- tests
+@check("go frame + shift right by one")
+def t03():
+    mel = torch.arange(1, 7, dtype=torch.float).reshape(1, 3, 2)
+    inp = make_decoder_inputs(mel)
+    shape_is(inp, mel.shape, "the input should have the same shape as the target")
+    true(not torch.equal(inp, mel), "the input is the target itself: the model only has to learn to copy")
+    eq(inp[0, 0], torch.zeros(2), msg="the input for frame 0 should be the all-zero go frame")
+    eq(inp[0, 1], mel[0, 0], msg="the input for frame t should be target frame t-1")
+    eq(inp[0, 2], mel[0, 1], msg="the input for frame t should be target frame t-1")
+--- hints
+- The go frame has shape (B, 1, n_mels): `torch.zeros_like(mel[:, :1])`.
+- The target without its last frame: `mel[:, :-1]`, shape (B, Tm−1, n_mels).
+- Join them along time: `torch.cat([go, mel[:, :-1]], dim=1)`.
+
+@@ item d12-04
+type: code
+title: Stop token labels
+level: 1
+cards: Stop tokens and the autoregressive loop
+targets: make_stop_labels
+ref: day12
+--- context
+An autoregressive model decides by itself when to stop: at each step it also outputs a stop logit, and it stops above a threshold. This 0/1 table is its training label. Put the 1 one frame off and at inference the model either swallows the last sound or never stops until the step limit.
+--- prompt
+Write `make_stop_labels(lengths, max_len)`.
+
+- `lengths`: (B,) int64, the real number of frames of each sentence (padding comes after)
+- Return a **float** tensor of shape (B, max_len): row b is 1.0 at the last real frame (index `lengths[b] - 1`) and 0.0 everywhere else
+
+Example: lengths = [3, 5], max_len = 5 → [[0, 0, 1, 0, 0], [0, 0, 0, 0, 1]].
+
+It must be float because the BCE loss needs float labels.
+--- starter
+def make_stop_labels(lengths, max_len):
+    """lengths: (B,) real frame counts.
+    Return a float (B, max_len): 1 at the last real frame, 0 elsewhere.
+    """
+    raise todo()
+--- solution
+def make_stop_labels(lengths, max_len):
+    s = torch.zeros(lengths.numel(), max_len, device=lengths.device)
+    s[torch.arange(lengths.numel(), device=lengths.device), lengths - 1] = 1.0
+    return s
+--- tests
+@check("1 at the last real frame, 0 elsewhere")
+def t04():
+    s = make_stop_labels(torch.tensor([3, 5, 1]), 5)
+    shape_is(s, (3, 5))
+    true(s.dtype == torch.float, f"the BCE loss needs float labels; yours are {s.dtype}")
+    eq(s[0], torch.tensor([0., 0., 1., 0., 0.]), msg="a sentence of length 3 has its 1 at index 2 (length - 1)")
+    eq(s[1], torch.tensor([0., 0., 0., 0., 1.]), msg="a sentence of length 5 has its 1 at index 4")
+    eq(s[2], torch.tensor([1., 0., 0., 0., 0.]), msg="a sentence of length 1 has its 1 at index 0")
+--- hints
+- Start with `torch.zeros(B, max_len)` (float32 by default), where B = `lengths.numel()`.
+- The last real frame is at index `lengths - 1`, one per row.
+- Set all rows at once: `s[torch.arange(B), lengths - 1] = 1.0`. A for loop over the rows works too.
+
+@@ item d12-05
+type: code
+title: A masked mel loss
+level: 2
+cards: Masked loss: padding does not count
+targets: masked_mel_loss
+ref: day12
+--- context
+Sentences in a batch have different lengths, so short mels are padded. Padding frames are not real sound: counting them makes the model learn meaningless values, and the loss changes with the amount of padding. Almost every sequence model needs a masked loss like this one.
+--- prompt
+Write `masked_mel_loss(pred, target, mask)`.
+
+- `pred`, `target`: (B, T, n_mels)
+- `mask`: (B, T), 1 on real frames and 0 on padding (it may be integer or bool)
+- Return a scalar: the mean L1 error |pred − target| over the real frames only
+- The denominator is "real frames × n_mels", the number of elements that really count
+
+Changing the target at padding positions must not change the result. Do not use `F.l1_loss`: it averages the padding in too.
+--- starter
+def masked_mel_loss(pred, target, mask):
+    """pred/target: (B, T, n_mels)   mask: (B, T), 1 on real frames.
+    L1 over the real frames only; divide by "real frames x n_mels".
+    """
+    raise todo()
+--- solution
+def masked_mel_loss(pred, target, mask):
+    m = mask.unsqueeze(-1).to(pred.dtype)
+    return ((pred - target).abs() * m).sum() / (m.sum() * pred.size(-1))
+--- tests
+@check("averages over real frames only")
+def t05():
+    p = torch.zeros(2, 4, 3)
+    t = torch.ones(2, 4, 3)
+    m = torch.tensor([[1, 1, 0, 0], [1, 1, 1, 1]])
+    eq(masked_mel_loss(p, t, m), torch.tensor(1.0),
+       msg="every real position has error 1, so the mean should be 1. Check the denominator: real frames x n_mels")
+
+@check("values in the padding do not change the loss")
+def t05b():
+    p = torch.zeros(2, 4, 3)
+    t = torch.ones(2, 4, 3)
+    m = torch.tensor([[1, 1, 0, 0], [1, 1, 1, 1]])
+    before = masked_mel_loss(p, t, m)
+    t[0, 2:] = 100.0                      # change only the padding
+    eq(masked_mel_loss(p, t, m), before,
+       msg="only the padding changed, yet the loss changed: the mask has no effect")
+--- hints
+- The mask has one dimension fewer than the error: `mask.unsqueeze(-1)` makes it (B, T, 1), which broadcasts to (B, T, n_mels); `.to(pred.dtype)` makes it float.
+- Numerator: `((pred - target).abs() * m).sum()`.
+- Denominator: `m.sum()` only counts real frames; multiply by `pred.size(-1)` (n_mels).
+
+@@ item d12-06
+type: code
+title: Duration regression in the log domain
+level: 2
+cards: Durations are regressed in the log domain; Masked loss: padding does not count
+targets: duration_loss, duration_from_log
+ref: day12
+--- context
+Durations have a long tail: most phonemes last 3–10 frames, but a pause at the end of a sentence can last 40 or more. With plain MSE on frame counts, a few long pauses dominate the loss. So FastSpeech 2 regresses in the log domain and converts back to whole frames at inference time.
+--- prompt
+Write two functions.
+
+1. `duration_loss(log_pred, target_dur, mask)`:
+- `log_pred`: (B, Tt) float, the model's duration prediction in the log domain
+- `target_dur`: (B, Tt) integers, the real frame counts
+- `mask`: (B, Tt), 1 on real text positions
+- First move the target to the log domain: `log(target_dur + 1)` (the +1 is because a duration can be 0, and log(0) = −∞)
+- Then compute the MSE over real positions only: the sum of squared errors ÷ the number of real positions
+
+2. `duration_from_log(log_pred)`: the inverse, for inference. `exp(log_pred) − 1`, rounded, with anything below 0 set to 0, returned as int64.
+--- starter
+def duration_loss(log_pred, target_dur, mask):
+    """log_pred: (B, Tt)   target_dur: (B, Tt) integers   mask: (B, Tt)
+    target = log(target_dur + 1); MSE over the real positions only.
+    """
+    raise todo()
+
+def duration_from_log(log_pred):
+    """Inverse: round(exp(log_pred) - 1), clamped to at least 0, returned as int64."""
+    raise todo()
+--- solution
+def duration_loss(log_pred, target_dur, mask):
+    tgt = torch.log(target_dur.float() + 1)
+    m = mask.to(log_pred.dtype)
+    return (((log_pred - tgt) ** 2) * m).sum() / m.sum()
+
+def duration_from_log(log_pred):
+    return (log_pred.exp() - 1).round().clamp(min=0).long()
+--- tests
+@check("log-domain loss and its inverse")
+def t06():
+    d = torch.tensor([[1, 4, 9]])
+    lp = torch.log(d.float() + 1)
+    m = torch.ones(1, 3)
+    eq(duration_loss(lp, d, m), torch.tensor(0.0),
+       msg="a perfect prediction should give loss 0. Turn the target into log(d + 1) first")
+    back = duration_from_log(lp)
+    true(back.dtype == torch.long, f"return int64 (.long()): repeat_interleave only takes integers; yours is {back.dtype}")
+    eq(back, d, msg="going to the log domain and back should give the original durations")
+    # negative predictions must be clamped, or repeat_interleave crashes
+    true((duration_from_log(torch.tensor([[-5.0]])) >= 0).all(), "a negative duration was not clamped to 0")
+--- hints
+- `torch.log(target_dur.float() + 1)`: an integer tensor must become float before taking the log.
+- Loss: multiply the squared error by the float mask, `.sum()` it, and divide by `m.sum()` (the number of real positions).
+- The inverse is one chain: `.exp() - 1` → `.round()` → `.clamp(min=0)` → `.long()`.
+
+@@ item d12-07
+type: code
+title: Predicted mel length at inference
+level: 1
+cards: Durations are regressed in the log domain; Masked loss: padding does not count
+targets: predict_mel_len
+ref: day12
+--- context
+At inference time a non-autoregressive model must know how many frames a sentence will have before it makes them: to allocate the output, to pad a batch, and to know in advance how many seconds the sentence will take. That number is the sum of the predicted durations over the real text positions.
+--- prompt
+Write `predict_mel_len(log_pred, mask)`.
+
+- `log_pred`: (B, Tt), duration predictions in the log domain
+- `mask`: (B, Tt), 1 on real text positions and 0 on padding
+- Return (B,) int64: the predicted total number of mel frames of each sentence
+
+First convert to whole frames with `duration_from_log` (already available: it is the function from the previous exercise). Frames predicted at padding positions must not count.
+--- starter
+def predict_mel_len(log_pred, mask):
+    """(B, Tt) -> (B,): predicted total frames per sentence, counting real text positions only."""
+    raise todo()
+--- solution
+def predict_mel_len(log_pred, mask):
+    d = duration_from_log(log_pred) * mask.long()
+    return d.sum(-1)
+--- tests
+@check("counts frames of real text positions only")
+def t07():
+    lp = torch.log(torch.tensor([[3., 5., 2.], [4., 4., 7.]]) + 1)
+    m = torch.tensor([[1, 1, 1], [1, 1, 0]])
+    eq(predict_mel_len(lp, m), torch.tensor([10, 8]),
+       msg="sentence 0 is 3+5+2=10; the last position of sentence 1 is padding, so only 4+4=8")
+--- hints
+- `d = duration_from_log(log_pred)` gives (B, Tt) whole frame counts.
+- Predictions at padding positions are not necessarily 0 (the model outputs some number there too); multiply by `mask.long()` to zero them.
+- Finally sum over the text axis: `.sum(-1)`.
+
+@@ item d12-08
+type: code
+title: The alignment matrix
+level: 2
+cards: Alignment: boundaries, frame owners, the matrix
+targets: alignment_matrix
+ref: day12
+--- context
+When you debug a TTS model, the alignment plot is the first thing you look at: it should be a staircase from top left to bottom right that never turns back. Breaks, jumps or backward steps mean skipped or repeated words. With this matrix you can also sum frame-level values per character with a single matrix multiplication.
+--- prompt
+Write `alignment_matrix(durations, n_frames)`. One sentence, no batch dimension.
+
+- `durations`: (Tt,) int64
+- Return a float 0/1 matrix of shape (n_frames, Tt): `A[f, i] = 1` means frame f comes from character i; everything else is 0
+
+Example: durations = [2, 1, 2], n_frames = 5 →
+```
+[[1, 0, 0],
+ [1, 0, 0],
+ [0, 1, 0],
+ [0, 0, 1],
+ [0, 0, 1]]
+```
+You can call `frame_to_text_index` from d12-02 (already available).
+--- starter
+def alignment_matrix(durations, n_frames):
+    """durations: (Tt,) -> a 0/1 matrix (n_frames, Tt); A[f, i] = 1 means frame f comes from character i."""
+    raise todo()
+--- solution
+def alignment_matrix(durations, n_frames):
+    idx = frame_to_text_index(durations, n_frames)
+    A = torch.zeros(n_frames, durations.numel(), device=durations.device)
+    A[torch.arange(n_frames, device=durations.device), idx] = 1.0
+    return A
+--- tests
+@check("one 1 per frame, column sums = durations, monotonic")
+def t08():
+    A = alignment_matrix(torch.tensor([2, 1, 2]), 5)
+    shape_is(A, (5, 3), "rows are frames (5), columns are characters (3)")
+    eq(A.sum(1), torch.ones(5), msg="each frame comes from exactly one character (exactly one 1 per row)")
+    eq(A.sum(0), torch.tensor([2., 1., 2.]), msg="each column should sum to that character's duration")
+    idx = A.argmax(1)
+    true((idx[1:] >= idx[:-1]).all(), "it must be monotonic: a staircase that never turns back")
+--- hints
+- `idx = frame_to_text_index(durations, n_frames)` tells you which column gets the 1 in each row.
+- Start from an all-zero `torch.zeros(n_frames, Tt)`.
+- Set them all at once with two index tensors: `A[torch.arange(n_frames), idx] = 1.0`.
+
+@@ item d12-09
+type: code
+title: The autoregressive decoding loop
+level: 3
+cards: Stop tokens and the autoregressive loop; Teacher forcing: shift the input right by one
+targets: ar_decode
+ref: day12
+--- context
+At inference time there is no real mel to feed, so an autoregressive model appends each frame it makes to its own input and computes the next one, until the stop token says stop. Get this loop wrong (forget to append the new frame, no step limit) and the service either produces garbage or hangs on a sentence that never ends.
+--- prompt
+Write `ar_decode(step_fn, n_mels, max_steps, stop_thresh=0.5)`. The `@torch.no_grad()` is already there.
+
+`step_fn` is one decoder step, given by the tests:
+- Input `prev`: (1, t, n_mels), all frames so far. The first frame is the all-zero go frame, so on the first call t = 1
+- Output `(mel_next, stop_logit)`: `mel_next` is the new frame, shape (1, n_mels); `stop_logit` has shape (1,)
+
+Each step: call `step_fn(prev)` → keep the new frame → append it to `prev` → stop if `sigmoid(stop_logit) > stop_thresh`. Call it at most `max_steps` times.
+
+Return the generated mel, shape (1, T, n_mels), where T is the number of frames made. The go frame is **not** included; the frame that triggered the stop is kept.
+--- starter
+@torch.no_grad()
+def ar_decode(step_fn, n_mels, max_steps, stop_thresh=0.5):
+    """step_fn(prev) -> (mel_next, stop_logit)
+       prev: (1, t, n_mels), the first frame is the all-zero go frame
+       mel_next: (1, n_mels)   stop_logit: (1,)
+    Return (1, T, n_mels) without the go frame.
+    """
+    raise todo()
+--- solution
+@torch.no_grad()
+def ar_decode(step_fn, n_mels, max_steps, stop_thresh=0.5):
+    prev = torch.zeros(1, 1, n_mels)          # go frame
+    frames = []
+    for _ in range(max_steps):
+        mel_next, stop_logit = step_fn(prev)
+        frames.append(mel_next)
+        prev = torch.cat([prev, mel_next.unsqueeze(1)], dim=1)
+        if torch.sigmoid(stop_logit).item() > stop_thresh:
+            break
+    return torch.stack(frames, dim=1)
+--- tests
+@check("stops when the stop token fires")
+def t09():
+    calls = {"n": 0}
+
+    def step(prev):
+        calls["n"] += 1
+        t = prev.size(1)
+        stop = torch.tensor([10.0]) if t >= 4 else torch.tensor([-10.0])
+        return torch.full((1, 3), float(t)), stop
+
+    out = ar_decode(step, 3, max_steps=20)
+    shape_is(out, (1, 4, 3),
+             "the stop fires on step 4, so there should be 4 frames (with the one that triggered the stop, without the go frame). Never stops? Check that the new frame is appended to prev")
+    eq(out[0, 0], torch.ones(3), msg="on the first call prev should hold only the go frame (t=1)")
+    true(calls["n"] == 4, f"step should be called 4 times, it was called {calls['n']} times")
+
+@check("max_steps stops a model that never says stop")
+def t09b():
+    never_stop = lambda prev: (torch.zeros(1, 3), torch.tensor([-10.0]))
+    shape_is(ar_decode(never_stop, 3, max_steps=7), (1, 7, 3), "a model that never stops must be cut off after max_steps steps")
+--- hints
+- Start with `prev = torch.zeros(1, 1, n_mels)`, `frames = []`, then `for _ in range(max_steps):`.
+- The new frame (1, n_mels) needs `unsqueeze(1)` to become (1, 1, n_mels); then `torch.cat([prev, ...], dim=1)` appends it along time.
+- `break` when `torch.sigmoid(stop_logit).item() > stop_thresh`; after the loop, `torch.stack(frames, dim=1)`.
+
+@@ item d12-10
+type: code
+title: Shapes through the whole TTS pipeline
+level: 1
+cards: The TTS pipeline: text → mel → waveform; The length regulator: copy by duration
+targets: TTS_SHAPES
+ref: day12
+--- context
+Interviews and papers keep asking "what is the shape here?". If you can work out every shape from token ids to waveform for one sentence, you can read the forward pass of any TTS model and spot a dimension mismatch at a glance.
+--- prompt
+Replace every `None` in the dictionary `TTS_SHAPES` with a tuple. The setup:
+
+- batch = 4, 20 characters (text tokens) per sentence
+- the text encoder has C = 192 channels
+- every character lasts exactly 8 mel frames, so after the length regulator there are 20 × 8 = 160 frames
+- n_mels = 80
+- vocoder: hop = 256, sample rate 22050 Hz; each mel frame becomes hop samples
+- the waveform is mono: write it as (batch, samples), with no channel dimension
+
+You may write arithmetic, for example `(4, 160 * 256)`.
+--- starter
+TTS_SHAPES = {
+    "text token ids":                    None,   # batch=4, 20 characters per sentence
+    "text encoder output (C=192)":       None,
+    "duration prediction (log domain)":  None,
+    "after the length regulator":        None,   # 20*8 = 160 frames
+    "decoder output mel":                None,
+    "vocoder output waveform":           None,   # 160 frames * hop 256
+}
+--- solution
+TTS_SHAPES = {
+    "text token ids": (4, 20),
+    "text encoder output (C=192)": (4, 20, 192),
+    "duration prediction (log domain)": (4, 20),
+    "after the length regulator": (4, 160, 192),
+    "decoder output mel": (4, 160, 80),
+    "vocoder output waveform": (4, 160 * 256),
+}
+--- tests
+@check("the shape at every step")
+def t10():
+    want = {
+        "text token ids": (4, 20),
+        "text encoder output (C=192)": (4, 20, 192),
+        "duration prediction (log domain)": (4, 20),
+        "after the length regulator": (4, 160, 192),
+        "decoder output mel": (4, 160, 80),
+        "vocoder output waveform": (4, 160 * 256),
+    }
+    wrong = []
+    for k, w in want.items():
+        v = TTS_SHAPES.get(k)
+        if v is None or tuple(v) != w:
+            wrong.append(f"{k!r}: yours is {v}, expected {w}")
+    true(not wrong, "\n       " + "\n       ".join(wrong))
+--- hints
+- There is one duration per character, so durations have the same shape as the text token ids.
+- The length regulator only changes the time axis (20 → 160); C stays the same. The decoder then turns C into n_mels.
+- The sample rate only decides how many seconds this is (160 × 256 = 40960 samples, about 1.86 s); it does not change the shape.
+
+@@ item d12-11
+type: fix
+title: Find the bugs: a TTS training step with 3 mistakes
+level: 2
+cards: Teacher forcing: shift the input right by one; Masked loss: padding does not count; Durations are regressed in the log domain
+targets: tts_step_buggy
+ref: day12
+--- context
+The three most common silent bugs in TTS training code: the decoder input is not shifted, the loss counts padding, and durations are not in the log domain. The code runs and the loss goes down, but the trained model is useless. Learn to spot them at a glance.
+--- prompt
+`tts_step_buggy` is part of a TTS training step. It returns 4 things: the decoder input `dec_in`, the real-frame mask `mask`, the mel loss `mel_l` and the duration loss `dur_l`. It has 3 mistakes (the `mask` line is correct). Fix them.
+
+Arguments:
+- `mel`: (B, T, n_mels) target mel; `lengths`: (B,) real frame count of each sentence
+- `log_dur_pred`: (B, Tt) duration predictions in the log domain; `durations`: (B, Tt) real frame counts; `dur_mask`: (B, Tt) real text positions
+- All zeros stand in for the model's mel prediction here, so the mel loss compares `torch.zeros_like(mel)` with `mel`
+
+The functions you wrote earlier, `make_decoder_inputs`, `masked_mel_loss` and `duration_loss`, are available: you can call them.
+--- starter
+def tts_step_buggy(mel, lengths, log_dur_pred, durations, dur_mask):
+    T = mel.size(1)
+    dec_in = mel
+    mask = (torch.arange(T)[None] < lengths[:, None]).long()
+    mel_l = F.l1_loss(torch.zeros_like(mel), mel)
+    dur_l = F.mse_loss(log_dur_pred, durations.float())
+    return dec_in, mask, mel_l, dur_l
+--- solution
+def tts_step_buggy(mel, lengths, log_dur_pred, durations, dur_mask):
+    T = mel.size(1)
+    dec_in = make_decoder_inputs(mel)                          # fix 1: shift right by one + go frame
+    mask = (torch.arange(T)[None] < lengths[:, None]).long()
+    mel_l = masked_mel_loss(torch.zeros_like(mel), mel, mask)  # fix 2: padding does not count
+    dur_l = duration_loss(log_dur_pred, durations, dur_mask)   # fix 3: compare in the log domain, with the mask
+    return dec_in, mask, mel_l, dur_l
+--- tests
+def _run_step():
+    seed(0)
+    mel = torch.randn(2, 6, 4)
+    lengths = torch.tensor([6, 3])
+    dur = torch.tensor([[2, 2, 2], [1, 1, 1]])
+    lp = torch.log(dur.float() + 1)
+    dm = torch.ones(2, 3)
+    return (mel, lengths, lp, dur, dm), tts_step_buggy(mel, lengths, lp, dur, dm)
+
+@check("mistake 1: the decoder input is shifted right by one")
+def t11a():
+    (mel, lengths, lp, dur, dm), (dec_in, mask, mel_l, dur_l) = _run_step()
+    eq(dec_in, make_decoder_inputs(mel),
+       msg="the decoder input must be shifted right by one with a go frame at the front, or the model just copies the answer")
+
+@check("mistake 2: the mel loss uses the mask")
+def t11b():
+    (mel, lengths, lp, dur, dm), (dec_in, mask, mel_l, dur_l) = _run_step()
+    eq(mel_l, masked_mel_loss(torch.zeros_like(mel), mel, mask),
+       msg="the mel loss must use the mask: padding must not count")
+
+@check("mistake 3: the duration loss is in the log domain")
+def t11c():
+    (mel, lengths, lp, dur, dm), (dec_in, mask, mel_l, dur_l) = _run_step()
+    eq(dur_l, duration_loss(lp, dur, dm), tol=1e-5,
+       msg="durations must be compared in the log domain, not against raw frame counts")
+--- hints
+- Look at `dec_in`: can the decoder input simply be the target?
+- `F.l1_loss` averages over every position, padding included, and the `mask` computed on the line above is never used.
+- `log_dur_pred` is in the log domain but `durations.float()` is raw frame counts: they are on different scales. `dur_mask` is not used either.
+
+@@ item d12-12
+type: predict
+title: Running sums and frame owners
+level: 1
+cards: Alignment: boundaries, frame owners, the matrix; The length regulator: copy by duration
+--- context
+The same durations can be written three ways: frames per character, the boundaries from a running sum, and the owner of each frame. Reading TTS code and debugging alignments means switching between them, so practise doing it in your head.
+--- prompt
+Without running it, write the three lines this code prints. The 256 in the third line is the vocoder's hop.
+--- code
+d = torch.tensor([3, 1, 0, 2])
+print(d.cumsum(0).tolist())
+print(torch.arange(4).repeat_interleave(d).tolist())
+print(int(d.sum()) * 256)
+--- explain
+`cumsum` gives each character's end frame: 3, 3+1=4, 4+0=4, 4+2=6, so [3, 4, 4, 6].
+
+`repeat_interleave`: index 0 is repeated 3 times, 1 once, 2 zero times (it disappears) and 3 twice, giving [0, 0, 0, 1, 3, 3]. Index 2 is missing: a character with duration 0 takes no frames.
+
+There are 6 frames in total and each becomes 256 samples, so the vocoder outputs 6 × 256 = 1536 samples.
+--- hints
+- A running sum: each position holds "the sum of everything up to here".
+- The index with duration 0 does not appear in the second line at all.
+
+@@ item d12-13
+type: predict
+title: Three averages, three numbers
+level: 2
+cards: Masked loss: padding does not count
+--- context
+A masked loss usually goes wrong in the denominator: forgetting the mask, or dividing by the number of real frames and forgetting n_mels. Either way the number is off, and losses from different experiments can no longer be compared.
+--- prompt
+Without running it, write the three lines this code prints.
+--- code
+pred = torch.zeros(1, 4, 2)
+target = torch.ones(1, 4, 2)
+target[0, 3] = 9.0                                   # frame 3 is padding
+m = torch.tensor([[1., 1., 1., 0.]]).unsqueeze(-1)   # (1, 4, 1)
+err = (pred - target).abs()
+print(err.mean().item())
+print((err * m).sum().item() / m.sum().item())
+print((err * m).sum().item() / (m.sum().item() * 2))
+--- explain
+`err` holds 4 × 2 = 8 numbers: the first 3 frames are 1 (6 numbers) and the padding frame is 9 (2 numbers), for a total of 6 + 18 = 24.
+
+1. No mask: 24 ÷ 8 = 3.0. The junk in the padding pushes the loss up.
+2. Masked, but the denominator counts frames only: the real errors add up to 6 and `m.sum()` is 3 (frames), so 6 ÷ 3 = 2.0. Each frame has 2 mel values; the denominator is missing the factor n_mels.
+3. Correct: 6 ÷ (3 × 2) = 1.0, which matches "every real position has error 1".
+--- hints
+- First work out every number in `err`: what are the first 3 frames, and what is frame 3 (the padding)?
+- `m` has shape (1, 4, 1), so `m.sum()` counts frames, not elements.
+
+@@ item d12-14
+type: choice
+title: Training loss tiny, inference mush
+level: 2
+cards: Teacher forcing: shift the input right by one
+--- context
+"Great training numbers, broken at inference" is one of the classic symptoms of autoregressive models. Working back from a symptom to its cause is a skill that interviews test and real debugging needs.
+--- prompt
+You are training a Tacotron-style autoregressive TTS model. The mel loss on the training set quickly drops close to 0, far better than the paper reports. But at inference time (making frames one by one on its own), the output mel is mush. What is the most likely cause?
+--- options
+- The learning rate is too small
+- The decoder input is the target mel itself, with no shift: step t can see the answer for frame t, so the model only learned to copy
+- The stop token label is on the last real frame
+- The mel loss uses L1 instead of MSE
+answer: 2
+--- explain
+A training loss that is too good, followed by a collapse at inference, usually means the model saw the answer during training. Without the shift, the input at step t is the target for frame t, so copying the input to the output gives a loss near 0. At inference there is no answer to copy, and the model knows nothing.
+
+- A learning rate that is too small makes the loss fall slowly, not "quickly close to 0".
+- The stop label on the last real frame is the correct setup.
+- Both L1 and MSE work for mel (the Tacotron 2 paper uses MSE, FastSpeech 2 uses L1); switching between them does not cause this symptom.
+--- hints
+- A training loss far better than the paper is suspicious in itself: did the model get information it should not have?
+- Think about which frame the decoder input at step t should be.
+
+@@ item d12-15
+type: choice
+title: Autoregressive or not: which is true?
+level: 2
+cards: The TTS pipeline: text → mel → waveform; The length regulator: copy by duration
+--- context
+"How is FastSpeech different from Tacotron?" is a classic interview question for speech roles. A good answer names concrete mechanisms: what decides the length, whether frames can be made in parallel, and whether a stop token is needed.
+--- prompt
+About FastSpeech 2 (predicted durations + length regulator) and Tacotron 2 (autoregressive + attention), which statement is true?
+--- options
+- FastSpeech 2 makes the mel one frame at a time, so it needs a stop token to decide when to stop
+- FastSpeech 2's number of output frames is the sum of the durations and all frames can be made in parallel; the alignment comes from the durations, so it is always monotonic and rarely skips or repeats words
+- Tacotron 2 also needs a duration label for every character in training
+- Both need the decoder input shifted right by one with a go frame in training
+answer: 2
+--- explain
+FastSpeech 2 first predicts each character's duration, and the length regulator stretches the text by those durations. The number of frames is the sum of the durations and all frames are made in parallel. The alignment is built by copying in order, so it is monotonic by construction and cannot skip or repeat a word the way attention can.
+
+- Making frames one at a time and needing a stop token describes Tacotron 2.
+- Tacotron 2 learns its alignment with attention and needs no duration labels; FastSpeech 2 is the one that needs external durations (for example from the Montreal Forced Aligner).
+- The right shift with a go frame is teacher forcing for autoregressive decoders. FastSpeech 2's decoder does not look at previously made frames, so there is nothing to shift.
+--- hints
+- Which model knows in advance how many frames it will make?
+- Teacher forcing and stop tokens only make sense for a model that makes frames one at a time.
+
+@@ item d12-16
+type: code
+title: The length regulator from scratch
+level: 2
+exam: yes
+cards: The length regulator: copy by duration
+targets: length_regulator
+ref: day12
+--- context
+The length regulator is the step in non-autoregressive TTS that turns the text length into the mel length. Writing it without notes shows you really know repeat_interleave, padding within a batch and how max_len works.
+--- prompt
+Write `length_regulator(x, durations, max_len=None)`.
+
+- `x`: (B, Tt, C); `durations`: (B, Tt) int64, how many frames each character lasts
+- Return (B, Tm, C): each character's feature vector repeated by its duration; characters with duration 0 are skipped
+- Tm: if `max_len` is given, Tm = `max_len` (cut what is longer); otherwise Tm = the largest duration sum in the batch
+- Sentences with fewer than Tm frames are padded with 0 on the right
+--- starter
+def length_regulator(x, durations, max_len=None):
+    raise todo()
+--- solution
+def length_regulator(x, durations, max_len=None):
+    outs = [x[b].repeat_interleave(durations[b], dim=0) for b in range(x.size(0))]
+    Tm = max_len or max(o.size(0) for o in outs)
+    out = x.new_zeros(x.size(0), Tm, x.size(2))
+    for b, o in enumerate(outs):
+        n = min(o.size(0), Tm)
+        out[b, :n] = o[:n]
+    return out
+--- tests
+@check("copies by duration, skips duration-0 characters")
+def t01():
+    x = torch.tensor([[[1.], [2.], [3.]]])            # (1, 3, 1)
+    d = torch.tensor([[2, 0, 3]])
+    o = length_regulator(x, d)
+    shape_is(o, (1, 5, 1))
+    eq(o[0, :, 0], torch.tensor([1., 1., 3., 3., 3.]),
+       msg="a character with duration 0 must be skipped completely (that is how the model learns 'this symbol is silent')")
+
+@check("shorter sentences in the batch are padded with 0")
+def t01b():
+    x2 = torch.ones(2, 2, 3)
+    d2 = torch.tensor([[1, 1], [3, 2]])
+    o2 = length_regulator(x2, d2)
+    shape_is(o2, (2, 5, 3), "Tm should be the largest duration sum in the batch (3+2=5)")
+    eq(o2[0, 2:], torch.zeros(3, 3), msg="sentence 0 has only 2 frames; the 3 frames after them must be 0")
+
+@check("max_len, when given, is the output length")
+def t01c():
+    x = torch.tensor([[[1.], [2.], [3.]]])
+    d = torch.tensor([[2, 0, 3]])
+    o = length_regulator(x, d, max_len=7)
+    shape_is(o, (1, 7, 1), "with max_len=7 the output should have 7 frames")
+    eq(o[0, :, 0], torch.tensor([1., 1., 3., 3., 3., 0., 0.]), msg="the part short of max_len must be 0")
+    o = length_regulator(x, d, max_len=4)
+    eq(o[0, :, 0], torch.tensor([1., 1., 3., 3.]), msg="frames beyond max_len must be cut off")
+--- hints
+- One sentence at a time: `x[b].repeat_interleave(durations[b], dim=0)`, results in a list.
+- Build the output with `x.new_zeros(B, Tm, C)`, then copy each sentence's first `min(length, Tm)` frames into it.
+
+@@ item d12-17
+type: code
+title: The autoregressive decoding loop from scratch
+level: 3
+exam: yes
+cards: Stop tokens and the autoregressive loop
+targets: ar_decode
+ref: day12
+--- context
+The autoregressive generation loop looks the same in TTS, language models and audio-token models: start from a start symbol, append each new output, and stop on a stop condition or a step limit. If you can write it closed-book, a different model will not scare you.
+--- prompt
+Write `ar_decode(step_fn, n_mels, max_steps, stop_thresh=0.5)`. The `@torch.no_grad()` is already there.
+
+- `step_fn(prev)` returns `(mel_next, stop_logit)`: `prev` is (1, t, n_mels) and its first frame is the all-zero go frame (t = 1 on the first call); `mel_next` is (1, n_mels); `stop_logit` is (1,)
+- At each step append the new frame to `prev`; stop when `sigmoid(stop_logit) > stop_thresh`; call it at most `max_steps` times
+- Return (1, T, n_mels): all generated frames, without the go frame, with the frame that triggered the stop
+--- starter
+@torch.no_grad()
+def ar_decode(step_fn, n_mels, max_steps, stop_thresh=0.5):
+    raise todo()
+--- solution
+@torch.no_grad()
+def ar_decode(step_fn, n_mels, max_steps, stop_thresh=0.5):
+    prev = torch.zeros(1, 1, n_mels)          # go frame
+    frames = []
+    for _ in range(max_steps):
+        mel_next, stop_logit = step_fn(prev)
+        frames.append(mel_next)
+        prev = torch.cat([prev, mel_next.unsqueeze(1)], dim=1)
+        if torch.sigmoid(stop_logit).item() > stop_thresh:
+            break
+    return torch.stack(frames, dim=1)
+--- tests
+@check("stops when the stop token fires")
+def t09():
+    calls = {"n": 0}
+
+    def step(prev):
+        calls["n"] += 1
+        t = prev.size(1)
+        stop = torch.tensor([10.0]) if t >= 4 else torch.tensor([-10.0])
+        return torch.full((1, 3), float(t)), stop
+
+    out = ar_decode(step, 3, max_steps=20)
+    shape_is(out, (1, 4, 3),
+             "the stop fires on step 4, so there should be 4 frames (with the one that triggered the stop, without the go frame). Never stops? Check that the new frame is appended to prev")
+    eq(out[0, 0], torch.ones(3), msg="on the first call prev should hold only the go frame (t=1)")
+    true(calls["n"] == 4, f"step should be called 4 times, it was called {calls['n']} times")
+
+@check("max_steps stops a model that never says stop")
+def t09b():
+    never_stop = lambda prev: (torch.zeros(1, 3), torch.tensor([-10.0]))
+    shape_is(ar_decode(never_stop, 3, max_steps=7), (1, 7, 3), "a model that never stops must be cut off after max_steps steps")
+--- hints
+- Start with the go frame `torch.zeros(1, 1, n_mels)`; `unsqueeze(1)` each new frame and `torch.cat` it on dim=1.
+- Keep the generated frames in a list and finish with `torch.stack(frames, dim=1)`.

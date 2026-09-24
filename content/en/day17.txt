@@ -1,0 +1,1039 @@
+@@ day 17
+title: Debugging 3: bugs that raise no error
+part: Debugging
+hours: 3–4 hours
+--- goal
+Recognise the most common training bugs that raise no error but quietly make results worse: a forgotten `eval()`, data leakage, unshifted labels, padding in the mean, unweighted gradient accumulation, weight decay on LayerNorm, and a scheduler stepped at the wrong rate. Write invariant tests that expose these bugs before they waste a week of GPU time.
+--- checklist
+- Clear the review queue first (redo from scratch any item whose answer you looked at yesterday)
+- Read the 8 cards; change one number in each card's code and run it again
+- Pass every practice item: read the failure message and find the buggy line before you change anything
+- Write both closed-book items without looking at the answers
+
+@@ concept
+title: train() and eval(): Dropout and BatchNorm change behaviour
+--- body
+Two common layers behave differently in training and in inference. `model.train()` and `model.eval()` switch between the two behaviours, and they apply to every submodule automatically.
+
+- **Dropout**: in train mode, each value is set to 0 with probability p, and the survivors are multiplied by 1/(1-p) so the average stays the same. In eval mode it does nothing.
+- **BatchNorm**: in train mode, it normalises with the mean and variance of *this batch*, and it also updates `running_mean` / `running_var` (statistics accumulated over training). In eval mode it uses those stored statistics instead.
+
+So if you forget `model.eval()` before predicting, nothing raises an error, but:
+
+1. Predicting the same input twice gives two different results (Dropout is dropping at random).
+2. One sample's prediction changes with the other samples in the batch (BatchNorm uses batch statistics).
+3. Every prediction changes BatchNorm's running statistics. `torch.no_grad()` does not stop this: it controls gradients, not the mode.
+
+Remember: **`no_grad` and `eval()` are two different things, and inference needs both.** The other way round: after an evaluation inside the training loop, switch back with `model.train()`, or the rest of training runs without Dropout.
+--- code
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(4, 8), nn.BatchNorm1d(8), nn.Dropout(0.5), nn.Linear(8, 2))
+x = torch.randn(6, 4)
+with torch.no_grad():
+    model.train()
+    print("train mode, same result twice:", torch.equal(model(x), model(x)))
+    print("running_mean was quietly changed:", model[1].running_mean[:3])
+    model.eval()
+    print("eval mode, same result twice:", torch.equal(model(x), model(x)))
+    print("eval mode, first 2 samples alone == inside the batch:", torch.allclose(model(x[:2]), model(x)[:2]))
+
+@@ concept
+title: Data leakage: statistics come from the training set only
+--- body
+Data leakage: information from the test set sneaks into training. Your evaluation scores then look better than the model will do in production, and you do not know it.
+
+The most common kind: you compute the mean and standard deviation for normalisation on *all* the data, and only then split it into a training set and a test set. The test values have now helped transform the training data.
+
+The correct order:
+
+1. Split first: training set and test set apart.
+2. Compute `mean` and `std` on the training set only (this is called "fitting" the statistics).
+3. Use that same `mean` / `std` to transform the training set, the test set, and every request in production.
+
+A simple check (this is an invariant test): **change only the test set, and the transformed training data must stay exactly the same.** If it changes, you have a leak.
+
+The same rule holds for a tokenizer's vocabulary, feature selection and deduplication: they may only "learn" from the training set.
+
+In the example below the test distribution has shifted. The leaky version hides half of that shift: in evaluation the test data looks only 1.74 standard deviations away, but in production the model faces 3.39.
+--- code
+torch.manual_seed(0)
+train = torch.randn(100, 1) + 5.0      # training set: mean about 5
+test = torch.randn(20, 1) + 8.0        # test set: shifted, mean about 8
+both = torch.cat([train, test])
+print(f"mean over all the data:      {both.mean().item():.2f}")
+print(f"mean over the training set:  {train.mean().item():.2f}")
+leaky = ((test - both.mean()) / both.std()).mean().item()
+clean = ((test - train.mean()) / train.std()).mean().item()
+print(f"normalised test mean, leaky:   {leaky:.2f}")
+print(f"normalised test mean, correct: {clean:.2f}  <- this is what the model sees in production")
+
+@@ concept
+title: Next-token labels are shifted by one
+--- body
+A language model's task: see the tokens at positions 0..t and guess the token at position t+1. So the inputs and the labels are **shifted by one**:
+
+- `inputs = tokens[:, :-1]` (drop the last token)
+- `targets = tokens[:, 1:]` (drop the first token)
+
+The model's output at position t, `logits[:, t]`, is compared with `targets[:, t]`, which is token t+1 of the original sequence.
+
+What happens if you forget the shift? The label is the current token, which the model can already see. It only has to learn to copy, and the loss drops almost to 0. The training curve looks great; the generated text is garbage. **A loss that is too good to be true is itself a bug signal.**
+
+The other mistake is shifting the wrong way (`inputs = tokens[:, 1:]`, `targets = tokens[:, :-1]`): the model then guesses the past from the future.
+
+Before `F.cross_entropy`, flatten the (B, T, V) logits to (B·T, V) and the labels to (B·T,). A sliced tensor may not be contiguous in memory, so use `.reshape`, not `.view` (day 16).
+--- code
+tokens = torch.tensor([[5, 6, 7, 8, 9]])
+inputs, targets = tokens[:, :-1], tokens[:, 1:]
+print("inputs :", inputs.tolist())
+print("targets:", targets.tolist())
+for t in range(inputs.shape[1]):
+    print(f"sees {inputs[0, :t + 1].tolist()} -> must guess {targets[0, t].item()}")
+
+@@ concept
+title: Padding must not count in the mean
+--- body
+Sentences in a batch have different lengths. The short ones get padding (fake filler tokens) at the end so that they fit into one (B, T) tensor. A mask goes with it: 1 marks a real token, 0 marks padding.
+
+Padding is not data. The loss, mean pooling and accuracy must be computed over real tokens only. The correct way:
+
+```
+masked_mean = (x * mask).sum() / mask.sum()
+```
+
+The common mistake: set the padding to 0 with `x * mask`, then call `.mean()`. The numerator is right, but the denominator counts *all* positions. The result: the more padding, the smaller the loss looks. Change the batch size or bucket the data by length, and the loss changes for no visible reason.
+
+With `F.cross_entropy` there is another way: set the target at padding positions to -100. Its default argument `ignore_index=-100` skips those positions, and the denominator counts only real tokens.
+
+The check (another invariant): **add a few more columns of padding, and the loss must not change at all.**
+--- code
+loss = torch.tensor([[2.0, 1.0, 3.0, 0.0, 0.0],
+                     [4.0, 0.0, 0.0, 0.0, 0.0]])   # loss per position (already 0 at the padding)
+mask = torch.tensor([[1., 1., 1., 0., 0.],
+                     [1., 0., 0., 0., 0.]])
+print("wrong   (loss*mask).mean()          =", (loss * mask).mean().item())
+print("correct (loss*mask).sum()/mask.sum() =", ((loss * mask).sum() / mask.sum()).item())
+wide_loss = torch.cat([loss, torch.zeros(2, 5)], 1)     # 5 more columns of padding
+wide_mask = torch.cat([mask, torch.zeros(2, 5)], 1)
+print("with 5 more columns, wrong   =", (wide_loss * wide_mask).mean().item())
+print("with 5 more columns, correct =", ((wide_loss * wide_mask).sum() / wide_mask.sum()).item())
+
+@@ concept
+title: Gradient accumulation: weight each part by its size
+--- body
+When a big batch does not fit in memory, you can cut it into several small batches (micro-batches). You call `backward()` on each one; the gradients are **added up automatically** in `.grad`; then you call `step()` once. This is gradient accumulation.
+
+The trap is the adding up. Each micro-batch loss is already an average over that micro-batch, so K gradients added together are **K times** the big-batch gradient.
+
+- Micro-batches of equal size: divide each loss by K.
+- Micro-batches of different sizes (the last one is often smaller): multiply each loss by `len(xb) / N`, where N is the total number of samples. Dividing by K gives the samples in the small batch too much weight.
+
+Why can this bug hide for so long? With Adam you barely notice: Adam rescales by the size of the gradient, so gradients that are K times larger give almost the same update. But with SGD the steps are K times too big, a gradient clipping threshold no longer means what you think, and the logged loss is K times too big.
+
+The check (compare with a reference): **the accumulated gradient == the gradient computed on the big batch directly.**
+--- code
+torch.manual_seed(0)
+x, y = torch.randn(8, 3), torch.randn(8, 1)
+m = nn.Linear(3, 1)
+F.mse_loss(m(x), y).backward()
+full = m.weight.grad.clone()                  # big-batch gradient (the reference)
+m.zero_grad()
+for xb, yb in zip(x.split(2), y.split(2)):    # 4 micro-batches of 2
+    F.mse_loss(m(xb), yb).backward()          # no weighting
+print("no weighting: the gradient is", (m.weight.grad / full).round(decimals=3).tolist(), "times the big-batch gradient")
+m.zero_grad()
+for xb, yb in zip(x.split(2), y.split(2)):
+    (F.mse_loss(m(xb), yb) * len(xb) / len(x)).backward()
+print("weighted by size, same as the big batch:", torch.allclose(m.weight.grad, full))
+
+@@ concept
+title: No weight decay on 1-D parameters
+--- body
+Weight decay pulls every parameter a little towards 0 at every step (in AdamW roughly `p = p - lr * wd * p`). It stops the weight matrices from growing too large.
+
+Two kinds of parameters should not be pulled towards 0:
+
+- **Biases**: they only shift values; pulling them to 0 does not regularise anything.
+- **The weight (scale) of LayerNorm / RMSNorm**: it starts at 1. Pulling it towards 0 shrinks the layer's whole output, more and more.
+
+What they have in common: they are 1-D (`p.ndim == 1`). Weight matrices and embeddings are 2-D. So the standard approach splits the parameters into two groups by number of dimensions and hands them to the optimizer as param groups (each group can have its own hyperparameters):
+
+```
+decay    = [p for p in model.parameters() if p.ndim >= 2]
+no_decay = [p for p in model.parameters() if p.ndim < 2]
+opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1},
+                         {"params": no_decay, "weight_decay": 0.0}], lr=3e-4)
+```
+
+Filtering by name (`"bias" in name`) is common, but it misses LayerNorm's weight: its name is something like `norm.weight`, with no "bias" in it.
+--- code
+torch.manual_seed(0)
+net = nn.Sequential(nn.Linear(4, 4), nn.LayerNorm(4))
+for name, p in net.named_parameters():
+    print(f"{name:9s} ndim={p.ndim}  ->", "decay" if p.ndim >= 2 else "no decay")
+opt = torch.optim.AdamW(net.parameters(), lr=0.1, weight_decay=0.1)   # the bad example: decay everything
+for _ in range(10):
+    for p in net.parameters():
+        p.grad = torch.zeros_like(p)          # zero gradient: only weight decay acts
+    opt.step()
+print("LayerNorm weight after 10 steps:", net[1].weight.data)
+
+@@ concept
+title: Step the LR scheduler every step
+--- body
+A learning-rate scheduler sets the current learning rate from how many times `scheduler.step()` has been called. Warmup (raising the learning rate slowly from a tiny value over the first few hundred steps), cosine decay and the other usual schedules are all designed in **optimizer steps**.
+
+So the call belongs in the inner loop, right after `optimizer.step()`:
+
+```
+for x, y in loader:
+    loss = ...
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    scheduler.step()      # once per step
+```
+
+Two common mistakes, neither of which raises an error:
+
+- In the epoch loop: the schedule moves one step per epoch. A warmup meant to end after 1,000 steps now takes 1,000 epochs; the learning rate stays tiny and the loss falls absurdly slowly.
+- Before `optimizer.step()`: the whole schedule runs one step early and the first learning rate is skipped. PyTorch only prints a warning.
+
+The check: record the learning rate actually used at every step (`optimizer.param_groups[0]["lr"]`) and compare it, entry by entry, with the schedule you designed.
+--- code
+def used_lrs(per_step):
+    m = nn.Linear(2, 1)
+    opt = torch.optim.SGD(m.parameters(), lr=0.1)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / 4))  # 4 warmup steps
+    used = []
+    for epoch in range(2):
+        for step in range(3):
+            used.append(round(opt.param_groups[0]["lr"], 4))
+            opt.step()
+            if per_step:
+                sched.step()
+        if not per_step:
+            sched.step()
+    return used
+
+print("step every step: ", used_lrs(True))
+print("step every epoch:", used_lrs(False))
+
+@@ concept
+title: Invariant tests: make silent bugs visible
+ref: day17
+--- body
+Bugs that raise no error are the most expensive: the code runs, the loss goes down, and the results are quietly worse. You may train for days before you notice.
+
+The remedy is **invariant tests**: find a property that must hold whatever the input is, and check it with random inputs. Today uses these:
+
+- **Causality**: change the inputs after position t, and the outputs at positions 0..t must not change. Catches a wrong attention mask, or a convolution that peeks at the next position.
+- **Batch independence**: split the batch in two halves and run each half separately; the result must match running the whole batch. Catches BatchNorm left in train mode, a softmax over dim 0.
+- **Padding invariance**: add a few columns of padding; the loss must not change. Catches padding counted in the mean.
+- **Change only the test set; the training data must not change**: catches data leakage.
+- **Compare with a reference**: gradient accumulation vs one big batch; hand-written attention vs `F.scaled_dot_product_attention`.
+- **Overfit one batch** (day 15): if the loss cannot get close to 0 there is a bug; if it drops to 0 immediately, be suspicious too (for example, unshifted labels).
+
+Two details when writing such tests. First, call `model.eval()`, or Dropout's randomness makes outputs change that should stay the same. Second, compare floats with `torch.allclose(a, b, atol=1e-5)`, not `==`.
+
+The code below checks causality at one position only. `CumMean` (the output at t is the mean of the first t+1 inputs) and `TinyAttention` (one-head attention; `mask="none"` means no mask) are small models prepared for today. In the practice items you turn this into a tool that checks every position.
+--- code
+torch.manual_seed(0)
+x = torch.randn(1, 6, 8)
+x2 = x.clone()
+x2[:, 4:] = torch.randn(1, 2, 8)          # change positions 4 and 5 only: the "future"
+for name, m in [("CumMean", CumMean()), ("attention without a mask", TinyAttention(8, mask="none"))]:
+    m.eval()
+    with torch.no_grad():
+        same = torch.allclose(m(x)[:, :4], m(x2)[:, :4], atol=1e-5)
+    print(f"{name}: outputs at the first 4 positions unchanged = {same}")
+
+@@ item d17-01
+type: predict
+title: What Dropout outputs in train and in eval mode
+level: 1
+cards: train() and eval(): Dropout and BatchNorm change behaviour
+--- context
+"The same input gives a different prediction every time" is one of the most common beginner questions, and the cause is almost always a forgotten `model.eval()`. First see with your own eyes what Dropout does in each mode.
+--- prompt
+Read the code and write the two lines it prints.
+
+Hint: in train mode, a Dropout with `p=0.5` multiplies the values it keeps by 1/(1-p).
+--- code
+torch.manual_seed(0)
+drop = nn.Dropout(p=0.5)
+x = torch.ones(4)
+drop.eval()
+print(drop(x).tolist())
+drop.train()
+print(sorted(set(drop(x).tolist())))
+--- explain
+Line 1: in eval mode Dropout does nothing, so the output equals the input: `[1.0, 1.0, 1.0, 1.0]`.
+
+Line 2: in train mode, each value becomes 0 with probability one half, and the others are multiplied by 1/(1-0.5) = 2, so the average stays 1. `set` removes duplicates and `sorted` orders them: `[0.0, 2.0]` (with this seed both values occur).
+
+So if you forget `eval()` at inference time, part of the network is switched off at random, and every prediction is different.
+--- hints
+- In eval mode Dropout lets everything through unchanged.
+- In train mode each 1.0 becomes either 0 or 1.0 / (1 - 0.5).
+
+@@ item d17-02
+type: fix
+title: Forgot model.eval() before predicting
+level: 1
+cards: train() and eval(): Dropout and BatchNorm change behaviour
+targets: predict
+ref: day17
+--- context
+Real production incidents: the same image sent twice gets two different answers; one user's result changes with the other requests in the same batch. Often the whole cause is one missing line, `model.eval()`.
+--- prompt
+`predict(model, x)` feeds x (shape (B, 8)) to a classifier and returns each sample's probabilities for 3 classes, shape (B, 3). The model comes from `make_classifier()` and contains BatchNorm and Dropout.
+
+It already uses `torch.no_grad()`. It runs and raises no error. But the tests found three problems:
+
+1. Predicting the same input twice gives different results.
+2. One sample's prediction changes with the other samples in the batch.
+3. Every prediction changes BatchNorm's `running_mean`.
+
+Fix `predict` so that all three problems go away.
+--- starter
+def predict(model, x):
+    """x: (B, 8) -> probabilities (B, 3)"""
+    with torch.no_grad():
+        logits = model(x)
+    return logits.softmax(-1)
+--- solution
+def predict(model, x):
+    """x: (B, 8) -> probabilities (B, 3)"""
+    model.eval()                     # Dropout off, BatchNorm uses its stored statistics
+    with torch.no_grad():
+        logits = model(x)
+    return logits.softmax(-1)
+--- tests
+@check("same input twice, same prediction")
+def _():
+    model = make_classifier()
+    model.train()                    # just finished training, still in train mode
+    x = torch.randn(16, 8)
+    p1 = predict(model, x)
+    p2 = predict(model, x)
+    eq(p2, p1, tol=1e-6, msg="The two predictions differ: Dropout is still on and switches off half the neurons at random each time.")
+
+@check("one sample's prediction does not depend on the rest of the batch")
+def _():
+    model = make_classifier()
+    model.train()
+    x = torch.randn(16, 8)
+    whole = predict(model, x)[:4]
+    part = predict(model, x[:4])
+    eq(part, whole, tol=1e-5, msg="The same 4 samples give different results alone and inside a batch of 16. In train mode BatchNorm uses the mean and variance of *this batch*.")
+
+@check("predicting does not change BatchNorm's statistics")
+def _():
+    model = make_classifier()
+    model.train()
+    before = model[1].running_mean.clone()
+    predict(model, torch.randn(16, 8) + 3.0)
+    eq(model[1].running_mean, before, tol=0.0, msg="running_mean changed during prediction: in train mode BatchNorm updates it on every forward pass, and torch.no_grad() does not stop that.")
+--- hints
+- `torch.no_grad()` only decides whether gradients are recorded; it does not change how layers behave.
+- Dropout and BatchNorm behave according to the model's mode. Which mode should the model be in when predicting?
+- Add `model.eval()` on the line before `with torch.no_grad():`.
+
+@@ item d17-03
+type: fix
+title: Forgot to switch back to train() after evaluating
+level: 2
+cards: train() and eval(): Dropout and BatchNorm change behaviour
+targets: fit
+ref: day17
+--- context
+Evaluate once in the middle of training, forget to switch back to train mode, and the next tens of thousands of steps run without Dropout. The model overfits more easily, and the logs show nothing unusual.
+--- prompt
+`fit(model, train_batches, val_batch, eval_every=2)` trains on `train_batches` (SGD, lr=0.1, MSE loss), evaluates on `val_batch` every `eval_every` steps, and returns the list of validation losses.
+
+The evaluation part is correct: it uses `model.eval()` and `torch.no_grad()`. The problem is what happens after it. Also, the model passed in may already be in eval mode (for example, just loaded, or just evaluated).
+
+Fix it so that **every training step runs in train mode and every evaluation runs in eval mode.**
+
+The tests put a `ModeSpy` at the front of the model. It records which mode the model is in at every forward pass.
+--- starter
+def fit(model, train_batches, val_batch, eval_every=2):
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    val_losses = []
+    for step, (x, y) in enumerate(train_batches):
+        loss = F.mse_loss(model(x), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if (step + 1) % eval_every == 0:
+            model.eval()
+            with torch.no_grad():
+                xv, yv = val_batch
+                val_losses.append(F.mse_loss(model(xv), yv).item())
+    return val_losses
+--- solution
+def fit(model, train_batches, val_batch, eval_every=2):
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    val_losses = []
+    for step, (x, y) in enumerate(train_batches):
+        model.train()                # train mode at the start of every step, whatever happened before
+        loss = F.mse_loss(model(x), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if (step + 1) % eval_every == 0:
+            model.eval()
+            with torch.no_grad():
+                xv, yv = val_batch
+                val_losses.append(F.mse_loss(model(xv), yv).item())
+    return val_losses
+--- tests
+def _toy():
+    spy = ModeSpy()
+    model = nn.Sequential(spy, nn.Linear(4, 8), nn.Dropout(0.2), nn.Linear(8, 1))
+    batches = [(torch.randn(4, 4), torch.randn(4, 1)) for _ in range(6)]   # training batches: 4 rows
+    val = (torch.randn(7, 4), torch.randn(7, 1))                           # validation batch: 7 rows
+    return spy, model, batches, val
+
+@check("train mode while training, eval mode while evaluating")
+def _():
+    spy, model, batches, val = _toy()
+    model.train()
+    fit(model, batches, val, eval_every=2)
+    train_modes = [mode for n, mode in spy.log if n == 4]
+    eval_modes = [mode for n, mode in spy.log if n == 7]
+    true(len(train_modes) == 6 and len(eval_modes) == 3,
+         f"Expected 6 training forward passes and 3 evaluation passes, got {len(train_modes)} and {len(eval_modes)}")
+    wrong = [i for i, mode in enumerate(train_modes) if not mode]
+    true(not wrong, f"At training steps {wrong} (counting from 0) the model was in eval mode: Dropout was off, and nothing raised an error. Switch back to train mode after evaluating.")
+    true(not any(eval_modes), "The model must be in eval mode while evaluating")
+
+@check("a model passed in eval mode still trains in train mode")
+def _():
+    spy, model, batches, val = _toy()
+    model.eval()                     # e.g. a checkpoint that was just loaded
+    fit(model, batches, val, eval_every=2)
+    train_modes = [mode for n, mode in spy.log if n == 4]
+    true(len(train_modes) == 6 and all(train_modes),
+         f"The modes of the training forward passes were {train_modes} (True = train mode). The model came in in eval mode, and fit never switched it to train.")
+--- hints
+- After the first evaluation, what switches the model back to train mode?
+- Rather than adding a line after the evaluation, set the mode at the start of every training step. Then a model that arrives in eval mode is fine too.
+- Add `model.train()` as the first line of the `for` loop body.
+
+@@ item d17-04
+type: fix
+title: Data leakage: the mean includes the test set
+level: 1
+cards: Data leakage: statistics come from the training set only; Invariant tests: make silent bugs visible
+targets: normalize_split
+ref: day17
+--- context
+Computing the mean and standard deviation on all the data and splitting afterwards is the most common form of data leakage. Evaluation scores look better than production, because information from the test set already went into the training data.
+--- prompt
+`normalize_split(x, n_train)`: `x` has shape (N, D); the first `n_train` rows are the training set and the rest is the test set. Normalise both parts with the **training set's** mean and standard deviation (per column, `.mean(0)` and `.std(0)` with the default unbiased estimate) and return `(x_train, x_test, mean, std)`.
+
+The current code runs, but the test data changes the training results. Fix it.
+--- starter
+def normalize_split(x, n_train):
+    mean = x.mean(0)
+    std = x.std(0)
+    x_train = (x[:n_train] - mean) / std
+    x_test = (x[n_train:] - mean) / std
+    return x_train, x_test, mean, std
+--- solution
+def normalize_split(x, n_train):
+    train, test = x[:n_train], x[n_train:]
+    mean = train.mean(0)             # statistics from the training set only
+    std = train.std(0)
+    x_train = (train - mean) / std
+    x_test = (test - mean) / std
+    return x_train, x_test, mean, std
+--- tests
+@check("changing only the test set leaves the training data unchanged")
+def _():
+    x = torch.randn(20, 3) * 2 + 1
+    tr1, _, _, _ = normalize_split(x, 15)
+    x2 = x.clone()
+    x2[15:] += 100.0                 # a batch of very large values arrives in the test set
+    tr2, _, _, _ = normalize_split(x2, 15)
+    eq(tr2, tr1, tol=1e-5, msg="Only the test set changed, yet the normalised training data changed too: the mean / std used the test set. That is data leakage.")
+
+@check("statistics come from the training set, and the test set uses them")
+def _():
+    x = torch.randn(20, 3) * 2 + 1
+    tr, te, mean, std = normalize_split(x, 15)
+    eq(mean, x[:15].mean(0), tol=1e-5, msg="mean must be computed on the training set only (the first n_train rows)")
+    eq(std, x[:15].std(0), tol=1e-5, msg="std must be computed on the training set only")
+    eq(te, (x[15:] - x[:15].mean(0)) / x[:15].std(0), tol=1e-5, msg="Normalise the test set with the training set's mean / std")
+--- hints
+- Which rows does `x.mean(0)` use?
+- Slice out `x[:n_train]` first and compute mean and std on it only. The test set uses the same mean and std.
+
+@@ item d17-05
+type: fix
+title: Next-token labels are not shifted
+level: 2
+cards: Next-token labels are shifted by one
+targets: lm_loss
+ref: day17
+--- context
+A language model with unshifted labels shows a loss that falls fast, close to 0; training looks excellent. In fact it has only learned to copy the current token. Bugs like this are often found only when someone reads the generated text.
+--- prompt
+`lm_loss(model, tokens)`: `tokens` has shape (B, T), dtype long. `model(inp)` turns (B, k) tokens into (B, k, V) logits, and the logits at position t are the guess for the **next** token. Return the mean cross-entropy over the batch (a scalar).
+
+The tests use two fake models: `NextModel` always guesses "current token + 1", and `CopyModel` always guesses "the current token". On data that counts up by 1 (0, 1, 2, 3, …), the first is a perfect language model and the second is useless. The current code says the opposite. Fix it.
+--- starter
+def lm_loss(model, tokens):
+    logits = model(tokens)                       # (B, T, V)
+    V = logits.size(-1)
+    return F.cross_entropy(logits.reshape(-1, V), tokens.reshape(-1))
+--- solution
+def lm_loss(model, tokens):
+    logits = model(tokens[:, :-1])               # positions 0..T-2 make the guesses
+    targets = tokens[:, 1:]                      # the tokens at 1..T-1: shifted by one
+    V = logits.size(-1)
+    return F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1))
+--- tests
+def _counting_tokens(B=4, T=9, V=11):
+    start = torch.randint(0, V, (B, 1))
+    return (start + torch.arange(T)) % V         # every row counts up by 1: the next token is always "current + 1"
+
+@check("a model that predicts the next token gets a loss close to 0")
+def _():
+    loss = lm_loss(NextModel(11), _counting_tokens())
+    true(loss.item() < 0.01,
+         f"loss = {loss.item():.3f}. NextModel always guesses the next token right, so the loss should be close to 0. "
+         "Are you comparing the output at position t with the token at position t?")
+
+@check("a model that copies the current token must not get a loss close to 0")
+def _():
+    loss = lm_loss(CopyModel(11), _counting_tokens())
+    true(loss.item() > 1.0,
+         f"loss = {loss.item():.4f}. A model that only copies got an almost perfect loss, too good to be true: the labels are not shifted, so the model is copying the answer.")
+--- hints
+- The logits at position t should be compared with the token at which position?
+- The inputs drop the last token; the labels drop the first token.
+- `logits = model(tokens[:, :-1])`, `targets = tokens[:, 1:]`, and flatten with `.reshape`.
+
+@@ item d17-06
+type: fix
+title: Padding counted in the mean loss
+level: 2
+cards: Padding must not count in the mean; Invariant tests: make silent bugs visible
+targets: masked_lm_loss
+ref: day17
+--- context
+With padding in the mean, the loss depends on how much padding there is. Change the batch size or the length bucketing and the loss curve jumps; losses from different runs can no longer be compared. The code never raises an error.
+--- prompt
+`masked_lm_loss(logits, targets, mask)`:
+
+- `logits` (B, T, V), `targets` (B, T) long
+- `mask` (B, T) float, 1.0 = real token, 0.0 = padding
+
+The target at padding positions is 0, and 0 is also a real token id, so you cannot simply rely on `ignore_index`.
+
+Return the mean cross-entropy **over all real tokens** (averaged per token, one scalar). The current code already multiplies the padding losses by 0, yet the result is still wrong. Fix it.
+--- starter
+def masked_lm_loss(logits, targets, mask):
+    V = logits.size(-1)
+    loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1), reduction="none")
+    loss = loss * mask.reshape(-1)               # loss at padding positions becomes 0
+    return loss.mean()
+--- solution
+def masked_lm_loss(logits, targets, mask):
+    V = logits.size(-1)
+    loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1), reduction="none")
+    mask = mask.reshape(-1).to(loss.dtype)
+    return (loss * mask).sum() / mask.sum()      # the denominator counts real tokens only
+--- tests
+def _batch(B=3, T=5, V=7):
+    logits = torch.randn(B, T, V)
+    lengths = torch.tensor([5, 3, 2])
+    mask = (torch.arange(T) < lengths[:, None]).float()      # (B, T)
+    targets = torch.randint(0, V, (B, T)) * mask.long()       # the target at padding positions is 0
+    return logits, targets, mask
+
+@check("more padding columns, same loss")
+def _():
+    logits, targets, mask = _batch()
+    a = masked_lm_loss(logits, targets, mask)
+    B, T, V = logits.shape
+    b = masked_lm_loss(torch.cat([logits, torch.randn(B, 4, V)], 1),
+                       torch.cat([targets, torch.zeros(B, 4, dtype=torch.long)], 1),
+                       torch.cat([mask, torch.zeros(B, 4)], 1))
+    eq(b, a, tol=1e-5,
+       msg=f"With 4 more columns of padding the loss went from {a.item():.4f} to {b.item():.4f}. More padding, smaller loss: the denominator counts all positions, not real tokens.")
+
+@check("equals the mean cross-entropy over real tokens")
+def _():
+    logits, targets, mask = _batch()
+    keep = mask.bool()
+    want = F.cross_entropy(logits[keep], targets[keep])
+    eq(masked_lm_loss(logits, targets, mask), want, tol=1e-5, msg="Average over real tokens only: (loss * mask).sum() / mask.sum()")
+--- hints
+- The numerator is already right (the padding losses are 0). What is the denominator of `.mean()`?
+- The denominator should be the number of real tokens, which is `mask.sum()`.
+
+@@ item d17-07
+type: fix
+title: Gradient accumulation without weighting
+level: 3
+cards: Gradient accumulation: weight each part by its size
+targets: accum_step
+ref: day17
+--- context
+Gradient accumulation is the standard way to train with a big batch on a small GPU. Forget to weight the losses and the gradient is several times too large: with SGD the steps are far too big, and with Adam the gradient clipping and the logged loss are both wrong. Nothing raises an error.
+--- prompt
+`accum_step(model, opt, micro_batches)`: `micro_batches` is `[(x, y), ...]`, and together these micro-batches form one big batch. Accumulate the gradients and call `opt.step()` only once.
+
+Requirement: the result must be **exactly the same** as "compute `F.mse_loss` (default: mean) on the big batch once, backward, step". Return the big-batch loss (a Python float).
+
+Careful: the micro-batches are not always the same size; the last one may be smaller (for example 4, 4, 2).
+
+The tests use SGD, because Adam hardly reacts to scaling the whole gradient and would hide this bug.
+--- starter
+def accum_step(model, opt, micro_batches):
+    opt.zero_grad()
+    total = 0.0
+    for x, y in micro_batches:
+        loss = F.mse_loss(model(x), y)
+        loss.backward()
+        total += loss.item()
+    opt.step()
+    return total
+--- solution
+def accum_step(model, opt, micro_batches):
+    n = sum(len(x) for x, _ in micro_batches)    # total number of rows in the big batch
+    opt.zero_grad()
+    total = 0.0
+    for x, y in micro_batches:
+        loss = F.mse_loss(model(x), y) * (len(x) / n)   # weight each part by its size
+        loss.backward()
+        total += loss.item()
+    opt.step()
+    return total
+--- tests
+def _compare(sizes):
+    x, y = torch.randn(sum(sizes), 4), torch.randn(sum(sizes), 2)
+    ref = nn.Linear(4, 2)
+    mine = nn.Linear(4, 2)
+    mine.load_state_dict(ref.state_dict())
+    ref_opt = torch.optim.SGD(ref.parameters(), lr=0.1)
+    ref_opt.zero_grad()
+    full = F.mse_loss(ref(x), y)                 # the reference: computed on the big batch directly
+    full.backward()
+    ref_opt.step()
+    opt = torch.optim.SGD(mine.parameters(), lr=0.1)
+    got = accum_step(mine, opt, list(zip(x.split(sizes), y.split(sizes))))
+    return ref, mine, full.item(), got
+
+@check("4 equal micro-batches == 1 big batch")
+def _():
+    ref, mine, _, _ = _compare([4, 4, 4, 4])
+    ratio = (mine.weight.grad.norm() / ref.weight.grad.norm()).item()
+    eq(mine.weight.grad, ref.weight.grad, tol=1e-5, msg=f"The accumulated gradient is {ratio:.2f} times the big-batch gradient: each micro-batch loss is a mean, so adding them up counts too much.")
+    eq(mine.weight, ref.weight, tol=1e-5, msg="After the step the parameters differ from big-batch training")
+
+@check("micro-batches of different sizes (4, 4, 2) are right too")
+def _():
+    ref, mine, _, _ = _compare([4, 4, 2])
+    eq(mine.weight.grad, ref.weight.grad, tol=1e-5,
+       msg="Dividing by the number of micro-batches is not enough: the last part has only 2 rows, so its loss should count 2/10, not 1/3. Multiply each loss by len(x) / total rows.")
+    eq(mine.weight, ref.weight, tol=1e-5, msg="After the step the parameters differ from big-batch training")
+
+@check("the returned loss equals the big-batch loss")
+def _():
+    _, _, full, got = _compare([4, 4, 2])
+    true(isinstance(got, float), f"Return a Python float (use .item()); you returned a {type(got).__name__}")
+    true(close(got, full, 1e-5), f"You returned {got:.4f}; the big-batch loss is {full:.4f}. The logged loss must be added up with the same weights.")
+--- hints
+- Each micro-batch loss is already a mean. If you add up the gradients of 4 means, how many times the big-batch gradient do you get?
+- The big-batch mean = the sum over parts of (that part's mean × its rows / total rows).
+- Compute `n = sum(len(x) for x, _ in micro_batches)` first; each part's `loss = F.mse_loss(model(x), y) * (len(x) / n)`, and `total` adds up this weighted value.
+
+@@ item d17-08
+type: fix
+title: Weight decay on LayerNorm
+level: 2
+cards: No weight decay on 1-D parameters
+targets: param_groups
+ref: day17
+--- context
+Almost every codebase that trains Transformers splits the parameters into a "decay" group and a "no decay" group. Filtering by name is the most common way to do it, and the easiest way to miss LayerNorm's weight, which then shrinks slowly during training.
+--- prompt
+`param_groups(model, weight_decay)` returns two parameter groups for `torch.optim.AdamW`:
+
+- group 1: the parameters that get weight decay, `"weight_decay": weight_decay`
+- group 2: the parameters that do not (all biases and LayerNorm weights), `"weight_decay": 0.0`
+
+Every parameter must appear in exactly one group. The current code looks for biases by name. It runs, but LayerNorm's weight still gets decay. Switch to a reliable rule: **1-D parameters (`p.ndim < 2`) get no decay; parameters with 2 or more dimensions get decay.**
+--- starter
+def param_groups(model, weight_decay):
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if name.endswith("bias"):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [{"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0}]
+--- solution
+def param_groups(model, weight_decay):
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if p.ndim < 2:               # biases and LayerNorm weights are 1-D
+            no_decay.append(p)
+        else:                        # weight matrices, embeddings
+            decay.append(p)
+    return [{"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0}]
+--- tests
+def _net():
+    return nn.Sequential(nn.Embedding(10, 8), nn.LayerNorm(8), nn.Linear(8, 8), nn.LayerNorm(8), nn.Linear(8, 10))
+
+@check("1-D parameters get no decay, all others do")
+def _():
+    net = _net()
+    groups = param_groups(net, 0.1)
+    names = {id(p): n for n, p in net.named_parameters()}
+    decay = [p for g in groups if g["weight_decay"] > 0 for p in g["params"]]
+    no_decay = [p for g in groups if g["weight_decay"] == 0 for p in g["params"]]
+    wrong = [names[id(p)] for p in decay if p.ndim < 2]
+    true(not wrong, f"These 1-D parameters get weight decay: {wrong}. LayerNorm's weight has no 'bias' in its name, so filtering by name misses it.")
+    true(sorted(names[id(p)] for p in decay) == sorted(n for n, p in net.named_parameters() if p.ndim >= 2),
+         "Every parameter with 2 or more dimensions (Embedding, Linear weights) must be in the decay group, each exactly once")
+    true(sorted(names[id(p)] for p in no_decay) == sorted(n for n, p in net.named_parameters() if p.ndim < 2),
+         "1-D parameters must be in the weight_decay=0 group, each exactly once")
+
+@check("LayerNorm's weight is not quietly shrunk during training")
+def _():
+    net = _net()
+    opt = torch.optim.AdamW(param_groups(net, 0.1), lr=0.1)
+    for _ in range(10):
+        for p in net.parameters():
+            p.grad = torch.zeros_like(p)     # zero gradient: only weight decay can change a parameter
+        opt.step()
+    ln = net[1].weight
+    true(torch.all(ln == 1.0),
+         f"The gradient was always 0, yet LayerNorm's weight shrank from 1.0 to {ln.mean().item():.3f}. That is all weight decay.")
+--- hints
+- What are the names of the two parameters of `nn.LayerNorm(8)`? Which one does not end in "bias"?
+- Look at the shape, not the name: what do biases and LayerNorm weights have in common?
+- Replace `if name.endswith("bias"):` with `if p.ndim < 2:`.
+
+@@ item d17-09
+type: fix
+title: The scheduler steps once per epoch
+level: 2
+cards: Step the LR scheduler every step
+targets: train_with_warmup
+ref: day17
+--- context
+A warmup schedule is designed in steps. Step it once per epoch and the learning rate stays at tiny values for a long time. The loss falls slowly, and people start tuning the model or the data without suspecting one misplaced scheduler line.
+--- prompt
+`train_with_warmup(model, batches, epochs, lr=0.1, warmup=8)` trains with SGD for `epochs` epochs; each epoch goes through all of `batches`.
+
+The schedule is a linear warmup: the learning rate at step s (counting from 0; every `opt.step()` is one step) is `lr * min(1, (s + 1) / warmup)`. So over the first 8 steps it rises from 0.0125 to 0.1, and then it stays at 0.1.
+
+The function returns the list of learning rates actually used by each `opt.step()`. The current code runs, but the learning rate rises too slowly. Fix it.
+--- starter
+def train_with_warmup(model, batches, epochs, lr=0.1, warmup=8):
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / warmup))
+    used = []
+    for epoch in range(epochs):
+        for x, y in batches:
+            loss = F.mse_loss(model(x), y)
+            opt.zero_grad()
+            loss.backward()
+            used.append(opt.param_groups[0]["lr"])
+            opt.step()
+        sched.step()
+    return used
+--- solution
+def train_with_warmup(model, batches, epochs, lr=0.1, warmup=8):
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / warmup))
+    used = []
+    for epoch in range(epochs):
+        for x, y in batches:
+            loss = F.mse_loss(model(x), y)
+            opt.zero_grad()
+            loss.backward()
+            used.append(opt.param_groups[0]["lr"])
+            opt.step()
+            sched.step()             # once per step, right after opt.step()
+    return used
+--- tests
+def _run():
+    model = nn.Linear(2, 1)
+    batches = [(torch.randn(5, 2), torch.randn(5, 1)) for _ in range(4)]
+    return train_with_warmup(model, batches, epochs=3, lr=0.1, warmup=8)
+
+@check("the learning rate reaches 0.1 at step 8 (index 7)")
+def _():
+    used = _run()
+    true(len(used) == 12, f"4 batches × 3 epochs = 12 steps, but you recorded {len(used)} learning rates")
+    true(close(used[7], 0.1, 1e-9),
+         f"The learning rate at index 7 should be 0.1, but it is {used[7]:.4f}. Warmup is designed in steps; your scheduler moves too slowly.")
+
+@check("every step's learning rate matches the schedule")
+def _():
+    used = _run()
+    want = [0.1 * min(1.0, (s + 1) / 8) for s in range(12)]
+    bad = [i for i in range(min(len(used), 12)) if not close(used[i], want[i], 1e-9)]
+    true(len(used) == 12 and not bad,
+         f"Mismatch from index {bad[0] if bad else len(used)} on.\n       schedule: {[round(v, 4) for v in want]}\n       yours:    {[round(v, 4) for v in used]}\n"
+         "       Call scheduler.step() after opt.step() in every step: not in the epoch loop, and not before opt.step().")
+--- hints
+- Which loop is `sched.step()` in now? How many times is it called per epoch?
+- Move it into the inner loop, on the line after `opt.step()`.
+
+@@ item d17-10
+type: code
+title: Invariant test 1: a causality check
+level: 2
+cards: Invariant tests: make silent bugs visible; train() and eval(): Dropout and BatchNorm change behaviour
+targets: check_causal
+ref: day17
+--- context
+An attention mask pointing the wrong way or letting one extra position through, a convolution whose padding shows the model the next token: none of these raises an error, and the training loss even looks unusually good. A causality check of a few lines catches all of them before training starts.
+--- prompt
+Write `check_causal(model, x)`, which checks whether a sequence model "peeks at the future".
+
+- `model` maps (B, T, D) to (B, T, D_out); `x` is a (B, T, D) float input.
+- For every position t = 0, 1, …, T-2: copy x, replace all inputs after position t (`t+1:`) with random numbers (`torch.randn_like`), and run the model again. The outputs at positions 0..t must be the same as before (`torch.allclose(..., atol=1e-5)`).
+- If they are always the same, return `True`; if any position changed, return `False`.
+- Call `model.eval()` first and run inside `torch.no_grad()`: some models contain Dropout, whose randomness changes the outputs anyway.
+
+The tests use `CumMean` (causal), `TinyAttention(mask="causal" / "none" / "peek1")`, `SameConv` (a convolution with padding=1) and `PeekMiddle` (only position 2 peeks at position 3).
+--- starter
+def check_causal(model, x):
+    """model: (B, T, D) -> (B, T, D_out)   x: (B, T, D)
+    Replace the inputs after each position t with random numbers; if the outputs at 0..t never change -> True, else False."""
+    raise todo()
+--- solution
+def check_causal(model, x):
+    model.eval()                                  # Dropout off, otherwise the outputs change anyway
+    with torch.no_grad():
+        base = model(x)
+        for t in range(x.shape[1] - 1):
+            x2 = x.clone()
+            x2[:, t + 1:] = torch.randn_like(x2[:, t + 1:])     # change only the "future"
+            if not torch.allclose(model(x2)[:, :t + 1], base[:, :t + 1], atol=1e-5):
+                return False                      # a past output changed: the model peeked at the future
+    return True
+--- tests
+@check("a causal model: returns True")
+def _():
+    x = torch.randn(2, 6, 8)
+    r = check_causal(CumMean(), x)
+    true(r is not None and bool(r), "CumMean only uses past and present inputs, so it is causal, but your check says it peeks at the future")
+    attn = TinyAttention(8, mask="causal", p_drop=0.3)
+    attn.train()                                  # has Dropout, and is in train mode right now
+    r = check_causal(attn, x)
+    true(r is not None and bool(r), "A causal attention with Dropout was judged to peek at the future: its outputs changed because of Dropout's randomness. Call model.eval() before checking.")
+
+@check("a model that peeks at the future: returns False")
+def _():
+    x = torch.randn(2, 6, 8)
+    cases = [("attention without a mask", TinyAttention(8, mask="none")),
+             ("attention whose mask uses tril(diagonal=1) (sees one extra position)", TinyAttention(8, mask="peek1")),
+             ("a convolution with padding=1 (sees the next position)", SameConv(8)),
+             ("a model where only position 2 peeks at position 3 (check every t)", PeekMiddle())]
+    for name, m in cases:
+        r = check_causal(m, x)
+        true(r is not None and not bool(r), f"{name} peeks at the future, and your check did not catch it")
+--- hints
+- Compute the original output once, `base = model(x)`, and compare with it every time.
+- For each t: `x2 = x.clone()`, `x2[:, t + 1:] = torch.randn_like(x2[:, t + 1:])`, then compare `model(x2)[:, :t + 1]` with `base[:, :t + 1]`.
+- Do not forget `model.eval()` and `with torch.no_grad():` at the start. Compare with `torch.allclose(a, b, atol=1e-5)`.
+
+@@ item d17-11
+type: code
+title: Invariant test 2: samples in a batch do not affect each other
+level: 2
+cards: Invariant tests: make silent bugs visible; train() and eval(): Dropout and BatchNorm change behaviour
+targets: check_batch_independent
+ref: day17
+--- context
+At inference time, a sample's result should not depend on which other samples share its batch. BatchNorm without `eval()` and a softmax over the wrong dim both break this. In production the results then change with traffic, which is hard to track down; one check before release is enough.
+--- prompt
+Write `check_batch_independent(f, x)`:
+
+- `f` is a function or a model that maps (B, …) to (B, …); dim 0 is the batch. `f` itself has no randomness.
+- Split x into two halves, `x[:h]` and `x[h:]` with `h = B // 2`. Run `f` on each half, then join the results along dim 0 with `torch.cat`.
+- If the joined result equals `f(x)` (the whole batch at once; `torch.allclose(..., atol=1e-5)`), return `True`; otherwise return `False`.
+- Do it inside `torch.no_grad()`.
+
+Careful: this check must **not** call `eval()`. What it checks is exactly how `f` behaves in its current state, for example whether your `predict` function forgot to switch the mode.
+--- starter
+def check_batch_independent(f, x):
+    """f: (B, ...) -> (B, ...)   x: (B, ...)
+    Two halves computed separately and joined == the whole batch at once -> True, else False."""
+    raise todo()
+--- solution
+def check_batch_independent(f, x):
+    h = x.shape[0] // 2
+    with torch.no_grad():
+        whole = f(x)                                   # the whole batch at once
+        parts = torch.cat([f(x[:h]), f(x[h:])])        # the two halves separately
+    return torch.allclose(parts, whole, atol=1e-5)
+--- tests
+@check("samples computed independently: returns True")
+def _():
+    x = torch.randn(8, 8)
+    model = make_classifier()
+    model.eval()
+    r = check_batch_independent(model, x)
+    true(r is not None and bool(r), "In eval mode the model computes every sample on its own, so the check should return True")
+    r = check_batch_independent(lambda t: t.softmax(-1), x)
+    true(r is not None and bool(r), "softmax(dim=-1) normalises inside each row, so samples do not affect each other; the check should return True")
+
+@check("samples that affect each other: returns False")
+def _():
+    x = torch.randn(8, 8)
+    bn = nn.Sequential(nn.Linear(8, 16), nn.BatchNorm1d(16))
+    bn.train()
+    cases = [("BatchNorm in train mode", bn),
+             ("softmax with dim=0 by mistake", lambda t: t.softmax(0)),
+             ("subtracting the mean of the whole batch", lambda t: t - t.mean(0))]
+    for name, f in cases:
+        r = check_batch_independent(f, x)
+        true(r is not None and not bool(r), f"{name}: one sample's output depends on the other samples in the batch, and your check did not catch it")
+--- hints
+- You need three calls of `f`: the whole of x, the first half, the second half.
+- `torch.cat([f(x[:h]), f(x[h:])])` joins along dim 0; compare it with `f(x)` using `torch.allclose(..., atol=1e-5)`.
+
+@@ item d17-12
+type: choice
+title: Which invariant catches which bug
+level: 2
+cards: Invariant tests: make silent bugs visible
+--- context
+Before writing an invariant test, be clear which bug you are worried about and which property it breaks. Test the wrong property and every test is green while the bug is still there.
+--- prompt
+Each option pairs an invariant test with a bug it can catch. Which pairs are **correct**? (Several answers.)
+--- options
+- Causality check (change the inputs after position t; the outputs at 0..t stay the same) → catches: an attention mask written as `tril(diagonal=1)`
+- Batch-independence check (two halves separately == whole batch at once) → catches: `model.eval()` forgotten before predicting, so BatchNorm uses batch statistics
+- Padding invariance (a few more columns of padding; the loss stays the same) → catches: padding positions counted in the mean loss
+- Comparison with the big batch (accumulated gradient == big-batch gradient) → catches: the scheduler steps only once per epoch
+- Causality check → catches: normalisation that uses the test set's mean
+answer: 1,2,3
+--- explain
+The first three are correct: each bug breaks the matching property, so the test fails.
+
+Option 4 is wrong: comparing with the big batch catches gradient accumulation without weighting. For the scheduler, record the learning rate actually used at every step and compare it with the schedule.
+
+Option 5 is wrong: causality is about positions in a sequence (the past must not see the future); it has nothing to do with leakage between the training and test sets. Check data leakage with "change only the test set; the training data must not change".
+--- hints
+- For each option ask: with this bug present, would the two things the test compares differ?
+- The gradient-accumulation comparison never calls a scheduler at all.
+
+@@ item d17-13
+type: code
+title: Closed book: a loss averaged over real tokens only
+level: 2
+exam: yes
+cards: Padding must not count in the mean
+targets: masked_lm_loss
+ref: day17
+--- context
+A loss with padding is code that everyone training NLP or speech models writes all the time. Write it without looking, and know why the denominator is `mask.sum()`.
+--- prompt
+Write `masked_lm_loss(logits, targets, mask)`: `logits` (B, T, V), `targets` (B, T) long, `mask` (B, T) float (1.0 = real token, 0.0 = padding; the target at padding positions is 0, which is also a valid token id).
+
+Return the mean cross-entropy over all real tokens (a scalar). Adding more columns of padding must not change the result.
+--- starter
+def masked_lm_loss(logits, targets, mask):
+    raise todo()
+--- solution
+def masked_lm_loss(logits, targets, mask):
+    V = logits.size(-1)
+    loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1), reduction="none")
+    mask = mask.reshape(-1).to(loss.dtype)
+    return (loss * mask).sum() / mask.sum()      # the denominator counts real tokens only
+--- tests
+def _batch(B=3, T=5, V=7):
+    logits = torch.randn(B, T, V)
+    lengths = torch.tensor([5, 3, 2])
+    mask = (torch.arange(T) < lengths[:, None]).float()      # (B, T)
+    targets = torch.randint(0, V, (B, T)) * mask.long()       # the target at padding positions is 0
+    return logits, targets, mask
+
+@check("more padding columns, same loss")
+def _():
+    logits, targets, mask = _batch()
+    a = masked_lm_loss(logits, targets, mask)
+    B, T, V = logits.shape
+    b = masked_lm_loss(torch.cat([logits, torch.randn(B, 4, V)], 1),
+                       torch.cat([targets, torch.zeros(B, 4, dtype=torch.long)], 1),
+                       torch.cat([mask, torch.zeros(B, 4)], 1))
+    eq(b, a, tol=1e-5,
+       msg=f"With 4 more columns of padding the loss went from {a.item():.4f} to {b.item():.4f}. More padding, smaller loss: the denominator counts all positions, not real tokens.")
+
+@check("equals the mean cross-entropy over real tokens")
+def _():
+    logits, targets, mask = _batch()
+    keep = mask.bool()
+    want = F.cross_entropy(logits[keep], targets[keep])
+    eq(masked_lm_loss(logits, targets, mask), want, tol=1e-5, msg="Average over real tokens only: (loss * mask).sum() / mask.sum()")
+--- hints
+- `reduction="none"` gives the loss at every position.
+- Multiply by the mask, then divide by `mask.sum()`.
+
+@@ item d17-14
+type: code
+title: Closed book: a causality check
+level: 2
+exam: yes
+cards: Invariant tests: make silent bugs visible
+targets: check_causal
+ref: day17
+--- context
+A causality check is among the most valuable few lines of test code for any sequence model. If you can write it without looking, you can run it on every new model before you start training.
+--- prompt
+Write `check_causal(model, x)`: `model` maps (B, T, D) to (B, T, D_out); `x` is (B, T, D).
+
+For every position t = 0 … T-2, replace the inputs after t with random numbers; the outputs at 0..t must all stay the same (`atol=1e-5`). If they do, return `True`; otherwise `False`. The model may contain Dropout.
+--- starter
+def check_causal(model, x):
+    raise todo()
+--- solution
+def check_causal(model, x):
+    model.eval()                                  # Dropout off, otherwise the outputs change anyway
+    with torch.no_grad():
+        base = model(x)
+        for t in range(x.shape[1] - 1):
+            x2 = x.clone()
+            x2[:, t + 1:] = torch.randn_like(x2[:, t + 1:])     # change only the "future"
+            if not torch.allclose(model(x2)[:, :t + 1], base[:, :t + 1], atol=1e-5):
+                return False                      # a past output changed: the model peeked at the future
+    return True
+--- tests
+@check("a causal model: returns True")
+def _():
+    x = torch.randn(2, 6, 8)
+    r = check_causal(CumMean(), x)
+    true(r is not None and bool(r), "CumMean only uses past and present inputs, so it is causal, but your check says it peeks at the future")
+    attn = TinyAttention(8, mask="causal", p_drop=0.3)
+    attn.train()                                  # has Dropout, and is in train mode right now
+    r = check_causal(attn, x)
+    true(r is not None and bool(r), "A causal attention with Dropout was judged to peek at the future: its outputs changed because of Dropout's randomness. Call model.eval() before checking.")
+
+@check("a model that peeks at the future: returns False")
+def _():
+    x = torch.randn(2, 6, 8)
+    cases = [("attention without a mask", TinyAttention(8, mask="none")),
+             ("attention whose mask uses tril(diagonal=1) (sees one extra position)", TinyAttention(8, mask="peek1")),
+             ("a convolution with padding=1 (sees the next position)", SameConv(8)),
+             ("a model where only position 2 peeks at position 3 (check every t)", PeekMiddle())]
+    for name, m in cases:
+        r = check_causal(m, x)
+        true(r is not None and not bool(r), f"{name} peeks at the future, and your check did not catch it")
+--- hints
+- Call `model.eval()` first and compute the original output inside `torch.no_grad()`.
+- For each t change only `t+1:` and compare `[:, :t + 1]`.

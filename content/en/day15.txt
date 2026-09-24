@@ -1,0 +1,1033 @@
+@@ day 15
+title: Debugging 1: when the loss looks wrong
+part: Debugging
+hours: 3–4 hours
+--- goal
+After today you can look at a loss curve that seems wrong and name the most likely cause. You can find which layer or which operation produced a nan. And when the loss will not go down, you can work through a fixed checklist, in order, and fix the most common training-loop bugs.
+--- checklist
+- Clear the review queue first (redo from scratch any item whose answer you looked at)
+- Run all 8 knowledge cards; change at least one number in each and run it again
+- Pass every practice item; for the 6 bug-fixing items, read the code and hunt for the bug yourself before you open a hint
+- Close the cards, write the "loss won't go down" checklist from memory on paper, then do the closed-book items
+
+@@ concept
+title: The first loss should be about ln C
+--- body
+A classifier that has just been initialized knows nothing. It should give each of the C classes roughly the same probability, about 1/C.
+
+Cross-entropy is the negative log of "the probability of the correct class". So the loss at the first step should be about -ln(1/C) = **ln C**:
+
+- 10 classes: ln 10 ≈ 2.30
+- GPT-2's vocabulary has 50257 tokens: ln 50257 ≈ 10.8
+
+Work this number out in your head before training starts, then compare it with the first loss in the log:
+
+- About the same (a few tenths apart): fine.
+- Much larger: the model starts out "confidently wrong". Common causes: the initial weights are too large, or the logits (the raw score the model gives each class, before softmax) are scaled up.
+- Much smaller: the model may be peeking at the answer (for example, the label leaked into the input), or the loss is wrong.
+
+In the example below, a normally initialized model has a first loss of 2.478, close to ln 10 = 2.303. Multiply the weights by 30 and the first loss becomes 25.738.
+--- code
+torch.manual_seed(0)
+C = 10
+model = nn.Linear(32, C)
+x = torch.randn(64, 32)
+y = torch.randint(0, C, (64,))
+
+print("ln C                    =", round(math.log(C), 3))
+print("first loss              =", round(F.cross_entropy(model(x), y).item(), 3))
+with torch.no_grad():
+    model.weight.mul_(30)            # pretend the initialization is too large
+print("loss with weights x 30  =", round(F.cross_entropy(model(x), y).item(), 3))
+
+@@ concept
+title: Reading a loss curve: flat, exploding, bouncing, floor
+--- body
+Print the loss every few steps (or plot it) and look at its shape first. These are the usual ways it can look wrong:
+
+- **Flat**: it stays near the first value (around 2.30 with 10 classes). The model is learning nothing. Either the parameters are not being updated at all (frozen, missing from the optimizer, lr is 0), or the labels do not match the inputs.
+- **Exploding**: it keeps growing, often all the way to inf or nan. The most common cause is a learning rate that is too high.
+- **Bouncing**: it jumps up and down with no downward trend. Usually the learning rate is a bit too high.
+- **Floor**: it drops to some value and never goes lower, even on one small batch. This is almost always a code bug, for example an extra softmax before cross_entropy.
+
+The learning rate (lr) is how far each step moves along the gradient. It decides the shape of the curve. Here is the simplest possible demo: one parameter w, loss = (w - 3)², lowest at w = 3.
+
+- lr = 0.05: each step moves only a little; the loss falls slowly.
+- lr = 0.4: w reaches 3 in a few steps; the loss falls to 0.
+- lr = 1.1: every step jumps over the bottom of the valley to the other side of 3, and each jump lands further away, so the loss keeps growing. That is "exploding". In real training, a few more jumps make the weights so large that they overflow, and the loss becomes inf or nan.
+--- code
+for lr in (0.05, 0.4, 1.1):
+    w = torch.tensor(0.0, requires_grad=True)
+    ws, losses = [], []
+    for step in range(6):
+        loss = (w - 3) ** 2
+        ws.append(round(w.item(), 2))
+        losses.append(round(loss.item(), 2))
+        w.grad = None
+        loss.backward()
+        with torch.no_grad():
+            w -= lr * w.grad            # move lr times the gradient, downhill
+    print(f"lr={lr:<5} w   : {ws}")
+    print(f"{'':9}loss: {losses}")
+
+@@ concept
+title: Where NaN and inf come from
+--- body
+inf means "infinity". nan means "Not a Number". Once either one appears in the loss, backward carries it into every gradient. After one optimizer step every weight is nan, and the model is ruined. The usual sources:
+
+- **log(0) = -inf**: a probability came out as exactly 0 (for example, a softmax probability too small for float32).
+- **exp of a large number**: float32 tops out at about 3.4e38. exp(88.7) already reaches it; anything larger is inf.
+- **Division by 0**: 1/0 = inf and 0/0 = nan. For example, standardizing by the standard deviation when one column has the same value everywhere, so its standard deviation is 0.
+- **inf used in more math**: 0 × inf = nan, inf - inf = nan.
+- **Square root or log of a negative number**: nan.
+- **fp16 overflow** (next card) and **a learning rate that is too high** (the weights grow with every update until they overflow).
+
+One more trap: **every comparison with nan is False**. `nan > 10` is False, and even `nan == nan` is False. So `if loss > 100: alert` never catches a nan.
+
+To check whether a number is normal, use `math.isfinite(x)` (Python numbers) or `torch.isfinite(t)` (tensors). They return True for ordinary numbers and False for nan, inf and -inf.
+--- code
+print(torch.exp(torch.tensor([10.0, 50.0, 90.0])).tolist())   # 90 already overflows
+print(torch.tensor(-1.0).sqrt().item(), float("inf") - float("inf"))
+
+x = torch.tensor([[1.0, 5.0], [1.0, 7.0]])      # column 0 is all 1s: standard deviation 0
+print(((x - x.mean(0)) / x.std(0)).tolist())     # 0 / 0 = nan
+
+print(torch.tensor([1.0, float("nan"), 3.0]).sum().item())   # one nan ruins the whole sum
+
+nan = float("nan")
+print(nan > 10, nan < 10, nan == nan)                          # all False
+print(math.isfinite(nan), math.isfinite(float("inf")), math.isfinite(2.5))
+
+@@ concept
+title: fp16 tops out at 65504
+--- body
+Mixed-precision training does much of the math in 16-bit floating point: it uses less memory and runs faster. But the two 16-bit formats are very different:
+
+- **float16 (fp16)**: the largest number it can hold is 65504. 256 × 256 = 65536 is already too big and becomes inf.
+- **bfloat16 (bf16)**: the same range as float32 (up to about 3.4e38), so it almost never overflows. The price is low precision: only 2 to 3 significant digits.
+- **float32**: up to about 3.4e38, about 7 significant digits.
+
+Where fp16 overflows most often: squares (x²), sums of many numbers, attention scores q·k, variances and norms. They are perfectly fine in float32 and become inf as soon as they run in fp16. After that, the inf may turn into nan, or it may quietly turn into 0: 1/sqrt(inf) = 0, so the whole layer's output gets multiplied by 0, with no error.
+
+The usual fixes:
+
+1. Do the risky part in float32 and convert back afterwards: `xf = x.float()` … `.to(x.dtype)`. Llama's RMSNorm is written exactly like this.
+2. Use bf16 instead of fp16 if your GPU supports it.
+3. When training in fp16, use `torch.amp.GradScaler`. It scales the loss up before backward, so tiny gradients do not round to 0 in fp16, and it skips the update for any step whose gradients contain inf.
+--- code
+print("float16 max:", torch.finfo(torch.float16).max)
+print("bfloat16 max:", torch.finfo(torch.bfloat16).max)
+
+a = torch.tensor([255.0, 256.0], dtype=torch.float16)
+print("fp16 squares:", (a * a).tolist())
+print("bf16 squares:", (a.bfloat16() * a.bfloat16()).tolist())
+print("fp32 squares:", (a.float() * a.float()).tolist())
+
+s = torch.full((1000,), 100.0, dtype=torch.float16)
+print("sum of 1000 x 100 in fp16:   ", s.sum().item())
+print("convert to float32, then sum:", s.float().sum().item())
+
+@@ concept
+title: Writing numerically stable code
+--- body
+The same formula, written a different way, can avoid inf and nan. Remember these rules:
+
+- **Never write `torch.log(torch.softmax(x))` yourself.** When a probability is too small for float32 it becomes 0, and log(0) = -inf. Use `F.log_softmax(x, dim=-1)`: it subtracts the maximum first, so the result is an ordinary negative number, never -inf.
+- **`F.cross_entropy` takes logits** (raw scores). It does the log_softmax itself. **Do not** put a softmax in front of it.
+- **The same goes for two classes**: do not take a sigmoid and then a log; use `F.binary_cross_entropy_with_logits`.
+- **Guard anything that can hit 0**: `torch.log(p.clamp_min(1e-12))`, `torch.sqrt(x + 1e-12)`, `x / (std + 1e-5)`.
+- **Do the overflow-prone part** (squares, sums, variances) in float32, then convert back to low precision.
+
+In the example below the logits are [0, 200]. Class 0 has probability e^-200, which float32 cannot hold, so softmax returns 0 and the log gives -inf. log_softmax gives the exact answer, -200.
+--- code
+logits = torch.tensor([[0.0, 200.0]])
+print("log(softmax):", torch.log(logits.softmax(-1)).tolist())
+print("log_softmax :", F.log_softmax(logits, -1).tolist())
+
+z = torch.tensor([40.0])             # the model is sure it is "positive", but the label is 0
+p = torch.sigmoid(z)
+print("after sigmoid:", p.item(), "  log(1 - p):", torch.log(1 - p).item())
+print("loss with the with_logits version:", F.binary_cross_entropy_with_logits(z, torch.tensor([0.0])).item())
+
+@@ concept
+title: Catch the first NaN: isfinite and detect_anomaly
+--- body
+A nan spreads to everything computed after it, so what you want is the **first** place it appears.
+
+1. **Check the loss at every step**: `if not torch.isfinite(loss): raise FloatingPointError(...)`. Training stops at the step where things went wrong. You can save that step's batch and study it, instead of training with nan weights for a few more hours.
+2. **A nan from forward**: pass the input through the model one layer at a time and check `torch.isfinite(out).all()` after each layer. The first layer that fails is the source; the layers after it were only infected.
+3. **A nan from backward**: every forward output is fine, but the gradients are nan. Wrap forward and backward in `with torch.autograd.detect_anomaly():`. Backward then raises an error as soon as it produces a nan, and the message names the backward function, for example `Function 'LogBackward0' returned nan values`. It also prints a warning that shows where that operation was called during forward: look for the line from your own code. It makes training much slower, so only turn it on while debugging.
+
+A classic example: `torch.where(x > 0, torch.log(x), 0)`. Forward is perfectly fine: where x ≤ 0 it picks the 0. But backward computes the gradient of both branches. The backward of log is "incoming gradient ÷ x", which at x = 0 is 0 ÷ 0 = nan. The fix is to make the input to log safe first: `torch.log(torch.where(x > 0, x, 1.0))`.
+--- code
+loss = torch.tensor(float("nan"))
+print("isfinite:", torch.isfinite(loss).item(), "  loss > 100:", (loss > 100).item())
+
+x = torch.tensor([0.0, 2.0], requires_grad=True)
+y = torch.where(x > 0, torch.log(x), torch.zeros_like(x))
+print("forward looks fine:", y.tolist())
+y.sum().backward()
+print("gradient:", x.grad.tolist())              # element 0 is nan
+
+x.grad = None
+try:
+    with torch.autograd.detect_anomaly():
+        y = torch.where(x > 0, torch.log(x), torch.zeros_like(x))
+        y.sum().backward()
+except RuntimeError as e:
+    print("detect_anomaly raised:", str(e).splitlines()[0])
+
+@@ concept
+title: Gradient norms per layer
+--- body
+After backward, each parameter's `.grad` holds its gradient. The **gradient norm** treats the gradient as one long vector and measures its length: `p.grad.norm()`. It tells you how hard that layer is being pushed.
+
+Print it for every layer and many problems are obvious at a glance:
+
+- **None**: this parameter got no gradient at all. Either it is frozen (`requires_grad=False`), or it was not used to compute the loss (for example, a layer you defined but never called in forward).
+- **0**: it got a gradient, but it is all zeros. For example, every input to a ReLU is negative (a "dead" ReLU), or the loss does not actually depend on it.
+- **Very large** (hundreds, thousands) or inf: exploding gradients; the next step may give nan. Lower the lr first, or clip the gradients (`torch.nn.utils.clip_grad_norm_`).
+- **Early layers several orders of magnitude smaller than later layers**: vanishing gradients; the early layers barely learn.
+
+During training, print the total gradient norm next to the loss (the return value of `clip_grad_norm_` is the total norm before clipping). Before the loss explodes, the gradient norm usually climbs first.
+--- code
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 4))
+model[0].weight.requires_grad_(False)           # pretend someone froze the first layer's weight
+x, y = torch.randn(32, 8), torch.randint(0, 4, (32,))
+F.cross_entropy(model(x), y).backward()
+
+for name, p in model.named_parameters():
+    g = None if p.grad is None else round(p.grad.norm().item(), 4)
+    print(f"{name:9s} requires_grad={p.requires_grad!s:5s}  grad norm = {g}")
+
+@@ concept
+title: The loss won't go down: check in this order
+--- body
+When the loss will not go down, do not start tuning hyperparameters yet. First make sure the code is right. Check in this order:
+
+1. **Overfit one small batch first** (you did this on day 14): train on the same batch again and again; the loss should get close to 0. If it does not, the code has a bug, and no lr or extra data will help.
+2. **Do you call zero_grad every step?** PyTorch **adds** gradients up: without clearing, this step's gradient is added on top of the last one, and every update is wrong.
+3. **Are the parameters really being trained?** Look at the gradient norms per layer: None means frozen. A gradient that is there while the weights never change means the parameter is not in the optimizer (typical when the optimizer was created first and a layer of the model was replaced afterwards).
+4. **Do the labels still match the inputs?** When you shuffle, x and y must use the same order. Print a few (x, y) pairs and look. With mismatched pairs, the loss gets stuck near ln C.
+5. **Is there an extra softmax before cross_entropy?** It expects logits. With one extra softmax, even a model that is completely right has a floor it cannot get below: ln(1 + (C-1)/e) for C classes, about 0.744 for 4 classes and about 1.46 for 10.
+6. **The learning rate**: too high explodes or bounces; too low falls very slowly. Try multiplying or dividing it by 10.
+--- code
+w = torch.tensor([1.0], requires_grad=True)
+for step in range(3):
+    loss = 3 * w.sum()                # the gradient of this loss with respect to w is always 3
+    loss.backward()
+    print("no zero_grad, step", step, " w.grad =", w.grad.item())
+
+logits = torch.tensor([[100.0, 0.0, 0.0, 0.0]])   # the model is very sure, and right
+y = torch.tensor([0])
+print("cross_entropy(logits)          =", F.cross_entropy(logits, y).item())
+print("cross_entropy(softmax(logits)) =", round(F.cross_entropy(logits.softmax(-1), y).item(), 4))
+
+@@ item d15-01
+type: predict
+title: What is the first loss?
+level: 1
+cards: The first loss should be about ln C
+--- context
+The first loss tells you whether the initialization and the loss are right. An experienced engineer looks at the first line of a training log and compares it with ln C, worked out in their head.
+--- prompt
+What does this code print? (three lines) Logits that are all 0 mean every class gets the same score.
+--- code
+logits = torch.zeros(4, 10)             # 4 samples, 10 classes, every score the same
+y = torch.tensor([3, 0, 7, 1])
+print(round(F.cross_entropy(logits, y).item(), 1))
+
+logits = torch.zeros(2, 50257)          # GPT-2's vocabulary size
+y = torch.tensor([11, 42])
+print(round(F.cross_entropy(logits, y).item(), 1))
+
+logits = torch.zeros(1, 10)
+logits[0, 0] = 20.0                     # very sure it is class 0...
+y = torch.tensor([3])                   # ...but the right answer is class 3
+print(round(F.cross_entropy(logits, y).item(), 1))
+--- explain
+Equal scores → every class has probability 1/C → loss = ln C. ln 10 ≈ 2.3 and ln 50257 ≈ 10.8. So when you train a model with a GPT-2-sized vocabulary from scratch, the first loss should be near 10.8. If you see 50, something is wrong with the initialization.
+
+Third line: the correct class scores 0 and class 0 scores 20, so the loss = ln(e^20 + 9) ≈ 20.0. Being confidently wrong costs about as much as the confidence. That is why an initialization that is too large makes the first loss much bigger than ln C.
+--- hints
+- After softmax, what probability does each class get when all the logits are 0?
+- loss = -ln(1/C) = ln C. ln 50257 = ln 5.0257 + 4 × ln 10 ≈ 1.6 + 9.2. Third line: loss = ln(e^20 + 9), and e^20 is far bigger than 9.
+
+@@ item d15-02
+type: code
+title: Read a loss curve automatically
+level: 2
+cards: Reading a loss curve: flat, exploding, bouncing, floor; Where NaN and inf come from
+targets: curve_verdict
+ref: day15
+--- context
+Big training runs take hours, and nobody watches them the whole time. Training scripts usually contain a small function that checks the loss automatically and raises an alarm, or stops the run, when it sees nan or an explosion, so no GPU time is wasted.
+--- prompt
+Write `curve_verdict(losses)`:
+
+- `losses`: a list of Python floats, one per step (at least 2)
+- Check these conditions in this order and return the string for the first one that holds:
+  1. any value is nan, inf or -inf → `"nan"`
+  2. the last value > 2 × the first value → `"exploding"`
+  3. |last value - first value| < 0.01 × the first value (it changed by less than 1%) → `"flat"`
+  4. anything else → `"ok"`
+
+Note: you cannot test for nan with `v == float("nan")`. Why not? See the card "Where NaN and inf come from".
+--- starter
+def curve_verdict(losses):
+    """losses: list of float -> "nan" / "exploding" / "flat" / "ok" (checked in this order)."""
+    raise todo()
+--- solution
+def curve_verdict(losses):
+    if not all(math.isfinite(v) for v in losses):     # nan and ±inf are not finite
+        return "nan"
+    if losses[-1] > 2 * losses[0]:
+        return "exploding"
+    if abs(losses[-1] - losses[0]) < 0.01 * losses[0]:
+        return "flat"
+    return "ok"
+--- tests
+@check("nan and inf are caught first")
+def _():
+    nan, inf = float("nan"), float("inf")
+    true(curve_verdict([2.3, 1.9, nan]) == "nan",
+         'the last value is nan, so the answer is "nan". Every comparison with nan (>, <, ==) is False: use math.isfinite')
+    true(curve_verdict([2.3, nan, 1.1]) == "nan",
+         'a nan in the middle counts too: check every value, not only the last one')
+    true(curve_verdict([2.3, 8.0, inf]) == "nan",
+         'inf is a bad value too (math.isfinite(inf) is False), so the answer is "nan"')
+    true(curve_verdict([2.3, -inf]) == "nan", '-inf is a bad value too, so the answer is "nan"')
+
+@check("exploding, flat, ok")
+def _():
+    true(curve_verdict([2.3, 3.1, 9.8]) == "exploding", '9.8 > 2 × 2.3, so the answer is "exploding"')
+    true(curve_verdict([2.3026, 2.3026, 2.3021]) == "flat", 'from 2.3026 to 2.3021 is a 0.02% change, so the answer is "flat"')
+    true(curve_verdict([2.3, 1.2, 0.4]) == "ok", 'falling from 2.3 to 0.4 is normal, so the answer is "ok"')
+    true(curve_verdict([1.0, 0.5, 1.9]) == "ok", '1.9 is not more than 2 × 1.0 and not flat either, so the answer is "ok"')
+    true(curve_verdict([1.0, 5.0, 2.5]) == "exploding", 'compare only the first and the last value: 2.5 > 2 × 1.0, so the answer is "exploding"')
+--- hints
+- Rule 1 has to look at every value: `any(...)`, `all(...)` or a for loop all work.
+- `math.isfinite(v)` returns False for nan, inf and -inf. Start with `if not all(math.isfinite(v) for v in losses): return "nan"`, then write the other three rules in order.
+
+@@ item d15-03
+type: choice
+title: Bouncing higher, then nan
+level: 1
+cards: Reading a loss curve: flat, exploding, bouncing, floor; The loss won't go down: check in this order
+--- context
+Naming the most likely cause from a loss log is the first step when training goes wrong. It is also a very common interview question.
+--- prompt
+You are training a 10-class model and print the loss every 10 steps:
+
+```
+step   0  loss 2.31
+step  10  loss 1.62
+step  20  loss 2.95
+step  30  loss 1.41
+step  40  loss 6.80
+step  50  loss 31.7
+step  60  loss nan
+```
+
+What is the most likely cause?
+--- options
+- The learning rate is too high: every step jumps over the bottom of the valley and lands further away, the weights keep growing, and finally they overflow to nan
+- There is an extra softmax before cross_entropy
+- When the data was shuffled, x and y were put in different orders
+- The last layer is frozen
+answer: 1
+--- explain
+Jumping up and down, with bigger and bigger swings, then nan: that is what a learning rate that is too high looks like (like w with lr = 1.1 in the card, which jumps to the other side of 3 each step and lands further away every time).
+
+None of the other three can make the loss explode. With an extra softmax, a 10-class loss is trapped between 1.46 and 2.46. With mismatched x and y, the loss stays near ln 10 ≈ 2.30. With a frozen last layer, the loss only falls slowly or not at all.
+
+Divide the lr by 10 and run again. If it still explodes, check for a missing zero_grad: gradients that keep adding up also make every step go further than the last.
+--- hints
+- This curve has two features: it jumps up and down, and the jumps get higher.
+- Remember the lr = 1.1 example in the card: w jumps to the other side of 3 on every step.
+
+@@ item d15-04
+type: predict
+title: How nan and inf appear
+level: 2
+cards: Where NaN and inf come from; fp16 tops out at 65504
+--- context
+When nan shows up in a training log, you need to know which operations can produce it. These lines cover the most common sources in real projects: log(0), the 0·log 0 in an entropy, exp overflow, 0/0 and fp16 overflow.
+--- prompt
+What does this code print? (five lines)
+--- code
+x = torch.tensor([0.0, 1.0])
+print(torch.log(x).tolist())
+print((x * torch.log(x)).tolist())
+print(torch.exp(torch.tensor(100.0)).item())
+print((torch.tensor(0.0) / torch.tensor(0.0)).item())
+h = torch.tensor(300.0, dtype=torch.float16)
+print((h * h).item(), (h.float() * h.float()).item())
+--- explain
+- log(0) = -inf and log(1) = 0.
+- 0 × (-inf) = nan. This is exactly what happens to the zero-probability terms when you compute an entropy -Σ p·log p. The fix is `torch.xlogy(p, p)` (it defines 0·log 0 = 0), or a clamp on p.
+- exp(100) is larger than float32's maximum (about 3.4e38; exp(88.7) already reaches it), so it is inf.
+- 0 / 0 = nan.
+- 300 × 300 = 90000 > 65504, so in fp16 it overflows to inf; converted to float32 first, it is a normal 90000.0.
+--- hints
+- The first two lines print Python lists via `.tolist()`, like `[1.5, 0.0]`. Python writes infinity as `inf` or `-inf` and nan as `nan`.
+- What is 0 × (-inf)? Is exp(100) above float32's limit? fp16's limit is 65504.
+
+@@ item d15-05
+type: fix
+title: A hand-written cross-entropy returns inf
+level: 2
+cards: Where NaN and inf come from; Writing numerically stable code
+targets: my_cross_entropy
+ref: day15
+--- context
+In real projects you often write your own loss (with class weights, a mask, label smoothing). "softmax, then log" is the most natural way to write it, and one of the most common reasons a loss suddenly turns into inf halfway through training.
+--- prompt
+The `my_cross_entropy(logits, y)` below usually works. But as soon as the logits are far apart, it returns inf, and after one training step every weight is nan. Fix it:
+
+- `logits`: (B, C) raw scores; `y`: (B,) int64 class ids
+- return the mean loss over the samples (it should equal `F.cross_entropy(logits, y)`)
+- do not call `F.cross_entropy` or `F.nll_loss` (the checks disable them). Pretend this is part of a more complicated custom loss
+--- starter
+def my_cross_entropy(logits, y):
+    probs = logits.softmax(dim=-1)                   # (B, C) probabilities
+    picked = probs[torch.arange(len(y)), y]          # (B,) probability of each sample's correct class
+    return -torch.log(picked).mean()
+--- solution
+def my_cross_entropy(logits, y):
+    logp = F.log_softmax(logits, dim=-1)             # (B, C) log probabilities, never -inf
+    picked = logp[torch.arange(len(y)), y]           # (B,) log probability of each sample's correct class
+    return -picked.mean()
+--- setup
+import contextlib
+
+
+@contextlib.contextmanager
+def _no_library_ce():
+    saved = F.cross_entropy, F.nll_loss
+
+    def banned(*args, **kwargs):
+        raise AssertionError("write it yourself with log_softmax: F.cross_entropy / F.nll_loss are not allowed here")
+
+    F.cross_entropy = F.nll_loss = banned
+    try:
+        yield
+    finally:
+        F.cross_entropy, F.nll_loss = saved
+--- tests
+@check("ordinary logits: same as F.cross_entropy")
+def _():
+    seed(0)
+    logits = torch.randn(6, 5) * 3
+    y = torch.randint(0, 5, (6,))
+    want = F.cross_entropy(logits, y)
+    with _no_library_ce():
+        got = my_cross_entropy(logits, y)
+    eq(got, want, tol=1e-5, msg="wrong even in the ordinary case: do you pick each sample's correct-class entry? Then negate and take the mean")
+
+@check("logits far apart: no inf")
+def _():
+    logits = torch.tensor([[0.0, 200.0, 0.0], [300.0, 0.0, 0.0]])
+    y = torch.tensor([0, 1])
+    with _no_library_ce():
+        got = my_cross_entropy(logits, y)
+    true(torch.isfinite(got).all(),
+         f"loss = {got.item()}: the correct class has probability e^-200, softmax rounds it to 0, and log(0) = -inf. Use F.log_softmax")
+    eq(got, torch.tensor(250.0), tol=1e-3,
+       msg="the two samples have losses 200 and 300, mean 250. A clamp with eps avoids inf but cuts the value off; use log_softmax")
+
+@check("the gradient is finite too")
+def _():
+    logits = torch.tensor([[0.0, 200.0, 0.0]], requires_grad=True)
+    with _no_library_ce():
+        my_cross_entropy(logits, torch.tensor([0])).backward()
+    true(logits.grad is not None and torch.isfinite(logits.grad).all(),
+         f"logits.grad = {logits.grad}: the gradient contains nan, so one training step ruins the weights")
+--- hints
+- Try logits = [[0., 200.]] and y = [0]: the correct class has probability e^-200, which float32 cannot hold, so softmax returns 0.
+- Do not compute probabilities and then take the log. Compute log probabilities directly: `F.log_softmax(logits, dim=-1)`.
+- Replace the softmax line with log_softmax. After picking the correct-class entries, do not take another log: just negate and take the mean.
+
+@@ item d15-06
+type: fix
+title: RMSNorm outputs zeros in fp16
+level: 2
+cards: fp16 tops out at 65504; Writing numerically stable code
+targets: rms_norm
+ref: day15
+--- context
+In mixed-precision training most layers are fine in fp16, but "square, then average" overflows. Llama's RMSNorm converts to float32 before doing that, precisely to prevent this. The bug raises no error; the output just quietly becomes 0.
+--- prompt
+`rms_norm(x, weight, eps)` is correct in float32. In float16, though, as soon as a row contains a value with |x| ≥ 256, that whole row of the output becomes 0, with no error. Fix it:
+
+- `x`: (..., D), possibly float16; `weight`: (D,), same dtype as x
+- formula: y = x / sqrt(mean(x², over the last dim) + eps) × weight
+- the output dtype must equal x's dtype (float16 in, float16 out)
+--- starter
+def rms_norm(x, weight, eps=1e-6):
+    ms = x.pow(2).mean(dim=-1, keepdim=True)         # mean square at each position
+    return x * torch.rsqrt(ms + eps) * weight
+--- solution
+def rms_norm(x, weight, eps=1e-6):
+    xf = x.float()                                   # square and average in float32: no overflow
+    ms = xf.pow(2).mean(dim=-1, keepdim=True)
+    return (xf * torch.rsqrt(ms + eps)).to(x.dtype) * weight
+--- tests
+@check("float32 input: same result as before")
+def _():
+    seed(0)
+    x = torch.randn(3, 16)
+    w = torch.rand(16) + 0.5
+    out = rms_norm(x, w)
+    true(out.dtype == torch.float32, f"float32 in should give float32 out; yours is {out.dtype}")
+    eq(out, _rms_ref(x, w), tol=1e-5, msg="the float32 result changed: the formula is x / sqrt(mean(x²) + eps) × weight")
+
+@check("float16 with |x| in the hundreds: no overflow")
+def _():
+    seed(0)
+    x = (torch.randn(4, 16) * 400).half()
+    w = (torch.rand(16) + 0.5).half()
+    out = rms_norm(x, w)
+    true(out.dtype == torch.float16,
+         f"the output is {out.dtype}; it should be float16 like the input: convert back with .to(x.dtype)")
+    true(torch.isfinite(out).all(), "the output contains inf or nan")
+    true(out.float().abs().max() > 0.1,
+         "the output is almost all 0: x² goes above 65504 in fp16 and becomes inf; rsqrt(inf) = 0, so the whole row is multiplied by 0. Square and average in float32")
+    eq(out.float(), _rms_ref(x.float(), w.float()), tol=1e-2,
+       msg="too far from the result computed in float32")
+--- hints
+- 300² = 90000 > 65504. `x.pow(2)` is already inf in fp16, and rsqrt(inf) = 0.
+- Start the function with `xf = x.float()` and use xf for the square, the mean and the normalization.
+- After normalizing, convert back with `.to(x.dtype)`, then multiply by weight.
+
+@@ item d15-07
+type: code
+title: Find the first layer that makes a nan
+level: 2
+cards: Catch the first NaN: isfinite and detect_anomaly; Where NaN and inf come from
+targets: find_nan_layer
+ref: day15
+--- context
+When a model outputs nan, every layer after the broken one is infected too, so the final output cannot tell you where it started. Check layer by layer: the first layer that goes wrong is the one to fix.
+--- prompt
+Write `find_nan_layer(model, x)`:
+
+- `model` is an `nn.Sequential`, `x` is the input
+- pass x through each layer of `model.named_children()` in turn
+- return the name of the first layer whose output contains nan or inf (a string: the name `named_children()` gives, such as `"1"` or `"exp"`)
+- if every layer's output is fine, return `None`
+
+The checks use a few small layers that are already defined: `Log()` takes the log of its input (negative numbers become nan), `Exp()` takes exp (large numbers become inf), and `Scale(s)` multiplies its input by s.
+--- starter
+def find_nan_layer(model, x):
+    """Return the name of the first child whose output has nan/inf; None if all are fine."""
+    raise todo()
+--- solution
+def find_nan_layer(model, x):
+    for name, layer in model.named_children():
+        x = layer(x)
+        if not torch.isfinite(x).all():              # catches nan and ±inf
+            return name
+    return None
+--- tests
+@check("find the first layer that makes a nan")
+def _():
+    seed(0)
+    m = nn.Sequential(nn.Linear(4, 8), Log(), nn.Linear(8, 2))
+    got = find_nan_layer(m, torch.randn(5, 4))
+    true(got == "1",
+         f"you returned {got!r}; it should be '1' (the Log layer: the Linear output has negative numbers, and log(negative) = nan). "
+         "Layer 2's output has nan too, but it was only infected: return the first one")
+
+@check("inf counts too")
+def _():
+    from collections import OrderedDict
+    seed(0)
+    m = nn.Sequential(OrderedDict([("fc", nn.Linear(4, 4)), ("scale", Scale(100.0)),
+                                   ("exp", Exp()), ("out", nn.Linear(4, 2))]))
+    got = find_nan_layer(m, torch.randn(3, 4))
+    true(got == "exp",
+         f"you returned {got!r}; it should be 'exp': exp's output contains inf (no nan yet). "
+         "Check with torch.isfinite, which is False for both nan and inf; isnan alone misses inf")
+
+@check("None when everything is fine")
+def _():
+    x, _y = toy_data()
+    got = find_nan_layer(tiny_mlp(), x)
+    true(got is None, f"every layer's output is an ordinary number, so the answer is None; you returned {got!r}")
+--- hints
+- `for name, layer in model.named_children():`, and inside the loop `x = layer(x)`.
+- After each layer, check `torch.isfinite(x).all()`: it is False for both nan and inf. `isnan` alone misses inf.
+
+@@ item d15-08
+type: fix
+title: Forward is fine, the gradient is nan
+level: 3
+cards: Catch the first NaN: isfinite and detect_anomaly; Writing numerically stable code
+targets: pairwise_dist
+ref: day15
+--- context
+Contrastive learning, clustering and triplet losses all need the distance between two points. When a point is compared with itself (or with an identical point), the distance is 0: forward is completely fine, but the gradient is nan. This is exactly where detect_anomaly earns its keep.
+--- prompt
+`pairwise_dist(a, b)` computes the Euclidean distances between two sets of points, and the values are right. But as soon as a and b share a point, backward gives nan gradients, and one training step ruins every weight.
+
+1. Run it yourself first: uncomment the lines in the editor and see which backward function detect_anomaly blames for the nan.
+2. Fix it: the distance values stay the same (within 1e-4), and the gradient is finite where the distance is 0.
+
+- `a`: (N, D), `b`: (M, D) → return (N, M)
+--- starter
+def pairwise_dist(a, b):
+    diff = a[:, None, :] - b[None, :, :]             # (N, M, D)
+    return diff.pow(2).sum(dim=-1).sqrt()            # (N, M)
+
+
+# Try it yourself first (you can delete this once it is fixed):
+# a = torch.randn(3, 2, requires_grad=True)
+# with torch.autograd.detect_anomaly():
+#     pairwise_dist(a, a).sum().backward()
+--- solution
+def pairwise_dist(a, b):
+    diff = a[:, None, :] - b[None, :, :]             # (N, M, D)
+    d2 = diff.pow(2).sum(dim=-1)                     # (N, M) squared distances, may be exactly 0
+    return (d2 + 1e-12).sqrt()                       # the input to sqrt is always > 0, so its derivative is never inf
+--- tests
+@check("same distance values as torch.cdist")
+def _():
+    seed(0)
+    a, b = torch.randn(5, 3), torch.randn(4, 3)
+    got = pairwise_dist(a, b)
+    shape_is(got, (5, 4))
+    eq(got, torch.cdist(a, b), tol=1e-4, msg="the distance values changed")
+
+@check("a point compared with itself (distance 0): no nan gradient")
+def _():
+    seed(0)
+    a = torch.randn(4, 3, requires_grad=True)
+    d = pairwise_dist(a, a)
+    true(torch.isfinite(d).all(), "the distances themselves already contain nan/inf")
+    d.sum().backward()
+    true(torch.isfinite(a.grad).all(),
+         "a.grad contains nan: at distance 0 the derivative of sqrt, 1/(2·sqrt(0)), is inf, and multiplied by 0 on the way back it becomes nan. "
+         "Keep the input to sqrt above 0 (hiding it with torch.where does not help: the gradients of both branches are computed)")
+
+@check("the gradient is right where the distance is not 0")
+def _():
+    seed(1)
+    a = torch.randn(4, 3, requires_grad=True)
+    b = torch.randn(5, 3)
+    pairwise_dist(a, b).sum().backward()
+    a2 = a.detach().clone().requires_grad_(True)
+    torch.cdist(a2, b).sum().backward()
+    true(a.grad is not None, "a got no gradient: do not dodge the nan with detach or no_grad")
+    eq(a.grad, a2.grad, tol=1e-4, msg="the gradient is wrong: only add a tiny number to the input of sqrt and change nothing else")
+--- hints
+- detect_anomaly blames `PowBackward0`, but the cause is one step after it: the derivative of sqrt at 0 is 1/(2·sqrt(0)) = inf, which becomes 0 × inf = nan in pow's backward.
+- Keep the input to sqrt above 0: `(d2 + 1e-12).sqrt()` or `d2.clamp_min(1e-12).sqrt()`.
+- `torch.where(d2 > 0, d2.sqrt(), 0)` does not work: as the card explains, the gradients of both branches of where are computed.
+
+@@ item d15-09
+type: code
+title: grad_norms: measure every layer's gradient
+level: 1
+cards: Gradient norms per layer
+targets: grad_norms
+ref: day15
+--- context
+Gradient norms are the heartbeat monitor of training: None means disconnected or frozen, 0 means the layer is dead, and a huge value means an explosion is coming. Many training frameworks log them at every step.
+--- prompt
+Write `grad_norms(model)`, to be called after `loss.backward()`:
+
+- return a dict whose keys are the names from `model.named_parameters()`, in the same order
+- each value is the L2 norm of that parameter's gradient, as a Python float (use `.item()`)
+- if `p.grad` is None (frozen, or not used to compute the loss), the value is `None`
+--- starter
+def grad_norms(model):
+    """{parameter name: L2 norm of its gradient (float)}; None for parameters without a gradient."""
+    raise todo()
+--- solution
+def grad_norms(model):
+    out = {}
+    for name, p in model.named_parameters():
+        out[name] = None if p.grad is None else p.grad.norm().item()
+    return out
+--- tests
+@check("one norm per parameter")
+def _():
+    m = tiny_mlp()
+    x, y = toy_data()
+    F.cross_entropy(m(x), y).backward()
+    g = grad_norms(m)
+    true(isinstance(g, dict), f"return a dict; you returned a {type(g).__name__}")
+    names = [n for n, _ in m.named_parameters()]
+    true(list(g) == names, f"the keys should be {names} (in named_parameters() order); yours are {list(g)}")
+    for n, p in m.named_parameters():
+        v = g[n]
+        true(isinstance(v, float), f"the value for {n} is a {type(v).__name__}; use .item() to get a Python float")
+        true(close(v, p.grad.norm().item(), 1e-5), f"the norm for {n} should be {p.grad.norm().item():.5f}; yours is {v}")
+
+@check("None for parameters without a gradient")
+def _():
+    m = tiny_mlp()
+    m[0].weight.requires_grad_(False)
+    x, y = toy_data()
+    F.cross_entropy(m(x), y).backward()
+    g = grad_norms(m)
+    true("0.weight" in g, "frozen parameters must appear in the result too (named_parameters() lists them)")
+    true(g["0.weight"] is None,
+         f"0.weight is frozen, so its .grad is None and the value should be None; yours is {g['0.weight']!r}")
+    true(isinstance(g["2.weight"], float), "2.weight is not frozen, so it should have a float norm")
+--- hints
+- `for name, p in model.named_parameters():`
+- Check `p.grad is None` first; otherwise use `p.grad.norm().item()`.
+
+@@ item d15-10
+type: fix
+title: Two bugs in a training loop
+level: 2
+cards: The loss won't go down: check in this order; Writing numerically stable code; Catch the first NaN: isfinite and detect_anomaly
+targets: train_classifier
+ref: day15
+--- context
+Neither bug raises an error: the program runs to the end and the loss goes down, just not as far as it should. They are the two most common entries on the "loss won't go down" checklist, and almost everyone has written them at some point.
+--- prompt
+`train_classifier(model, x, y, steps, lr)` trains with SGD for `steps` steps on the same (x, y) and returns the loss of every step (a list of Python floats). If the loss is not a finite number, it raises `FloatingPointError` right away (that part is already written and correct).
+
+The function has two bugs: it cannot overfit one small batch no matter how long it trains, and from the second step on every update is wrong. Find and fix them.
+
+- `model` outputs logits (B, C); `x`: (B, D); `y`: (B,), int64
+--- starter
+def train_classifier(model, x, y, steps=100, lr=0.5):
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    losses = []
+    for step in range(steps):
+        logits = model(x)
+        probs = logits.softmax(dim=-1)
+        loss = F.cross_entropy(probs, y)
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"step {step}: loss = {loss.item()}")
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+--- solution
+def train_classifier(model, x, y, steps=100, lr=0.5):
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    losses = []
+    for step in range(steps):
+        logits = model(x)
+        loss = F.cross_entropy(logits, y)            # fix 1: pass the logits; it does log_softmax itself
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"step {step}: loss = {loss.item()}")
+        opt.zero_grad()                              # fix 2: clear the previous step's gradients
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+--- tests
+@check("each step uses only its own gradient")
+def _():
+    x, y = toy_data(16)
+    m, ref = tiny_mlp(), tiny_mlp()
+    losses = train_classifier(m, x, y, steps=2, lr=0.5)
+    true(isinstance(losses, list) and len(losses) == 2 and all(isinstance(v, float) for v in losses),
+         "return a list with one Python float per step (use loss.item())")
+    _sgd_ref(ref, x, y, steps=2, lr=0.5)
+    for (n, p), q in zip(m.named_parameters(), ref.parameters()):
+        eq(p, q, tol=1e-5,
+           msg=f"after 2 steps, {n} differs from the reference. Usual causes: no zero_grad (the gradients add up step after step), or the wrong input to the loss")
+
+@check("it can overfit one batch")
+def _():
+    x, y = toy_data(16)
+    losses = train_classifier(tiny_mlp(), x, y, steps=200, lr=0.5)
+    true(losses[-1] < 0.05,
+         f"after 200 steps the loss is still {losses[-1]:.3f}. With 4 classes, being stuck near 0.744 means an extra softmax before cross_entropy: it wants logits")
+
+@check("it stops at once when the lr is too high")
+def _():
+    x, y = toy_data(16)
+    try:
+        train_classifier(tiny_mlp(), x, y, steps=100, lr=100.0)
+    except FloatingPointError as e:
+        true("step" in str(e), f"the error message must say which step, like 'step 12: loss = nan'; yours is {str(e)!r}")
+        return
+    true(False, "with lr = 100 a correct training loop hits nan within a dozen or so steps, and should then raise FloatingPointError. "
+                "(If the first two checks still fail, fix those first: with an extra softmax the loss is trapped in a small range and cannot explode)")
+--- hints
+- Compare with items 2 and 5 of the card "The loss won't go down: check in this order".
+- `F.cross_entropy` does the log_softmax itself: give it the logits directly.
+- Add `opt.zero_grad()` before `loss.backward()`, or the gradients add up step after step.
+
+@@ item d15-11
+type: fix
+title: Shuffled data, lost labels
+level: 2
+cards: The loss won't go down: check in this order
+targets: make_batches
+ref: day15
+--- context
+Shuffling x and y separately in a data pipeline is a bug that has happened countless times in real projects. Nothing raises an error, the loss sits near ln C, and people usually suspect the model and the learning rate first.
+--- prompt
+`make_batches(x, y, batch_size, seed)` shuffles the data once, cuts it into batches and returns `[(xb, yb), ...]`. Training on its batches, the loss stays stuck near ln C. Fix it:
+
+- it must still shuffle, and the same seed must give the same result
+- every x must stay with its own y
+- the last batch may be smaller than `batch_size`
+--- starter
+def make_batches(x, y, batch_size, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    x = x[torch.randperm(len(x), generator=g)]
+    y = y[torch.randperm(len(y), generator=g)]
+    return [(x[i:i + batch_size], y[i:i + batch_size])
+            for i in range(0, len(x), batch_size)]
+--- solution
+def make_batches(x, y, batch_size, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(len(x), generator=g)       # make one order only
+    x, y = x[perm], y[perm]                          # x and y use the same order
+    return [(x[i:i + batch_size], y[i:i + batch_size])
+            for i in range(0, len(x), batch_size)]
+--- tests
+@check("every x is still with its own y")
+def _():
+    x = torch.arange(20).float()[:, None].repeat(1, 3)   # row i is [i, i, i]
+    y = torch.arange(20) + 100                            # the label of row i is i + 100
+    for xb, yb in make_batches(x, y, batch_size=8, seed=0):
+        rows = xb[:, 0].long()
+        true(torch.equal(rows + 100, yb),
+             f"rows {rows.tolist()} got the labels of rows {(yb - 100).tolist()}: x and y were shuffled in different orders. "
+             "The model is learning random pairs, so the loss can only sit near ln C")
+
+@check("still shuffled, every row exactly once")
+def _():
+    x = torch.arange(20).float()[:, None].repeat(1, 3)
+    y = torch.arange(20) + 100
+    batches = make_batches(x, y, batch_size=8, seed=0)
+    true([len(xb) for xb, _ in batches] == [8, 8, 4],
+         f"with 20 rows and batch_size=8 the batch sizes should be [8, 8, 4]; yours are {[len(xb) for xb, _ in batches]}")
+    rows = torch.cat([xb[:, 0] for xb, _ in batches]).long().tolist()
+    true(sorted(rows) == list(range(20)), "every row should appear exactly once")
+    true(rows != list(range(20)), "not shuffled: training data should be shuffled; x and y just have to use the same order")
+
+@check("same seed, same result")
+def _():
+    x = torch.arange(20).float()[:, None].repeat(1, 3)
+    y = torch.arange(20) + 100
+    a = make_batches(x, y, 8, seed=3)
+    b = make_batches(x, y, 8, seed=3)
+    true(all(torch.equal(p[0], q[0]) and torch.equal(p[1], q[1]) for p, q in zip(a, b)),
+         "two calls with the same seed should give exactly the same batches (shuffle with a Generator made from the seed)")
+--- hints
+- The two calls to `randperm` give different orders: after the first call, the generator's state has moved on.
+- Make a single `perm = torch.randperm(len(x), generator=g)` and use it for both x and y: `x, y = x[perm], y[perm]`.
+
+@@ item d15-12
+type: fix
+title: A new head, and the loss does not move
+level: 2
+cards: The loss won't go down: check in this order; Gradient norms per layer
+targets: finetune_new_head
+ref: day15
+--- context
+Transfer learning (take a pretrained model, freeze its backbone, train only a new classifier head) is one of the most common ways to train. "Create the optimizer first, replace a layer later" is the classic trap here: the new layer gets gradients but is never updated.
+--- prompt
+What `finetune_new_head` is meant to do: freeze `model.backbone`, replace `model.head` with a new `nn.Linear(in_features, num_classes)`, and train only that new head. But the loss is exactly the same from the first step to the last. Fix it:
+
+- use SGD and `F.cross_entropy`, and return the loss of every step (Python floats)
+- the backbone must stay frozen: `requires_grad=False`, and its weights unchanged after training
+- the checks use a `TinyNet`, which has two parts: `.backbone` and `.head`
+--- starter
+def finetune_new_head(model, x, y, num_classes, steps=100, lr=0.5):
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    for p in model.backbone.parameters():
+        p.requires_grad = False                                   # freeze the backbone
+    model.head = nn.Linear(model.head.in_features, num_classes)   # a new head for the new task
+    losses = []
+    for step in range(steps):
+        loss = F.cross_entropy(model(x), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+--- solution
+def finetune_new_head(model, x, y, num_classes, steps=100, lr=0.5):
+    for p in model.backbone.parameters():
+        p.requires_grad = False                                   # freeze the backbone
+    model.head = nn.Linear(model.head.in_features, num_classes)   # a new head for the new task
+    opt = torch.optim.SGD(model.head.parameters(), lr=lr)         # create the optimizer after the new head exists
+    losses = []
+    for step in range(steps):
+        loss = F.cross_entropy(model(x), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+--- tests
+@check("the new head really learns")
+def _():
+    x, y = toy_data(32)
+    model = TinyNet(c=10)
+    losses = finetune_new_head(model, x, y, num_classes=4, steps=100, lr=0.5)
+    true(model.head.out_features == 4, f"the head should be replaced by a 4-class one; it has {model.head.out_features} classes")
+    true(losses[-1] < 0.5 * losses[0],
+         f"the loss went from {losses[0]:.4f} to {losses[-1]:.4f}: it barely moved. The new head has gradients, but the optimizer does not have it: "
+         "the optimizer was created before the head was replaced, so it still holds the old head's parameters")
+
+@check("the backbone stays frozen")
+def _():
+    x, y = toy_data(32)
+    model = TinyNet(c=10)
+    before = {k: v.clone() for k, v in model.backbone.state_dict().items()}
+    finetune_new_head(model, x, y, num_classes=4, steps=20, lr=0.5)
+    true(all(not p.requires_grad for p in model.backbone.parameters()),
+         "the backbone's parameters should have requires_grad=False")
+    for k, v in model.backbone.state_dict().items():
+        eq(v, before[k], tol=0, msg=f"backbone.{k} changed: keep the backbone frozen and train only the new head")
+--- hints
+- Look with grad_norms: the new head's gradient is not None, yet its weights never change. Who is responsible for updating weights?
+- An optimizer only updates the parameters it was given when it was created. When the first line runs, the new head does not exist yet.
+- Move `opt = ...` to after the head is replaced, and give it only `model.head.parameters()`.
+
+@@ item d15-13
+type: self
+title: My debugging playbook
+level: 1
+cards: The loss won't go down: check in this order; Catch the first NaN: isfinite and detect_anomaly; Gradient norms per layer
+--- context
+Debugging runs on a fixed order, not on inspiration. Know this list well, and when an interviewer asks "the loss won't go down, what do you check?", you can walk through it point by point.
+--- prompt
+Without your notes, ask yourself for each line: can I do this, or explain it, right now? Tick it only if you can.
+--- checklist
+- Before training, I work out ln C and compare it with the first loss, and I can say what "much larger" and "much smaller" each mean
+- I overfit one small batch first and make sure the loss gets close to 0 before the real training run
+- I can name 5 sources of nan and inf: log(0), exp overflow, division by 0, fp16 above 65504, and a learning rate that is too high
+- My training loop checks every step's loss with torch.isfinite, stops at once when it goes bad, and reports the step
+- For a nan in forward I check layer by layer; for a nan in backward I use detect_anomaly
+- I print gradient norms per layer and can say what None, 0 and a very large value each mean
+- When the loss won't go down, I check in order: zero_grad, whether the parameters are trained (frozen / missing from the optimizer), whether labels match inputs, an extra softmax before cross_entropy, the learning rate
+--- hints
+- For any line you cannot tick, reread the matching card and redo the related items from blank.
+- In an interview, "symptom → what I check first → how I confirm it" convinces far more than a list of terms.
+
+@@ item d15-14
+type: code
+title: Closed book: a training loop that raises the alarm
+level: 2
+exam: yes
+cards: The loss won't go down: check in this order; Catch the first NaN: isfinite and detect_anomaly
+targets: train_classifier
+ref: day15
+--- context
+A clean training loop with a nan check at every step is the skeleton of every training script you will ever write. Write it once more from a blank page, closed book, to make sure you remember every line.
+--- prompt
+Write `train_classifier(model, x, y, steps=100, lr=0.5)` from scratch:
+
+- use `torch.optim.SGD` and `F.cross_entropy` (it takes logits), and train for `steps` steps on the same (x, y)
+- return the loss of every step (a list of Python floats)
+- if the loss is not a finite number, raise `FloatingPointError` right away, with the step in the message, like `"step 12: loss = nan"`
+--- starter
+def train_classifier(model, x, y, steps=100, lr=0.5):
+    raise todo()
+--- solution
+def train_classifier(model, x, y, steps=100, lr=0.5):
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    losses = []
+    for step in range(steps):
+        loss = F.cross_entropy(model(x), y)
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"step {step}: loss = {loss.item()}")
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+--- tests
+@check("each step uses only its own gradient")
+def _():
+    x, y = toy_data(16)
+    m, ref = tiny_mlp(), tiny_mlp()
+    losses = train_classifier(m, x, y, steps=2, lr=0.5)
+    true(isinstance(losses, list) and len(losses) == 2 and all(isinstance(v, float) for v in losses),
+         "return a list with one Python float per step (use loss.item())")
+    _sgd_ref(ref, x, y, steps=2, lr=0.5)
+    for (n, p), q in zip(m.named_parameters(), ref.parameters()):
+        eq(p, q, tol=1e-5,
+           msg=f"after 2 steps, {n} differs from the reference. Usual causes: no zero_grad (the gradients add up step after step), or the wrong input to the loss")
+
+@check("it can overfit one batch")
+def _():
+    x, y = toy_data(16)
+    losses = train_classifier(tiny_mlp(), x, y, steps=200, lr=0.5)
+    true(losses[-1] < 0.05,
+         f"after 200 steps the loss is still {losses[-1]:.3f}. With 4 classes, being stuck near 0.744 means an extra softmax before cross_entropy: it wants logits")
+
+@check("it stops at once when the lr is too high")
+def _():
+    x, y = toy_data(16)
+    try:
+        train_classifier(tiny_mlp(), x, y, steps=100, lr=100.0)
+    except FloatingPointError as e:
+        true("step" in str(e), f"the error message must say which step, like 'step 12: loss = nan'; yours is {str(e)!r}")
+        return
+    true(False, "with lr = 100 a correct training loop hits nan within a dozen or so steps, and should then raise FloatingPointError. "
+                "(If the first two checks still fail, fix those first: with an extra softmax the loss is trapped in a small range and cannot explode)")
+--- hints
+- The order: forward to get the loss → check the loss → clear the gradients → backward → step → record loss.item().
+- Check with `torch.isfinite(loss)`; if it is not finite, `raise FloatingPointError(f"step {step}: loss = {loss.item()}")`.
+
+@@ item d15-15
+type: code
+title: Closed book: grad_norms
+level: 1
+exam: yes
+cards: Gradient norms per layer
+targets: grad_norms
+ref: day15
+--- context
+Per-layer gradient norms are the first thing to print when the loss won't go down or blows up. Write the function once more, closed book, so you can type it out in seconds whenever you need it.
+--- prompt
+Write `grad_norms(model)` from scratch (it is called after `loss.backward()`):
+
+- return a dict whose keys are the names from `model.named_parameters()`, in the same order
+- each value is the L2 norm of the gradient (a Python float); when `p.grad` is None, the value is `None`
+--- starter
+def grad_norms(model):
+    raise todo()
+--- solution
+def grad_norms(model):
+    out = {}
+    for name, p in model.named_parameters():
+        out[name] = None if p.grad is None else p.grad.norm().item()
+    return out
+--- tests
+@check("one norm per parameter")
+def _():
+    m = tiny_mlp()
+    x, y = toy_data()
+    F.cross_entropy(m(x), y).backward()
+    g = grad_norms(m)
+    true(isinstance(g, dict), f"return a dict; you returned a {type(g).__name__}")
+    names = [n for n, _ in m.named_parameters()]
+    true(list(g) == names, f"the keys should be {names} (in named_parameters() order); yours are {list(g)}")
+    for n, p in m.named_parameters():
+        v = g[n]
+        true(isinstance(v, float), f"the value for {n} is a {type(v).__name__}; use .item() to get a Python float")
+        true(close(v, p.grad.norm().item(), 1e-5), f"the norm for {n} should be {p.grad.norm().item():.5f}; yours is {v}")
+
+@check("None for parameters without a gradient")
+def _():
+    m = tiny_mlp()
+    m[0].weight.requires_grad_(False)
+    x, y = toy_data()
+    F.cross_entropy(m(x), y).backward()
+    g = grad_norms(m)
+    true("0.weight" in g, "frozen parameters must appear in the result too (named_parameters() lists them)")
+    true(g["0.weight"] is None,
+         f"0.weight is frozen, so its .grad is None and the value should be None; yours is {g['0.weight']!r}")
+    true(isinstance(g["2.weight"], float), "2.weight is not frozen, so it should have a float norm")
+--- hints
+- Loop over `model.named_parameters()` and check `p.grad is None` for each parameter first.
+- When it is not None, the value is `p.grad.norm().item()`.

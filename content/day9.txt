@@ -3,35 +3,292 @@ title: 条件化：mini Stable Diffusion
 part: 图像生成
 hours: 3–4 小时
 --- goal
-TODO: 一句话写今天学完能做什么。
+让扩散模型「听话」：用 cross-attention 和条件嵌入把文本或类别告诉模型，用条件 dropout 加 CFG 控制它有多听话，再用 DDIM 只走 10 步就采出图；最后把 Stable Diffusion 每一步的张量形状算清楚。
 --- checklist
-- 先清空复习区
-- 读完知识卡片并改动运行
-- 练习区全部通过
+- 先清空复习区（之前看过答案的题，从空白重做一遍）
+- 读完 8 张卡片，每个例子改一个数再运行
+- 练习区全部通过，重点是「CFG 的 batch 技巧」和「DDIM 一步」
+- 闭卷默写 cfg_forward 和 ddim_step
+
+@@ concept
+title: 图像变成 token 序列
+--- body
+attention 吃的是「一串 token」，形状 (B, T, C)：B 个样本，每个 T 个 token，每个 token 是 C 维向量。图像特征图的形状是 (B, C, H, W)。想让图像特征做 attention，先把它摊平成序列。
+
+- 每个像素位置变成一个 token。这个 token 的向量，就是这个位置上 C 个通道的值。
+- 一共 H*W 个 token。顺序是**行优先**：先第 0 行从左到右，再第 1 行，依此类推。
+- 写法：`x.flatten(2)` 把第 2 维以后的 (H, W) 合成一维，得到 (B, C, H*W)；再 `.transpose(1, 2)` 交换第 1、2 维，得到 (B, H*W, C)。
+
+attention 做完要接回卷积，得变回去：先 `transpose(1, 2)` 回到 (B, C, H*W)，再 `reshape(B, C, H, W)`。注意：transpose 之后内存不连续，这里用 `view` 会报错，要用 `reshape`。
+
+真实的数字：64×64 的特征图、320 个通道，摊平以后是 4096 个 token，每个 320 维。
+--- code
+import torch
+
+x = torch.arange(12.).reshape(1, 3, 2, 2)   # B=1, C=3, H=2, W=2
+print(x[0, 0])                               # 通道 0 的 2x2
+tok = x.flatten(2).transpose(1, 2)
+print(tok.shape)                             # 4 个 token，每个 3 维
+print(tok[0])                                # 第 0 行 = 左上角像素的 3 个通道；第 1 行 = 它右边的像素
+back = tok.transpose(1, 2).reshape(1, 3, 2, 2)
+print(torch.equal(back, x))                  # 变回去，一个数都不差
+
+@@ concept
+title: Cross-attention：图像提问，文本回答
+--- body
+self-attention 里，Q、K、V 都来自同一个序列。cross-attention 把它们分开：
+
+- **Q 来自图像 token** x，形状 (B, Tx, C)。每个像素位置在问：「文本里哪些词和我有关？」
+- **K 和 V 来自文本嵌入** ctx，形状 (B, Tc, Cc)。文本的维度 Cc 可以和 C 不一样，所以投影矩阵 wk、wv 的形状是 (Cc, C)，把文本投影到 C 维。
+- 注意力矩阵是 (Tx, Tc)：每个图像 token 给每个文本 token 打一个分，softmax 以后每行加起来是 1。
+- 输出是 (B, Tx, C)。**输出的长度跟着 Q（图像）走**，和文本多长无关。文本是 7 个 token 还是 77 个 token，输出形状都一样。
+
+不需要 causal mask（因果遮挡）：每个图像 token 都可以看全部文本。
+
+多头的拆法和第 4 天一样：投影以后 `view(B, T, n_head, hd).transpose(1, 2)`，变成 (B, n_head, T, hd)，其中 hd = C // n_head；过 `F.scaled_dot_product_attention` 以后，再 `transpose(1, 2).reshape(B, T, C)` 拼回去。唯一的区别：Q 的长度是 Tx，K、V 的长度是 Tc。
+
+Stable Diffusion 就是这样把文字「告诉」UNet 的：UNet 里很多层都有 cross-attention，Q 是图像特征，K、V 是文本编码器的输出。
+--- code
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+B, Tx, Tc, C, Cc = 1, 6, 3, 8, 5
+x = torch.randn(B, Tx, C)        # 6 个图像 token，每个 8 维
+ctx = torch.randn(B, Tc, Cc)     # 3 个文本 token，每个 5 维
+wq, wk, wv = torch.randn(C, C), torch.randn(Cc, C), torch.randn(Cc, C)
+q, k, v = x @ wq, ctx @ wk, ctx @ wv
+print("q", tuple(q.shape), "k", tuple(k.shape), "v", tuple(v.shape))
+att = (q @ k.transpose(1, 2) / C ** 0.5).softmax(-1)
+print("注意力矩阵", tuple(att.shape))    # 每个图像 token 对 3 个文本 token 各打一个分
+print("每行加起来", att.sum(-1))
+out = F.scaled_dot_product_attention(q, k, v)
+print("输出", tuple(out.shape))           # 长度跟着图像走
+
+@@ concept
+title: 类别条件：加到时间嵌入上
+--- body
+「条件」就是你想控制的东西：一个类别（「画一个数字 7」），或者一句文本。文本很长，用上一张卡的 cross-attention。**类别**只是一个编号，最简单的做法是：
+
+1. 用 `nn.Embedding(num_classes, D)` 把类别编号变成一个 D 维向量（类别嵌入）。
+2. 直接**加到时间嵌入上**：`emb = t_emb + class_emb`，两个都是 (B, D)。
+3. 之后 emb 照常走第 8 天的 FiLM，进每一个 ResBlock。
+
+为什么相加就够了？相加以后，后面的 Linear 层拿到的一个向量里，既有「现在是第几步」，也有「要画什么」。网络会自己学会把两者分开用。DiT 和很多按类别生成的扩散模型都是这么做的。
+
+为 CFG 多准备一件事：多留一个编号表示「无条件」（null）。比如 10 个类别，就建 `nn.Embedding(11, D)`，编号 10 的意思是「不告诉你要画什么」。
+--- code
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+D, num_classes = 4, 10
+class_table = nn.Embedding(num_classes + 1, D)   # 编号 10 = null（无条件）
+t_emb = torch.zeros(3, D)                         # 假装这是 3 个样本的时间嵌入
+labels = torch.tensor([7, 7, 10])                 # 两个「7」，一个「无条件」
+emb = t_emb + class_table(labels)
+print(emb.shape)
+print(emb.detach().round(decimals=2))             # 前两行一样：同一个类别、同一个时间步
+
+@@ concept
+title: 条件 dropout：CFG 的前提
+--- body
+下一张卡的 CFG 在采样时要**两个**预测：一个有条件，一个无条件。要训练两个模型吗？不用。训练时随机把一部分样本的条件换成 null，同一个模型就学会了两件事：
+
+- 看到真条件：预测「按这个条件」该去掉的噪声。
+- 看到 null：预测「什么都不知道时」该去掉的噪声。
+
+要点：
+
+- 丢弃概率 p 通常取 0.1，也就是 10% 的样本不给条件。
+- **按样本丢，不是按元素丢**。一个样本的条件，要么整条保留，要么整条换成 null。像普通 dropout 那样把向量里的一部分数变成 0，得到的是「半个条件」，采样时根本用不上。
+- 写法：每个样本抽**一个**随机数，`keep = torch.rand(B, 1) >= p`。形状 (B, 1) 可以广播到 (B, D)。把 keep 转成浮点数，再 `keep * cond + (1 - keep) * null`。
+- 只在训练时这样做。采样时条件由你决定。
+--- code
+import torch
+
+torch.manual_seed(0)
+B, D, p = 6, 3, 0.5                # 这里 p 取 0.5，效果明显；真实训练常用 0.1
+cond = torch.ones(B, D)            # 真条件：全 1
+null = torch.zeros(D)              # null 条件：全 0
+keep = (torch.rand(B, 1) >= p).float()
+print(keep.squeeze(1))             # 每个样本一个 0 或 1
+out = keep * cond + (1 - keep) * null
+print(out)                         # 每一行要么全 1，要么全 0
+
+@@ concept
+title: CFG：公式和 batch 技巧
+--- body
+classifier-free guidance（CFG，无分类器引导）是让模型「更听话」的旋钮。采样的每一步，模型预测两次噪声：
+
+- eps_u：给 null 条件时的预测（无条件）
+- eps_c：给真条件时的预测（有条件）
+
+然后这样组合：
+
+```
+eps = eps_u + scale * (eps_c - eps_u)
+```
+
+- `eps_c - eps_u` 是「条件带来的变化」，一个方向。
+- scale = 0：结果就是 eps_u，条件被忽略。
+- scale = 1：结果正好是 eps_c，就是普通的条件生成。
+- scale > 1：沿着这个方向**再多推一点**（外推）。图更贴合条件，但多样性下降；太大（比如 20）颜色会过饱和。Stable Diffusion 默认用 7.5。
+
+结果离 eps_u 的距离正好是 scale × |eps_c - eps_u|，所以 scale 越大离得越远。
+
+**batch 技巧**：两个预测不要跑两次模型。把输入复制一份拼起来，一次前向算完：
+
+1. x 变成 `torch.cat([x, x])`，形状 (2B, ...)；时间步 t 也一样拼。
+2. 条件拼成 `torch.cat([null 扩成 B 行, cond])`：**前一半 null，后一半 cond**。这是约定，拆的时候要对上。
+3. 输出用 `out.chunk(2)` 拆成两块，第一块是 eps_u，第二块是 eps_c，再套上面的公式。
+
+在 GPU 上，一次 batch 为 2B 的前向，比两次 batch 为 B 的前向快。代价是这一步的激活显存翻倍。
+--- code
+import torch
+
+eps_u = torch.tensor([0.0, 1.0])
+eps_c = torch.tensor([1.0, 1.0])
+for scale in [0.0, 1.0, 3.0, 7.5]:
+    eps = eps_u + scale * (eps_c - eps_u)
+    print(scale, eps.tolist(), "离 eps_u 的距离", (eps - eps_u).norm().item())
+
+B, D = 2, 4
+x = torch.randn(B, 1, 8, 8)
+cond = torch.ones(B, D)
+null = torch.zeros(D)
+both_x = torch.cat([x, x])
+both_c = torch.cat([null.expand(B, -1), cond])     # 前一半 null，后一半 cond
+print(both_x.shape, both_c.shape)
+print(both_c)
+
+@@ concept
+title: DDIM 的时间步：跳着走
+--- body
+第 8 天的 DDPM 训练时用 T=1000 步，采样时也得一步一步走 1000 步，太慢。DDIM 用**同一个训练好的模型**，只挑其中一小部分时间步来走，比如 50 步，甚至 10 步。不用重新训练。
+
+怎么挑：等间隔。间隔 k = T // steps（整除），要的时间步是 0, k, 2k, …, (steps-1)*k，一共 steps 个。采样从噪声最大的地方开始，所以要**倒过来**，从大到小走：
+
+- T=1000，steps=5：k=200，时间步是 [800, 600, 400, 200, 0]
+- T=1000，steps=50：k=20，时间步是 [980, 960, …, 20, 0]
+
+两个细节：
+
+- 最后一个一定是 0。最后一步要落到干净图上。
+- 个数必须正好是 steps。`torch.arange(0, T, k)` 在 T 能被 steps 整除时没问题；T=100、steps=30 时 k=3，它会给出 34 个（0, 3, …, 99），多了 4 个。
+
+每一步从 t 走到列表里的下一个时间步，叫 t_prev（比如 800 走到 600）。最后一步从 0 走到 -1：-1 的意思是「干净图本身」。
+--- code
+import torch
+
+T, steps = 1000, 5
+k = T // steps
+print("k =", k)
+print(torch.arange(0, T, k))              # 从小到大
+print(torch.arange(0, T, k).flip(0))      # 倒过来：从噪声最大的地方开始
+
+T, steps = 100, 30
+k = T // steps
+print(f"k = {k}，arange(0, T, k) 给了 {len(torch.arange(0, T, k))} 个，要的是 {steps} 个")
+
+@@ concept
+title: DDIM 一步：先猜 x0，再重新加噪
+ref: day8
+--- body
+回忆第 8 天的 q_sample：`x_t = sqrt(ab_t) * x0 + sqrt(1 - ab_t) * eps`。ab 是 alphas_cumprod（alpha 的累乘），t 越大 ab 越小，x_t 里噪声越多。
+
+DDIM 的一步（eta=0，不加新的随机噪声）分两半：
+
+1. **从 x_t 反推 x0**。模型预测了噪声 eps，把 q_sample 的式子倒过来解：`x0_pred = (x_t - sqrt(1 - ab_t) * eps) / sqrt(ab_t)`
+2. **用同一个 eps，重新加噪到 t_prev**：`x_prev = sqrt(ab_prev) * x0_pred + sqrt(1 - ab_prev) * eps`
+
+第 2 步其实就是 `q_sample(x0_pred, t_prev, eps)`。所以，如果模型预测的 eps 正好是当初加进去的真噪声，DDIM 一步会**精确**落在 `q_sample(x0, t_prev, eps)` 上。这是检验采样器最好用的单元测试。
+
+- t_prev = -1 表示「走到头」：规定 ab_prev = 1，于是 x_prev 就是 x0_pred。
+- 整个过程没有随机数。同一个起始噪声，永远得到同一张图。DDPM 每一步都会加新的随机噪声，所以每次都不一样。
+- t 和 t_prev 都是 (B,) 的张量。取系数用第 8 天的 `extract(arr, t, x.shape)`，它把 (B,) 变成 (B, 1, 1, 1)，方便和图像广播。
+- `extract` 里的 gather 不接受 -1。先用 `t_prev.clamp(min=0)` 取出 ab_prev，再用 `torch.where` 把 t_prev < 0 的位置换成 1。
+
+**采样循环**：从 `x = torch.randn(shape)` 出发，依次走 (t, t_prev) = (800, 600), (600, 400), …, (0, -1)。每一步先 `eps = model(x, t)`，再 `x = ddim_step(x, t, t_prev, eps, sched)`。最后的 x 就是生成的图。
+
+下面的例子只演示第 1 步：t=600 时 x_t 几乎全是噪声，但只要 eps 是真噪声，反推出来的 x0 一个数都不差。
+--- code
+torch.manual_seed(0)
+s = linear_schedule(1000)
+x0 = torch.randn(1, 4)                 # 一张只有 4 个数的「干净图」
+eps = torch.randn(1, 4)                # 当初加进去的噪声
+t = torch.tensor([600])
+x_t = q_sample(x0, t, eps, s)
+ab = extract(s["alphas_cumprod"], t, x_t.shape)
+print("ab_600 =", round(ab.item(), 4))  # 很小：x_t 里几乎全是噪声
+print("x_t    ", x_t)
+x0_pred = (x_t - (1 - ab).sqrt() * eps) / ab.sqrt()
+print("x0     ", x0)
+print("x0_pred", x0_pred)              # 和 x0 一样
+
+@@ concept
+title: Latent diffusion：Stable Diffusion 的形状账
+--- body
+直接在 512×512 的像素上做扩散太贵：一张图有 3×512×512 ≈ 78 万个数，UNet 每一步都要处理一遍。Stable Diffusion 用的是 latent diffusion（潜空间扩散）：先用第 7 天那种 VAE 把图压小，在小的 latent 上做扩散，最后再解码回像素。
+
+Stable Diffusion 1.x 的几个固定数字：
+
+- VAE：长宽各缩小 8 倍，latent 有 4 个通道。
+- UNet 的第一个卷积把 4 个通道升到 320 个。
+- 文本编码器（CLIP）把提示词变成 77 个 token，每个 768 维。
+
+有了这几个数，每一步的形状都能推出来。下面用 batch 2、256×256 的图举例：
+
+1. 图像：(2, 3, 256, 256)
+2. VAE 编码：256 ÷ 8 = 32，latent 是 (2, 4, 32, 32)。数的个数少了 48 倍。
+3. 加噪、UNet 预测噪声、DDIM 去噪，全都在 latent 上做。UNet 输出（预测的噪声）和输入 latent 同形：(2, 4, 32, 32)。
+4. UNet 里面：第一个卷积以后是 (2, 320, 32, 32)；摊平成 token 是 (2, 32*32, 320) = (2, 1024, 320)。
+5. 文本嵌入：(2, 77, 768)。
+6. cross-attention：Q 来自 (2, 1024, 320)，K、V 来自 (2, 77, 768)（wk、wv 把 768 投影到 320）。输出跟着 Q 走：(2, 1024, 320)。
+7. 采样结束，VAE 解码回 (2, 3, 256, 256)。
+
+再加上 CFG 的 batch 技巧，UNet 每一步实际处理的 batch 会翻倍。
+--- code
+import torch
+import torch.nn as nn
+
+B, H, W = 2, 256, 256
+image = torch.zeros(B, 3, H, W)
+latent = torch.zeros(B, 4, H // 8, W // 8)        # VAE：长宽 ÷8，4 个通道
+print("image ", tuple(image.shape), image[0].numel(), "个数 / 张")
+print("latent", tuple(latent.shape), latent[0].numel(), "个数 / 张")
+print(f"少了 {image.numel() // latent.numel()} 倍")
+h = nn.Conv2d(4, 320, 3, padding=1)(latent)       # UNet 第一层：4 -> 320 通道
+tokens = h.flatten(2).transpose(1, 2)
+print("latent tokens", tuple(tokens.shape))
 
 @@ item d9-01
 type: code
 title: 空间 <-> token 往返
-level: 2
+level: 1
+cards: 图像变成 token 序列
 targets: to_tokens, to_spatial
 ref: day8, day9
 --- context
-TODO
+UNet 里的 attention 层、DiT、ViT 都要先把 (B, C, H, W) 的特征图摊成 token 序列，做完再变回去。顺序一错，token 就对不上原来的像素：不会报错，但模型学不好。
 --- prompt
-01  空间特征 <-> token 序列
+写两个函数：
+
+- `to_tokens(x)`：输入 (B, C, H, W)，输出 (B, H*W, C)。第 i 个 token 是第 i 个像素位置上 C 个通道的值，像素按**行优先**排（先第 0 行从左到右，再第 1 行……）。
+- `to_spatial(tok, H, W)`：输入 (B, H*W, C)，输出 (B, C, H, W)。它是 `to_tokens` 的逆操作：`to_spatial(to_tokens(x), H, W)` 必须和 x 完全一样。
+
+例子：x 的形状是 (2, 8, 4, 6)，`to_tokens(x)` 是 (2, 24, 8)。
 --- starter
 def to_tokens(x):
-    """(B, C, H, W) -> (B, H*W, C)。这一步之后，图像就变成了"一句话"。"""
-    # --- TODO 01 ---
+    """(B, C, H, W) -> (B, H*W, C)。这一步之后，图像就变成了「一句话」。"""
     raise todo()
 
 def to_spatial(tok, H, W):
     """(B, H*W, C) -> (B, C, H, W)，是 to_tokens 的逆操作。"""
-    # --- TODO 01b ---
     raise todo()
 --- solution
 def to_tokens(x):
-    return x.flatten(2).transpose(1, 2)          # (B,C,H,W) -> (B,HW,C)
+    return x.flatten(2).transpose(1, 2)          # (B,C,H,W) -> (B,C,HW) -> (B,HW,C)
 
 def to_spatial(tok, H, W):
     B, N, C = tok.shape
@@ -46,36 +303,45 @@ def t01():
     eq(tok[0, 0], x[0, :, 0, 0], msg="第 0 个 token 应该是左上角像素的通道向量")
     eq(tok[0, 1], x[0, :, 0, 1], msg="第 1 个 token 应该是它右边那个像素（行优先）")
 --- hints
-- TODO
+- `x.flatten(2)` 把第 2 维以后的 H、W 合成一维，得到 (B, C, H*W)。还差一步：把 C 换到最后。
+- `to_tokens`：`x.flatten(2).transpose(1, 2)`。
+- `to_spatial`：先 `tok.transpose(1, 2)` 回到 (B, C, H*W)，再 `.reshape(B, C, H, W)`。这里用 `view` 会报错，因为 transpose 之后内存不连续。
 
 @@ item d9-02
 type: code
 title: cross-attention
 level: 2
+cards: Cross-attention：图像提问，文本回答
 targets: cross_attention
 ref: day8, day9
 --- context
-TODO
+Stable Diffusion 就是靠 cross-attention 把文字告诉 UNet 的：图像特征当 Q，文本嵌入当 K 和 V。文本可以任意长，输出形状只跟着图像走，所以同一个 UNet 能配不同长度的提示词。
 --- prompt
-02  cross-attention：Q 来自图，KV 来自文本
+写 `cross_attention(x, ctx, wq, wk, wv, n_head)`：
+
+- x：(B, Tx, C)，图像 token。ctx：(B, Tc, Cc)，文本嵌入。Tc 和 Tx 没有关系，Cc 也可以不等于 C。
+- 权重：wq 是 (C, C)，wk 和 wv 是 (Cc, C)。投影就是 `x @ wq`、`ctx @ wk`、`ctx @ wv`，没有 bias。
+- 分成 n_head 个头，每个头 hd = C // n_head 维。用 `F.scaled_dot_product_attention` 算注意力，不要 causal mask。最后把头拼回去。
+- 返回 (B, Tx, C)。
+
+测试先用 Tc=7 和参考结果对拍，再换成 Tc=77，看形状还对不对。
 --- starter
 def cross_attention(x, ctx, wq, wk, wv, n_head):
     """x:   (B, Tx, C)    图像 token
     ctx: (B, Tc, Cc)   文本嵌入（长度和 Tx 完全无关）
     wq: (C, C)   wk: (Cc, C)   wv: (Cc, C)
-    返回 (B, Tx, C)。允许用 F.scaled_dot_product_attention（不需要 causal mask）。
+    返回 (B, Tx, C)。可以用 F.scaled_dot_product_attention（不需要 causal mask）。
     """
-    # --- TODO 02 ---
     raise todo()
 --- solution
 def cross_attention(x, ctx, wq, wk, wv, n_head):
     B, Tx, C = x.shape
     Tc = ctx.size(1)
     hd = C // n_head
-    q = (x @ wq).view(B, Tx, n_head, hd).transpose(1, 2)
-    k = (ctx @ wk).view(B, Tc, n_head, hd).transpose(1, 2)     # KV 来自文本
+    q = (x @ wq).view(B, Tx, n_head, hd).transpose(1, 2)       # Q 来自图像
+    k = (ctx @ wk).view(B, Tc, n_head, hd).transpose(1, 2)     # K、V 来自文本
     v = (ctx @ wv).view(B, Tc, n_head, hd).transpose(1, 2)
-    o = F.scaled_dot_product_attention(q, k, v)
+    o = F.scaled_dot_product_attention(q, k, v)                 # (B, n_head, Tx, hd)
     return o.transpose(1, 2).reshape(B, Tx, C)
 --- tests
 @check("cross-attention")
@@ -91,29 +357,34 @@ def t02():
     k = (ctx @ wk).view(B, Tc, nh, C // nh).transpose(1, 2)
     v = (ctx @ wv).view(B, Tc, nh, C // nh).transpose(1, 2)
     ref = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, Tx, C)
-    eq(out, ref, tol=1e-4)
+    eq(out, ref, tol=1e-4, msg="数值和参考不一样。检查：Q 用 x，K、V 用 ctx；拆头用 view + transpose(1, 2)")
 
-    # 文本长度换一个也要能跑 —— 这正是 cross-attn 比 concat 好用的地方
-    shape_is(cross_attention(x, torch.randn(B, 77, Cc), wq, wk, wv, nh), (B, Tx, C))
+    # 文本长度换一个也要能跑 —— 这正是 cross-attention 比直接拼接好用的地方
+    shape_is(cross_attention(x, torch.randn(B, 77, Cc), wq, wk, wv, nh), (B, Tx, C),
+             "文本换成 77 个 token 以后形状不对：K、V 的长度要用 ctx 的长度 Tc")
 --- hints
-- TODO
+- 先投影：`x @ wq` 是 (B, Tx, C)；`ctx @ wk` 和 `ctx @ wv` 是 (B, Tc, C)。
+- 拆头：`q.view(B, Tx, n_head, hd).transpose(1, 2)` 得到 (B, n_head, Tx, hd)。k、v 一样拆，只是长度用 Tc。
+- SDPA 的输出是 (B, n_head, Tx, hd)，用 `o.transpose(1, 2).reshape(B, Tx, C)` 拼回去。
 
 @@ item d9-03
 type: code
 title: 条件嵌入相加
-level: 2
+level: 1
+cards: 类别条件：加到时间嵌入上
 targets: combine_cond
 ref: day8, day9
 --- context
-TODO
+按类别生成（比如「画一个数字 7」）时，最省事的条件注入就是把类别嵌入加到时间嵌入上，后面照常走 FiLM。DiT 和很多按类别生成的扩散模型都这么做。
 --- prompt
-03  条件嵌入的注入：最省事的那种
+写 `combine_cond(t_emb, class_emb)`：两个输入都是 (B, D)，返回它们逐元素相加的结果，形状 (B, D)。
+
+这题很短。写完想一想：为什么加在一起，后面的层就能同时知道「现在是第几步」和「要画什么」？
 --- starter
 def combine_cond(t_emb, class_emb):
-    """class-conditional 最简单的做法: 直接把类别嵌入加到时间嵌入上。
+    """按类别生成最简单的做法：直接把类别嵌入加到时间嵌入上。
     两个都是 (B, D)。返回 (B, D)。
     """
-    # --- TODO 03 ---
     raise todo()
 --- solution
 def combine_cond(t_emb, class_emb):
@@ -122,32 +393,41 @@ def combine_cond(t_emb, class_emb):
 @check("条件嵌入相加")
 def t03():
     a, b = torch.randn(4, 16), torch.randn(4, 16)
-    eq(combine_cond(a, b), a + b)
+    eq(combine_cond(a, b), a + b, msg="应该是两个嵌入逐元素相加")
 --- hints
-- TODO
+- 两个形状一样的张量，直接用 `+`。
+- `return t_emb + class_emb`
 
 @@ item d9-04
 type: code
 title: 条件 dropout
 level: 2
+cards: 条件 dropout：CFG 的前提
 targets: drop_cond
 ref: day8, day9
 --- context
-TODO
+CFG 采样时要一个无条件预测，但没人想为它再训一个模型。训练时随机把约 10% 样本的条件换成 null，同一个模型就同时学会了有条件和无条件。要是按元素丢，CFG 就用不了。
 --- prompt
-04  训练时的条件 dropout —— CFG 的前提
+写 `drop_cond(cond_emb, null_emb, p, generator=None)`：
+
+- cond_emb：(B, D)，每个样本的条件嵌入。null_emb：(D,)，「无条件」的嵌入。
+- 每个样本独立地、以概率 p 把**整行**换成 null_emb；否则保持原样。返回 (B, D)。
+- 必须按样本丢：每一行要么完全是原来的条件，要么完全是 null_emb。
+- p=0 时一个都不丢，p=1 时全部丢掉。
+- 抽随机数时把 generator 传进去：`torch.rand(..., generator=generator)`。generator 是 None 时，用的就是全局随机数。
+
+测试：B=4000、p=0.1 时，被丢掉的行的比例要在 0.08 到 0.12 之间。
 --- starter
 def drop_cond(cond_emb, null_emb, p, generator=None):
     """以概率 p 把某些样本的条件整条换成 null_emb（无条件嵌入）。
     cond_emb: (B, D)   null_emb: (D,)   返回 (B, D)。
-    必须是**按样本**丢，不是按元素丢。
+    必须是按样本丢，不是按元素丢。
     """
-    # --- TODO 04 ---
     raise todo()
 --- solution
 def drop_cond(cond_emb, null_emb, p, generator=None):
     B = cond_emb.size(0)
-    keep = (torch.rand(B, 1, generator=generator) >= p).to(cond_emb.dtype)
+    keep = (torch.rand(B, 1, generator=generator) >= p).to(cond_emb.dtype)   # 每个样本一个随机数
     return keep * cond_emb + (1 - keep) * null_emb.expand_as(cond_emb)
 --- tests
 @check("条件 dropout")
@@ -160,31 +440,42 @@ def t04():
     shape_is(out, (B, D))
     per_row = out.sum(1)
     true(set(per_row.unique().tolist()) <= {0.0, float(D)},
-         "有的行被丢了一半 —— 必须整行丢弃，不能按元素")
+         "有的行只被丢了一部分 —— 必须整行丢弃，不能按元素丢（每个样本只抽一个随机数）")
     frac = (per_row == 0).float().mean().item()
-    true(abs(frac - 0.1) < 0.02, f"丢弃比例应该 ≈ 0.1, 实际 {frac:.3f}")
-    eq(drop_cond(cond, null, p=0.0), cond, msg="p=0 时不该丢")
-    eq(drop_cond(cond, null, p=1.0), torch.zeros(B, D), msg="p=1 时应该全丢")
+    true(abs(frac - 0.1) < 0.02, f"丢弃比例应该 ≈ 0.1，实际是 {frac:.3f}")
+    eq(drop_cond(cond, null, p=0.0), cond, msg="p=0 时一行都不该丢")
+    eq(drop_cond(cond, null, p=1.0), torch.zeros(B, D), msg="p=1 时应该全部丢掉")
 --- hints
-- TODO
+- 每个样本只抽一个随机数：`torch.rand(B, 1, generator=generator)`。形状 (B, 1) 能广播到 (B, D)。
+- `keep = torch.rand(B, 1, generator=generator) >= p`：随机数 ≥ p 的样本保留。这样 p=0 时全部保留，p=1 时全部丢掉。
+- `keep = keep.to(cond_emb.dtype)`，然后 `return keep * cond_emb + (1 - keep) * null_emb`（null_emb 会自动广播成 (B, D)）。
 
 @@ item d9-05
 type: code
 title: CFG 组合公式
-level: 2
+level: 1
+cards: CFG：公式和 batch 技巧
 targets: cfg_combine
 ref: day8, day9
-# merged checks: t10 guidance 的单调性
 --- context
-TODO
+CFG 的 scale 是文生图里最常调的旋钮（Stable Diffusion 默认 7.5）。公式只有一行，但方向写反或者基准项写错，出来的图就是一团糟，而且不会报任何错。
 --- prompt
-05  CFG 的组合公式
+写 `cfg_combine(eps_uncond, eps_cond, scale)`，返回：
+
+```
+eps_uncond + scale * (eps_cond - eps_uncond)
+```
+
+两个 eps 形状相同，scale 是一个浮点数。检查会验证：
+
+- scale=0 时，结果正好是 eps_uncond
+- scale=1 时，结果正好是 eps_cond
+- scale 越大，结果离 eps_uncond 越远
 --- starter
 def cfg_combine(eps_uncond, eps_cond, scale):
     """eps = eps_uncond + scale * (eps_cond - eps_uncond)
-    scale=1 时就是普通条件生成；scale>1 时"往条件方向多推一点"。
+    scale=1 时就是普通的条件生成；scale>1 时「往条件方向多推一点」。
     """
-    # --- TODO 05 ---
     raise todo()
 --- solution
 def cfg_combine(eps_uncond, eps_cond, scale):
@@ -193,13 +484,13 @@ def cfg_combine(eps_uncond, eps_cond, scale):
 @check("CFG 组合公式")
 def t05():
     u, c = torch.randn(2, 3), torch.randn(2, 3)
-    eq(cfg_combine(u, c, 1.0), c, msg="scale=1 应该正好等于条件预测")
-    eq(cfg_combine(u, c, 0.0), u, msg="scale=0 应该退化成无条件")
+    eq(cfg_combine(u, c, 1.0), c, msg="scale=1 时应该正好等于条件预测")
+    eq(cfg_combine(u, c, 0.0), u, msg="scale=0 时应该退化成无条件预测")
     eq(cfg_combine(u, c, 2.0), 2 * c - u)
-    # 方向检查: scale 越大越远离无条件
+    # 方向检查：scale 越大，离无条件预测越远
     d1 = (cfg_combine(u, c, 3.0) - u).norm()
     d2 = (cfg_combine(u, c, 1.0) - u).norm()
-    true(d1 > d2, "scale 变大应该离无条件预测更远，你的公式方向反了")
+    true(d1 > d2, "scale 变大，结果应该离无条件预测更远 —— 你的公式方向反了")
 
 @check("guidance 的单调性")
 def t10():
@@ -209,36 +500,44 @@ def t10():
     for sc in [1.0, 2.0, 5.0, 10.0]:
         d = (cfg_combine(u, c, sc) - u).norm().item()
         if prev is not None:
-            true(d > prev, f"scale={sc} 时反而更靠近无条件了")
+            true(d > prev, f"scale={sc} 时反而离无条件预测更近了")
         prev = d
 --- hints
-- TODO
+- 照着公式写。注意差值是 `eps_cond - eps_uncond`，不是反过来；前面加的是 `eps_uncond`。
+- `return eps_uncond + scale * (eps_cond - eps_uncond)`
 
 @@ item d9-06
 type: code
 title: CFG 的 batch 技巧
 level: 2
+cards: CFG：公式和 batch 技巧
 targets: cfg_forward
 ref: day8, day9
 --- context
-TODO
+上线采样时，CFG 的两个分支会合成一次 batch 为 2B 的前向，比跑两次模型快，diffusers 等库都是这么写的。拼的顺序和拆的顺序对不上，结果就错了，而且不会报错。
 --- prompt
-06  CFG 的 batch 技巧：一次前向算两个分支
+写 `cfg_forward(model, x, t, cond, null_cond, scale)`：
+
+- x：(B, C, H, W)；t：(B,)；cond：(B, D)；null_cond：(D,)。
+- `model(x, t, c)` 返回和 x 同形状的噪声预测。
+- 只调用**一次** model。输入的 batch 是 2B：x 和 t 各复制一份拼起来；条件**前一半是 null_cond，后一半是 cond**。
+- 把输出拆成两半 (eps_uncond, eps_cond)，用 `cfg_combine(eps_uncond, eps_cond, scale)` 组合（这个函数已经给你了），返回 (B, C, H, W)。
+
+测试用的假模型，输出等于条件向量的均值：null 全是 0，cond 全是 2，scale=3，结果应该处处是 0 + 3 × (2 - 0) = 6。
 --- starter
 def cfg_forward(model, x, t, cond, null_cond, scale):
     """不要跑两次 model。把 x 复制两份、条件拼成 [null, cond]，一次前向再拆开。
-    x: (B,C,H,W)   cond: (B,D)   null_cond: (D,)
+    x: (B,C,H,W)   t: (B,)   cond: (B,D)   null_cond: (D,)
     model(x, t, c) -> 和 x 同形状
     返回组合后的 (B,C,H,W)。
     """
-    # --- TODO 06 ---
     raise todo()
 --- solution
 def cfg_forward(model, x, t, cond, null_cond, scale):
     B = x.size(0)
     both_x = torch.cat([x, x])
     both_t = torch.cat([t, t])
-    both_c = torch.cat([null_cond.expand(B, -1), cond])       # 约定: 前 null 后 cond
+    both_c = torch.cat([null_cond.expand(B, -1), cond])       # 约定：前一半 null，后一半 cond
     out = model(both_x, both_t, both_c)
     e_u, e_c = out.chunk(2)
     return cfg_combine(e_u, e_c, scale)
@@ -254,7 +553,7 @@ def t06():
     shape_is(out, x.shape)
     # uncond=0, cond=2 -> 0 + 3*(2-0) = 6
     eq(out, torch.full_like(x, 6.0),
-       msg="拼接顺序错了。约定是前一半 null、后一半 cond")
+       msg="结果不对。约定是前一半 null、后一半 cond；chunk(2) 以后第一块是无条件，第二块是有条件")
     calls = []
     class Counting(nn.Module):
         def forward(self, x, t, c):
@@ -262,70 +561,517 @@ def t06():
             return torch.zeros_like(x) + c.mean(-1).reshape(-1, 1, 1, 1)
     cfg_forward(Counting(), x, t, cond, null, 3.0)
     true(len(calls) == 1 and calls[0] == 6,
-         f"应该只调用一次 model、batch 翻倍到 6，实际调用 {len(calls)} 次 batch={calls}")
+         f"应该只调用一次 model，batch 翻倍到 6；实际调用了 {len(calls)} 次，batch={calls}")
 --- hints
-- TODO
+- 复制：`torch.cat([x, x])`、`torch.cat([t, t])`。null_cond 只有一行，先 `null_cond.expand(B, -1)` 变成 (B, D)。
+- 条件：`torch.cat([null_cond.expand(B, -1), cond])`。一次前向以后，`e_u, e_c = out.chunk(2)`。
+- 最后 `return cfg_combine(e_u, e_c, scale)`。
 
 @@ item d9-07
 type: code
 title: DDIM 时间步子集
 level: 2
+cards: DDIM 的时间步：跳着走
 targets: ddim_timesteps
 ref: day8, day9
 --- context
-TODO
+DDIM 只用训练时 1000 步里的一小部分（常见 20 到 50 步）来采样，出图快几十倍。第一件事是挑出这些步：顺序反了、最后一步不是 0、个数不对，图都会出问题。
 --- prompt
-07  DDIM 的时间步子集
+写 `ddim_timesteps(T, steps)`：
+
+- 间隔 k = T // steps，取 0, k, 2k, …, (steps-1)*k 这 steps 个时间步。
+- **从大到小**返回，是一个 1D 的 LongTensor（dtype 是 torch.long）。
+- 最后一个必须是 0。个数必须正好是 steps，T 不能被 steps 整除时也一样。
+
+例子：
+
+- T=1000，steps=5：tensor([800, 600, 400, 200, 0])
+- T=1000，steps=50：[980, 960, …, 20, 0]
+- T=100，steps=30：k=3，[87, 84, …, 3, 0]，正好 30 个
 --- starter
 def ddim_timesteps(T, steps):
-    """从 [0, T) 里等间隔取 steps 个时间步，**从大到小**返回 1D LongTensor。
+    """从 [0, T) 里等间隔取 steps 个时间步，从大到小返回 1D LongTensor。
     最后一个必须是 0（否则最后一步落不到干净图上）。
     T=1000, steps=5 -> tensor([800, 600, 400, 200, 0])
     """
-    # --- TODO 07 ---
     raise todo()
 --- solution
 def ddim_timesteps(T, steps):
-    return torch.arange(0, T, T // steps).flip(0).long()
+    return (torch.arange(steps) * (T // steps)).flip(0).long()
 --- tests
 @check("DDIM 时间步子集")
 def t07():
     ts = ddim_timesteps(1000, 5)
-    true(ts.dtype == torch.long)
+    true(ts.dtype == torch.long, f"dtype 应该是 torch.long，你的是 {ts.dtype}")
     eq(ts, torch.tensor([800, 600, 400, 200, 0]))
     ts2 = ddim_timesteps(1000, 50)
-    true(len(ts2) == 50 and ts2[0] == 980 and ts2[-1] == 0)
+    true(len(ts2) == 50 and ts2[0] == 980 and ts2[-1] == 0,
+         "T=1000, steps=50 时应该是 50 个，从 980 到 0")
     true((ts2[1:] < ts2[:-1]).all(), "必须严格递减")
+    ts3 = ddim_timesteps(100, 30)
+    true(len(ts3) == 30 and ts3[0] == 87 and ts3[-1] == 0,
+         f"T=100, steps=30 时应该正好 30 个（87, 84, …, 0），你给了 {len(ts3)} 个。"
+         "torch.arange(0, T, k) 在这里会多出来")
 --- hints
-- TODO
+- `torch.arange(steps)` 是 0, 1, …, steps-1。每个数乘上 k = T // steps，就是要的时间步（从小到大）。
+- 别用 `torch.arange(0, T, k)`：T=100、steps=30 时它会给出 34 个。
+- `(torch.arange(steps) * (T // steps)).flip(0)`。整数的 arange 本来就是 long。
 
 @@ item d9-08
 type: code
 title: DDIM 一步（精确还原检验）
-level: 2
+level: 3
+cards: DDIM 一步：先猜 x0，再重新加噪
 targets: ddim_step
 ref: day8, day9
 --- context
-TODO
+DDIM 是扩散模型最常用的快速采样器。这一步写对了，喂进真噪声就能精确还原加噪过程：这是检验采样器最好用的单元测试，也说明了 DDIM 为什么没有随机性。
 --- prompt
-08  DDIM 一步 —— 喂进真噪声应该精确还原
+写 `ddim_step(x_t, t, t_prev, eps_pred, sched)`（eta=0，不加新的随机噪声）：
+
+- x_t：(B, C, H, W)。t 和 t_prev：(B,) 的 long 张量。eps_pred：模型预测的噪声，和 x_t 同形状。sched：第 8 天的调度字典，这里只用 `sched["alphas_cumprod"]`。
+- ab_t = alphas_cumprod[t]，ab_prev = alphas_cumprod[t_prev]。用 `extract` 取，得到 (B, 1, 1, 1)。
+- `x0_pred = (x_t - sqrt(1 - ab_t) * eps_pred) / sqrt(ab_t)`
+- 返回 `x_prev = sqrt(ab_prev) * x0_pred + sqrt(1 - ab_prev) * eps_pred`
+- t_prev 可能是 -1（表示走到头）。这时 ab_prev 按 1 算，于是返回的就是 x0_pred。
+
+第 8 天的 `linear_schedule`、`q_sample`、`extract` 已经加载好了，可以直接用。
 --- starter
 def ddim_step(x_t, t, t_prev, eps_pred, sched):
     """x0_pred = (x_t - sqrt(1-ab_t) * eps) / sqrt(ab_t)
     x_prev  = sqrt(ab_prev) * x0_pred + sqrt(1-ab_prev) * eps      (eta=0，不加随机噪声)
-    t / t_prev 都是 (B,) 张量。t_prev 允许是 -1，此时 ab_prev = 1（直接返回 x0_pred）。
+    t / t_prev 都是 (B,) 张量。t_prev 可以是 -1，这时 ab_prev = 1（直接返回 x0_pred）。
     """
-    # --- TODO 08 ---
+    raise todo()
+--- solution
+def ddim_step(x_t, t, t_prev, eps_pred, sched):
+    ab = extract(sched["alphas_cumprod"], t, x_t.shape)
+    x0 = (x_t - (1 - ab).sqrt() * eps_pred) / ab.sqrt()          # 第 1 步：反推 x0
+    prev_ok = (t_prev >= 0)
+    tp = t_prev.clamp(min=0)                                       # gather 不接受 -1
+    ab_prev = extract(sched["alphas_cumprod"], tp, x_t.shape)
+    ones = torch.ones_like(ab_prev)
+    ab_prev = torch.where(prev_ok.reshape(-1, *([1] * (x_t.dim() - 1))), ab_prev, ones)
+    return ab_prev.sqrt() * x0 + (1 - ab_prev).sqrt() * eps_pred   # 第 2 步：用同一个 eps 重新加噪
+--- tests
+@check("DDIM 一步（精确还原检验）")
+def t08():
+    seed(2)
+    s = linear_schedule(1000)
+    x0 = torch.randn(4, 1, 8, 8)
+    eps = torch.randn_like(x0)
+    t = torch.full((4,), 600, dtype=torch.long)
+    tp = torch.full((4,), 400, dtype=torch.long)
+    xt = q_sample(x0, t, eps, s)
+    got = ddim_step(xt, t, tp, eps, s)
+    want = q_sample(x0, tp, eps, s)
+    eq(got, want, tol=1e-4,
+       msg="喂进当初真正用的那个噪声，DDIM 一步应该精确落在 q_sample(x0, t_prev) 上。"
+           "这就是 DDIM 没有随机性的原因")
+    # 走到底
+    last = ddim_step(xt, t, torch.full((4,), -1, dtype=torch.long), eps, s)
+    eq(last, x0, tol=1e-3, msg="t_prev=-1 时应该直接给出 x0（ab_prev 按 1 算）")
+--- hints
+- 先用 `extract(sched["alphas_cumprod"], t, x_t.shape)` 取出 ab_t，按公式算 x0_pred。
+- `extract` 里的 gather 不接受 -1。先用 `t_prev.clamp(min=0)` 取出 ab_prev，再把 t_prev < 0 的位置换成 1：`torch.where((t_prev >= 0).reshape(-1, 1, 1, 1), ab_prev, torch.ones_like(ab_prev))`。
+- 最后 `return ab_prev.sqrt() * x0_pred + (1 - ab_prev).sqrt() * eps_pred`。
+
+@@ item d9-09
+type: code
+title: DDIM 采样循环
+level: 2
+cards: DDIM 的时间步：跳着走; DDIM 一步：先猜 x0，再重新加噪
+targets: ddim_sample
+ref: day8, day9
+--- context
+把前两题串起来，就是一个能用的采样器。Stable Diffusion 界面上的「采样步数 20 / 50」，指的就是这个循环跑几次。DDIM 没有随机性，同一个种子永远出同一张图，调试和复现都靠这一点。
+--- prompt
+写 `ddim_sample(model, shape, sched, steps=10, device="cpu")`：
+
+1. 时间步：`ts = ddim_timesteps(len(sched["betas"]), steps)`（T 就是 betas 的长度）。
+2. 起点：`x = torch.randn(shape, device=device)`。整个函数只在这里用一次随机数。
+3. 按顺序走：第 i 步 t = ts[i]，t_prev = ts[i+1]；最后一步 t_prev = -1。t 和 t_prev 都要做成 (B,) 的 long 张量，B = shape[0]。
+4. 每一步：`x = ddim_step(x, t, t_prev, model(x, t), sched)`。
+5. 返回最后的 x，形状等于 shape。
+
+`ddim_timesteps` 和 `ddim_step` 已经给你了（参考实现）。函数上面的 `@torch.no_grad()` 留着：采样不需要梯度。
+--- starter
+@torch.no_grad()
+def ddim_sample(model, shape, sched, steps=10, device="cpu"):
+    """从 N(0,I) 出发，按 ddim_timesteps 依次调用 ddim_step。
+    model(x, t) -> 预测的噪声。返回最终的 x0，形状 = shape。
+    """
+    raise todo()
+--- solution
+@torch.no_grad()
+def ddim_sample(model, shape, sched, steps=10, device="cpu"):
+    ts = ddim_timesteps(len(sched["betas"]), steps).to(device)
+    x = torch.randn(shape, device=device)
+    for i, tv in enumerate(ts):
+        t = torch.full((shape[0],), int(tv), dtype=torch.long, device=device)
+        tp_val = int(ts[i + 1]) if i + 1 < len(ts) else -1          # 最后一步走到 -1
+        t_prev = torch.full((shape[0],), tp_val, dtype=torch.long, device=device)
+        x = ddim_step(x, t, t_prev, model(x, t), sched)
+    return x
+--- tests
+class _Tiny(nn.Module):
+    """一个很小的「噪声预测模型」：一层卷积。"""
+    def __init__(self):
+        super().__init__()
+        self.c = nn.Conv2d(1, 1, 3, 1, 1)
+    def forward(self, x, t):
+        return self.c(x) * 0.1
+
+@check("DDIM 采样循环")
+def t09():
+    seed(3)
+    s = linear_schedule(100)
+    m = _Tiny().eval()
+    torch.manual_seed(7)
+    a = ddim_sample(m, (2, 1, 8, 8), s, steps=10)
+    shape_is(a, (2, 1, 8, 8))
+    torch.manual_seed(7)
+    b = ddim_sample(m, (2, 1, 8, 8), s, steps=10)
+    eq(a, b, msg="同一个起始噪声，DDIM 必须给出完全相同的结果（它没有随机性）")
+    true(torch.isfinite(a).all(), "出现了 nan/inf")
+
+@check("和手动逐步调用 ddim_step 的结果一致")
+def t09b():
+    seed(3)
+    s = linear_schedule(100)
+    m = _Tiny().eval()
+    torch.manual_seed(7)
+    got = ddim_sample(m, (2, 1, 8, 8), s, steps=10)
+    torch.manual_seed(7)
+    with torch.no_grad():
+        x = torch.randn(2, 1, 8, 8)
+        ts = ddim_timesteps(100, 10).tolist() + [-1]
+        for a, b in zip(ts[:-1], ts[1:]):
+            t = torch.full((2,), a, dtype=torch.long)
+            x = ddim_step(x, t, torch.full((2,), b, dtype=torch.long), m(x, t), s)
+    eq(got, x, tol=1e-4,
+       msg="和逐步手算的结果不一样。检查：起点只用一次 torch.randn(shape)；时间步从大到小；"
+           "每步把当前的 x 喂给 model；最后一步的 t_prev 是 -1")
+--- hints
+- `torch.full((B,), value, dtype=torch.long, device=device)` 把一个整数变成 (B,) 的时间步张量。
+- 下一个时间步：`int(ts[i + 1]) if i + 1 < len(ts) else -1`。
+- 循环：`for i, tv in enumerate(ts):`，在里面做出 t 和 t_prev，再 `x = ddim_step(x, t, t_prev, model(x, t), sched)`。
+
+@@ item d9-10
+type: code
+title: latent diffusion 的形状账
+level: 2
+cards: Latent diffusion：Stable Diffusion 的形状账; 图像变成 token 序列; Cross-attention：图像提问，文本回答
+targets: LDM_SHAPES
+ref: day8, day9
+--- context
+面试和读代码时最常被问的一类问题：「Stable Diffusion 里这个张量是什么形状？」把 VAE、UNet、文本编码器、cross-attention 的形状串起来算一遍，整个系统就清楚了。
+--- prompt
+这题不写函数，填一个字典：把每个 None 换成一个形状元组，比如 `(4, 3, 512, 512)`。可以写 `64 * 64` 这样的算式。
+
+设定（Stable Diffusion 1.x）：
+
+- batch 4，512×512 的 RGB 图像
+- VAE：长宽各缩小 8 倍，latent 有 4 个通道
+- UNet 第一层把 latent 升到 320 个通道，再摊平成 token，给 cross-attention 当 Q
+- CLIP 文本嵌入：77 个 token，每个 768 维
+
+先心算，再运行。卡片里的例子用的是 batch 2、256×256，数字不一样，规则一样。
+--- starter
+LDM_SHAPES = {
+    "image":          None,   # 512x512 RGB 图像，batch 4
+    "latent":         None,   # VAE 编码后：8 倍下采样，4 个通道
+    "latent_tokens":  None,   # UNet 第一层升到 320 通道，再摊平成 token 序列
+    "text_emb":       None,   # CLIP 文本嵌入：77 个 token，每个 768 维
+    "cross_attn_out": None,   # cross-attention 的输出
+    "unet_out":       None,   # UNet 输出（预测的噪声）
+}
+--- solution
+LDM_SHAPES = {
+    "image": (4, 3, 512, 512),
+    "latent": (4, 4, 64, 64),
+    "latent_tokens": (4, 64 * 64, 320),
+    "text_emb": (4, 77, 768),
+    "cross_attn_out": (4, 64 * 64, 320),      # 跟着 Q（图像 token）走
+    "unet_out": (4, 4, 64, 64),               # 和 latent 同形
+}
+--- tests
+@check("latent diffusion 的形状账")
+def t11():
+    want = {
+        "image": (4, 3, 512, 512),
+        "latent": (4, 4, 64, 64),
+        "latent_tokens": (4, 64 * 64, 320),
+        "text_emb": (4, 77, 768),
+        "cross_attn_out": (4, 64 * 64, 320),
+        "unet_out": (4, 4, 64, 64),
+    }
+    why = {
+        "image": "(B, C, H, W)，RGB 有 3 个通道",
+        "latent": "长宽各除以 8，通道数是 4",
+        "latent_tokens": "token 序列是 (B, H*W, C)，C 是 UNet 第一层的通道数",
+        "text_emb": "(B, token 个数, 每个 token 的维度)",
+        "cross_attn_out": "输出的形状跟着 Q（图像 token）走",
+        "unet_out": "UNet 预测的是 latent 上的噪声",
+    }
+    wrong = [f"{k}: 你填的是 {LDM_SHAPES.get(k)}，不对。提示：{why[k]}" for k in want
+             if LDM_SHAPES.get(k) is None or tuple(LDM_SHAPES[k]) != want[k]]
+    true(not wrong, "\n".join(wrong))
+--- hints
+- latent：512 ÷ 8 = 64，通道数是 4，batch 不变。
+- token 序列是 (B, H*W, C)：64*64 个 token，每个 320 维。cross-attention 的输出跟着 Q（图像）走，和文本长度无关。
+- UNet 预测的是 latent 上的噪声，所以和 latent 形状一样。
+
+@@ item d9-11
+type: fix
+title: 找 bug：cfg_sample_buggy
+level: 2
+cards: CFG：公式和 batch 技巧
+targets: cfg_sample_buggy
+ref: day8, day9
+--- context
+CFG 的 bug 不会报错，只会让图变差，很难发现。真实项目里最常见的就是：拼 batch 的顺序和拆 batch 的顺序对不上，或者公式里的方向写反了。
+--- prompt
+`cfg_sample_buggy` 本来应该和 `cfg_forward` 做完全一样的事：只前向一次，条件**前一半 null、后一半 cond**，再按 `eps_u + scale * (eps_c - eps_u)` 组合。现在它有 2 处错。找出来改好，函数名不要改。
+
+有两个检查：结果和 `cfg_forward` 一样；传给 model 的条件确实是前一半 null、后一半 cond。
+--- starter
+def cfg_sample_buggy(model, x, t, cond, null_cond, scale):
+    both_x = torch.cat([x, x])
+    both_c = torch.cat([cond, null_cond.expand(cond.size(0), -1)])
+    both_t = torch.cat([t, t])
+    out = model(both_x, both_t, both_c)
+    e_a, e_b = out.chunk(2)
+    return e_a + scale * (e_a - e_b)
+--- solution
+def cfg_sample_buggy(model, x, t, cond, null_cond, scale):
+    both_x = torch.cat([x, x])
+    both_c = torch.cat([null_cond.expand(cond.size(0), -1), cond])   # 修 1：顺序是 [null, cond]
+    both_t = torch.cat([t, t])
+    out = model(both_x, both_t, both_c)
+    e_u, e_c = out.chunk(2)
+    return e_u + scale * (e_c - e_u)                                 # 修 2：差值是 (cond - uncond)
+--- tests
+@check("结果和 cfg_forward 一样")
+def t12():
+    m = _FakeEps()
+    x = torch.randn(3, 1, 2, 2)
+    t = torch.zeros(3, dtype=torch.long)
+    cond, null = torch.full((3, 4), 2.0), torch.zeros(4)
+    for sc in [1.0, 3.0]:
+        eq(cfg_sample_buggy(m, x, t, cond, null, sc),
+           cfg_forward(m, x, t, cond, null, sc), tol=1e-5,
+           msg=f"scale={sc} 时结果不对。先看 chunk(2) 以后哪一块是无条件、哪一块是有条件，"
+               "再看公式：基准项应该是无条件，差值应该是 (有条件 - 无条件)")
+
+@check("传给 model 的条件：前一半 null，后一半 cond")
+def t12b():
+    seen = []
+    class Rec(nn.Module):
+        def forward(self, x, t, c):
+            seen.append(c.detach().clone())
+            return torch.zeros_like(x) + c.mean(-1).reshape(-1, 1, 1, 1)
+    x = torch.randn(3, 1, 2, 2)
+    t = torch.zeros(3, dtype=torch.long)
+    cond, null = torch.full((3, 4), 2.0), torch.zeros(4)
+    cfg_sample_buggy(Rec(), x, t, cond, null, 3.0)
+    true(len(seen) == 1, f"model 应该只调用一次，实际调用了 {len(seen)} 次")
+    shape_is(seen[0], (6, 4), "条件应该拼成 2B 行")
+    eq(seen[0][:3], null.expand(3, -1), msg="前一半（前 3 行）应该是 null 条件")
+    eq(seen[0][3:], cond, msg="后一半（后 3 行）应该是真条件 cond")
+--- hints
+- 先看 `both_c`：哪一半是 null？再看 `chunk(2)` 以后，e_a 和 e_b 分别是谁的预测。
+- 把拼接改成 [null, cond] 以后，e_a 是无条件预测，e_b 是有条件预测。公式里的差值应该是（有条件 - 无条件）。
+- `both_c = torch.cat([null_cond.expand(cond.size(0), -1), cond])`，最后 `return e_a + scale * (e_b - e_a)`。顺手把变量名改成 e_u、e_c，以后读代码就不会搞混。
+
+@@ item d9-12
+type: predict
+title: 心算 CFG
+level: 1
+cards: CFG：公式和 batch 技巧
+--- context
+调 guidance scale 之前，先能心算这个公式：scale 大于 1 是外推，结果会跑到两个预测的范围之外。这也是 scale 太大时图会过饱和的原因。
+--- prompt
+不要运行。写出这段代码的输出，每个 print 一行。
+--- code
+eps_u = torch.tensor([1.0, 2.0])
+eps_c = torch.tensor([3.0, 1.0])
+for scale in [0.0, 1.0, 3.0]:
+    eps = eps_u + scale * (eps_c - eps_u)
+    print(scale, eps.tolist())
+--- explain
+差值 `eps_c - eps_u` = [2.0, -1.0]。
+
+- scale=0：就是 eps_u，[1.0, 2.0]。
+- scale=1：正好是 eps_c，[3.0, 1.0]。
+- scale=3：[1 + 3×2, 2 + 3×(-1)] = [7.0, -1.0]。
+
+注意第二个数：两个预测分别是 2 和 1，结果却是 -1，跑到了两者之外。这就是「外推」。scale 越大，跑得越远。
+--- hints
+- 先算差值 eps_c - eps_u。
+- scale=3 时，结果 = eps_u + 3 × 差值。
+
+@@ item d9-13
+type: choice
+title: 不做条件 dropout 会怎样
+level: 2
+cards: 条件 dropout：CFG 的前提; CFG：公式和 batch 技巧
+answer: 2
+--- context
+面试常问：「CFG 为什么叫 classifier-free（不用分类器）？无条件预测是从哪来的？」答案就在训练时的条件 dropout。
+--- prompt
+一个文生图模型训练时**没有**做条件 dropout（p=0），每个样本都带着真实的条件。训练完以后，你想用 CFG（scale=7.5）采样，无条件分支喂的是 null 嵌入。会怎样？
+--- options
+- 没问题。CFG 只是采样时的技巧，和训练没有关系
+- 无条件分支不可靠：模型从没见过 null 条件，eps_uncond 是它没学过的输出，(eps_cond - eps_uncond) 这个方向也就没有意义
+- 会报错，因为 null 嵌入的形状不对
+- 采样会更快，因为可以跳过无条件分支
+--- explain
+CFG 需要一个模型同时会两件事：有条件预测和无条件预测。无条件预测是训练时靠条件 dropout 学来的：约 10% 的样本条件被换成 null，模型就学会了「没有条件时该怎么去噪」。
+
+p=0 时，模型从没见过 null。给它 null，它的输出没有经过训练，是什么都说不准。CFG 再把 (eps_cond - eps_uncond) 放大 7.5 倍，图通常会更差。
+
+不会报错：null 嵌入和真条件形状一样，代码照常运行。这正是它危险的地方。也不会更快：CFG 照样要算两个分支。
+--- hints
+- 无条件预测是从哪里学来的？
+- 看卡片「条件 dropout：CFG 的前提」。
+
+@@ item d9-14
+type: predict
+title: DDIM 每一步从哪走到哪
+level: 2
+cards: DDIM 的时间步：跳着走; DDIM 一步：先猜 x0，再重新加噪
+--- context
+采样循环最容易错的是最后一步：要从 0 走到 -1，直接给出 x0。漏了这一步，图上会留一点噪声。先把每一步的 (t, t_prev) 列出来，循环就不会写错。
+--- prompt
+不要运行。写出这段代码的输出，每个 print 一行。
+--- code
+ts = (torch.arange(4) * (1000 // 4)).flip(0).tolist()
+print(ts)
+for i in range(len(ts)):
+    t = ts[i]
+    t_prev = ts[i + 1] if i + 1 < len(ts) else -1
+    print(t, "->", t_prev)
+print(len(ts), "次模型调用")
+--- explain
+k = 1000 // 4 = 250。`torch.arange(4) * 250` 是 [0, 250, 500, 750]，flip 以后是 [750, 500, 250, 0]。
+
+每一步从 t 走到列表里的下一个；0 后面没有了，所以 t_prev = -1，表示「直接给出 x0」。
+
+4 个时间步就是 4 次循环，每次调用一次模型。加上 CFG 的 batch 技巧，还是 4 次调用，只是每次的 batch 翻倍。
+--- hints
+- 先算 k = 1000 // 4，再列出 0, k, 2k, 3k，最后倒过来。
+- 最后一个时间步后面没有下一个了，t_prev 取什么？
+
+@@ item d9-15
+type: choice
+title: CFG 时 UNet 看到的形状
+level: 2
+cards: Latent diffusion：Stable Diffusion 的形状账; CFG：公式和 batch 技巧
+answer: 3
+--- context
+估算显存和速度时，要知道 UNet 每一步实际处理多大的张量。CFG 的 batch 技巧会让 batch 翻倍，这是文生图服务显存占用的一个大头。
+--- prompt
+Stable Diffusion 1.x，一次生成 4 张 512×512 的图，用 CFG 的 batch 技巧。DDIM 的每一步，送进 UNet 的带噪 latent 是什么形状？
+--- options
+- (4, 4, 64, 64)
+- (8, 3, 512, 512)
+- (8, 4, 64, 64)
+- (4, 8, 64, 64)
+--- explain
+latent 是 (4, 4, 64, 64)：512 ÷ 8 = 64，4 个通道。
+
+CFG 的 batch 技巧用 `torch.cat([x, x])` 沿第 0 维（batch 维）拼接，所以 batch 从 4 变成 8：(8, 4, 64, 64)。
+
+- (4, 4, 64, 64)：没算 CFG 的翻倍。
+- (8, 3, 512, 512)：UNet 不处理像素，处理的是 latent。
+- (4, 8, 64, 64)：这是沿通道维（dim=1）拼接的结果，是一个常见的 bug。
+--- hints
+- 先算 latent 的形状，再想 `torch.cat([x, x])` 默认沿哪一维拼。
+
+@@ item d9-16
+type: code
+title: 闭卷：CFG 的 batch 技巧
+level: 2
+exam: yes
+cards: CFG：公式和 batch 技巧
+targets: cfg_forward
+ref: day8, day9
+--- context
+CFG 的 batch 技巧是每个文生图推理代码里都有的几行。能不看资料写对拼接顺序和组合公式，读 diffusers 源码和面试手写时都用得上。
+--- prompt
+不看卡片，写出 `cfg_forward(model, x, t, cond, null_cond, scale)`：
+
+- x：(B, C, H, W)；t：(B,)；cond：(B, D)；null_cond：(D,)。`model(x, t, c)` 返回和 x 同形状的噪声预测。
+- 只调用一次 model：batch 是 2B，条件前一半 null_cond、后一半 cond。
+- 拆成 (eps_uncond, eps_cond)，返回 `eps_uncond + scale * (eps_cond - eps_uncond)`，形状 (B, C, H, W)。
+
+`cfg_combine` 可以用，也可以直接写公式。
+--- starter
+def cfg_forward(model, x, t, cond, null_cond, scale):
+    raise todo()
+--- solution
+def cfg_forward(model, x, t, cond, null_cond, scale):
+    B = x.size(0)
+    both_x = torch.cat([x, x])
+    both_t = torch.cat([t, t])
+    both_c = torch.cat([null_cond.expand(B, -1), cond])       # 约定：前一半 null，后一半 cond
+    out = model(both_x, both_t, both_c)
+    e_u, e_c = out.chunk(2)
+    return e_u + scale * (e_c - e_u)
+--- tests
+@check("CFG 的 batch 技巧")
+def t06():
+    m = _FakeEps()
+    x = torch.randn(3, 1, 2, 2)
+    t = torch.zeros(3, dtype=torch.long)
+    cond = torch.full((3, 4), 2.0)
+    null = torch.zeros(4)
+    out = cfg_forward(m, x, t, cond, null, scale=3.0)
+    shape_is(out, x.shape)
+    # uncond=0, cond=2 -> 0 + 3*(2-0) = 6
+    eq(out, torch.full_like(x, 6.0),
+       msg="结果不对。约定是前一半 null、后一半 cond；chunk(2) 以后第一块是无条件，第二块是有条件")
+    calls = []
+    class Counting(nn.Module):
+        def forward(self, x, t, c):
+            calls.append(x.shape[0])
+            return torch.zeros_like(x) + c.mean(-1).reshape(-1, 1, 1, 1)
+    cfg_forward(Counting(), x, t, cond, null, 3.0)
+    true(len(calls) == 1 and calls[0] == 6,
+         f"应该只调用一次 model，batch 翻倍到 6；实际调用了 {len(calls)} 次，batch={calls}")
+--- hints
+- x、t 各自 `torch.cat([a, a])`；条件 `torch.cat([null_cond.expand(B, -1), cond])`。
+- `e_u, e_c = out.chunk(2)`，再套公式。
+
+@@ item d9-17
+type: code
+title: 闭卷：DDIM 一步
+level: 3
+exam: yes
+cards: DDIM 一步：先猜 x0，再重新加噪
+targets: ddim_step
+ref: day8, day9
+--- context
+DDIM 一步是今天最核心的公式：先从 x_t 反推 x0，再用同一个噪声加回到 t_prev。能默写出来，就真正理解了为什么 DDIM 没有随机性、为什么能跳着走。
+--- prompt
+不看卡片，写出 `ddim_step(x_t, t, t_prev, eps_pred, sched)`（eta=0）：
+
+- x_t：(B, C, H, W)；t、t_prev：(B,) 的 long 张量；eps_pred 和 x_t 同形状；用 `sched["alphas_cumprod"]`。
+- 先从 x_t 和 eps_pred 反推 x0_pred，再用同一个 eps_pred 加噪到 t_prev，返回结果。
+- t_prev 可能是 -1，这时 ab_prev 按 1 算（返回 x0_pred）。
+
+`extract`、`linear_schedule`、`q_sample` 可以直接用。
+--- starter
+def ddim_step(x_t, t, t_prev, eps_pred, sched):
     raise todo()
 --- solution
 def ddim_step(x_t, t, t_prev, eps_pred, sched):
     ab = extract(sched["alphas_cumprod"], t, x_t.shape)
     x0 = (x_t - (1 - ab).sqrt() * eps_pred) / ab.sqrt()
-    prev_ok = (t_prev >= 0)
     tp = t_prev.clamp(min=0)
     ab_prev = extract(sched["alphas_cumprod"], tp, x_t.shape)
-    ones = torch.ones_like(ab_prev)
-    ab_prev = torch.where(prev_ok.reshape(-1, *([1] * (x_t.dim() - 1))), ab_prev, ones)
+    ab_prev = torch.where((t_prev >= 0).reshape(-1, *([1] * (x_t.dim() - 1))), ab_prev, torch.ones_like(ab_prev))
     return ab_prev.sqrt() * x0 + (1 - ab_prev).sqrt() * eps_pred
 --- tests
 @check("DDIM 一步（精确还原检验）")
@@ -340,149 +1086,11 @@ def t08():
     got = ddim_step(xt, t, tp, eps, s)
     want = q_sample(x0, tp, eps, s)
     eq(got, want, tol=1e-4,
-       msg="喂进当初真正用的那个噪声，DDIM 一步应该**精确**落在 q_sample(x0, t_prev) 上。"
-           "这就是 DDIM 确定性的来源")
+       msg="喂进当初真正用的那个噪声，DDIM 一步应该精确落在 q_sample(x0, t_prev) 上。"
+           "这就是 DDIM 没有随机性的原因")
     # 走到底
     last = ddim_step(xt, t, torch.full((4,), -1, dtype=torch.long), eps, s)
-    eq(last, x0, tol=1e-3, msg="t_prev=-1 时应该直接给出 x0")
+    eq(last, x0, tol=1e-3, msg="t_prev=-1 时应该直接给出 x0（ab_prev 按 1 算）")
 --- hints
-- TODO
-
-@@ item d9-09
-type: code
-title: DDIM 采样循环
-level: 2
-targets: ddim_sample
-ref: day8, day9
---- context
-TODO
---- prompt
-09  完整 DDIM 采样循环
---- starter
-@torch.no_grad()
-def ddim_sample(model, shape, sched, steps=10, device="cpu"):
-    """从 N(0,I) 出发，按 ddim_timesteps 依次调 ddim_step。
-    model(x, t) -> 预测噪声。返回最终的 x0，形状 = shape。
-    """
-    # --- TODO 09 ---
-    raise todo()
---- solution
-@torch.no_grad()
-def ddim_sample(model, shape, sched, steps=10, device="cpu"):
-    ts = ddim_timesteps(len(sched["betas"]), steps).to(device)
-    x = torch.randn(shape, device=device)
-    for i, tv in enumerate(ts):
-        t = torch.full((shape[0],), int(tv), dtype=torch.long, device=device)
-        tp_val = int(ts[i + 1]) if i + 1 < len(ts) else -1
-        t_prev = torch.full((shape[0],), tp_val, dtype=torch.long, device=device)
-        x = ddim_step(x, t, t_prev, model(x, t), sched)
-    return x
---- tests
-@check("DDIM 采样循环")
-def t09():
-    seed(3)
-    s = linear_schedule(100)
-
-    class Tiny(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.c = nn.Conv2d(1, 1, 3, 1, 1)
-        def forward(self, x, t):
-            return self.c(x) * 0.1
-
-    m = Tiny().eval()
-    torch.manual_seed(7)
-    a = ddim_sample(m, (2, 1, 8, 8), s, steps=10)
-    shape_is(a, (2, 1, 8, 8))
-    torch.manual_seed(7)
-    b = ddim_sample(m, (2, 1, 8, 8), s, steps=10)
-    eq(a, b, msg="同一个起始噪声，DDIM 必须给出完全相同的结果（它没有随机性）")
-    true(torch.isfinite(a).all(), "出现了 nan/inf")
---- hints
-- TODO
-
-@@ item d9-10
-type: code
-title: latent diffusion 的形状账
-level: 2
-targets: LDM_SHAPES
-ref: day8, day9
---- context
-TODO
---- prompt
-11  latent diffusion：把 VAE 接进来的形状账
---- starter
-LDM_SHAPES = {
-    "图像 x":                    None,   # 512x512 RGB，batch 4
-    "VAE 编码后的 latent":        None,   # 8 倍下采样，4 通道
-    "latent 转成 token 序列":     None,   # 给 cross-attn 用，通道数 320
-    "CLIP 文本嵌入":              None,   # 77 个 token，768 维
-    "cross-attn 输出":            None,   # 和 latent token 同形
-    "UNet 输出（预测的噪声）":     None,
-}
---- solution
-LDM_SHAPES = {
-    "图像 x": (4, 3, 512, 512),
-    "VAE 编码后的 latent": (4, 4, 64, 64),
-    "latent 转成 token 序列": (4, 64 * 64, 320),
-    "CLIP 文本嵌入": (4, 77, 768),
-    "cross-attn 输出": (4, 64 * 64, 320),
-    "UNet 输出（预测的噪声）": (4, 4, 64, 64),
-}
---- tests
-@check("latent diffusion 的形状账")
-def t11():
-    want = {
-        "图像 x": (4, 3, 512, 512),
-        "VAE 编码后的 latent": (4, 4, 64, 64),
-        "latent 转成 token 序列": (4, 64 * 64, 320),
-        "CLIP 文本嵌入": (4, 77, 768),
-        "cross-attn 输出": (4, 64 * 64, 320),
-        "UNet 输出（预测的噪声）": (4, 4, 64, 64),
-    }
-    wrong = [f"{k!r}: 你填 {v}, 应为 {want[k]}" for k, v in LDM_SHAPES.items()
-             if v is None or tuple(v) != want[k]]
-    true(not wrong, "\n       " + "\n       ".join(wrong))
---- hints
-- TODO
-
-@@ item d9-11
-type: fix
-title: 找 bug: cfg_sample_buggy
-level: 2
-targets: cfg_sample_buggy
-ref: day8, day9
---- context
-TODO
---- prompt
-12  找 bug —— 这个 CFG 采样有 3 处错
---- starter
-def cfg_sample_buggy(model, x, t, cond, null_cond, scale):
-    both_x = torch.cat([x, x])
-    both_c = torch.cat([cond, null_cond.expand(cond.size(0), -1)])
-    both_t = torch.cat([t, t])
-    out = model(both_x, both_t, both_c)
-    e_a, e_b = out.chunk(2)
-    return e_a + scale * (e_a - e_b)
---- solution
-def cfg_sample_buggy(model, x, t, cond, null_cond, scale):
-    both_x = torch.cat([x, x])
-    both_c = torch.cat([null_cond.expand(cond.size(0), -1), cond])   # 修 1: 顺序
-    both_t = torch.cat([t, t])
-    out = model(both_x, both_t, both_c)
-    e_u, e_c = out.chunk(2)
-    return e_u + scale * (e_c - e_u)                                 # 修 2+3
---- tests
-@check("找 bug: cfg_sample_buggy")
-def t12():
-    m = _FakeEps()
-    x = torch.randn(3, 1, 2, 2)
-    t = torch.zeros(3, dtype=torch.long)
-    cond, null = torch.full((3, 4), 2.0), torch.zeros(4)
-    for sc in [1.0, 3.0]:
-        eq(cfg_sample_buggy(m, x, t, cond, null, sc),
-           cfg_forward(m, x, t, cond, null, sc), tol=1e-5,
-           msg="三处: 拼接顺序应为 [null, cond]；差值方向应为 (cond - uncond)；"
-               "基准项应该是 uncond 不是 cond")
---- hints
-- TODO
+- 两步：x0_pred = (x_t - sqrt(1 - ab_t) * eps) / sqrt(ab_t)；x_prev = sqrt(ab_prev) * x0_pred + sqrt(1 - ab_prev) * eps。
+- -1 的处理：先 `clamp(min=0)` 再 `extract`，然后用 `torch.where` 把这些位置的 ab_prev 换成 1。

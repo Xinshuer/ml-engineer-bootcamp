@@ -1,0 +1,1033 @@
+@@ day 15
+title: 调试一：loss 不对劲
+part: 调试与排错
+hours: 3–4 小时
+--- goal
+学完今天，你看到一条不对劲的 loss 曲线，能说出最可能的原因；能找到 nan 是从哪一层、哪个运算来的；loss 不降时，能按固定的顺序一项一项排查，修好训练循环里最常见的几个 bug。
+--- checklist
+- 先清空复习区（之前看过答案的题，从空白重做）
+- 8 张知识卡片都运行一遍，每张至少改一个数字再跑
+- 练习区全部通过，6 道修 bug 题先自己读代码找，再看提示
+- 合上卡片，在纸上默写「loss 不降」的排查顺序，然后做闭卷题
+
+@@ concept
+title: 第一步的 loss：约等于 ln C
+--- body
+刚初始化的分类模型什么都不懂。它给 C 个类别的概率应该差不多，都在 1/C 附近。
+
+cross-entropy（交叉熵）= 「正确类别的概率」取负对数。所以第一步的 loss 应该约等于 -ln(1/C) = **ln C**：
+
+- 10 类：ln 10 ≈ 2.30
+- GPT-2 的词表有 50257 个 token：ln 50257 ≈ 10.8
+
+训练开始前先心算这个数，再和日志里第一步的 loss 比一比：
+
+- 差不多（只差零点几）：正常。
+- 大很多：模型一开始就「很自信地猜错」。常见原因是初始化的权重太大，或者 logits（模型对每个类别打的原始分数，还没过 softmax）被放大了。
+- 小很多：模型可能偷看到了答案（比如标签混进了输入），或者 loss 写错了。
+
+下面的例子里，正常初始化时第一步的 loss 是 2.478，接近 ln 10 = 2.303；把权重放大 30 倍，第一步的 loss 就变成了 25.738。
+--- code
+torch.manual_seed(0)
+C = 10
+model = nn.Linear(32, C)
+x = torch.randn(64, 32)
+y = torch.randint(0, C, (64,))
+
+print("ln C               =", round(math.log(C), 3))
+print("第一步的 loss       =", round(F.cross_entropy(model(x), y).item(), 3))
+with torch.no_grad():
+    model.weight.mul_(30)            # 模拟「初始化太大」
+print("权重 ×30 之后的 loss =", round(F.cross_entropy(model(x), y).item(), 3))
+
+@@ concept
+title: 读 loss 曲线：平、爆、跳、地板
+--- body
+每隔几步把 loss 打印出来（或者画成曲线），先看它的形状。常见的「不对劲」有这几种：
+
+- **平的**：一直停在第一步的值附近（10 类时一直是 2.30 左右），说明模型什么都没学到。要么参数根本没被更新（被冻住了、不在优化器里、lr 是 0），要么标签和输入对不上。
+- **爆炸**：越来越大，常常一路涨到 inf 或 nan。最常见的原因是学习率太大。
+- **来回跳**：忽高忽低，看不出往下走的趋势。通常是学习率偏大。
+- **有地板**：降到某个值就再也下不去，连一个小 batch 都背不下来。这多半是代码 bug，比如 cross_entropy 前面多做了一次 softmax。
+
+学习率（lr）= 每一步沿着梯度走多远。它直接决定曲线的形状。下面用最简单的例子演示：只有一个参数 w，loss = (w - 3)²，最低点在 w = 3。
+
+- lr = 0.05：每步只走一小段，loss 降得很慢。
+- lr = 0.4：几步就到 3，loss 降到 0。
+- lr = 1.1：每一步都跨过谷底，跳到 3 的另一边，而且一次比一次跳得远，loss 越来越大。这就是「爆炸」。真实训练里再多跳几步，权重大到溢出，loss 就变成 inf 或 nan。
+--- code
+for lr in (0.05, 0.4, 1.1):
+    w = torch.tensor(0.0, requires_grad=True)
+    ws, losses = [], []
+    for step in range(6):
+        loss = (w - 3) ** 2
+        ws.append(round(w.item(), 2))
+        losses.append(round(loss.item(), 2))
+        w.grad = None
+        loss.backward()
+        with torch.no_grad():
+            w -= lr * w.grad            # 沿梯度的反方向走 lr 那么远
+    print(f"lr={lr:<5} w   : {ws}")
+    print(f"{'':9}loss: {losses}")
+
+@@ concept
+title: NaN 和 inf 从哪里来
+--- body
+inf 是「无穷大」，nan 是「不是一个数」（Not a Number）。loss 里一旦出现它们，backward 会把它们带进每一个梯度，优化器走一步之后，所有权重都变成 nan，模型就废了。常见来源：
+
+- **log(0) = -inf**：概率被算成了正好 0（比如 softmax 算出来的概率太小，float32 表示不了）。
+- **exp 太大**：float32 最大约 3.4e38，exp(88.7) 就到顶了，再大就是 inf。
+- **除以 0**：1/0 = inf，0/0 = nan。比如做标准化时除以标准差，而某一列数据全都一样，标准差是 0。
+- **inf 再参与运算**：0 × inf = nan，inf - inf = nan。
+- **负数开方、负数取 log**：结果是 nan。
+- **fp16 溢出**（下一张卡片）和**学习率太大**（权重越更新越大，最后溢出）。
+
+还有一个坑：**nan 和任何数比较都是 False**。`nan > 10` 是 False，`nan == nan` 也是 False。所以 `if loss > 100: 报警` 永远抓不到 nan。
+
+要判断一个数正不正常，用 `math.isfinite(x)`（Python 的数）或 `torch.isfinite(t)`（tensor）：普通的数返回 True，nan、inf、-inf 都返回 False。
+--- code
+print(torch.exp(torch.tensor([10.0, 50.0, 90.0])).tolist())   # 90 已经溢出
+print(torch.tensor(-1.0).sqrt().item(), float("inf") - float("inf"))
+
+x = torch.tensor([[1.0, 5.0], [1.0, 7.0]])      # 第 0 列全是 1，标准差是 0
+print(((x - x.mean(0)) / x.std(0)).tolist())     # 0 / 0 = nan
+
+print(torch.tensor([1.0, float("nan"), 3.0]).sum().item())   # 一个 nan 污染整个和
+
+nan = float("nan")
+print(nan > 10, nan < 10, nan == nan)                          # 全是 False
+print(math.isfinite(nan), math.isfinite(float("inf")), math.isfinite(2.5))
+
+@@ concept
+title: fp16 的天花板：65504
+--- body
+混合精度训练（mixed precision）把很多计算放到 16 位浮点数里做：省显存，也更快。但两种 16 位格式差别很大：
+
+- **float16（fp16）**：最大只能表示 65504。256 × 256 = 65536，已经超了，变成 inf。
+- **bfloat16（bf16）**：能表示的范围和 float32 一样大（最大约 3.4e38），几乎不会溢出。代价是精度低，只有 2～3 位有效数字。
+- **float32**：最大约 3.4e38，大约 7 位有效数字。
+
+fp16 最容易溢出的地方：平方（x²）、很多数加在一起（sum）、注意力分数 q·k、方差和范数。它们在 float32 里完全正常，一换成 fp16 就变成 inf。之后 inf 可能变成 nan，也可能「悄悄地」变成 0：比如 1/sqrt(inf) = 0，整层输出都被乘成 0，而且不报错。
+
+常见的修法：
+
+1. 危险的那一小段先转成 float32 算，算完再转回来：`xf = x.float()` … `.to(x.dtype)`。Llama 的 RMSNorm 就是这么写的。
+2. 显卡支持的话，用 bf16 代替 fp16。
+3. 用 fp16 训练时配上 `torch.amp.GradScaler`：它先把 loss 放大再 backward，防止很小的梯度在 fp16 里变成 0；梯度里出现 inf 时，它会跳过这一步更新。
+--- code
+print("float16 最大值:", torch.finfo(torch.float16).max)
+print("bfloat16 最大值:", torch.finfo(torch.bfloat16).max)
+
+a = torch.tensor([255.0, 256.0], dtype=torch.float16)
+print("fp16 平方:", (a * a).tolist())
+print("bf16 平方:", (a.bfloat16() * a.bfloat16()).tolist())
+print("fp32 平方:", (a.float() * a.float()).tolist())
+
+s = torch.full((1000,), 100.0, dtype=torch.float16)
+print("1000 个 100 在 fp16 里求和:", s.sum().item())
+print("先转成 float32 再求和:   ", s.float().sum().item())
+
+@@ concept
+title: 数值稳定的写法
+--- body
+同一个公式，换一种写法就能避开 inf 和 nan。记住这几条：
+
+- **不要自己写 `torch.log(torch.softmax(x))`**。某个概率小到 float32 表示不了时会变成 0，log(0) = -inf。用 `F.log_softmax(x, dim=-1)`：它在内部先减掉最大值再算，结果是一个正常的负数，不会是 -inf。
+- **`F.cross_entropy` 要的是 logits**（原始分数），它内部自己会做 log_softmax。**不要**在它前面再加 softmax。
+- **二分类同理**：不要先 sigmoid 再 log，用 `F.binary_cross_entropy_with_logits`。
+- **可能碰到 0 的地方加一点保护**：`torch.log(p.clamp_min(1e-12))`、`torch.sqrt(x + 1e-12)`、`x / (std + 1e-5)`。
+- **容易溢出的一小段**（平方、求和、方差）在 float32 里算完，再转回低精度。
+
+下面的例子：logits 是 [0, 200]，第 0 类的概率是 e^-200，float32 表示不了，softmax 直接给出 0，再取 log 就是 -inf；log_softmax 算出的是准确的 -200。
+--- code
+logits = torch.tensor([[0.0, 200.0]])
+print("log(softmax):", torch.log(logits.softmax(-1)).tolist())
+print("log_softmax :", F.log_softmax(logits, -1).tolist())
+
+z = torch.tensor([40.0])             # 模型非常确定是「正类」，但标签是 0
+p = torch.sigmoid(z)
+print("sigmoid 之后:", p.item(), "  log(1 - p):", torch.log(1 - p).item())
+print("with_logits 版本的 loss:", F.binary_cross_entropy_with_logits(z, torch.tensor([0.0])).item())
+
+@@ concept
+title: 抓住第一个 NaN：isfinite 和 detect_anomaly
+--- body
+nan 一出现就会往后扩散，所以要找的是**第一个**出问题的地方。
+
+1. **每一步检查 loss**：`if not torch.isfinite(loss): raise FloatingPointError(...)`。训练会停在出事的那一步，你可以把那一步的 batch 存下来慢慢查，而不是带着 nan 权重再跑几个小时。
+2. **forward 里出的 nan**：让输入一层一层地经过模型，每一层之后检查 `torch.isfinite(out).all()`。第一个不通过的层就是源头，后面的层只是被传染了。
+3. **backward 里出的 nan**：forward 的输出都正常，梯度却是 nan。这时把 forward 和 backward 都包进 `with torch.autograd.detect_anomaly():`。backward 一算出 nan 就会报错，错误信息里写着是哪个反向函数，比如 `Function 'LogBackward0' returned nan values`。它还会打印一段 warning，列出这个运算在 forward 里是从哪里调用的：在里面找到你自己代码的那一行。它会让训练慢很多，只在调试时打开。
+
+一个经典的例子：`torch.where(x > 0, torch.log(x), 0)`。forward 完全没问题：x ≤ 0 的位置选的是 0。但 backward 时，两个分支的梯度都会算：log 的反向是「上游梯度 ÷ x」，在 x = 0 的位置就是 0 ÷ 0 = nan。修法是先让 log 的输入变安全：`torch.log(torch.where(x > 0, x, 1.0))`。
+--- code
+loss = torch.tensor(float("nan"))
+print("isfinite:", torch.isfinite(loss).item(), "  loss > 100:", (loss > 100).item())
+
+x = torch.tensor([0.0, 2.0], requires_grad=True)
+y = torch.where(x > 0, torch.log(x), torch.zeros_like(x))
+print("forward 正常:", y.tolist())
+y.sum().backward()
+print("梯度:", x.grad.tolist())                  # 第 0 个是 nan
+
+x.grad = None
+try:
+    with torch.autograd.detect_anomaly():
+        y = torch.where(x > 0, torch.log(x), torch.zeros_like(x))
+        y.sum().backward()
+except RuntimeError as e:
+    print("detect_anomaly 报错:", str(e).splitlines()[0])
+
+@@ concept
+title: 每一层的梯度范数
+--- body
+backward 之后，每个参数的 `.grad` 里存着它的梯度。**梯度范数**就是把梯度看成一个长长的向量，算它的长度：`p.grad.norm()`。它告诉你这一层「被推得有多用力」。
+
+按层打印一遍，很多问题一眼就能看出来：
+
+- **None**：这个参数根本没收到梯度。要么被冻住了（`requires_grad=False`），要么它没参与计算 loss（比如定义了一层，却没在 forward 里用上）。
+- **0**：收到了，但全是 0。比如 ReLU 前面的值全是负数（「死掉」的 ReLU），或者 loss 其实和它没关系。
+- **很大**（几百、几千）或 inf：梯度爆炸，下一步就可能出 nan。先降低 lr，或者做梯度裁剪（`torch.nn.utils.clip_grad_norm_`）。
+- **前面几层比后面几层小好几个数量级**：梯度消失，前面的层几乎学不到东西。
+
+训练时把总的梯度范数和 loss 一起打印出来（`clip_grad_norm_` 的返回值就是裁剪前的总范数）。loss 爆炸之前，梯度范数通常会先涨起来。
+--- code
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 4))
+model[0].weight.requires_grad_(False)           # 假装有人把第一层的权重冻住了
+x, y = torch.randn(32, 8), torch.randint(0, 4, (32,))
+F.cross_entropy(model(x), y).backward()
+
+for name, p in model.named_parameters():
+    g = None if p.grad is None else round(p.grad.norm().item(), 4)
+    print(f"{name:9s} requires_grad={p.requires_grad!s:5s}  梯度范数 = {g}")
+
+@@ concept
+title: loss 不降：按顺序查这几项
+--- body
+loss 不降的时候，先别急着调超参数。先确认代码没错，按这个顺序查：
+
+1. **先在一个小 batch 上过拟合**（第 14 天学过）：拿同一个 batch 反复训练，loss 应该能降到接近 0。降不下去，就是代码有 bug，调 lr、加数据都没用。
+2. **每一步都 zero_grad 了吗？** PyTorch 的梯度是**累加**的：不清零，这一步的梯度会加在上一步的上面，每一步的更新都不对。
+3. **参数真的在被训练吗？** 看每层的梯度范数：None = 被冻住了；有梯度但权重从来不变 = 它不在优化器里（常见于先建了优化器，后来又换掉了模型的某一层）。
+4. **标签还和输入对得上吗？** 打乱数据时，x 和 y 必须用同一个顺序。打印几对 (x, y) 看一眼。配错之后，loss 会卡在 ln C 附近。
+5. **cross_entropy 前面是不是多了一个 softmax？** 它要的是 logits。多做一次 softmax 之后，就算模型完全答对，loss 也有一块下不去的「地板」：C 类时是 ln(1 + (C-1)/e)，4 类约 0.744，10 类约 1.46。
+6. **学习率**：太大会爆炸或来回跳，太小会降得很慢。每次乘或除以 10 试一试。
+--- code
+w = torch.tensor([1.0], requires_grad=True)
+for step in range(3):
+    loss = 3 * w.sum()                # 这个 loss 对 w 的梯度永远是 3
+    loss.backward()
+    print("没有清零，第", step, "步 w.grad =", w.grad.item())
+
+logits = torch.tensor([[100.0, 0.0, 0.0, 0.0]])   # 模型非常确定，而且答对了
+y = torch.tensor([0])
+print("cross_entropy(logits)          =", F.cross_entropy(logits, y).item())
+print("cross_entropy(softmax(logits)) =", round(F.cross_entropy(logits.softmax(-1), y).item(), 4))
+
+@@ item d15-01
+type: predict
+title: 第一步的 loss 是多少
+level: 1
+cards: 第一步的 loss：约等于 ln C
+--- context
+第一步的 loss 能告诉你初始化和 loss 写得对不对。有经验的工程师看到训练日志的第一行，就会先心算一下 ln C 做对比。
+--- prompt
+这段代码会打印什么？（三行）全 0 的 logits 表示每个类别的分数一样。
+--- code
+logits = torch.zeros(4, 10)             # 4 个样本，10 个类别，分数全都一样
+y = torch.tensor([3, 0, 7, 1])
+print(round(F.cross_entropy(logits, y).item(), 1))
+
+logits = torch.zeros(2, 50257)          # GPT-2 的词表大小
+y = torch.tensor([11, 42])
+print(round(F.cross_entropy(logits, y).item(), 1))
+
+logits = torch.zeros(1, 10)
+logits[0, 0] = 20.0                     # 很自信地选了第 0 类……
+y = torch.tensor([3])                   # ……但正确答案是第 3 类
+print(round(F.cross_entropy(logits, y).item(), 1))
+--- explain
+分数全一样 → 每个类别的概率都是 1/C → loss = ln C。ln 10 ≈ 2.3，ln 50257 ≈ 10.8。所以从头训练 GPT-2 大小的词表时，第一步的 loss 应该在 10.8 附近；如果看到 50，初始化就有问题。
+
+第三行：正确类别的分数是 0，第 0 类是 20，loss = ln(e^20 + 9) ≈ 20.0。很自信地猜错，惩罚和自信的程度差不多一样大。这就是初始化太大时，第一步的 loss 会远远大于 ln C 的原因。
+--- hints
+- 全 0 的 logits 经过 softmax 之后，每个类别的概率是多少？
+- loss = -ln(1/C) = ln C。ln 50257 = ln 5.0257 + 4 × ln 10 ≈ 1.6 + 9.2。第三行：loss = ln(e^20 + 9)，e^20 比 9 大得多。
+
+@@ item d15-02
+type: code
+title: 自动读 loss 曲线
+level: 2
+cards: 读 loss 曲线：平、爆、跳、地板; NaN 和 inf 从哪里来
+targets: curve_verdict
+ref: day15
+--- context
+大的训练一跑就是几个小时，没有人会一直盯着看。训练脚本里通常有一个小函数自动检查 loss，发现 nan 或爆炸就报警、停下，不浪费 GPU 时间。
+--- prompt
+写 `curve_verdict(losses)`：
+
+- `losses`：Python float 的 list，每步一个（至少 2 个）
+- 按下面的顺序判断，返回第一个满足条件的字符串：
+  1. 有任何一个值是 nan、inf 或 -inf → `"nan"`
+  2. 最后一个值 > 2 × 第一个值 → `"exploding"`
+  3. |最后一个值 - 第一个值| < 0.01 × 第一个值（变化不到 1%）→ `"flat"`
+  4. 其他情况 → `"ok"`
+
+注意：不能用 `v == float("nan")` 来判断 nan。为什么？看卡片「NaN 和 inf 从哪里来」。
+--- starter
+def curve_verdict(losses):
+    """losses: list of float -> "nan" / "exploding" / "flat" / "ok"（按顺序判断）。"""
+    raise todo()
+--- solution
+def curve_verdict(losses):
+    if not all(math.isfinite(v) for v in losses):     # nan 和 ±inf 都不是有限的数
+        return "nan"
+    if losses[-1] > 2 * losses[0]:
+        return "exploding"
+    if abs(losses[-1] - losses[0]) < 0.01 * losses[0]:
+        return "flat"
+    return "ok"
+--- tests
+@check("nan 和 inf 要最先查出来")
+def _():
+    nan, inf = float("nan"), float("inf")
+    true(curve_verdict([2.3, 1.9, nan]) == "nan",
+         '最后一个值是 nan，应该返回 "nan"。nan 和任何数比较（>、<、==）都是 False，要用 math.isfinite 判断')
+    true(curve_verdict([2.3, nan, 1.1]) == "nan",
+         '中间出现过 nan 也算：每一个值都要检查，不只是最后一个')
+    true(curve_verdict([2.3, 8.0, inf]) == "nan",
+         'inf 也算坏值（math.isfinite(inf) 是 False），应该返回 "nan"')
+    true(curve_verdict([2.3, -inf]) == "nan", '-inf 也算坏值，应该返回 "nan"')
+
+@check("exploding、flat、ok")
+def _():
+    true(curve_verdict([2.3, 3.1, 9.8]) == "exploding", '9.8 > 2 × 2.3，应该是 "exploding"')
+    true(curve_verdict([2.3026, 2.3026, 2.3021]) == "flat", '从 2.3026 到 2.3021 只变了 0.02%，应该是 "flat"')
+    true(curve_verdict([2.3, 1.2, 0.4]) == "ok", '从 2.3 降到 0.4 是正常的，应该返回 "ok"')
+    true(curve_verdict([1.0, 0.5, 1.9]) == "ok", '1.9 没有超过 2 × 1.0，也不算平，应该返回 "ok"')
+    true(curve_verdict([1.0, 5.0, 2.5]) == "exploding", '只比较第一个和最后一个：2.5 > 2 × 1.0，应该是 "exploding"')
+--- hints
+- 第 1 条要检查每一个值：`any(...)`、`all(...)` 或者一个 for 循环都可以。
+- `math.isfinite(v)` 对 nan、inf、-inf 都返回 False。先写 `if not all(math.isfinite(v) for v in losses): return "nan"`，再按顺序写后面三条。
+
+@@ item d15-03
+type: choice
+title: 越跳越高，最后 nan
+level: 1
+cards: 读 loss 曲线：平、爆、跳、地板; loss 不降：按顺序查这几项
+--- context
+看着 loss 日志说出最可能的病因，是训练出问题时的第一步，也是面试里很常见的题目。
+--- prompt
+你在训练一个 10 分类模型，每 10 步打印一次 loss：
+
+```
+step   0  loss 2.31
+step  10  loss 1.62
+step  20  loss 2.95
+step  30  loss 1.41
+step  40  loss 6.80
+step  50  loss 31.7
+step  60  loss nan
+```
+
+最可能的原因是什么？
+--- options
+- 学习率太大：每一步都跨过了谷底，越跳越远，权重越来越大，最后溢出成 nan
+- cross_entropy 前面多做了一次 softmax
+- 打乱数据时，x 和 y 用了不同的顺序
+- 最后一层被冻住了
+answer: 1
+--- explain
+忽高忽低、幅度越来越大、最后变成 nan，是学习率太大的典型样子（就像卡片里 lr = 1.1 的 w，每一步都跳到 3 的另一边，而且越跳越远）。
+
+另外三个都不会让 loss 爆炸：多做一次 softmax 后，10 类的 loss 被困在 1.46 到 2.46 之间；x 和 y 配错，loss 会停在 ln 10 ≈ 2.30 附近；冻住最后一层，loss 只会降得很慢或者不动。
+
+先把 lr 除以 10 再跑。如果还是爆炸，再查有没有忘了 zero_grad：梯度一直累加，也会让每一步走得越来越远。
+--- hints
+- 这条曲线有两个特点：上下跳，而且跳得越来越高。
+- 回想卡片里 lr = 1.1 的例子：w 每一步都跳到 3 的另一边。
+
+@@ item d15-04
+type: predict
+title: nan 和 inf 是怎么冒出来的
+level: 2
+cards: NaN 和 inf 从哪里来; fp16 的天花板：65504
+--- context
+训练日志里出现 nan 时，你得先知道哪些运算会产生它。这几行覆盖了真实项目里最常见的来源：log(0)、熵里的 0·log 0、exp 溢出、0/0 和 fp16 溢出。
+--- prompt
+这段代码会打印什么？（五行）
+--- code
+x = torch.tensor([0.0, 1.0])
+print(torch.log(x).tolist())
+print((x * torch.log(x)).tolist())
+print(torch.exp(torch.tensor(100.0)).item())
+print((torch.tensor(0.0) / torch.tensor(0.0)).item())
+h = torch.tensor(300.0, dtype=torch.float16)
+print((h * h).item(), (h.float() * h.float()).item())
+--- explain
+- log(0) = -inf，log(1) = 0。
+- 0 × (-inf) = nan。算熵 -Σ p·log p 时，概率为 0 的那一项就会这样。修法是用 `torch.xlogy(p, p)`（它规定 0·log 0 = 0），或者先给 p 加 clamp。
+- exp(100) 超过了 float32 的最大值（约 3.4e38，exp(88.7) 就到顶了），所以是 inf。
+- 0 / 0 = nan。
+- 300 × 300 = 90000 > 65504，在 fp16 里溢出成 inf；转成 float32 再算就是正常的 90000.0。
+--- hints
+- 前两行用 `.tolist()` 打印，结果是 Python 的 list，比如 `[1.5, 0.0]`；Python 把无穷大写成 `inf`、`-inf`，把 nan 写成 `nan`。
+- 0 × (-inf) 是多少？exp(100) 比 float32 的上限大吗？fp16 的上限是 65504。
+
+@@ item d15-05
+type: fix
+title: 手写的 cross-entropy 出了 inf
+level: 2
+cards: NaN 和 inf 从哪里来; 数值稳定的写法
+targets: my_cross_entropy
+ref: day15
+--- context
+真实项目里经常要自己写 loss（加权重、加 mask、做 label smoothing）。「先 softmax 再 log」是最顺手的写法，也是训练中途突然出现 inf 的最常见原因之一。
+--- prompt
+下面的 `my_cross_entropy(logits, y)` 平时没问题，可一旦 logits 之间差得很大，它就返回 inf，训练一步之后权重全变成 nan。修好它：
+
+- `logits`：(B, C)，原始分数；`y`：(B,)，int64 类别编号
+- 返回所有样本 loss 的平均值（结果应该和 `F.cross_entropy(logits, y)` 一样）
+- 不许调用 `F.cross_entropy` 或 `F.nll_loss`（检查时它们会被禁用）。就当这是一个更复杂的自定义 loss 的一部分
+--- starter
+def my_cross_entropy(logits, y):
+    probs = logits.softmax(dim=-1)                   # (B, C) 概率
+    picked = probs[torch.arange(len(y)), y]          # (B,) 每个样本正确类别的概率
+    return -torch.log(picked).mean()
+--- solution
+def my_cross_entropy(logits, y):
+    logp = F.log_softmax(logits, dim=-1)             # (B, C) log 概率，不会是 -inf
+    picked = logp[torch.arange(len(y)), y]           # (B,) 每个样本正确类别的 log 概率
+    return -picked.mean()
+--- setup
+import contextlib
+
+
+@contextlib.contextmanager
+def _no_library_ce():
+    saved = F.cross_entropy, F.nll_loss
+
+    def banned(*args, **kwargs):
+        raise AssertionError("这道题要自己用 log_softmax 写，不能调用 F.cross_entropy / F.nll_loss")
+
+    F.cross_entropy = F.nll_loss = banned
+    try:
+        yield
+    finally:
+        F.cross_entropy, F.nll_loss = saved
+--- tests
+@check("普通的 logits：和 F.cross_entropy 一样")
+def _():
+    seed(0)
+    logits = torch.randn(6, 5) * 3
+    y = torch.randint(0, 5, (6,))
+    want = F.cross_entropy(logits, y)
+    with _no_library_ce():
+        got = my_cross_entropy(logits, y)
+    eq(got, want, tol=1e-5, msg="普通情况下就算错了：取的是不是每个样本「正确类别」那一格？最后要取负号、求平均")
+
+@check("差距很大的 logits：不能是 inf")
+def _():
+    logits = torch.tensor([[0.0, 200.0, 0.0], [300.0, 0.0, 0.0]])
+    y = torch.tensor([0, 1])
+    with _no_library_ce():
+        got = my_cross_entropy(logits, y)
+    true(torch.isfinite(got).all(),
+         f"loss = {got.item()}：正确类别的概率是 e^-200，softmax 把它算成了 0，log(0) = -inf。改用 F.log_softmax")
+    eq(got, torch.tensor(250.0), tol=1e-3,
+       msg="两个样本的 loss 分别是 200 和 300，平均是 250。clamp 加 eps 能避开 inf，但数值被截断了，要用 log_softmax")
+
+@check("梯度也是有限的")
+def _():
+    logits = torch.tensor([[0.0, 200.0, 0.0]], requires_grad=True)
+    with _no_library_ce():
+        my_cross_entropy(logits, torch.tensor([0])).backward()
+    true(logits.grad is not None and torch.isfinite(logits.grad).all(),
+         f"logits.grad = {logits.grad}：梯度里有 nan，训练一步之后权重就坏了")
+--- hints
+- 试一下 logits = [[0., 200.]]、y = [0]：正确类别的概率是 e^-200，float32 表示不了，softmax 直接给出 0。
+- 不要先算概率再取 log，直接算「log 概率」：`F.log_softmax(logits, dim=-1)`。
+- 把 softmax 那一行换成 log_softmax，取出正确类别那一格之后，不用再 log，直接取负号、求平均。
+
+@@ item d15-06
+type: fix
+title: fp16 下 RMSNorm 输出全是 0
+level: 2
+cards: fp16 的天花板：65504; 数值稳定的写法
+targets: rms_norm
+ref: day15
+--- context
+混合精度训练里，大多数层在 fp16 下都没问题，但「先平方再求平均」会溢出。Llama 的 RMSNorm 专门先转成 float32 再算，就是为了防这个。这种 bug 不报错，只是输出悄悄变成 0。
+--- prompt
+`rms_norm(x, weight, eps)` 在 float32 下是对的。但在 float16 下，只要某一行里有一个数的 |x| ≥ 256，这一行的输出就全变成 0，而且不报错。修好它：
+
+- `x`：(..., D)，可能是 float16；`weight`：(D,)，和 x 的 dtype 一样
+- 公式：y = x / sqrt(mean(x², 最后一维) + eps) × weight
+- 输出的 dtype 必须和 x 一样（float16 进，float16 出）
+--- starter
+def rms_norm(x, weight, eps=1e-6):
+    ms = x.pow(2).mean(dim=-1, keepdim=True)         # 每个位置的均方值
+    return x * torch.rsqrt(ms + eps) * weight
+--- solution
+def rms_norm(x, weight, eps=1e-6):
+    xf = x.float()                                   # 平方和求平均在 float32 里做，不会溢出
+    ms = xf.pow(2).mean(dim=-1, keepdim=True)
+    return (xf * torch.rsqrt(ms + eps)).to(x.dtype) * weight
+--- tests
+@check("float32 输入：结果和以前一样")
+def _():
+    seed(0)
+    x = torch.randn(3, 16)
+    w = torch.rand(16) + 0.5
+    out = rms_norm(x, w)
+    true(out.dtype == torch.float32, f"float32 进，应该 float32 出，你的是 {out.dtype}")
+    eq(out, _rms_ref(x, w), tol=1e-5, msg="float32 下的结果变了：公式是 x / sqrt(mean(x²) + eps) × weight")
+
+@check("float16、|x| 到几百：不能溢出")
+def _():
+    seed(0)
+    x = (torch.randn(4, 16) * 400).half()
+    w = (torch.rand(16) + 0.5).half()
+    out = rms_norm(x, w)
+    true(out.dtype == torch.float16,
+         f"输出是 {out.dtype}，应该和输入一样是 float16：算完用 .to(x.dtype) 转回去")
+    true(torch.isfinite(out).all(), "输出里有 inf 或 nan")
+    true(out.float().abs().max() > 0.1,
+         "输出几乎全是 0：x² 在 fp16 里超过了 65504，变成 inf；rsqrt(inf) = 0，整行都被乘成了 0。平方和求平均要在 float32 里做")
+    eq(out.float(), _rms_ref(x.float(), w.float()), tol=1e-2,
+       msg="和 float32 算出来的结果差太多")
+--- hints
+- 300² = 90000 > 65504。`x.pow(2)` 在 fp16 里就已经是 inf 了，而 rsqrt(inf) = 0。
+- 在函数开头写 `xf = x.float()`，用 xf 去算平方、平均和归一化。
+- 归一化之后用 `.to(x.dtype)` 转回原来的类型，再乘 weight。
+
+@@ item d15-07
+type: code
+title: 找到第一个出 nan 的层
+level: 2
+cards: 抓住第一个 NaN：isfinite 和 detect_anomaly; NaN 和 inf 从哪里来
+targets: find_nan_layer
+ref: day15
+--- context
+模型输出 nan 时，出问题那一层后面的每一层都会被传染，只看最后的输出找不到源头。一层一层地检查，第一个出问题的层才是要修的地方。
+--- prompt
+写 `find_nan_layer(model, x)`：
+
+- `model` 是一个 `nn.Sequential`，`x` 是输入
+- 让 x 依次经过 `model.named_children()` 里的每一层
+- 返回第一个「输出里有 nan 或 inf」的层的名字（字符串，就是 `named_children()` 给出的名字，比如 `"1"` 或 `"exp"`）
+- 每一层的输出都正常时，返回 `None`
+
+检查时会用到几个已经定义好的小层：`Log()` 对输入取 log（负数会变成 nan），`Exp()` 对输入取 exp（太大会变成 inf），`Scale(s)` 把输入乘以 s。
+--- starter
+def find_nan_layer(model, x):
+    """返回第一个输出里有 nan/inf 的子层的名字；都正常就返回 None。"""
+    raise todo()
+--- solution
+def find_nan_layer(model, x):
+    for name, layer in model.named_children():
+        x = layer(x)
+        if not torch.isfinite(x).all():              # nan 和 ±inf 都算
+            return name
+    return None
+--- tests
+@check("找到第一个出 nan 的层")
+def _():
+    seed(0)
+    m = nn.Sequential(nn.Linear(4, 8), Log(), nn.Linear(8, 2))
+    got = find_nan_layer(m, torch.randn(5, 4))
+    true(got == "1",
+         f"你返回了 {got!r}，应该是 '1'（Log 层：Linear 的输出里有负数，log(负数) = nan）。"
+         "第 2 层的输出也有 nan，但它只是被传染的：要返回第一个")
+
+@check("inf 也要算")
+def _():
+    from collections import OrderedDict
+    seed(0)
+    m = nn.Sequential(OrderedDict([("fc", nn.Linear(4, 4)), ("scale", Scale(100.0)),
+                                   ("exp", Exp()), ("out", nn.Linear(4, 2))]))
+    got = find_nan_layer(m, torch.randn(3, 4))
+    true(got == "exp",
+         f"你返回了 {got!r}，应该是 'exp'：exp 的输出里有 inf（还没有 nan）。"
+         "用 torch.isfinite 检查，它对 nan 和 inf 都返回 False；只用 isnan 会漏掉 inf")
+
+@check("全部正常时返回 None")
+def _():
+    x, _y = toy_data()
+    got = find_nan_layer(tiny_mlp(), x)
+    true(got is None, f"每一层的输出都是正常的数，应该返回 None，你返回了 {got!r}")
+--- hints
+- `for name, layer in model.named_children():`，循环里写 `x = layer(x)`。
+- 每一层之后用 `torch.isfinite(x).all()` 检查：它对 nan 和 inf 都会给出 False。只用 `isnan` 会漏掉 inf。
+
+@@ item d15-08
+type: fix
+title: forward 正常，梯度却是 nan
+level: 3
+cards: 抓住第一个 NaN：isfinite 和 detect_anomaly; 数值稳定的写法
+targets: pairwise_dist
+ref: day15
+--- context
+对比学习、聚类、triplet loss 都要算两个点之间的距离。一个点和它自己（或者一个一模一样的点）比较时，距离是 0：forward 一切正常，梯度却是 nan。这正是 detect_anomaly 最常派上用场的地方。
+--- prompt
+`pairwise_dist(a, b)` 计算两组点之间的欧氏距离，算出来的值是对的。但只要 a 和 b 里有重合的点，backward 得到的梯度就是 nan，训练一步之后权重全坏了。
+
+1. 先自己跑一遍：把编辑器里注释掉的那几行打开，看 detect_anomaly 说是哪个反向函数出了 nan。
+2. 修好它：距离的值不变（误差在 1e-4 以内），距离为 0 时梯度也是有限的数。
+
+- `a`：(N, D)，`b`：(M, D) → 返回 (N, M)
+--- starter
+def pairwise_dist(a, b):
+    diff = a[:, None, :] - b[None, :, :]             # (N, M, D)
+    return diff.pow(2).sum(dim=-1).sqrt()            # (N, M)
+
+
+# 先自己试一试（修好之后可以删掉）：
+# a = torch.randn(3, 2, requires_grad=True)
+# with torch.autograd.detect_anomaly():
+#     pairwise_dist(a, a).sum().backward()
+--- solution
+def pairwise_dist(a, b):
+    diff = a[:, None, :] - b[None, :, :]             # (N, M, D)
+    d2 = diff.pow(2).sum(dim=-1)                     # (N, M) 距离的平方，可能正好是 0
+    return (d2 + 1e-12).sqrt()                       # sqrt 的输入永远 > 0，导数不会是 inf
+--- tests
+@check("距离的值和 torch.cdist 一样")
+def _():
+    seed(0)
+    a, b = torch.randn(5, 3), torch.randn(4, 3)
+    got = pairwise_dist(a, b)
+    shape_is(got, (5, 4))
+    eq(got, torch.cdist(a, b), tol=1e-4, msg="距离的值变了")
+
+@check("点和自己比（距离是 0）：梯度不能是 nan")
+def _():
+    seed(0)
+    a = torch.randn(4, 3, requires_grad=True)
+    d = pairwise_dist(a, a)
+    true(torch.isfinite(d).all(), "距离里就有 nan/inf 了")
+    d.sum().backward()
+    true(torch.isfinite(a.grad).all(),
+         "a.grad 里有 nan：距离为 0 时，sqrt 的导数 1/(2·sqrt(0)) 是 inf，传回去乘上 0 就是 nan。"
+         "让 sqrt 的输入永远大于 0（用 torch.where 挡住没用，两个分支的梯度都会算）")
+
+@check("距离不为 0 时，梯度也是对的")
+def _():
+    seed(1)
+    a = torch.randn(4, 3, requires_grad=True)
+    b = torch.randn(5, 3)
+    pairwise_dist(a, b).sum().backward()
+    a2 = a.detach().clone().requires_grad_(True)
+    torch.cdist(a2, b).sum().backward()
+    true(a.grad is not None, "a 没有收到梯度：不要用 detach 或 no_grad 来躲开 nan")
+    eq(a.grad, a2.grad, tol=1e-4, msg="梯度不对：只在 sqrt 的输入上加一个很小的数，别的不要动")
+--- hints
+- detect_anomaly 说的是 `PowBackward0`，但根源在它后面一步：sqrt 在 0 处的导数是 1/(2·sqrt(0)) = inf，传到 pow 的反向时变成 0 × inf = nan。
+- 让 sqrt 的输入永远大于 0：`(d2 + 1e-12).sqrt()` 或 `d2.clamp_min(1e-12).sqrt()`。
+- `torch.where(d2 > 0, d2.sqrt(), 0)` 不行：卡片里讲过，where 两个分支的梯度都会算。
+
+@@ item d15-09
+type: code
+title: grad_norms：给每一层量一量梯度
+level: 1
+cards: 每一层的梯度范数
+targets: grad_norms
+ref: day15
+--- context
+梯度范数就像训练的「心电图」：None 表示没接上或被冻住了，0 表示这一层死了，很大表示快要爆炸。很多训练框架每一步都会把它记进日志。
+--- prompt
+写 `grad_norms(model)`，在 `loss.backward()` 之后调用：
+
+- 返回一个 dict：key 是 `model.named_parameters()` 给出的名字，顺序也一样
+- value 是这个参数的梯度的 L2 范数，要是 Python float（用 `.item()`）
+- 如果 `p.grad` 是 None（被冻住了，或者没参与计算 loss），value 就是 `None`
+--- starter
+def grad_norms(model):
+    """{参数名: 梯度的 L2 范数（float）}；没有梯度的参数对应 None。"""
+    raise todo()
+--- solution
+def grad_norms(model):
+    out = {}
+    for name, p in model.named_parameters():
+        out[name] = None if p.grad is None else p.grad.norm().item()
+    return out
+--- tests
+@check("每个参数一个范数")
+def _():
+    m = tiny_mlp()
+    x, y = toy_data()
+    F.cross_entropy(m(x), y).backward()
+    g = grad_norms(m)
+    true(isinstance(g, dict), f"要返回 dict，你返回的是 {type(g).__name__}")
+    names = [n for n, _ in m.named_parameters()]
+    true(list(g) == names, f"key 应该是 {names}（和 named_parameters() 的顺序一样），你的是 {list(g)}")
+    for n, p in m.named_parameters():
+        v = g[n]
+        true(isinstance(v, float), f"{n} 的值是 {type(v).__name__}，要用 .item() 变成 Python float")
+        true(close(v, p.grad.norm().item(), 1e-5), f"{n} 的范数应该是 {p.grad.norm().item():.5f}，你的是 {v}")
+
+@check("没有梯度的参数对应 None")
+def _():
+    m = tiny_mlp()
+    m[0].weight.requires_grad_(False)
+    x, y = toy_data()
+    F.cross_entropy(m(x), y).backward()
+    g = grad_norms(m)
+    true("0.weight" in g, "被冻住的参数也要出现在结果里（named_parameters() 会列出它）")
+    true(g["0.weight"] is None,
+         f"0.weight 被冻住了，它的 .grad 是 None，这时 value 应该是 None，你的是 {g['0.weight']!r}")
+    true(isinstance(g["2.weight"], float), "没被冻住的 2.weight 应该有一个 float 范数")
+--- hints
+- `for name, p in model.named_parameters():`
+- 先判断 `p.grad is None`；不是 None 时用 `p.grad.norm().item()`。
+
+@@ item d15-10
+type: fix
+title: 训练循环里的两个 bug
+level: 2
+cards: loss 不降：按顺序查这几项; 数值稳定的写法; 抓住第一个 NaN：isfinite 和 detect_anomaly
+targets: train_classifier
+ref: day15
+--- context
+这两个 bug 都不会报错：程序照常跑完，loss 也在降，只是降不到该到的地方。它们是「loss 不降」清单上最常见的两项，几乎每个人都写出过。
+--- prompt
+`train_classifier(model, x, y, steps, lr)` 用 SGD 在同一份 (x, y) 上训练 `steps` 步，返回每一步的 loss（Python float 的 list）。loss 不是有限的数时，立刻 raise `FloatingPointError`（这一部分已经写好了，是对的）。
+
+这个函数里有两个 bug：在一个小 batch 上怎么都过拟合不了，而且从第二步开始，每一步的更新都不对。找到并修好它们。
+
+- `model` 输出 logits (B, C)；`x`：(B, D)；`y`：(B,)，int64
+--- starter
+def train_classifier(model, x, y, steps=100, lr=0.5):
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    losses = []
+    for step in range(steps):
+        logits = model(x)
+        probs = logits.softmax(dim=-1)
+        loss = F.cross_entropy(probs, y)
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"step {step}: loss = {loss.item()}")
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+--- solution
+def train_classifier(model, x, y, steps=100, lr=0.5):
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    losses = []
+    for step in range(steps):
+        logits = model(x)
+        loss = F.cross_entropy(logits, y)            # 修 1：直接给 logits，它内部会做 log_softmax
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"step {step}: loss = {loss.item()}")
+        opt.zero_grad()                              # 修 2：清掉上一步的梯度
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+--- tests
+@check("每一步只用这一步的梯度")
+def _():
+    x, y = toy_data(16)
+    m, ref = tiny_mlp(), tiny_mlp()
+    losses = train_classifier(m, x, y, steps=2, lr=0.5)
+    true(isinstance(losses, list) and len(losses) == 2 and all(isinstance(v, float) for v in losses),
+         "返回值要是 list，每一步一个 Python float（用 loss.item()）")
+    _sgd_ref(ref, x, y, steps=2, lr=0.5)
+    for (n, p), q in zip(m.named_parameters(), ref.parameters()):
+        eq(p, q, tol=1e-5,
+           msg=f"走了 2 步之后，{n} 和标准答案不一样。常见原因：没有 zero_grad（梯度一步步累加），或者 loss 的输入不对")
+
+@check("能在一个 batch 上过拟合")
+def _():
+    x, y = toy_data(16)
+    losses = train_classifier(tiny_mlp(), x, y, steps=200, lr=0.5)
+    true(losses[-1] < 0.05,
+         f"200 步之后 loss 还是 {losses[-1]:.3f}。4 类时如果卡在 0.744 附近，就是 cross_entropy 前面多做了一次 softmax：它要的是 logits")
+
+@check("lr 太大时立刻停下")
+def _():
+    x, y = toy_data(16)
+    try:
+        train_classifier(tiny_mlp(), x, y, steps=100, lr=100.0)
+    except FloatingPointError as e:
+        true("step" in str(e), f"报错信息要写出是第几步，比如 'step 12: loss = nan'，你的是 {str(e)!r}")
+        return
+    true(False, "lr = 100 时，正确的训练循环会在十几步内出现 nan，这时应该 raise FloatingPointError。"
+                "（如果前两项还没通过，先修好它们：多做一次 softmax 后 loss 被困在一个小范围里，不会爆炸）")
+--- hints
+- 对照卡片「loss 不降：按顺序查这几项」的第 2 条和第 5 条。
+- `F.cross_entropy` 自己会做 log_softmax，要直接把 logits 给它。
+- 在 `loss.backward()` 之前加 `opt.zero_grad()`，否则梯度会一步一步地累加。
+
+@@ item d15-11
+type: fix
+title: 打乱数据，标签跟丢了
+level: 2
+cards: loss 不降：按顺序查这几项
+targets: make_batches
+ref: day15
+--- context
+数据管道里把 x 和 y 分开打乱，是真实项目里出现过无数次的 bug：不报错，loss 卡在 ln C 附近，大家往往先去怀疑模型和学习率。
+--- prompt
+`make_batches(x, y, batch_size, seed)` 把数据打乱一次，再切成 batch，返回 `[(xb, yb), ...]`。用它训练时，loss 一直卡在 ln C 附近。修好它：
+
+- 仍然要打乱，而且同一个 seed 得到同样的结果
+- 每个 x 必须和它原来的 y 待在一起
+- 最后一个 batch 可以比 `batch_size` 小
+--- starter
+def make_batches(x, y, batch_size, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    x = x[torch.randperm(len(x), generator=g)]
+    y = y[torch.randperm(len(y), generator=g)]
+    return [(x[i:i + batch_size], y[i:i + batch_size])
+            for i in range(0, len(x), batch_size)]
+--- solution
+def make_batches(x, y, batch_size, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(len(x), generator=g)       # 只生成一个顺序
+    x, y = x[perm], y[perm]                          # x 和 y 用同一个顺序
+    return [(x[i:i + batch_size], y[i:i + batch_size])
+            for i in range(0, len(x), batch_size)]
+--- tests
+@check("每个 x 还和它自己的 y 在一起")
+def _():
+    x = torch.arange(20).float()[:, None].repeat(1, 3)   # 第 i 行是 [i, i, i]
+    y = torch.arange(20) + 100                            # 第 i 行的标签是 i + 100
+    for xb, yb in make_batches(x, y, batch_size=8, seed=0):
+        rows = xb[:, 0].long()
+        true(torch.equal(rows + 100, yb),
+             f"第 {rows.tolist()} 行配上了第 {(yb - 100).tolist()} 行的标签：x 和 y 用了不同的打乱顺序。"
+             "模型学到的是随机配对，loss 只能卡在 ln C 附近")
+
+@check("仍然打乱了，每行只出现一次")
+def _():
+    x = torch.arange(20).float()[:, None].repeat(1, 3)
+    y = torch.arange(20) + 100
+    batches = make_batches(x, y, batch_size=8, seed=0)
+    true([len(xb) for xb, _ in batches] == [8, 8, 4],
+         f"20 行、batch_size=8，batch 大小应该是 [8, 8, 4]，你的是 {[len(xb) for xb, _ in batches]}")
+    rows = torch.cat([xb[:, 0] for xb, _ in batches]).long().tolist()
+    true(sorted(rows) == list(range(20)), "每一行都应该正好出现一次")
+    true(rows != list(range(20)), "没有打乱：训练数据要打乱，只是 x 和 y 必须用同一个顺序")
+
+@check("同一个 seed，结果一样")
+def _():
+    x = torch.arange(20).float()[:, None].repeat(1, 3)
+    y = torch.arange(20) + 100
+    a = make_batches(x, y, 8, seed=3)
+    b = make_batches(x, y, 8, seed=3)
+    true(all(torch.equal(p[0], q[0]) and torch.equal(p[1], q[1]) for p, q in zip(a, b)),
+         "同一个 seed 调用两次，结果应该完全一样（用 seed 生成的 Generator 来打乱）")
+--- hints
+- 两次调用 `randperm` 得到的顺序是不一样的：第一次调用之后，generator 的状态已经往前走了。
+- 只生成一个 `perm = torch.randperm(len(x), generator=g)`，然后用它同时去取 x 和 y：`x, y = x[perm], y[perm]`。
+
+@@ item d15-12
+type: fix
+title: 换了新 head，loss 一动不动
+level: 2
+cards: loss 不降：按顺序查这几项; 每一层的梯度范数
+targets: finetune_new_head
+ref: day15
+--- context
+迁移学习（拿一个预训练好的模型，冻住主干，只训练新的分类头）是最常见的训练方式之一。「先建优化器，后换层」是这里最经典的坑：新层有梯度，却从来没有被更新。
+--- prompt
+`finetune_new_head` 想做的事：冻住 `model.backbone`，把 `model.head` 换成一个新的 `nn.Linear(in_features, num_classes)`，然后只训练这个新 head。可是 loss 从第一步到最后一步一模一样。修好它：
+
+- 用 SGD 和 `F.cross_entropy`，返回每一步的 loss（Python float）
+- backbone 必须保持冻住：`requires_grad=False`，训练完权重不变
+- 检查时用的模型是 `TinyNet`：它有 `.backbone` 和 `.head` 两部分
+--- starter
+def finetune_new_head(model, x, y, num_classes, steps=100, lr=0.5):
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    for p in model.backbone.parameters():
+        p.requires_grad = False                                   # 冻住主干
+    model.head = nn.Linear(model.head.in_features, num_classes)   # 新任务的新 head
+    losses = []
+    for step in range(steps):
+        loss = F.cross_entropy(model(x), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+--- solution
+def finetune_new_head(model, x, y, num_classes, steps=100, lr=0.5):
+    for p in model.backbone.parameters():
+        p.requires_grad = False                                   # 冻住主干
+    model.head = nn.Linear(model.head.in_features, num_classes)   # 新任务的新 head
+    opt = torch.optim.SGD(model.head.parameters(), lr=lr)         # 换完 head 再建优化器
+    losses = []
+    for step in range(steps):
+        loss = F.cross_entropy(model(x), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+--- tests
+@check("新 head 真的在学")
+def _():
+    x, y = toy_data(32)
+    model = TinyNet(c=10)
+    losses = finetune_new_head(model, x, y, num_classes=4, steps=100, lr=0.5)
+    true(model.head.out_features == 4, f"head 应该换成 4 类的，现在是 {model.head.out_features} 类")
+    true(losses[-1] < 0.5 * losses[0],
+         f"loss 从 {losses[0]:.4f} 到 {losses[-1]:.4f}，几乎没动。新 head 有梯度，但优化器里没有它："
+         "优化器是在换 head 之前建的，它手里拿的还是旧 head 的参数")
+
+@check("backbone 保持冻住")
+def _():
+    x, y = toy_data(32)
+    model = TinyNet(c=10)
+    before = {k: v.clone() for k, v in model.backbone.state_dict().items()}
+    finetune_new_head(model, x, y, num_classes=4, steps=20, lr=0.5)
+    true(all(not p.requires_grad for p in model.backbone.parameters()),
+         "backbone 的参数应该是 requires_grad=False")
+    for k, v in model.backbone.state_dict().items():
+        eq(v, before[k], tol=0, msg=f"backbone.{k} 被改动了：backbone 要冻住，只训练新 head")
+--- hints
+- 用 grad_norms 看一看：新 head 的梯度不是 None，可它的权重一直没变。负责更新权重的是谁？
+- 优化器只会更新创建它时传进去的那些参数。第一行执行的时候，新 head 还不存在。
+- 把 `opt = ...` 挪到换 head 之后，并且只把 `model.head.parameters()` 传给它。
+
+@@ item d15-13
+type: self
+title: 我的排错手册
+level: 1
+cards: loss 不降：按顺序查这几项; 抓住第一个 NaN：isfinite 和 detect_anomaly; 每一层的梯度范数
+--- context
+调试靠的是固定的顺序，而不是灵感。把这张清单记熟，面试时被问到「loss 不降，你怎么查」，就能一条一条讲清楚。
+--- prompt
+不看笔记，对着每一条问自己：我能不能马上做到、马上讲清楚？做得到才打勾。
+--- checklist
+- 训练开始前，我会先算 ln C 和第一步的 loss 对比，并且能说出「大很多」和「小很多」分别意味着什么
+- 我会先在一个小 batch 上过拟合，确认 loss 能降到接近 0，再开始正式训练
+- 我能说出 nan 和 inf 的 5 个来源：log(0)、exp 溢出、除以 0、fp16 超过 65504、学习率太大
+- 我的训练循环会用 torch.isfinite 检查每一步的 loss，出事立刻停下，并报告是第几步
+- forward 出 nan，我会一层一层地查；backward 出 nan，我会用 detect_anomaly
+- 我会按层打印梯度范数，并且能说出 None、0、很大分别意味着什么
+- loss 不降时，我能按顺序查：zero_grad、参数有没有在训练（冻住了 / 不在优化器里）、标签和输入是否对齐、cross_entropy 前有没有多余的 softmax、学习率
+--- hints
+- 做不到的那一条，回去重读对应的卡片，再从空白重做相关的题。
+- 面试时按「症状 → 我先查什么 → 怎么确认」的顺序讲，比背名词更有说服力。
+
+@@ item d15-14
+type: code
+title: 闭卷：一个会自己报警的训练循环
+level: 2
+exam: yes
+cards: loss 不降：按顺序查这几项; 抓住第一个 NaN：isfinite 和 detect_anomaly
+targets: train_classifier
+ref: day15
+--- context
+一个干净的训练循环，加上每一步的 nan 检查，是你以后写的每一个训练脚本的骨架。闭卷从空白写一遍，确认每一行都记住了。
+--- prompt
+从空白写 `train_classifier(model, x, y, steps=100, lr=0.5)`：
+
+- 用 `torch.optim.SGD` 和 `F.cross_entropy`（输入是 logits），在同一份 (x, y) 上训练 `steps` 步
+- 返回每一步的 loss（Python float 的 list）
+- loss 不是有限的数时，立刻 raise `FloatingPointError`，信息里写出是第几步，比如 `"step 12: loss = nan"`
+--- starter
+def train_classifier(model, x, y, steps=100, lr=0.5):
+    raise todo()
+--- solution
+def train_classifier(model, x, y, steps=100, lr=0.5):
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    losses = []
+    for step in range(steps):
+        loss = F.cross_entropy(model(x), y)
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"step {step}: loss = {loss.item()}")
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+--- tests
+@check("每一步只用这一步的梯度")
+def _():
+    x, y = toy_data(16)
+    m, ref = tiny_mlp(), tiny_mlp()
+    losses = train_classifier(m, x, y, steps=2, lr=0.5)
+    true(isinstance(losses, list) and len(losses) == 2 and all(isinstance(v, float) for v in losses),
+         "返回值要是 list，每一步一个 Python float（用 loss.item()）")
+    _sgd_ref(ref, x, y, steps=2, lr=0.5)
+    for (n, p), q in zip(m.named_parameters(), ref.parameters()):
+        eq(p, q, tol=1e-5,
+           msg=f"走了 2 步之后，{n} 和标准答案不一样。常见原因：没有 zero_grad（梯度一步步累加），或者 loss 的输入不对")
+
+@check("能在一个 batch 上过拟合")
+def _():
+    x, y = toy_data(16)
+    losses = train_classifier(tiny_mlp(), x, y, steps=200, lr=0.5)
+    true(losses[-1] < 0.05,
+         f"200 步之后 loss 还是 {losses[-1]:.3f}。4 类时如果卡在 0.744 附近，就是 cross_entropy 前面多做了一次 softmax：它要的是 logits")
+
+@check("lr 太大时立刻停下")
+def _():
+    x, y = toy_data(16)
+    try:
+        train_classifier(tiny_mlp(), x, y, steps=100, lr=100.0)
+    except FloatingPointError as e:
+        true("step" in str(e), f"报错信息要写出是第几步，比如 'step 12: loss = nan'，你的是 {str(e)!r}")
+        return
+    true(False, "lr = 100 时，正确的训练循环会在十几步内出现 nan，这时应该 raise FloatingPointError。"
+                "（如果前两项还没通过，先修好它们：多做一次 softmax 后 loss 被困在一个小范围里，不会爆炸）")
+--- hints
+- 顺序：前向算 loss → 检查 loss → 清梯度 → backward → step → 记下 loss.item()。
+- 检查用 `torch.isfinite(loss)`，不是有限的数就 `raise FloatingPointError(f"step {step}: loss = {loss.item()}")`。
+
+@@ item d15-15
+type: code
+title: 闭卷：grad_norms
+level: 1
+exam: yes
+cards: 每一层的梯度范数
+targets: grad_norms
+ref: day15
+--- context
+每层的梯度范数是排查「loss 不降」和「loss 爆炸」时最先打印的东西。闭卷写一遍，以后遇到问题几秒钟就能把它敲出来。
+--- prompt
+从空白写 `grad_norms(model)`（在 `loss.backward()` 之后调用）：
+
+- 返回 dict：key 是 `model.named_parameters()` 的名字，顺序一样
+- value 是梯度的 L2 范数（Python float）；`p.grad` 是 None 时，value 是 `None`
+--- starter
+def grad_norms(model):
+    raise todo()
+--- solution
+def grad_norms(model):
+    out = {}
+    for name, p in model.named_parameters():
+        out[name] = None if p.grad is None else p.grad.norm().item()
+    return out
+--- tests
+@check("每个参数一个范数")
+def _():
+    m = tiny_mlp()
+    x, y = toy_data()
+    F.cross_entropy(m(x), y).backward()
+    g = grad_norms(m)
+    true(isinstance(g, dict), f"要返回 dict，你返回的是 {type(g).__name__}")
+    names = [n for n, _ in m.named_parameters()]
+    true(list(g) == names, f"key 应该是 {names}（和 named_parameters() 的顺序一样），你的是 {list(g)}")
+    for n, p in m.named_parameters():
+        v = g[n]
+        true(isinstance(v, float), f"{n} 的值是 {type(v).__name__}，要用 .item() 变成 Python float")
+        true(close(v, p.grad.norm().item(), 1e-5), f"{n} 的范数应该是 {p.grad.norm().item():.5f}，你的是 {v}")
+
+@check("没有梯度的参数对应 None")
+def _():
+    m = tiny_mlp()
+    m[0].weight.requires_grad_(False)
+    x, y = toy_data()
+    F.cross_entropy(m(x), y).backward()
+    g = grad_norms(m)
+    true("0.weight" in g, "被冻住的参数也要出现在结果里（named_parameters() 会列出它）")
+    true(g["0.weight"] is None,
+         f"0.weight 被冻住了，它的 .grad 是 None，这时 value 应该是 None，你的是 {g['0.weight']!r}")
+    true(isinstance(g["2.weight"], float), "没被冻住的 2.weight 应该有一个 float 范数")
+--- hints
+- 遍历 `model.named_parameters()`，每个参数先判断 `p.grad is None`。
+- 不是 None 时，value 是 `p.grad.norm().item()`。
