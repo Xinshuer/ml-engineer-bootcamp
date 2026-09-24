@@ -317,7 +317,7 @@ ImportError: attempted relative import with no known parent package
 本课统一用绝对导入 + 在项目根目录跑，避开这个问题：
 
 ```
-cd G:/个人项目/ai-14days
+cd classic                    # 在本仓库的根目录下
 python drills/day04.py            # 文件里写 from common.trainer import Trainer
 ```
 
@@ -456,7 +456,7 @@ except TypeError as e:
 三份讲义读完了，接下来是今天的第二个动作——做题：
 
 ```
-cd G:/个人项目/ai-14days
+cd classic                    # 在本仓库的根目录下
 python drills/day01.py        # 先看一眼 12 道题长什么样
 python drills/day01.py 05     # 只跑第 5 题
 ```

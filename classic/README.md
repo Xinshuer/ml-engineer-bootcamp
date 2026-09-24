@@ -5,7 +5,7 @@
 ## 怎么用
 
 ```bash
-cd G:/个人项目/ai-14days
+cd classic                    # 在本仓库的根目录下
 
 python check.py              # 看 14 天总进度
 python drills/day02.py       # 做 Day 02 的题
