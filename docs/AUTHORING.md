@@ -106,6 +106,25 @@ Type-specific sections:
 | `self` | ticks a checklist honestly (dictation, "ran it on the GPU") | `--- checklist` (`- ` list) |
 | `local` | does something outside the page (Docker, a terminal) and pastes the output | `--- prompt` with steps, `verify: <regex the pasted output must match>`, optional `placeholder:` |
 
+### Sample data and "try it" (`--- above`, `--- below`)
+
+Every `code` and `fix` item (closed-book ones too) has them, so the editor reads like a real script instead of
+a bare signature:
+
+- `--- above` goes before the starter: a first comment line saying where the input comes from in a real model
+  or project (`# 上文：…` / `# Where the input comes from: …`), then a small sample of it with exactly the
+  shapes, dtypes and keys the tests use (`x = torch.randn(2, 5, 12)  # 2 句话，每句 5 个 token…`).
+- `--- below` goes after it, under a "try it" line the build adds: call the learner's function(s) on the
+  sample and print something readable (shapes, a few rounded values, `.tolist()` of a small tensor).
+
+The build joins them to the starter and the solution and writes under the call what the reference solution
+prints ("写对了会打印：…"). `app/runner.py` grades only the code above the try-it line and runs the try-it
+part after the checks (seeds reset first), reporting its output and errors on their own: a function that is
+still `raise todo()` shows "not written yet" there and never changes the verdict. The build rejects a try-it
+part that fails with the reference solution or prints nothing, output longer than 12 lines × 110
+characters, output that differs between two runs, and an `above`/`below` that defines the learner's function.
+`--show <id>` prints the runs, including the try-it output.
+
 ## How an exercise runs
 
 The server runs, in one fresh namespace:

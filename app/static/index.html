@@ -987,6 +987,16 @@ function resultView(res, { item, editor, onPassNext, noTests }) {
   }
   if (res.stdout) els.push(h("p", { class: "panelLabel" }, tr("输出（print）", "Output (print)")), h("pre", { class: "outBox" }, res.stdout));
   if (noTests && !res.error && !res.stdout) els.push(h("p", { class: "note" }, tr("运行完成，没有输出。加一行 print 看看结果。", "Finished without output. Add a print to see the result.")));
+  if (res.demo) {
+    // the "try it" part at the bottom of the exercise: it runs after the checks and does not change the verdict
+    els.push(h("p", { class: "panelLabel" }, tr("试一试的输出", "Try it: output")));
+    if (res.demo.stdout) els.push(h("pre", { class: "outBox" }, res.demo.stdout));
+    if (res.demo.error) {
+      els.push(h("pre", { class: "outBox err" }, res.demo.error));
+      const g = pyGloss(res.demo.error);
+      if (g) els.push(h("div", { class: "gloss" }, g));
+    } else if (!res.demo.stdout) els.push(h("p", { class: "note" }, tr("试一试这一段没有输出。", "The try-it part printed nothing.")));
+  }
   if (res.seconds !== undefined && !noTests) els.push(h("p", { class: "note" }, tr(`用时 ${res.seconds} 秒`, `took ${res.seconds} s`)));
   return els;
 }

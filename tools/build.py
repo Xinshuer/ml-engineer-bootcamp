@@ -244,9 +244,39 @@ def parity(zh, en):
             for k in ("options", "fills", "lines", "distractors", "checks", "hints", "checklist"):
                 if len(it.get(k) or []) != len(zi.get(k) or []):
                     bad(f"en {it['id']}", f"{k}: {len(it.get(k) or [])}, Chinese has {len(zi.get(k) or [])}")
-            for k in ("starter", "solution", "tests", "code", "template", "context", "explain", "verify", "setup"):
+            for k in ("starter", "solution", "tests", "code", "template", "context", "explain", "verify", "setup", "above", "below"):
                 if bool(it.get(k)) != bool(zi.get(k)):
                     bad(f"en {it['id']}", f"--- {k} present in one language only")
+
+
+# ---------------------------------------------------------------- the code around the learner's function
+# --- above / --- below make the editor read like a real script: sample data first (what the input is and
+# where it comes from), then the function, then a "try it" part that calls it and prints. The build joins
+# them to the starter and the solution and writes under the call what the reference solution prints.
+# app/runner.py grades only the code above the try-it line (TRY_RE) and runs the rest after the checks.
+DEMO_TYPES = {"code", "fix"}
+TRY_MARK = {"zh": "---- 试一试：这一段也会运行，但判题只检查上面的代码 ----",
+            "en": "---- Try it: this part runs too, but only the code above is checked ----"}
+PRINTS = {"zh": "写对了会打印：", "en": "When your code is right, this prints: "}
+
+
+def graded(it, code):
+    return f"{it['above']}\n\n\n{code}" if it.get("above") else code
+
+
+def with_demo(it, middle, lang, printed=None):
+    tail = ""
+    if it.get("below"):
+        tail = f"\n\n\n# {TRY_MARK[lang]}\n{it['below']}"
+        if printed is not None:
+            lines = printed.split("\n")
+            tail += (f"\n# {PRINTS[lang]}{lines[0]}".rstrip() if len(lines) == 1
+                     else f"\n# {PRINTS[lang].rstrip()}\n" + "\n".join(f"# {ln}".rstrip() for ln in lines))
+    return graded(it, middle) + tail + "\n"
+
+
+def has_demo(it):
+    return bool(it.get("above") or it.get("below"))
 
 
 # ---------------------------------------------------------------- validate with real PyTorch
@@ -256,6 +286,7 @@ def all_passed(r):
 
 def validate(days, lang, pool, only, show):
     jobs = []
+    demo_items = []
     for d in days:
         if only and d["id"] not in only:
             continue
@@ -264,10 +295,27 @@ def validate(days, lang, pool, only, show):
                 c["_setup"] = resolve_setup(c, f"{lang} {c['id']}")
                 jobs.append(("concept", c, None))
         for it in d["items"]:
+            if has_demo(it) and it.get("type") not in DEMO_TYPES:
+                bad(f"{lang} {it['id']}", "--- above / --- below are only for code and fix items")
+                continue
             if it.get("type") in RUNNABLE or it.get("type") == "predict":
                 it["_setup"] = resolve_setup(it, f"{lang} {it['id']}")
                 if it["type"] == "predict":
                     jobs.append(("predict", it, None))
+                elif has_demo(it):
+                    where = f"{lang} {it['id']}"
+                    if not it.get("below"):
+                        bad(where, "--- above needs a --- below that calls the function and prints the result")
+                        continue
+                    first = re.search(r"^(?:def|class)\s+(\w+)", it.get("solution", ""), re.M)
+                    if first and re.search(rf"^(?:def|class)\s+{first.group(1)}\b", f"{it.get('above', '')}\n{it['below']}", re.M):
+                        bad(where, f"--- above / --- below must not define {first.group(1)}: that is the learner's job")
+                    demo_items.append(it)
+                    jobs.append(("solution", it, with_demo(it, it.get("solution", ""), lang)))
+                    jobs.append(("solution2", it, with_demo(it, it.get("solution", ""), lang)))
+                    jobs.append(("starter", it, with_demo(it, it.get("starter", ""), lang)))
+                    if it["targets"]:
+                        jobs.append(("blank", it, ""))
                 else:
                     jobs.append(("solution", it, it.get("solution")))
                     jobs.append(("starter", it, it.get("starter")))
@@ -302,14 +350,42 @@ def validate(days, lang, pool, only, show):
                 if r.get("error"):
                     bad(where, f"predict code fails: {r['error'][-300:]}")
                 blk["expected"] = r.get("stdout", "").rstrip("\n")
-            elif kind == "solution":
-                if not all_passed(r):
+            elif kind in ("solution", "solution2"):
+                if kind == "solution" and not all_passed(r):
                     fails = [f"{c['title']}: {c['message'][:160]}" for c in r.get("checks", []) if not c["passed"]]
                     bad(where, f"solution does not pass: {(r.get('error') or '')[-300:]} {fails}")
                 blk["_sol_seconds"] = r.get("seconds")
+                if has_demo(blk):
+                    demo = r.get("demo")
+                    if not demo:
+                        bad(where, "the try-it part (--- below) did not run")
+                    elif demo.get("error"):
+                        bad(where, f"the try-it part (--- below) fails with the reference solution: {demo['error'][-300:]}")
+                    else:
+                        blk["_printed" if kind == "solution" else "_printed2"] = demo.get("stdout", "").rstrip()
             elif kind in ("starter", "blank"):
                 if all_passed(r):
                     bad(where, f"the {kind} already passes every check")
+    for it in demo_items:
+        where = f"{lang} {it['id']}"
+        printed = it.pop("_printed", None)
+        again = it.pop("_printed2", None)
+        if printed is None:
+            continue
+        lines = printed.split("\n")
+        if not printed:
+            bad(where, "--- below prints nothing: call the function and print the result")
+            continue
+        if len(lines) > 12 or any(len(ln) > 110 for ln in lines):
+            bad(where, f"the try-it output is too long for a comment ({len(lines)} lines, longest "
+                       f"{max(len(ln) for ln in lines)} characters; max 12 x 110): print less")
+        if again is not None and again != printed:
+            bad(where, f"the try-it output differs between two runs:\n    1: {printed[:200]!r}\n    2: {again[:200]!r}")
+        it["starter"] = with_demo(it, it.get("starter", ""), lang, printed)
+        it["solution"] = with_demo(it, it.get("solution", ""), lang, printed)
+        it["demoOut"] = printed
+        it.pop("above", None)
+        it.pop("below", None)
     return len(jobs), time.time() - t0
 
 

@@ -48,6 +48,14 @@ def main(path, lang="zh"):
         if not c["passed"] and c.get("message"):
             print(f"       -> {c['message']}")
         ok += c["passed"]
+    demo = res.get("demo")
+    if demo:  # the "try it" part at the bottom of the exercise: not graded, shown on its own
+        print("-" * 64)
+        print("试一试的输出:" if zh else "Try it: output:")
+        if demo.get("stdout"):
+            print(demo["stdout"].rstrip())
+        if demo.get("error"):
+            print(demo["error"])
     print("-" * 64)
     n = len(res["checks"])
     print(f"  {'通过' if zh else 'passed'} {ok}/{n}    ({res.get('seconds')} s)")

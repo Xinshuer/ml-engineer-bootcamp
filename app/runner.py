@@ -183,6 +183,29 @@ def _format_error(e, tb):
     return (("\n".join(lines) + "\n") if lines else "") + head
 
 
+# The "try it" part at the bottom of an exercise (sample data above the function, a call that prints below):
+# only the code above this line is graded; the rest runs after the checks, and what it prints or raises is
+# reported on its own ("demo"), so a function that is not written yet still shows as "not written yet".
+TRY_RE = re.compile(r"^[ \t]*# ---- (?:试一试|Try it)", re.M)
+
+
+def _run_demo(demo_src, ns, lang):
+    out = io.StringIO()
+    res = {"stdout": "", "error": None, "line": None}
+    _reset_torch()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+        try:
+            exec(compile(demo_src, USER_FILE, "exec"), ns)
+        except NotWrittenYet as e:
+            res["error"] = str(e) or MSG[lang]["todo"]
+            res["line"] = _user_line(e.__traceback__)
+        except BaseException as e:  # noqa: BLE001
+            res["error"] = _format_error(e, e.__traceback__)
+            res["line"] = _user_line(e.__traceback__)
+    res["stdout"] = _RUNNER_FRAME.sub("", out.getvalue())[-8000:]
+    return res
+
+
 def run_job(job):
     t0 = time.time()
     lang = job.get("lang", "zh")
@@ -192,6 +215,11 @@ def run_job(job):
     mode = job.get("mode", "check")
     out = io.StringIO()
     result = {"checks": [], "stdout": "", "error": None, "error_line": None}
+    try_at = TRY_RE.search(code) if mode == "check" else None
+    demo_src = None
+    if try_at:  # keep the editor's line numbers in the try-it part's tracebacks
+        demo_src = "\n" * code.count("\n", 0, try_at.start()) + code[try_at.start():]
+        code = code[:try_at.start()]
 
     # make `inspect.getsource` / tracebacks show the learner's lines
     for name, text in ((USER_FILE, code), (TESTS_FILE, tests), (SETUP_FILE, setup)):
@@ -218,9 +246,11 @@ def run_job(job):
         except BaseException as e:  # noqa: BLE001 - report everything, never crash the worker
             result["error"] = MSG[lang]["setup"] + "\n" + "".join(traceback.format_exception(e))[-3000:]
             result["setup_failed"] = True
+        main_ok = False
         if not result["error"]:
             try:
                 exec(compile(code, USER_FILE, "exec"), ns)
+                main_ok = True
             except SyntaxError as e:
                 result["error"] = f"SyntaxError: {e.msg}" + (f"\n  line {e.lineno}: {(e.text or '').strip()}" if e.lineno else "")
                 result["error_line"] = e.lineno
@@ -256,6 +286,8 @@ def run_job(job):
                 result["checks"].append(c)
             if not registered and not result["error"]:
                 result["error"] = MSG[lang]["no_checks"]
+    if demo_src is not None and main_ok and not result.get("setup_failed"):
+        result["demo"] = _run_demo(demo_src, ns, lang)
     result["stdout"] = _RUNNER_FRAME.sub("", out.getvalue())[-20000:]
     result["seconds"] = round(time.time() - t0, 3)
     return result
