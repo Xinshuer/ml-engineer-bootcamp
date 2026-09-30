@@ -279,6 +279,14 @@ Write a class `CharTokenizer`:
 Rules: `decode(encode(s)) == s`; every id is between 0 and `vocab_size - 1`; the same character always gets the same id.
 
 Example: `CharTokenizer("hello world")` has `vocab_size` 8; the space sorts first and gets id 0; `encode("hello")` is `[3, 2, 4, 4, 5]`.
+--- above
+# Where the input comes from: nanoGPT first reads the whole corpus; here, one line of Shakespeare
+corpus = "to be or not to be"
+--- below
+tok = CharTokenizer(corpus)
+ids = tok.encode("not to be")
+print("vocab_size:", tok.vocab_size, "  encode('not to be'):", ids)
+print("decoded back:", repr(tok.decode(ids)))
 --- starter
 class CharTokenizer:
     """Usage:
@@ -355,6 +363,14 @@ pair_counts(["a","b","a","b","c"])      -> {("a","b"): 2, ("b","a"): 1, ("b","c"
 merge_pair(["a","b","a","b"], ("a","b")) -> ["ab", "ab"]
 merge_pair(["a","a","a"], ("a","a"))     -> ["aa", "a"]
 ```
+--- above
+# Where the input comes from: BPE training first splits the corpus into characters, one token each
+corpus = list("hug hugs")      # ['h', 'u', 'g', ' ', 'h', 'u', 'g', 's']
+--- below
+print("pair counts:", pair_counts(corpus))
+step1 = merge_pair(corpus, ("h", "u"))
+print("merge ('h','u'):", step1)
+print("then merge ('hu','g'):", merge_pair(step1, ("hu", "g")))
 --- starter
 def pair_counts(tokens):
     """tokens: list[str]. Count every pair of neighbouring tokens.
@@ -419,6 +435,13 @@ Write `compression_ratio(text, encode_fn)`:
 - Return number of characters ÷ number of tokens (a float).
 
 Example: a tokenizer that makes one token out of every two characters turns "abcdefgh" (8 characters) into 4 tokens, so the ratio is 2.0. With one token per character, the ratio is 1.0.
+--- above
+# Where the input comes from: GPT-2's BPE starts from UTF-8 bytes; how do English and Chinese compare?
+byte_encode = lambda s: list(s.encode("utf-8"))    # one token per byte
+english, chinese = "hello world", "你好世界"
+--- below
+print("English, one token per byte:", round(compression_ratio(english, byte_encode), 2))
+print("Chinese, one token per byte:", round(compression_ratio(chinese, byte_encode), 2))
 --- starter
 def compression_ratio(text, encode_fn):
     """Return characters / tokens. Bigger means the tokenizer is more efficient on this text."""
@@ -457,6 +480,17 @@ Write `get_batch(data, batch_size, block_size, generator=None)`:
 - The starts must keep y inside the data: the largest i is `len(data) - block_size - 1`.
 
 Example: with `data = torch.arange(1000)`, y should equal x + 1 everywhere.
+--- above
+# Where the input comes from: the corpus, encoded with d3-01's CharTokenizer (reference version here)
+text = "to be or not to be, that is the question"
+tok = CharTokenizer(text)
+corpus_ids = torch.tensor(tok.encode(text))    # a 1D LongTensor of 40 token ids
+g = torch.Generator().manual_seed(1)
+--- below
+x, y = get_batch(corpus_ids, 2, 8, generator=g)
+print("shapes of x and y:", tuple(x.shape), tuple(y.shape), " dtype:", x.dtype)
+print("x as text:", [tok.decode(row) for row in x])
+print("y as text:", [tok.decode(row) for row in y])
 --- starter
 def get_batch(data, batch_size, block_size, generator=None):
     """data: 1D LongTensor (the token ids of the whole corpus)
@@ -518,6 +552,17 @@ Write two functions (`np` and `os` are already imported):
 2. `load_bin(path)`: open the file with `np.memmap`, read-only (`mode="r"`), dtype uint16, and return the memmap object itself. Do not read the whole file into memory with something like `np.fromfile`.
 
 Example: after saving 1000 ids (0 to 999), the file is exactly 2000 bytes and `load_bin(path)[999] == 999`.
+--- above
+# Where the input comes from: preprocessing turned the corpus into token ids for train.bin (only 5 here)
+import tempfile
+tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)    # a temporary folder to hold train.bin
+bin_path = os.path.join(tmp.name, "train.bin")
+token_ids = [15, 50256, 7, 8, 42]       # 50256 is GPT-2's end-of-text token <|endoftext|>
+--- below
+save_bin(bin_path, token_ids)
+m = load_bin(bin_path)
+print("file size:", os.path.getsize(bin_path), "bytes   read back:", type(m).__name__, m.dtype, m.tolist())
+del m, tmp                              # close the file first, then delete the temporary folder
 --- starter
 def save_bin(path, ids):
     """Write ids (list[int] or 1D ndarray) to a binary file as uint16."""
@@ -569,6 +614,15 @@ Write `bigram_counts(ids, vocab_size)`:
 - No Python loop over ids. Use `torch.bincount` (or `index_put_`, `scatter_add_`).
 
 Example: `ids = [0, 1, 0, 1, 2]`, V = 3. The neighbouring pairs are (0,1) (1,0) (0,1) (1,2), so `C[0,1] = 2`, `C[1,0] = 1`, `C[1,2] = 1`, and everything else is 0. All counts add up to `len(ids) - 1`.
+--- above
+# Where the input comes from: "hello" encoded by d3-01's character tokenizer: e=0, h=1, l=2, o=3
+token_ids = torch.tensor([1, 0, 2, 2, 3])     # h e l l o
+V = 4
+--- below
+C = bigram_counts(token_ids, V)
+print("shape:", tuple(C.shape), " total count:", C.sum().item())
+for ch, row in zip("ehlo", C.tolist()):
+    print(ch, "is followed by e/h/l/o this many times:", row)
 --- starter
 def bigram_counts(ids, vocab_size):
     """ids: 1D LongTensor. Return the (V, V) count matrix C, C[i, j] = how often j follows i.
@@ -609,6 +663,13 @@ Write two functions:
 2. `is_broken(loss, vocab_size, tol=0.05)`: return True when loss is within a relative error tol of `uniform_loss(vocab_size)`, that is `|loss - base| / base < tol` (still guessing after all that training); otherwise return False.
 
 Example: for V = 65 the baseline is about 4.17. A loss still at 4.17 after a long run → True; a loss of 1.48 → False.
+--- above
+# Where the input comes from: the last loss in the logs of two long runs (Llama vocabulary, V = 32000)
+V = 32000
+loss_a, loss_b = 10.31, 2.95
+--- below
+print("loss of a model that learned nothing:", round(uniform_loss(V), 4))
+print("run A broken:", is_broken(loss_a, V), "   run B broken:", is_broken(loss_b, V))
 --- starter
 def uniform_loss(vocab_size):
     """What cross-entropy does a model that learned nothing get? Return that number."""
@@ -661,6 +722,14 @@ ids  = [[5, 6, 7], [8, -1, -1], [9, 10, -1]]
 mask = [[1, 1, 1], [1,  0,  0], [1,  1,  0]]
 pos  = [[0, 1, 2], [0,  0,  0], [0,  1,  0]]
 ```
+--- above
+# Where the input comes from: one batch of 3 sentences, already turned into token ids; lengths differ
+batch = [[12, 7, 30], [4, 9], [21, 5, 8, 16]]     # 3, 2 and 4 tokens
+--- below
+ids, mask, pos = pad_batch(batch)
+print("ids: ", ids.tolist())
+print("mask:", mask.tolist())
+print("pos: ", pos.tolist())
 --- starter
 def pad_batch(seqs, pad_id=0):
     """seqs: list[list[int]]. Return (ids, attn_mask, pos_ids), all (B, Tmax) int64.
@@ -713,6 +782,16 @@ Write `mask_to_bias(attn_mask)`:
 - Do not write `(1 - mask) * float("-inf")`: real positions would compute `0 * -inf = nan`.
 
 Example: `mask_to_bias(torch.tensor([[1, 1, 0]]))` returns `tensor([[[[0., 0., -inf]]]])`, of shape `(1, 1, 1, 3)`.
+--- above
+# Where the input comes from: pad_batch's attention mask: 2 sentences, the 2nd ends with 2 pad positions
+attn = torch.tensor([[1, 1, 1, 1],
+                     [1, 1, 0, 0]])
+scores = torch.zeros(2, 3, 4, 4)      # attention scores (B, nh, T, T): 2 sentences, 3 heads; all 0 for now
+--- below
+bias = mask_to_bias(attn)
+print("bias:", tuple(bias.shape), bias.flatten(1).tolist())
+w = (scores + bias).softmax(-1)
+print("weights:", tuple(w.shape), "  sentence 2, head 1, row 1:", w[1, 0, 0].tolist())
 --- starter
 def mask_to_bias(attn_mask):
     """attn_mask: (B, T) of 0/1  ->  additive bias of shape (B, 1, 1, T):
@@ -753,6 +832,14 @@ This get_batch has 3 bugs: one raises an error only sometimes, one makes the emb
 `get_batch_buggy(data, batch_size, block_size)` should do the same as get_batch from d3-04: pick random starts, x is a piece of data, y is x shifted right by one, both of shape `(batch_size, block_size)` and dtype int64.
 
 It has 3 mistakes. Find and fix them; keep the function name and arguments.
+--- above
+# Where the input comes from: each training step cuts a batch from the corpus (here the 30 ids 100 to 129)
+token_ids = torch.arange(100, 130)
+--- below
+x, y = get_batch_buggy(token_ids, 2, 6)
+print("x:", x.tolist())
+print("y:", y.tolist())
+print("dtype:", x.dtype, y.dtype)
 --- starter
 def get_batch_buggy(data, batch_size, block_size):
     ix = torch.randint(len(data), (batch_size,))
@@ -798,6 +885,13 @@ Let B = 8 (batch size), T = 256 (block_size), V = 50257 (vocabulary size), C = 7
 - `pos = torch.arange(T)`, of shape `(T,)`.
 - A scalar (a tensor holding one number) has the empty tuple `()` as its shape.
 - You can write products like `8 * 256`. Do not change the keys.
+--- above
+# Where the input comes from: the four numbers of one training step of GPT-2 small
+B, T, V, C = 8, 256, 50257, 768     # batch size, block_size, vocabulary size, width of each token vector
+--- below
+n = math.prod(BATCH_SHAPES["logits = lm_head(hidden)"])
+print("logits hold", n, "numbers; at 4 bytes each in fp32 that is about", round(n * 4 / 1e6), "MB")
+print("same number of values after view:", math.prod(BATCH_SHAPES["logits.view(-1, V)"]) == n)
 --- starter
 BATCH_SHAPES = {
     "x  (input token ids)":           None,
@@ -957,6 +1051,14 @@ Without the cards or earlier answers, write `get_batch(data, batch_size, block_s
 - `data` is a 1D LongTensor; pick `batch_size` random starts and pass `generator` to `torch.randint`.
 - `x` is the `block_size` tokens from a start; `y` is x shifted right by one.
 - Return `(x, y)`, both of shape `(batch_size, block_size)` and dtype int64; y must stay in range.
+--- above
+# Where the input comes from: the corpus as one long run of token ids (50 to 69 here, so the shift shows)
+token_ids = torch.arange(50, 70)
+--- below
+x, y = get_batch(token_ids, 3, 4, generator=torch.Generator().manual_seed(7))
+print("x:", x.tolist())
+print("y:", y.tolist())
+print("shape:", tuple(x.shape), " dtype:", x.dtype)
 --- starter
 def get_batch(data, batch_size, block_size, generator=None):
     raise todo()
@@ -1008,6 +1110,15 @@ Without the cards or earlier answers, write `pad_batch(seqs, pad_id=0)`:
 
 - `seqs` is a `list[list[int]]`; return `(ids, attn_mask, pos_ids)`, all of shape `(B, Tmax)` and dtype int64.
 - `ids` is padded on the right with `pad_id`; `attn_mask` is 1 for real tokens and 0 for padding; `pos_ids` counts real tokens from 0 in each sentence, with 0 at padded positions.
+--- above
+# Where the input comes from: an inference server gets 3 requests at once; as token ids, lengths differ
+requests = [[31, 8], [2, 44, 17, 9, 5], [60]]
+PAD = 50256          # GPT-2 has no pad token; people often borrow the id of <|endoftext|>
+--- below
+ids, mask, pos = pad_batch(requests, pad_id=PAD)
+print("ids: ", ids.tolist())
+print("mask:", mask.tolist())
+print("pos: ", pos.tolist())
 --- starter
 def pad_batch(seqs, pad_id=0):
     raise todo()

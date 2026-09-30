@@ -287,6 +287,18 @@ targets: Preprocessor
 - `transform(x)`：返回 `(x - self.mean) / self.std`。**只用存下的统计量**，不能拿 x 自己现算。既没 fit 也没加载过就调用，要 `raise RuntimeError(...)`。
 - `state_dict()`：返回 `{"mean": ..., "std": ...}`（两个 tensor），用来和模型权重存进同一个文件。
 - `load_state_dict(d)`：从这样一个 dict 恢复 `self.mean` 和 `self.std`。
+--- above
+# 上文：训练集的特征，和上线后服务里来的一条请求
+train_x = torch.tensor([[50.0, 3.0],
+                        [60.0, 3.2],
+                        [40.0, 2.8],
+                        [50.0, 3.0]])     # (4, 2)：4 条训练数据，每条 2 个特征，两列的大小差很多
+request_x = torch.tensor([[60.0, 3.1]])   # (1, 2)：服务里只来了 1 条请求
+--- below
+pre = Preprocessor().fit(train_x)                         # 训练时：只在训练数据上 fit
+served = Preprocessor()
+served.load_state_dict(pre.state_dict())                  # 服务启动时：加载存下的统计量，不再 fit
+print("这条请求标准化后:", [round(v, 3) for v in served.transform(request_x)[0].tolist()])
 --- starter
 class Preprocessor:
     def __init__(self):
@@ -412,6 +424,17 @@ targets: vocab_fingerprint, check_vocab
 - `check_vocab(saved_fp, vocab)`：saved_fp 是训练时存下的指纹。当前词表的指纹和它一样，就什么都不做（返回 None）；不一样，就 `raise ValueError(...)`，报错信息里写上两个指纹，方便排查。
 
 不要用 Python 的 `hash()`。
+--- above
+# 上文：训练时用的词表（token → id），和服务里加载到的词表
+train_vocab = {"<pad>": 0, "<eos>": 1, "good": 2, "bad": 3}
+served_vocab = {"<pad>": 0, "<eos>": 1, "good": 3, "bad": 2}   # good 和 bad 的 id 对调了
+--- below
+saved_fp = vocab_fingerprint(train_vocab)   # 训练时算好，和 checkpoint 存在一起
+print("训练时的指纹:", saved_fp)
+try:
+    check_vocab(saved_fp, served_vocab)
+except ValueError as e:
+    print("服务拒绝启动:", e)
 --- starter
 import hashlib
 import json
@@ -501,6 +524,15 @@ ref: day18
 - 同一个输入调用两次，结果完全一样
 - 一条请求的结果不随同一批的其他请求变化
 - 模型的前向在 `torch.inference_mode()` 里运行，返回的张量不记录梯度
+--- above
+# 上文：刚训练完的分类模型，交到服务手里时还在 train 模式
+model = make_net()             # 题目准备好的：Linear → BatchNorm → ReLU → Dropout → Linear
+requests = torch.randn(3, 4)   # 3 条请求拼成一批，每条 4 个特征
+--- below
+probs = serve_predict(model, requests)
+print("第 0 条请求的 3 个类别概率:", [round(p, 3) for p in probs[0].tolist()])
+print("同一批再算一次，结果一样吗:", torch.equal(probs, serve_predict(model, requests)))
+print("结果还记录梯度吗:", probs.requires_grad)
 --- starter
 def serve_predict(model, x):
     logits = model(x)
@@ -631,6 +663,14 @@ targets: batch_gap
 - 返回两者之差的绝对值的最大值，是一个 Python float（用 `.item()`）
 
 前向都放在 `with torch.inference_mode():` 里。不要改模型的模式（不要调 `eval()` 或 `train()`）：你是在**测**它，不是在修它。
+--- above
+# 上文：上线前要测的模型（卷积层接 BatchNorm），刚训练完还在 train 模式
+model = nn.Sequential(nn.Conv1d(3, 4, kernel_size=3, padding=1), nn.BatchNorm1d(4), nn.ReLU())
+x_batch = torch.randn(5, 3, 8)   # 5 条数据，每条 3 个通道、长度 8（比如 3 个传感器、8 个时间点）
+--- below
+print("train 模式，整批和逐条最多差:", round(batch_gap(model, x_batch), 4))
+model.eval()
+print("eval 模式，整批和逐条最多差:", round(batch_gap(model, x_batch), 4))
 --- starter
 def batch_gap(model, x):
     raise todo()
@@ -705,6 +745,14 @@ input_ids      = [[5, 6, 7], [0, 0, 8]]
 attention_mask = [[1, 1, 1], [0, 0, 1]]
 position_ids   = [[0, 1, 2], [0, 0, 0]]
 ```
+--- above
+# 上文：tokenizer 把一批长短不同的 prompt 变成了 token id 列表
+prompts = [[12, 7, 3], [5], [9, 4]]   # 3 条 prompt，长度 3、1、2
+--- below
+ids, mask, pos = left_pad(prompts, pad_id=0)
+print("input_ids:     ", ids.tolist())
+print("attention_mask:", mask.tolist())
+print("position_ids:  ", pos.tolist())
 --- starter
 def left_pad(seqs, pad_id=0):
     raise todo()
@@ -771,6 +819,14 @@ ref: day18
 它应该和 `generate_one(model, p, 1)[0]`（一条一条算，不补 pad）给出一样的结果，现在却不一样。
 
 改好它：用左填充，并把 attention mask 和 position ids 传给模型。可以直接用已经写好的 `left_pad(seqs, pad_id)`（返回 ids、mask、pos）。模型的调用方式是 `model(ids, attention_mask=mask, position_ids=pos)`，返回 `(B, T, V)` 的 logits。
+--- above
+# 上文：服务里同时来了 3 条 prompt（已经变成 token id），要拼成一批算下一个词
+model = tiny_lm()                        # 题目准备好的小语言模型：词表 16 个词，0 号是 pad
+prompts = [[6, 2, 10, 14], [13], [8, 5]]
+--- below
+print("拼成一批算:", next_token_batch(model, prompts))
+# generate_one 也是题目准备好的：一条一条算，不补 pad，结果是标准答案
+print("一条一条算:", [generate_one(model, p, 1)[0] for p in prompts])
 --- starter
 def next_token_batch(model, prompts, pad_id=0):
     T = max(len(p) for p in prompts)
@@ -905,6 +961,15 @@ targets: set_seed
 - 给 Python 的 `random`、NumPy、PyTorch 都设上种子
 - `deterministic=True` 时，再打开三个确定性开关：`torch.backends.cudnn.benchmark = False`、`torch.backends.cudnn.deterministic = True`、`torch.use_deterministic_algorithms(True)`
 - `deterministic=False`（默认）时，不碰这些开关
+--- above
+# 上文：训练里有三处随机：打乱数据（random）、数据增强（NumPy）、初始化（torch）
+run_seed = 42                    # 训练配置里写的种子
+--- below
+set_seed(run_seed)
+first = [random.random(), float(np.random.rand()), torch.rand(1).item()]
+set_seed(run_seed)
+second = [random.random(), float(np.random.rand()), torch.rand(1).item()]
+print("重新设种子后，random / NumPy / torch 抽到的数一样吗:", [a == b for a, b in zip(first, second)])
 --- starter
 import random
 
@@ -1041,6 +1106,17 @@ targets: outputs_match
 - 按 `got.dtype` 从 `TOL` 里取 `(rtol, atol)`
 - 两边都转成 fp32，逐个元素检查 `|got - ref| <= atol + rtol * |ref|`
 - 全部满足返回 `True`，否则返回 `False`。要返回 Python 的 bool（用 `bool(...)` 或 `.item()`）。nan 和 inf 算不满足。
+--- above
+# 上文：同一个线性层、同一批输入，先用 fp32 算一遍，再换成 bf16 算一遍
+layer = nn.Linear(16, 4)
+x = torch.randn(3, 16)                          # 3 条输入，每条 16 维
+with torch.no_grad():
+    fp32_out = layer(x)                         # 参考输出：(3, 4)，fp32
+    bf16_out = layer.bfloat16()(x.bfloat16())   # 换成 bf16 算的输出：(3, 4)，bf16
+--- below
+print("bf16 和 fp32 最大差多少:", round((bf16_out.float() - fp32_out).abs().max().item(), 4))
+print("bf16 的输出，算一致吗:", outputs_match(fp32_out, bf16_out))
+print("fp32 的输出整体偏了 0.001，算一致吗:", outputs_match(fp32_out, fp32_out + 0.001))
 --- starter
 TOL = {                          # (rtol, atol)，给模型输出用的经验值
     torch.float32: (1e-5, 1e-5),
@@ -1163,6 +1239,17 @@ targets: Preprocessor
 - `transform(x)`：只用存下的统计量；还没有统计量就 `raise RuntimeError`
 - `state_dict()`：返回 `{"mean": ..., "std": ...}`
 - `load_state_dict(d)`：从这个 dict 恢复统计量
+--- above
+# 上文：训练集的特征（第 3 列全是 1.0，是常数列），和服务里来的一条请求
+train_x = torch.tensor([[10.0, 0.5, 1.0],
+                        [20.0, 0.7, 1.0],
+                        [30.0, 0.9, 1.0]])     # (3, 3)：3 条训练数据，每条 3 个特征
+request_x = torch.tensor([[25.0, 0.6, 1.0]])   # (1, 3)：服务里来的 1 条请求
+--- below
+pre = Preprocessor().fit(train_x)                          # 训练时
+served = Preprocessor()
+served.load_state_dict(pre.state_dict())                   # 服务启动时
+print("这条请求标准化后:", [round(v, 3) for v in served.transform(request_x)[0].tolist()])
 --- starter
 class Preprocessor:
     def __init__(self):
@@ -1290,6 +1377,14 @@ ref: day18
 - `position_ids`：每个真实 token 在自己那条序列里的位置，pad 位置填 0，dtype 为 `torch.long`
 
 `left_pad([[5, 6, 7], [8]])` → ids `[[5, 6, 7], [0, 0, 8]]`，mask `[[1, 1, 1], [0, 0, 1]]`，pos `[[0, 1, 2], [0, 0, 0]]`。
+--- above
+# 上文：tokenizer 给出的一批 prompt，每条是一串 token id
+prompts = [[2, 8], [6, 1, 3, 5], [7]]   # 3 条 prompt，长度 2、4、1
+--- below
+ids, mask, pos = left_pad(prompts)
+print("input_ids:     ", ids.tolist())
+print("attention_mask:", mask.tolist())
+print("position_ids:  ", pos.tolist())
 --- starter
 def left_pad(seqs, pad_id=0):
     raise todo()

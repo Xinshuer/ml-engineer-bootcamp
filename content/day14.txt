@@ -272,6 +272,14 @@ ref: day14
 - 「loss 有几项」填 int。
 - 「条件注入方式」从 `"add"`、`"cross-attn"`、`"adaln"`、`"concat"`、`"none"` 里选一个。
 - 「采样方式」从 `"single"`、`"autoregressive"`、`"iterative-denoise"` 里选一个。
+--- above
+# 上文：论文里码本的大小 K，VQ-VAE 原文用的是 512
+K = 512   # 每个离散码就是 0 到 511 之间的一个整数编号
+--- below
+images = torch.randn(FIVE_QUESTIONS["输入 shape"])             # 照你填的 shape 造一批假图
+codes = torch.randint(0, K, FIVE_QUESTIONS["潜变量 shape"])     # 照你填的 shape 造一批离散码
+print("一张图:", images[0].numel(), "个小数 → 编码后:", codes[0].numel(), "个整数编号")
+print("第 1 张图第 1 行的前 5 个码:", codes[0, 0, :5].tolist())
 --- starter
 FIVE_QUESTIONS = {
     "输入 shape":      None,   # 填 tuple：batch 8, RGB, 64x64
@@ -335,6 +343,15 @@ ref: day14
 5. 全部通过就返回 `True`。
 
 例：`smoke_test(nn.Linear(4, 3), (2, 4), expect_shape=(2, 3))` 返回 True。模型有两个输入时，就传两个 shape：`smoke_test(model, (2, 3), (2, 3))`。
+--- above
+# 上文：刚写完的一个小模型，每个样本 16 维特征，输出 10 个类的分数
+net = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 10))
+--- below
+print("shape 对、没有 nan:", smoke_test(net, (4, 16), expect_shape=(4, 10)))
+try:
+    smoke_test(net, (4, 16), expect_shape=(4, 5))      # 故意把期望的 shape 写错
+except AssertionError as err:
+    print("期望写错时:", err)
 --- starter
 def smoke_test(model, *input_shapes, expect_shape=None):
     """喂随机张量跑一次 forward，检查:
@@ -412,6 +429,15 @@ ref: day14
 - 返回每一步的 loss 组成的列表，元素是 Python float（用 `loss.item()`）。
 
 判题用一个 8 → 32 → 5 的小 MLP 和 16 个样本，要求最后一步的 loss < 0.01。
+--- above
+# 上文：刚写完的一个小分类模型，和从训练集里取出来的一个 batch
+clf = nn.Sequential(nn.Linear(6, 16), nn.ReLU(), nn.Linear(16, 3))   # 6 维特征 → 3 个类
+x_batch = torch.randn(12, 6)             # 12 个样本，每个 6 维
+y_batch = torch.randint(0, 3, (12,))     # 每个样本的类别编号：0、1 或 2
+--- below
+losses = overfit_one_batch(clf, x_batch, y_batch, steps=200)
+print("一共", len(losses), "个 loss，瞎猜时约为 ln 3 =", round(math.log(3), 4))
+print("每 50 步看一次:", [round(v, 4) for v in losses[::50]], " 最后一步:", round(losses[-1], 4))
 --- starter
 def overfit_one_batch(model, x, y, steps=300, lr=1e-2):
     """反复在同一个 (x, y) 上训练。返回 loss 列表（float）。
@@ -479,6 +505,16 @@ ref: day14
 - 用 `torch.nn.utils.clip_grad_norm_`：它的返回值正好就是裁剪前的总范数（一个 0 维 tensor）。
 
 判题用一个 `nn.Linear(4, 2)`：weight 的 8 个梯度都是 3，bias 的梯度是 0。裁剪前的总范数是 sqrt(8 × 9) = sqrt(72) ≈ 8.485；`max_norm=1.0` 时，裁剪后的总范数应该正好是 1。
+--- above
+# 上文：训练中某一步刚做完 loss.backward()，这一步的梯度特别大
+layer = nn.Linear(3, 2)
+loss = (layer(torch.randn(8, 3)) * 50).pow(2).mean()    # 一个偏大的 loss
+loss.backward()                                          # 梯度存进了 layer.weight.grad 和 layer.bias.grad
+--- below
+before = clip_and_report(layer, max_norm=1.0)
+after = torch.cat([p.grad.flatten() for p in layer.parameters()]).norm()   # 所有梯度连成一个长向量，它的长度就是总范数
+print("裁剪前的总范数:", round(before, 2), " 类型:", type(before).__name__)
+print("裁剪后的总范数:", round(after.item(), 4))
 --- starter
 def clip_and_report(model, max_norm):
     """裁剪梯度，返回**裁剪前**的总梯度范数（float）。
@@ -521,6 +557,16 @@ ref: day14
 返回 `(z_q, indices)`：`z_q` 是 (B, D)，`indices` 是 (B,) 的 int64。
 
 例：码本是 `[[0, 0], [1, 1], [-1, 2]]`，z 的第一行是 `[0.1, 0.1]`。离它最近的是第 0 个码，所以 `indices[0] == 0`，`z_q[0]` 等于 `[0, 0]`。
+--- above
+# 上文：encoder 把图上每个位置变成一个 2 维向量 z_e；码本里有 4 个可学习的码
+cb = torch.tensor([[0.0, 0.0], [2.0, 0.0], [0.0, 2.0], [2.0, 2.0]])    # 码本：K=4 个码，每个 D=2 维
+z_e = torch.tensor([[0.2, -0.1], [1.8, 0.3], [0.4, 1.7], [1.2, 0.9]],
+                   requires_grad=True)                                  # encoder 的输出：B=4 个向量
+--- below
+z_q, idx = vq_quantize(z_e, cb)
+print("选中的码:", idx.tolist(), " z_q 的值:", z_q.tolist())
+z_q.sum().backward()                   # 看梯度能不能穿过量化，传回 z_e
+print("z_e 的梯度:", z_e.grad.tolist())
 --- starter
 def vq_quantize(z, codebook):
     """z: (B, D)   codebook: (K, D)
@@ -584,6 +630,15 @@ VQ-VAE 的码本只能靠 loss 里的 stop-gradient 项来学。sg 放错一个�
 例：z = [[1, 0]]，e = [[0, 0]]，β = 0.25。codebook 项 = mean(1², 0²) = 0.5，commitment 项 = 0.25 × 0.5 = 0.125，合计 0.625。
 
 判题还会检查梯度的流向，以及一个反直觉的事实：经过直通以后，重建误差对码本没有梯度。这正是需要 codebook 项的原因。
+--- above
+# 上文：encoder 的输出 z_e，和 vq_quantize 挑出的码本向量 e（没经过直通）
+z_e = torch.tensor([[0.5, 1.5], [2.0, -1.0]], requires_grad=True)     # encoder 的输出 (B=2, D=2)
+chosen = torch.tensor([[0.0, 1.0], [1.5, 0.0]], requires_grad=True)   # 选中的码本向量，就是公式里的 e (B=2, D=2)
+--- below
+loss = vq_loss(z_e, chosen, beta=0.25)
+loss.backward()
+print("loss:", round(loss.item(), 4), " 码本那边 e 的梯度:", chosen.grad.tolist())
+print("encoder 那边 z_e 的梯度:", z_e.grad.tolist())
 --- starter
 def vq_loss(z, z_q_hard, beta=0.25):
     """z: encoder 输出 (B, D)（带梯度）   z_q_hard: 量化后的码本向量 (B, D)
@@ -658,6 +713,13 @@ ref: day14
 - `"循环里存了带计算图的tensor"`
 
 贪心解码的意思是：每一步都选概率最大的 token，没有任何随机性。
+--- above
+# 上文：训练出问题时最常见的五种病因（和题目里的字符串一模一样）
+causes = ["模型没学到东西", "lr过大或fp16溢出", "标签泄漏",
+          "忘了model.eval", "循环里存了带计算图的tensor"]
+--- below
+print("填好的症状:", sum(v is not None for v in DIAGNOSIS.values()), "/ 5")
+print("还没用上（或拼错了）的病因:", [c for c in causes if c not in DIAGNOSIS.values()])
 --- starter
 # 可选的病因（复制过去用，每个用一次）:
 #   "模型没学到东西"   "lr过大或fp16溢出"   "标签泄漏"
@@ -720,6 +782,14 @@ loss = F.mse_loss(zq, data) + vq_loss(data, codebook[idx], beta=0.0)
 返回每一步的 loss 列表（Python float）。`_toy_data`、`vq_quantize`、`vq_loss` 已经准备好了（参考实现），直接调用。
 
 判题：第一步的 loss 应该 > 5（码本在 0 附近，数据远在 ±3），最后一步 < 0.03（码都到了簇心，只剩噪声）。
+--- above
+# 上文：已经准备好的 _toy_data()：64 个一维的点，围着 -3、-1、1、3 四个中心
+points = _toy_data()     # (64, 1)，每个中心 16 个点，按中心排好
+--- below
+centres = points.view(4, 16).mean(1)       # 每 16 个点一组，求平均
+print("数据:", tuple(points.shape), " 每组的平均:", [round(v, 2) for v in centres.tolist()])
+losses = train_vq_toy()
+print("每 60 步看一次 loss:", [round(v, 4) for v in losses[::60]], " 最后一步:", round(losses[-1], 4))
 --- starter
 def train_vq_toy(steps=300, lr=1e-1):
     """用 VQ 把 4 个簇心学出来。
@@ -895,6 +965,16 @@ ref: day14
 返回 `(z_q, indices)`：
 - `indices` 是 (B,) 的 int64，每一行 z 在码本里最近的码的编号；
 - `z_q` 是 (B, D)，前向的值等于选中的码本向量，反向时梯度原样传回 z（直通估计器）。
+--- above
+# 上文：encoder 把图上每个位置变成一个 2 维向量 z_e；码本里有 4 个可学习的码
+cb = torch.tensor([[0.0, 0.0], [2.0, 0.0], [0.0, 2.0], [2.0, 2.0]])    # 码本：K=4 个码，每个 D=2 维
+z_e = torch.tensor([[0.2, -0.1], [1.8, 0.3], [0.4, 1.7], [1.2, 0.9]],
+                   requires_grad=True)                                  # encoder 的输出：B=4 个向量
+--- below
+z_q, idx = vq_quantize(z_e, cb)
+print("选中的码:", idx.tolist(), " z_q 的值:", z_q.tolist())
+z_q.sum().backward()                   # 看梯度能不能穿过量化，传回 z_e
+print("z_e 的梯度:", z_e.grad.tolist())
 --- starter
 def vq_quantize(z, codebook):
     raise todo()
@@ -942,6 +1022,15 @@ ref: day14
 不管复现哪篇论文，新模型接上 loss 以后，第一件事都是在一个 batch 上过拟合。这个循环要能随手写出来。
 --- prompt
 写 `overfit_one_batch(model, x, y, steps=300, lr=1e-2)`：用 AdamW 和 `F.cross_entropy`，在同一个 `(x, y)` 上训练 `steps` 步，返回每一步的 loss 列表（Python float）。
+--- above
+# 上文：刚写完的一个小分类模型，和从训练集里取出来的一个 batch
+clf = nn.Sequential(nn.Linear(6, 16), nn.ReLU(), nn.Linear(16, 3))   # 6 维特征 → 3 个类
+x_batch = torch.randn(12, 6)             # 12 个样本，每个 6 维
+y_batch = torch.randint(0, 3, (12,))     # 每个样本的类别编号：0、1 或 2
+--- below
+losses = overfit_one_batch(clf, x_batch, y_batch, steps=200)
+print("一共", len(losses), "个 loss，瞎猜时约为 ln 3 =", round(math.log(3), 4))
+print("每 50 步看一次:", [round(v, 4) for v in losses[::50]], " 最后一步:", round(losses[-1], 4))
 --- starter
 def overfit_one_batch(model, x, y, steps=300, lr=1e-2):
     raise todo()

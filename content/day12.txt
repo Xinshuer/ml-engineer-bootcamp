@@ -223,6 +223,18 @@ FastSpeech 2 这类非自回归 TTS 的核心就是这一步：文本只有 20 �
 例：3 个字的特征是 [1], [2], [3]，durations = [2, 0, 3] → [1, 1, 3, 3, 3]。
 
 可以用 `repeat_interleave`；batch 维用 Python 循环就行。
+--- above
+# 上文：文本编码器给每个字一个向量，duration 预测器说每个字念几帧
+# （真实的 C 是 192，这里只用 2；数字取得简单，方便看出复制）
+enc_out = torch.tensor([[[1., 1.], [2., 2.], [3., 3.], [4., 4.]],
+                        [[5., 5.], [6., 6.], [7., 7.], [0., 0.]]])   # (2, 4, 2)：2 句，每句 4 个位置
+dur = torch.tensor([[1, 2, 0, 2],     # 第 0 句：第 2 个字是标点，念 0 帧
+                    [2, 1, 1, 0]])    # 第 1 句只有 3 个字，最后一位是 pad，也是 0 帧
+--- below
+frames = length_regulator(enc_out, dur)
+print("输出 shape:", tuple(frames.shape))
+print("每帧的第 0 个通道:", frames[..., 0].tolist())
+print("max_len=3 时:", length_regulator(enc_out, dur, max_len=3)[..., 0].tolist())
 --- starter
 def length_regulator(x, durations, max_len=None):
     """x: (B, Tt, C)   durations: (B, Tt) int64
@@ -284,6 +296,16 @@ ref: day12
 
 1. `duration_to_boundaries(durations)`：(Tt,) → (Tt, 2)。第 i 行是第 i 个字的 [起始帧, 结束帧)，左闭右开：包含起始帧，不包含结束帧。例：[2, 0, 3] → [[0, 2], [2, 2], [2, 5]]（duration 为 0 的字起止相同）。
 2. `frame_to_text_index(durations, n_frames)`：返回 (n_frames,)，第 f 个数是「第 f 帧属于第几个字」。例：[2, 0, 3]，n_frames=5 → [0, 0, 2, 2, 2]。`n_frames` 不会超过 duration 之和；比它小时只保留前 `n_frames` 个。
+--- above
+# 上文：强制对齐工具（比如 MFA）给出一句话里每个音素念几帧
+phonemes = ["n", "i", "h", "ao", ","]    # 「你好，」的音素，最后是逗号
+dur = torch.tensor([3, 4, 2, 5, 0])      # 逗号不发音，0 帧
+mel_frames = 14                          # 这句话的 mel 一共 14 帧
+--- below
+print("边界 [起始帧, 结束帧):", duration_to_boundaries(dur).tolist())
+owner = frame_to_text_index(dur, mel_frames)
+print("每帧属于第几个音素:", owner.tolist())
+print("每帧的音素:", [phonemes[i] for i in owner.tolist()])
 --- starter
 def duration_to_boundaries(durations):
     """(Tt,) -> (Tt, 2)，每行 [起始帧, 结束帧)。
@@ -338,6 +360,15 @@ Tacotron 2 这类自回归模型一帧一帧地生成 mel。训练时直接喂�
 - 也就是在时间维（dim=1）上整体右移一位，目标的最后一帧被挤掉
 
 例：目标帧是 [a, b, c] → 输入是 [0, a, b]。
+--- above
+# 上文：训练 Tacotron 2 时，一个 batch 的目标 mel（从真实录音算出来的）
+target_mel = torch.tensor([[[1., 1.], [2., 2.], [3., 3.], [4., 4.]],
+                           [[5., 5.], [6., 6.], [7., 7.], [8., 8.]]])   # (2, 4, 2)：2 句，每句 4 帧，n_mels=2（真实是 80）
+--- below
+dec_in = make_decoder_inputs(target_mel)
+print("shape:", tuple(dec_in.shape))
+print("目标 mel   第 0 句:", target_mel[0].tolist())
+print("解码器输入 第 0 句:", dec_in[0].tolist())
 --- starter
 def make_decoder_inputs(mel):
     """mel: (B, Tm, n_mels) 是目标。
@@ -381,6 +412,15 @@ ref: day12
 例：lengths = [3, 5]，max_len = 5 → [[0, 0, 1, 0, 0], [0, 0, 0, 0, 1]]。
 
 要 float，因为 BCE loss 要求标签是浮点数。
+--- above
+# 上文：一个 batch 里 3 句话的真实 mel 帧数
+mel_lengths = torch.tensor([6, 4, 2])    # 每句真实有几帧
+padded_len = 6                           # 补 pad 以后，每句都是 6 帧
+--- below
+stop = make_stop_labels(mel_lengths, padded_len)
+print("dtype:", stop.dtype)
+for n, row in zip(mel_lengths.tolist(), stop.tolist()):
+    print("长度", n, "->", row)
 --- starter
 def make_stop_labels(lengths, max_len):
     """lengths: (B,) 真实帧数。
@@ -424,6 +464,16 @@ ref: day12
 - 分母是「有效帧数 × n_mels」，也就是真正参与计算的元素个数
 
 改动 pad 位置上的 target，结果不能变。不要用 `F.l1_loss`，它会把 pad 也平均进去。
+--- above
+# 上文：解码器对一个 batch 预测的 mel，和真实的 mel；第 1 句短，后面补了 pad
+pred_mel = torch.zeros(2, 3, 4)                              # 2 句，每句 3 帧（含 pad），n_mels=4
+true_mel = torch.full((2, 3, 4), 0.5)                        # 真实 mel：有效的地方都是 0.5
+true_mel[1, 2] = 9.0                                         # 第 1 句的第 2 帧是 pad，里面是垃圾值
+mel_mask = torch.tensor([[1, 1, 1],
+                         [1, 1, 0]])                         # (2, 3)：有效帧是 1，pad 帧是 0
+--- below
+print("带 mask 的 loss:", round(masked_mel_loss(pred_mel, true_mel, mel_mask).item(), 4))
+print("对比 F.l1_loss（pad 也算进去了）:", round(F.l1_loss(pred_mel, true_mel).item(), 4))
 --- starter
 def masked_mel_loss(pred, target, mask):
     """pred/target: (B, T, n_mels)   mask: (B, T)，有效帧是 1。
@@ -477,6 +527,17 @@ duration 的分布是长尾的：大多数音素 3–10 帧，句末停顿可能
 - 再只在有效位上算 MSE：平方误差之和 ÷ 有效位的个数
 
 2. `duration_from_log(log_pred)`：推理时的逆变换。`exp(log_pred) − 1`，四舍五入，小于 0 的变成 0，返回 int64。
+--- above
+# 上文：duration 预测器对 2 句话的输出（log 域），和对齐工具给的真实帧数
+dur_log_pred = torch.tensor([[1.1, 1.8, 0.2, 2.0],
+                             [1.4, 1.3, 0.6, -1.0]])   # 模型的输出，可以是负数
+true_dur = torch.tensor([[2, 5, 0, 7],
+                         [3, 3, 1, 0]])                # 真实帧数（整数）
+text_mask = torch.tensor([[1., 1., 1., 1.],
+                          [1., 1., 1., 0.]])           # 第 1 句最后一位是 pad
+--- below
+print("duration loss:", round(duration_loss(dur_log_pred, true_dur, text_mask).item(), 4))
+print("推理时变回帧数:", duration_from_log(dur_log_pred).tolist())
 --- starter
 def duration_loss(log_pred, target_dur, mask):
     """log_pred: (B, Tt)   target_dur: (B, Tt) 整数   mask: (B, Tt)
@@ -530,6 +591,16 @@ ref: day12
 - 返回 (B,) 的 int64：每句预测的总 mel 帧数
 
 先用 `duration_from_log` 变回整数帧数（环境里已经有了，就是上一题的函数），pad 位的帧数不能算进去。
+--- above
+# 上文：推理时，duration 预测器对一个 batch 的输出（log 域）
+dur_log_pred = torch.tensor([[2.0, 2.3, 1.6, 2.6],
+                             [1.4, 0.9, 3.0, 2.5]])   # pad 位上模型也会随便输出一个数
+text_mask = torch.tensor([[1, 1, 1, 1],
+                          [1, 1, 0, 0]])              # 第 1 句只有 2 个字，后面 2 位是 pad
+--- below
+mel_len = predict_mel_len(dur_log_pred, text_mask)
+print("每句的 mel 帧数:", mel_len.tolist())
+print("大约几秒（hop=256，22050Hz）:", [round(n * 256 / 22050, 2) for n in mel_len.tolist()])
 --- starter
 def predict_mel_len(log_pred, mask):
     """(B, Tt) -> (B,)：每句预测的总帧数，只数有效的文本位。"""
@@ -574,6 +645,15 @@ ref: day12
  [0, 0, 1]]
 ```
 可以直接调用 d12-02 的 `frame_to_text_index`（环境里已经有了）。
+--- above
+# 上文：对齐工具给的一句话 4 个音素的 duration，这句 mel 一共 6 帧
+dur = torch.tensor([1, 3, 0, 2])      # 第 2 个音素不发音，0 帧
+mel_frames = 6
+--- below
+A = alignment_matrix(dur, mel_frames)
+for f, row in enumerate(A.long().tolist()):
+    print(f"第 {f} 帧:", row)
+print("每列的和:", A.sum(0).tolist())
 --- starter
 def alignment_matrix(durations, n_frames):
     """durations: (Tt,) -> (n_frames, Tt) 的 0/1 矩阵，A[f, i] = 1 表示第 f 帧来自第 i 个字。"""
@@ -617,6 +697,19 @@ ref: day12
 每一步：调用 `step_fn(prev)` → 记下新帧 → 把新帧接到 `prev` 后面 → 如果 `sigmoid(stop_logit) > stop_thresh` 就停。最多调用 `max_steps` 次。
 
 返回生成的 mel，shape (1, T, n_mels)，T 是生成的帧数。**不含** go 帧；触发停止的那一帧要保留。
+--- above
+# 上文：Tacotron 2 解码器的一步：看已经生成的帧，给出下一帧和 stop logit
+# 这里用一个假的解码器代替真网络：下一帧 = 最后一帧 + 1；已有 5 帧（含 go 帧）时说「停」
+n_mels = 2                                    # 真实是 80，这里用 2 方便看
+def decoder_step(prev):                       # prev: (1, t, n_mels)
+    mel_next = prev[:, -1] + 1                # (1, n_mels)
+    stop_logit = torch.tensor([5.0]) if prev.size(1) >= 5 else torch.tensor([-5.0])   # (1,)
+    return mel_next, stop_logit
+--- below
+generated = ar_decode(decoder_step, n_mels, max_steps=50)
+print("shape:", tuple(generated.shape))
+print("生成的帧:", generated[0].tolist())
+print("max_steps=3 时:", tuple(ar_decode(decoder_step, n_mels, max_steps=3).shape))
 --- starter
 @torch.no_grad()
 def ar_decode(step_fn, n_mels, max_steps, stop_thresh=0.5):
@@ -684,6 +777,15 @@ ref: day12
 - 波形是单声道，写成 (batch, 采样点数)，不要声道维
 
 可以写算式，比如 `(4, 160 * 256)`。
+--- above
+# 上文：模型配置文件里的几个数，每一步的 shape 都由它们决定
+batch, n_chars, C, n_mels = 4, 20, 192, 80
+frames_per_char, hop, sample_rate = 8, 256, 22050
+--- below
+# 按顺序取出字典里的 6 个 shape
+ids_shape, enc_shape, dur_shape, lr_shape, mel_shape, wave_shape = TTS_SHAPES.values()
+print("mel 帧数:", mel_shape[1], "| 波形采样点数:", wave_shape[1])
+print("每句话大约", round(wave_shape[1] / sample_rate, 2), "秒")
 --- starter
 TTS_SHAPES = {
     "文本 token id":            None,   # batch=4，每句 20 个字符
@@ -742,6 +844,19 @@ TTS 训练脚本里最常见的三个「不报错」的 bug：解码器输入没
 - 这里用全 0 代替模型的 mel 预测，所以 mel loss 是拿 `torch.zeros_like(mel)` 和 `mel` 比
 
 前面写过的 `make_decoder_inputs`、`masked_mel_loss`、`duration_loss` 在环境里都有，可以直接调用。
+--- above
+# 上文：训练时的一个 batch：目标 mel、真实帧数、duration 的预测和标签
+target_mel = torch.tensor([[[1.], [2.], [3.], [4.]],
+                           [[5.], [6.], [0.], [0.]]])   # (2, 4, 1)，n_mels=1；第 1 句只有 2 帧，后面是 pad
+mel_lengths = torch.tensor([4, 2])                      # 每句的真实帧数
+true_dur = torch.tensor([[1, 2, 1], [1, 1, 0]])         # 每个字念几帧；第 1 句最后一位是 pad
+dur_log_pred = torch.log(true_dur.float() + 1)          # 假设有效位上 duration 预测器全猜对了
+dur_log_pred[1, 2] = 1.5                                # pad 位上模型随便输出了一个数
+text_mask = torch.tensor([[1., 1., 1.], [1., 1., 0.]])  # 有效的文本位是 1
+--- below
+dec_in, mask, mel_l, dur_l = tts_step_buggy(target_mel, mel_lengths, dur_log_pred, true_dur, text_mask)
+print("解码器输入:", dec_in[..., 0].tolist())
+print("mel loss:", round(mel_l.item(), 4), "| duration loss:", round(dur_l.item(), 4))
 --- starter
 def tts_step_buggy(mel, lengths, log_dur_pred, durations, dur_mask):
     T = mel.size(1)
@@ -910,6 +1025,17 @@ length regulator 是非自回归 TTS 里把文本长度变成 mel 长度的那�
 - 返回 (B, Tm, C)：每个字的特征向量按 duration 重复，duration 为 0 的字跳过
 - Tm：传了 `max_len` 就等于 `max_len`（太长的截掉）；没传就等于 batch 里 duration 之和的最大值
 - 总帧数不到 Tm 的句子，右边补 0
+--- above
+# 上文：FastSpeech 2 里，文本编码器的输出和每个字的 duration
+enc_out = torch.tensor([[[1., 1.], [2., 2.], [3., 3.]],
+                        [[4., 4.], [5., 5.], [6., 6.]]])   # (2, 3, 2)：2 句，每句 3 个字，C=2
+dur = torch.tensor([[2, 1, 2],
+                    [1, 0, 1]])                           # 每个字念几帧
+--- below
+out = length_regulator(enc_out, dur)
+print("输出 shape:", tuple(out.shape))
+print("每帧的第 0 个通道:", out[..., 0].tolist())
+print("max_len=3 时:", length_regulator(enc_out, dur, max_len=3)[..., 0].tolist())
 --- starter
 def length_regulator(x, durations, max_len=None):
     raise todo()
@@ -969,6 +1095,19 @@ ref: day12
 - `step_fn(prev)` 返回 `(mel_next, stop_logit)`：`prev` 是 (1, t, n_mels)，第一帧是全 0 的 go 帧（第一次调用时 t = 1）；`mel_next` 是 (1, n_mels)；`stop_logit` 是 (1,)
 - 每一步把新帧接到 `prev` 后面；`sigmoid(stop_logit) > stop_thresh` 时停；最多调用 `max_steps` 次
 - 返回 (1, T, n_mels)：生成的所有帧，不含 go 帧，含触发停止的那一帧
+--- above
+# 上文：自回归解码器的一步：看已经生成的帧，给出下一帧和 stop logit
+# 这里用一个假的解码器代替真网络：下一帧 = 最后一帧 × 2 + 1；已有 3 帧（含 go 帧）时说「停」
+n_mels = 2
+def fake_step(prev):                          # prev: (1, t, n_mels)
+    mel_next = prev[:, -1] * 2 + 1            # (1, n_mels)
+    stop_logit = torch.tensor([3.0]) if prev.size(1) >= 3 else torch.tensor([-3.0])   # (1,)
+    return mel_next, stop_logit
+--- below
+generated = ar_decode(fake_step, n_mels, max_steps=100)
+print("shape:", tuple(generated.shape))
+print("生成的帧:", generated[0].tolist())
+print("max_steps=2 时:", tuple(ar_decode(fake_step, n_mels, max_steps=2).shape))
 --- starter
 @torch.no_grad()
 def ar_decode(step_fn, n_mels, max_steps, stop_thresh=0.5):

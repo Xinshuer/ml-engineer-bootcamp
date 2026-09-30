@@ -374,6 +374,14 @@ Write `model_bytes(model)`. It returns a tuple `(param_bytes, buffer_bytes)`:
 - `buffer_bytes`: the bytes of all buffers added up
 
 Compute each tensor's bytes with `numel() * element_size()`; do not hard-code 4 bytes. Count a shared weight only once (`model.parameters()` already removes duplicates).
+--- above
+# Where the input comes from: before deployment, you build the model (or load it from a checkpoint)
+# a small classifier with a BatchNorm inside
+clf = nn.Sequential(nn.Linear(32, 64), nn.BatchNorm1d(64), nn.ReLU(), nn.Linear(64, 3))
+--- below
+p, b = model_bytes(clf)
+print("parameters:", p, "bytes  buffers:", b, "bytes")
+print("after half() (parameters, buffers):", model_bytes(clf.half()))
 --- starter
 def model_bytes(model):
     """Return (bytes of the parameters, bytes of the buffers)."""
@@ -446,6 +454,13 @@ precision   weights  grads  master  adam (m + v)
 - `total` is the sum of the first four.
 - Any other `precision` must `raise ValueError`.
 - Example: `train_state_bytes(7_000_000_000, "fp32")["total"] == 112_000_000_000`
+--- above
+# Where the input comes from: the parameter count is in the model's name (1B, 7B...), or you count it with model.parameters()
+n = 1_000_000_000   # a 1B (one billion parameters) model: 1 byte per parameter is 1 GB
+--- below
+for p in ["fp32", "mixed", "bf16"]:
+    r = train_state_bytes(n, p)
+    print(p, "(GB):", {k: v / 1e9 for k, v in r.items()})
 --- starter
 def train_state_bytes(n_params, precision):
     """Bytes of weights, grads, master weights and Adam states when training with Adam, plus the total."""
@@ -529,6 +544,17 @@ Write `max_micro_batch(gpu_bytes, static_bytes, seq, hidden, n_layers, bytes_per
 - return an int
 
 Example: a 24 GB GPU (`24_000_000_000`), static part `19_327_352_832` (about 1.2 billion parameters, mixed precision + Adam), seq=2048, hidden=2048, 24 layers, bf16 (2 bytes) → returns 1.
+--- above
+# Where the input comes from: a 16 GB GPU that has to train a 350-million-parameter model (mixed precision + Adam)
+gpu_mem = 16_000_000_000
+static_mem = 350_000_000 * 16                  # weights, grads, master weights, Adam states: 16 bytes per parameter
+seq_len, hidden_dim, layers = 1024, 1024, 24   # 1024 tokens per sample, hidden size 1024, 24 layers
+bf16 = 2                                       # activations are stored in bf16, 2 bytes per number
+--- below
+print("16 tensors per layer:", max_micro_batch(gpu_mem, static_mem, seq_len, hidden_dim, layers, bf16))
+print("twice the sequence length:", max_micro_batch(gpu_mem, static_mem, 2 * seq_len, hidden_dim, layers, bf16))
+print("with activation checkpointing, 1 per layer:",
+      max_micro_batch(gpu_mem, static_mem, seq_len, hidden_dim, layers, bf16, tensors_per_layer=1))
 --- starter
 def max_micro_batch(gpu_bytes, static_bytes, seq, hidden, n_layers, bytes_per_value, tensors_per_layer=16):
     """After the static part, how many samples' activations fit in the rest of the memory."""
@@ -581,6 +607,14 @@ The `train_epoch` below trains fine, but it stores losses with their graphs in a
 
 - return `(losses, mean_loss)`: `losses` is the loss of each batch, a list of Python `float`s; `mean_loss` is their mean, also a Python `float`
 - do not change the training steps (zero_grad, backward, step)
+--- above
+# Where the input comes from: the training script of a small regression model; each epoch goes through these batches
+net = nn.Sequential(nn.Linear(3, 8), nn.ReLU(), nn.Linear(8, 1))
+optimizer = torch.optim.SGD(net.parameters(), lr=0.1)
+train_batches = [(torch.randn(5, 3), torch.randn(5, 1)) for _ in range(3)]   # 3 batches: x is (5, 3), y is (5, 1)
+--- below
+losses, mean_loss = train_epoch(net, optimizer, train_batches)
+print("losses holds:", [type(v).__name__ for v in losses], " mean_loss is:", type(mean_loss).__name__)
 --- starter
 def train_epoch(model, opt, batches):
     losses = []
@@ -762,6 +796,13 @@ Write `benchmark(fn, warmup=3, runs=10, clock=time.perf_counter, sync=None)`. It
 4. Return the median of the `runs` times (you may use `statistics.median`).
 
 Always read the time through the `clock` argument, never call `time.perf_counter()` directly: the tests pass in a fake clock so the results are the same every time.
+--- above
+# Where the input comes from: timing one forward pass of a model; the course's FakeGPU stands in for a real GPU (fake clock)
+# gpu.fn() is like model(x) (only queued); gpu.sync() is like torch.cuda.synchronize(); gpu.clock() reads the time
+gpu = FakeGPU([9.0, 5.0, 1.2, 1.0, 1.1, 3.5, 1.0])   # seconds per call: the first two are slow, the 6th gets interrupted
+--- below
+t = benchmark(gpu.fn, warmup=2, runs=5, clock=gpu.clock, sync=gpu.sync)
+print("median:", round(t, 4), "s; fn was called", gpu.calls, "times")
 --- starter
 import statistics
 import time
@@ -835,6 +876,16 @@ The tests check three things:
 - the output is the same (the blocks contain dropout, so the tests fix the random seed)
 - when the input x needs no gradients, the parameters' gradients are exactly the same as without checkpointing
 - the bytes saved for backward drop by more than half (measured with `saved_bytes`)
+--- above
+# Where the input comes from: the model's blocks sit in an nn.ModuleList, and h is a batch going into the first one
+layers = nn.ModuleList([nn.Sequential(nn.Linear(8, 32), nn.GELU(), nn.Linear(32, 8)) for _ in range(3)])
+h = torch.randn(4, 8)   # 4 samples, 8 dims each; this is data, it needs no gradients
+# saved_bytes (card "Activations grow with batch and length") returns (output, bytes saved for backward)
+--- below
+plain_out, plain_n = saved_bytes(nn.Sequential(*layers), h, skip=layers.parameters())   # plain forward
+out, ckpt_n = saved_bytes(forward_checkpointed, layers, h, skip=layers.parameters())
+print("output shape:", tuple(out.shape), " same as the plain forward:", torch.allclose(out, plain_out))
+print("bytes saved for backward: plain forward", plain_n, " with checkpointing", ckpt_n)
 --- starter
 from torch.utils.checkpoint import checkpoint
 
@@ -963,6 +1014,13 @@ exam: yes
 A timing function is the foundation of performance work: every "how much faster" rests on it. Writing it from blank, closed book, shows you remember warm-up, synchronization and the median.
 --- prompt
 Write `benchmark(fn, warmup=3, runs=10, clock=time.perf_counter, sync=None)` from blank: warm up `warmup` times without timing; then time `runs` calls one by one; when `sync` is not `None`, call it before reading the start time and before reading the end time; read the time only through `clock`; return the median time in seconds.
+--- above
+# Where the input comes from: timing one inference call on a CPU; the course's FakeGPU stands in (fake clock)
+# async_=False works like a CPU: when cpu.fn() returns the work is done, no sync needed; cpu.clock() reads the time
+cpu = FakeGPU([30.0, 2.0, 2.4, 2.1, 9.0], async_=False)   # seconds per call: the first is very slow, the last one is interrupted
+--- below
+t = benchmark(cpu.fn, warmup=1, runs=4, clock=cpu.clock)
+print("median:", round(t, 4), "s; fn was called", cpu.calls, "times")
 --- starter
 import statistics
 import time
@@ -1029,6 +1087,13 @@ exam: yes
 "How much GPU memory does full fine-tuning of a 7B model need?" comes up in interviews all the time. Write it once closed book to check that you remember the bytes per parameter for all three precisions.
 --- prompt
 Write `train_state_bytes(n_params, precision)` from blank; the optimizer is Adam. Return a dict (bytes, ints) with the keys `"weights"`, `"grads"`, `"master"`, `"adam"`, `"total"`; `precision` is `"fp32"`, `"mixed"` or `"bf16"`, and any other value must `raise ValueError`. The bytes of each part for each precision are for you to remember.
+--- above
+# Where the input comes from: the interview question "can you fully fine-tune an 8B model on one 80 GB GPU?"
+n = 8_000_000_000         # 8B = 8 billion parameters
+gpu_mem = 80_000_000_000  # one 80 GB GPU (an A100 80GB, for example)
+--- below
+for p in ["fp32", "mixed", "bf16"]:
+    print(p, "+ Adam fits (activations not counted):", train_state_bytes(n, p)["total"] <= gpu_mem)
 --- starter
 def train_state_bytes(n_params, precision):
     raise todo()

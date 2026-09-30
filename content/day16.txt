@@ -409,6 +409,17 @@ cards: 不报错的广播：(B,) 和 (B, 1)
 `regression_loss(model, x, y)`：`model(x)` 输出 (B, 1)，`y` 是 (B,)。要返回一个标量：每个样本的预测减去**它自己的**标签，平方，再取平均（MSE）。
 
 现在的代码能跑，但算错了。改好它。建议顺手加一行 assert，让 shape 不一样时直接报错。
+--- above
+# 上文：一个回归模型（用 3 个特征预测 1 个数）和一小批 4 个样本
+net = nn.Linear(3, 1)          # 最后一层只输出 1 个数，所以整批的输出是 (4, 1)
+nn.init.ones_(net.weight)      # 手动设好权重全是 1、偏置是 0：预测值 = 3 个特征加起来
+nn.init.zeros_(net.bias)
+feats = torch.randn(4, 3)      # 4 个样本，每个 3 个特征
+targets = feats.sum(dim=1)     # 标签也是 3 个特征加起来，shape 是 (4,)：模型每个都预测对了
+--- below
+loss = regression_loss(net, feats, targets)
+print("模型输出:", tuple(net(feats).shape), "  标签:", tuple(targets.shape))
+print("loss（每个都预测对了，应该是 0）:", round(loss.item(), 4))
 --- starter
 def regression_loss(model, x, y):
     """model(x): (B, 1)   y: (B,)   返回标量 MSE"""
@@ -485,6 +496,16 @@ sizes = {}
 assert_shape(logits, "B,T,V", sizes)
 assert_shape(labels, "B,T", sizes)   # 这里的 B 和 T 必须和 logits 的一样
 ```
+--- above
+# 上文：训练语言模型时的一批 logits 和标签，算 loss 之前先检查 shape
+logits = torch.zeros(2, 5, 10)                 # 2 句话，每句 5 个 token，每个 token 给词表里 10 个词各打一个分
+labels = torch.zeros(2, 5, dtype=torch.long)   # 每个 token 的正确答案（词的编号）
+known = {}                                     # 名字 -> 大小，几次检查共用这一个 dict
+--- below
+out = assert_shape(logits, "B,T,V", known)
+assert_shape(labels, "B,T", known)
+print("返回的就是 logits 本身:", out is logits)
+print("记下的大小:", known)
 --- starter
 def assert_shape(x, spec, sizes):
     """检查 x.shape 符合 spec（比如 "B,T,C"）：符合就返回 x，否则 raise ValueError。
@@ -596,6 +617,15 @@ ViT、DiT 这类模型要把特征图 (B, C, H, W) 摊成 token 序列 (B, H*W, 
 - `flatten_tokens(t)`：(B, N, C) → (B*N, C)，把所有 token 排成一行一个（比如要给每个 token 单独算 loss 时）。第 `b*N + n` 行是 `t[b, n]`。
 
 现在两个函数连起来用不报错，因为 reshape 出来的张量是连续的。等你修好 `image_to_tokens`，它的输出就不连续了，`flatten_tokens` 里的 view 会开始报错。两个都改好。
+--- above
+# 上文：ViT 里图片经过卷积得到的特征图 (B, C, H, W)，下一步要摊成 token
+feat = torch.arange(24.0).view(2, 3, 2, 2)   # 2 张图，3 个通道，2×2 个像素；里面的数就是 0 到 23 的编号
+# 第 0 张图：通道 0 是 [[0, 1], [2, 3]]，通道 1 是 [[4, 5], [6, 7]]，通道 2 是 [[8, 9], [10, 11]]
+--- below
+tokens = image_to_tokens(feat)
+print("tokens:", tuple(tokens.shape), " 第 0 张图:", tokens[0].tolist())
+rows = flatten_tokens(tokens)
+print("rows:", tuple(rows.shape), " 第 5 行（第 1 张图、像素 (0, 1)）:", rows[5].tolist())
 --- starter
 def image_to_tokens(x):
     """(B, C, H, W) -> (B, H*W, C)"""
@@ -724,6 +754,14 @@ cards: register_buffer：跟着模块一起搬家; 设备：新建的张量要�
 现在的写法在 CPU + float32 上结果是对的，但每次 forward 都在 CPU 上新建一个 float32 的 mask。改成：在 `__init__` 里按 max_len 建一次，用 `register_buffer` 登记（建议加 `persistent=False`），forward 里切出 `[:T, :T]` 来用。
 
 检查会把模块换成 float64、bfloat16，再搬到 meta 设备（代替 GPU）上跑。
+--- above
+# 上文：attention 算出的分数 (B, T, T)，用 bf16 混合精度训练时是 bfloat16
+att_scores = torch.zeros(1, 3, 3, dtype=torch.bfloat16)   # 1 句话、3 个 token；分数全是 0，方便看 mask 加上去以后的样子
+--- below
+causal = CausalMask(max_len=8).to(torch.bfloat16)   # 整个模型换成 bf16 时，这一层也跟着换
+out = causal(att_scores)
+print("输出的 dtype:", out.dtype, "  登记的 buffer 个数:", len(list(causal.buffers())))
+print(out[0].tolist())
 --- starter
 class CausalMask(nn.Module):
     def __init__(self, max_len):
@@ -838,6 +876,17 @@ cards: dtype：long 标签、numpy 的 float64、整数除法; 读懂 PyTorch �
 - `accuracy(logits, y)`：`logits` 是 (B, C)，`y` 是 (B,)。返回 Python float：预测对的比例，在 0 到 1 之间。
 
 一共三处 bug，都改好。
+--- above
+# 上文：用 numpy / pandas 读进来的一小批数据，和一个还没训练的分类器
+import numpy as np
+feats_np = np.array([[0.5, 1.0], [2.0, -1.0], [-1.5, 0.3], [0.2, -0.7]])   # 4 个样本，每个 2 个特征；numpy 默认是 float64
+label_list = [0, 2, 1, 0]                                                   # 每个样本属于第几类（一共 3 类）
+classifier = nn.Linear(2, 3)                                                # 2 个特征进，3 个类别的分数出
+--- below
+x, y = make_batch(feats_np, label_list)
+print("x:", x.dtype, "  y:", y.dtype)
+logits = classifier(x)
+print("loss:", round(F.cross_entropy(logits, y).item(), 4), "  准确率:", accuracy(logits, y))
 --- starter
 def make_batch(features, labels):
     x = torch.from_numpy(features)
@@ -913,6 +962,20 @@ cards: 嵌套的 batch：递归走一遍 dict / list / tuple; 设备：新建的
 - 返回一个新的结构，不要改动传进来的 `batch`。
 
 检查用 meta 设备代替 GPU，所以没有 GPU 也能测。
+--- above
+# 上文：DataLoader 给出的一个 batch，张量装在 dict 和 list 里，还夹着字符串和数字
+batch_cpu = {
+    "input_ids": torch.tensor([[11, 25, 3], [7, 42, 0]]),              # 2 句话的 token id：long
+    "mask": torch.tensor([[True, True, True], [True, True, False]]),   # 哪些位置是真 token：bool
+    "pixels": torch.randn(2, 3, 4, 4),                                 # 2 张 3 通道 4×4 的小图：float32
+    "boxes": [torch.rand(1, 4), torch.rand(3, 4)],                     # 每张图的框数不一样，只好放进 list：float32
+    "info": {"lengths": [3, 2], "names": ("cat.jpg", "dog.jpg")},      # 不是张量
+}
+--- below
+out = move_to(batch_cpu, "meta", float_dtype=torch.float16)   # "meta" 设备代替 GPU，没有 GPU 也能试
+for key in ["input_ids", "mask", "pixels"]:
+    print(key, "->", out[key].device, out[key].dtype, "  原来:", batch_cpu[key].device, batch_cpu[key].dtype)
+print("boxes[1] ->", out["boxes"][1].device, out["boxes"][1].dtype, "  info ->", out["info"])
 --- starter
 def move_to(batch, device, float_dtype=None):
     """把嵌套 batch 里的每个张量搬到 device；给了 float_dtype 时只转换浮点张量。"""
@@ -1027,6 +1090,21 @@ cards: forward hook：让每一层报出输出 shape; 读懂 PyTorch 报错：�
 - 不管成功还是报错，返回前都要把所有 hook 取下来。
 
 （输出不是张量的层今天不考虑。）
+--- above
+# 上文：一个刚写好的小 CNN，一跑就报 shape 错，想知道崩在哪一层
+cnn = nn.Sequential(
+    nn.Conv2d(3, 4, kernel_size=3, padding=1),
+    nn.ReLU(),
+    nn.MaxPool2d(2),
+    nn.Flatten(),
+    nn.Linear(4 * 8 * 8, 10),
+)
+images = torch.randn(2, 3, 8, 8)   # 2 张 3 通道 8×8 的小图
+--- below
+records, error = trace_shapes(cnn, images)
+for name, shape in records:
+    print(repr(name), shape)
+print("error:", repr(error))
 --- starter
 def trace_shapes(model, x):
     """跑一次 model(x)，返回 (records, error)。
@@ -1123,6 +1201,19 @@ cards: forward hook：让每一层报出输出 shape
 - `records`：每个叶子模块每跑一次记一条 `(name, tuple(output.shape))`，`name` 来自 `model.named_modules()`，按运行顺序。
 - `error`：正常时是 `None`；forward 报错时是那个异常对象（接住，不要抛出）。
 - 返回前取下所有 hook，报错时也要取。
+--- above
+# 上文：一个分成两段的小 MLP，想看每一层输出的 shape
+mlp = nn.Sequential(
+    nn.Sequential(nn.Linear(6, 16), nn.GELU()),
+    nn.Sequential(nn.Linear(16, 16), nn.GELU()),
+    nn.Linear(16, 3),
+)
+feats = torch.randn(4, 6)   # 4 个样本，每个 6 个特征
+--- below
+records, error = trace_shapes(mlp, feats)
+for name, shape in records:
+    print(repr(name), shape)
+print("error:", repr(error))
 --- starter
 def trace_shapes(model, x):
     raise todo()
@@ -1209,6 +1300,19 @@ cards: 嵌套的 batch：递归走一遍 dict / list / tuple
 - 张量 `.to(device)`；给了 `float_dtype` 时只转换浮点张量，整数和 bool 张量保持原 dtype。
 - dict / list / tuple 任意嵌套，容器类型不变；其他东西原样返回。
 - 返回新的结构，不改动传进来的 `batch`。
+--- above
+# 上文：一个文本分类的 batch，训练循环的第一行要把它搬到 GPU
+batch_cpu = {
+    "input_ids": torch.tensor([[101, 7, 9, 102], [101, 5, 102, 0]]),   # 2 句话的 token id：long
+    "labels": torch.tensor([0, 1]),                                     # 类别标签：long
+    "extra": [torch.randn(2, 8), None],                                 # 额外特征：一个 float32 张量，一个缺失（None）
+    "texts": ("great movie", "boring"),                                 # 原文，不是张量
+}
+--- below
+out = move_to(batch_cpu, "meta", float_dtype=torch.bfloat16)   # "meta" 设备代替 GPU
+print("input_ids:", out["input_ids"].device, out["input_ids"].dtype, "  labels:", out["labels"].dtype)
+print("extra:", type(out["extra"]).__name__, out["extra"][0].device, out["extra"][0].dtype, out["extra"][1])
+print("texts:", out["texts"], "  原来的 input_ids 还在:", batch_cpu["input_ids"].device)
 --- starter
 def move_to(batch, device, float_dtype=None):
     raise todo()

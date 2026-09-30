@@ -272,6 +272,14 @@ Fill in the dictionary `FIVE_QUESTIONS` using the five questions. The concrete s
 - "loss terms" is an int.
 - For "condition injection", pick one of `"add"`, `"cross-attn"`, `"adaln"`, `"concat"`, `"none"`.
 - For "sampling", pick one of `"single"`, `"autoregressive"`, `"iterative-denoise"`.
+--- above
+# Where the input comes from: the paper's codebook size K; the VQ-VAE paper uses 512
+K = 512   # every discrete code is an integer id from 0 to 511
+--- below
+images = torch.randn(FIVE_QUESTIONS["input shape"])            # fake images with the shape you wrote
+codes = torch.randint(0, K, FIVE_QUESTIONS["latent shape"])     # fake codes with the shape you wrote
+print("one image:", images[0].numel(), "floats → after encoding:", codes[0].numel(), "integer ids")
+print("first 5 codes in row 1 of image 1:", codes[0, 0, :5].tolist())
 --- starter
 FIVE_QUESTIONS = {
     "input shape":          None,   # a tuple: batch 8, RGB, 64x64
@@ -335,6 +343,15 @@ Write `smoke_test(model, *input_shapes, expect_shape=None)`:
 5. If everything passes, return `True`.
 
 Example: `smoke_test(nn.Linear(4, 3), (2, 4), expect_shape=(2, 3))` returns True. For a model with two inputs, pass two shapes: `smoke_test(model, (2, 3), (2, 3))`.
+--- above
+# Where the input comes from: a small model you just wrote (16 features in, scores for 10 classes out)
+net = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 10))
+--- below
+print("right shape, no nan:", smoke_test(net, (4, 16), expect_shape=(4, 10)))
+try:
+    smoke_test(net, (4, 16), expect_shape=(4, 5))      # the expected shape is wrong on purpose
+except AssertionError as err:
+    print("with a wrong expected shape:", err)
 --- starter
 def smoke_test(model, *input_shapes, expect_shape=None):
     """Run the forward pass once on random tensors and check:
@@ -412,6 +429,15 @@ Write `overfit_one_batch(model, x, y, steps=300, lr=1e-2)`:
 - Return the list of the losses of every step, as Python floats (use `loss.item()`).
 
 The grader uses a small 8 → 32 → 5 MLP and 16 examples, and wants the last loss below 0.01.
+--- above
+# Where the input comes from: a small classifier you just wrote, and one batch from the training set
+clf = nn.Sequential(nn.Linear(6, 16), nn.ReLU(), nn.Linear(16, 3))   # 6 features → 3 classes
+x_batch = torch.randn(12, 6)             # 12 examples, 6 features each
+y_batch = torch.randint(0, 3, (12,))     # the class id of each example: 0, 1 or 2
+--- below
+losses = overfit_one_batch(clf, x_batch, y_batch, steps=200)
+print(len(losses), "losses; a random guess gives about ln 3 =", round(math.log(3), 4))
+print("every 50 steps:", [round(v, 4) for v in losses[::50]], " last step:", round(losses[-1], 4))
 --- starter
 def overfit_one_batch(model, x, y, steps=300, lr=1e-2):
     """Train again and again on the same (x, y). Return the list of losses (floats).
@@ -479,6 +505,16 @@ Write `clip_and_report(model, max_norm)`:
 - Use `torch.nn.utils.clip_grad_norm_`: its return value is exactly the total norm before clipping (a 0-dimensional tensor).
 
 The grader uses an `nn.Linear(4, 2)`: all 8 weight gradients are 3 and the bias gradient is 0. The total norm before clipping is sqrt(8 × 9) = sqrt(72) ≈ 8.485; with `max_norm=1.0`, the norm after clipping should be exactly 1.
+--- above
+# Where the input comes from: a training step just ran loss.backward() and got a very large gradient
+layer = nn.Linear(3, 2)
+loss = (layer(torch.randn(8, 3)) * 50).pow(2).mean()    # a rather large loss
+loss.backward()                                          # fills layer.weight.grad and layer.bias.grad
+--- below
+before = clip_and_report(layer, max_norm=1.0)
+after = torch.cat([p.grad.flatten() for p in layer.parameters()]).norm()   # the total norm of all gradients
+print("total norm before clipping:", round(before, 2), " type:", type(before).__name__)
+print("total norm after clipping:", round(after.item(), 4))
 --- starter
 def clip_and_report(model, max_norm):
     """Clip the gradients and return the total gradient norm from **before** clipping (a float).
@@ -521,6 +557,16 @@ Inputs: `z` is (B, D), `codebook` is (K, D).
 Return `(z_q, indices)`: `z_q` is (B, D), `indices` is (B,) int64.
 
 Example: the codebook is `[[0, 0], [1, 1], [-1, 2]]` and the first row of z is `[0.1, 0.1]`. The nearest code is code 0, so `indices[0] == 0` and `z_q[0]` equals `[0, 0]`.
+--- above
+# Where the input comes from: the encoder's output vectors z_e, and a codebook of 4 learnable codes
+cb = torch.tensor([[0.0, 0.0], [2.0, 0.0], [0.0, 2.0], [2.0, 2.0]])    # codebook: K=4 codes, D=2 each
+z_e = torch.tensor([[0.2, -0.1], [1.8, 0.3], [0.4, 1.7], [1.2, 0.9]],
+                   requires_grad=True)                                  # encoder output: B=4 vectors
+--- below
+z_q, idx = vq_quantize(z_e, cb)
+print("chosen codes:", idx.tolist(), " values of z_q:", z_q.tolist())
+z_q.sum().backward()                   # can the gradient get through the quantization back to z_e?
+print("gradient of z_e:", z_e.grad.tolist())
 --- starter
 def vq_quantize(z, codebook):
     """z: (B, D)   codebook: (K, D)
@@ -584,6 +630,15 @@ Write `vq_loss(z, z_q_hard, beta=0.25)` and return the sum of these two terms:
 Example: z = [[1, 0]], e = [[0, 0]], β = 0.25. Codebook term = mean(1², 0²) = 0.5, commitment term = 0.25 × 0.5 = 0.125, total 0.625.
 
 The grader also checks where the gradients go, plus one counter-intuitive fact: after the straight-through step, the reconstruction error has no gradient to the codebook. That is exactly why the codebook term is needed.
+--- above
+# Where the input comes from: the encoder output z_e and its nearest codebook vectors e (no straight-through)
+z_e = torch.tensor([[0.5, 1.5], [2.0, -1.0]], requires_grad=True)     # encoder output (B=2, D=2)
+chosen = torch.tensor([[0.0, 1.0], [1.5, 0.0]], requires_grad=True)   # the chosen codebook vectors, e in the formulas (B=2, D=2)
+--- below
+loss = vq_loss(z_e, chosen, beta=0.25)
+loss.backward()
+print("loss:", round(loss.item(), 4), " gradient of e (codebook side):", chosen.grad.tolist())
+print("gradient of z_e (encoder side):", z_e.grad.tolist())
 --- starter
 def vq_loss(z, z_q_hard, beta=0.25):
     """z: encoder output (B, D) (with gradient)   z_q_hard: the chosen codebook vectors (B, D)
@@ -658,6 +713,13 @@ For each symptom in the dictionary `DIAGNOSIS`, fill in the most likely cause. P
 - `"tensors with graphs kept in a loop"`
 
 Greedy decoding means: at every step, pick the most likely token, with no randomness at all.
+--- above
+# Where the input comes from: the five usual causes of a broken training run (the task's exact strings)
+causes = ["model learns nothing", "lr too high or fp16 overflow", "label leakage",
+          "forgot model.eval", "tensors with graphs kept in a loop"]
+--- below
+print("symptoms filled in:", sum(v is not None for v in DIAGNOSIS.values()), "/ 5")
+print("causes not used yet (or misspelled):", [c for c in causes if c not in DIAGNOSIS.values()])
 --- starter
 # the possible causes (copy them, use each once):
 #   "model learns nothing"   "lr too high or fp16 overflow"   "label leakage"
@@ -720,6 +782,14 @@ loss = F.mse_loss(zq, data) + vq_loss(data, codebook[idx], beta=0.0)
 Return the list of the losses of every step (Python floats). `_toy_data`, `vq_quantize` and `vq_loss` are already defined (reference versions); just call them.
 
 The grader: the first loss should be > 5 (the codebook is near 0, the data is out at ±3), the last one < 0.03 (the codes reached the centres; only the noise is left).
+--- above
+# Where the input comes from: the provided _toy_data(): 64 one-dimensional points around -3, -1, 1 and 3
+points = _toy_data()     # (64, 1), 16 points per centre, sorted by centre
+--- below
+centres = points.view(4, 16).mean(1)       # the mean of each group of 16 points
+print("data:", tuple(points.shape), " mean of each group:", [round(v, 2) for v in centres.tolist()])
+losses = train_vq_toy()
+print("loss every 60 steps:", [round(v, 4) for v in losses[::60]], " last step:", round(losses[-1], 4))
 --- starter
 def train_vq_toy(steps=300, lr=1e-1):
     """Learn the 4 cluster centres with VQ.
@@ -895,6 +965,16 @@ Write `vq_quantize(z, codebook)`: `z` is (B, D), `codebook` is (K, D).
 Return `(z_q, indices)`:
 - `indices` is (B,) int64: for each row of z, the index of the nearest code in the codebook;
 - `z_q` is (B, D): its forward value equals the chosen codebook vectors, and in the backward pass the gradient goes to z unchanged (straight-through estimator).
+--- above
+# Where the input comes from: the encoder's output vectors z_e, and a codebook of 4 learnable codes
+cb = torch.tensor([[0.0, 0.0], [2.0, 0.0], [0.0, 2.0], [2.0, 2.0]])    # codebook: K=4 codes, D=2 each
+z_e = torch.tensor([[0.2, -0.1], [1.8, 0.3], [0.4, 1.7], [1.2, 0.9]],
+                   requires_grad=True)                                  # encoder output: B=4 vectors
+--- below
+z_q, idx = vq_quantize(z_e, cb)
+print("chosen codes:", idx.tolist(), " values of z_q:", z_q.tolist())
+z_q.sum().backward()                   # can the gradient get through the quantization back to z_e?
+print("gradient of z_e:", z_e.grad.tolist())
 --- starter
 def vq_quantize(z, codebook):
     raise todo()
@@ -942,6 +1022,15 @@ ref: day14
 Whatever paper you reproduce, once the new model is connected to its loss, the first thing you do is overfit one batch. You should be able to write this loop without thinking.
 --- prompt
 Write `overfit_one_batch(model, x, y, steps=300, lr=1e-2)`: with AdamW and `F.cross_entropy`, train `steps` steps on the same `(x, y)` and return the list of the losses of every step (Python floats).
+--- above
+# Where the input comes from: a small classifier you just wrote, and one batch from the training set
+clf = nn.Sequential(nn.Linear(6, 16), nn.ReLU(), nn.Linear(16, 3))   # 6 features → 3 classes
+x_batch = torch.randn(12, 6)             # 12 examples, 6 features each
+y_batch = torch.randint(0, 3, (12,))     # the class id of each example: 0, 1 or 2
+--- below
+losses = overfit_one_batch(clf, x_batch, y_batch, steps=200)
+print(len(losses), "losses; a random guess gives about ln 3 =", round(math.log(3), 4))
+print("every 50 steps:", [round(v, 4) for v in losses[::50]], " last step:", round(losses[-1], 4))
 --- starter
 def overfit_one_batch(model, x, y, steps=300, lr=1e-2):
     raise todo()

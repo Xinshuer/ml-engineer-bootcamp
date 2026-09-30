@@ -381,6 +381,15 @@ T=3 时，最后两维应该是：
  [0.,   0., -inf],
  [0.,   0.,   0.]]
 ```
+--- above
+# 上文：一句 5 个 token 的话进了 attention，每个头算出一个 5×5 的分数矩阵
+T = 5
+scores = torch.randn(1, 2, T, T)     # (B, nh, T, T)：1 句话、2 个头
+--- below
+mask = causal_bias(T)
+print("mask:", tuple(mask.shape), " 加到分数上:", tuple((scores + mask).shape))
+for row in mask[0, 0].tolist():
+    print(row)
 --- starter
 def causal_bias(T, device=None):
     """返回 (1, 1, T, T) 的加性 mask：允许的位置 0.0，禁止的位置 -inf。
@@ -424,6 +433,14 @@ attention 是 Transformer 的心脏，也是面试里最常被要求当场手写
 测试做两件事：
 1. 对拍：和 `F.scaled_dot_product_attention` 比，causal 和非 causal 都要一致（误差 < 1e-4）
 2. 因果性检验：只改最后 2 个位置的 k、v，前 4 个位置的输出必须一点不变
+--- above
+# 上文：拆成多个头之后，每个头有自己的 q、k、v，形状都是 (B, nh, T, hs)
+q, k, v = (torch.randn(1, 2, 4, 8) for _ in range(3))    # 1 句话、2 个头、4 个 token、每个头 8 维
+--- below
+out = attention(q, k, v)
+sdpa = F.scaled_dot_product_attention(q, k, v, is_causal=True)    # PyTorch 自带的版本
+print("输出:", tuple(out.shape), " 和 SDPA 的最大差:", round((out - sdpa).abs().max().item(), 4))
+print("第 0 个 token 的输出就是它自己的 v 吗？", torch.allclose(out[:, :, 0], v[:, :, 0]))
 --- starter
 def attention(q, k, v, causal=True):
     """q, k, v: (B, nh, T, hs)  ->  (B, nh, T, hs)
@@ -490,6 +507,13 @@ ref: day4
 4. 合并头回 `(B, T, C)`，再过 `proj`
 
 参数量必须正好是 3C² + C²（两个 Linear 都没有 bias）。测试还会检查：T 比 block_size 短也能跑；改掉 x 的后几个位置，前面位置的输出不变。
+--- above
+# 上文：GPT 的每个 Block 里，token 向量 x 过完 LayerNorm 就进这一层
+x = torch.randn(2, 5, 12)             # (B, T, C)：2 句话，每句 5 个 token，每个 token 12 维
+--- below
+attn = CausalSelfAttention(n_embd=12, n_head=3, block_size=8)    # 3 个头（每头 4 维），最多 8 个 token
+print("输入:", tuple(x.shape), " 输出:", tuple(attn(x).shape))
+print("参数个数:", sum(p.numel() for p in attn.parameters()), " buffer:", [name for name, _ in attn.named_buffers()])
 --- starter
 class CausalSelfAttention(nn.Module):
     """要求:
@@ -563,6 +587,14 @@ attention 负责让 token 之间交换信息，MLP 负责让每个 token 自己�
 - GELU 用 `F.gelu` 或 `nn.GELU()` 都行
 
 测试检查输出形状和参数量：C=16 时应该是 16·64 + 64 + 64·16 + 16 = 2128。
+--- above
+# 上文：Block 里 attention 之后，每个 token 的向量再各自过一遍 MLP
+n_embd = 8
+x = torch.randn(1, 3, n_embd)      # 1 句话、3 个 token，每个 8 维
+--- below
+mlp = MLP(n_embd)
+print("输入:", tuple(x.shape), " 输出:", tuple(mlp(x).shape))
+print("参数个数:", sum(p.numel() for p in mlp.parameters()))
 --- starter
 class MLP(nn.Module):
     """标准 GPT-2 MLP: Linear(C, 4C) -> GELU -> Linear(4C, C)，两层都带 bias。"""
@@ -613,6 +645,14 @@ x = x + self.mlp(self.ln2(x))
 - pre-LN：LayerNorm 在残差分支**里面**；主干上的 `x` 不经过 LN
 
 测试：把 attn 的 `proj` 和整个 MLP 的参数清零，两个子层都输出 0，这时 Block 必须原样返回 x。
+--- above
+# 上文：GPT 把 token 嵌入加上位置嵌入得到 x，再让 x 一层层过 Block
+n_embd, n_head, block_size = 12, 3, 8
+x = torch.randn(2, 5, n_embd)          # 2 句话，每句 5 个 token，每个 12 维
+--- below
+block = Block(n_embd, n_head, block_size)
+print("输入:", tuple(x.shape), " 输出:", tuple(block(x).shape))
+print("参数个数:", sum(p.numel() for p in block.parameters()), " 公式 12*C*C + 9*C =", 12 * n_embd * n_embd + 9 * n_embd)
 --- starter
 class Block(nn.Module):
     """x = x + attn(ln1(x));  x = x + mlp(ln2(x))
@@ -690,6 +730,16 @@ ref: day4
 - `targets` 是 None 时 `loss` 也是 None；否则 `loss` 是 `F.cross_entropy` 算出的一个标量
 
 测试：刚初始化的模型，loss 要在 ln(17) ≈ 2.83 附近（±0.7）；`lm_head.weight` 和 `wte.weight` 必须是同一个对象；n_layer=1 时参数量正好是 13696。
+--- above
+# 上文：一段文本按字符变成 token id（第 3 天的 tokenizer），答案往后错一位
+chars = sorted(set("hello world"))                                 # 8 个不同的字符，V = 8
+data = torch.tensor([[chars.index(ch) for ch in "hello world"]])   # (1, 11)：1 句话，11 个 token id
+idx, targets = data[:, :-1], data[:, 1:]       # 输入是前 10 个；每个位置的答案是它的下一个字符
+--- below
+model = GPT(vocab_size=len(chars), block_size=16)
+logits, loss = model(idx, targets)
+print("logits:", tuple(logits.shape), " 初始 loss:", round(loss.item(), 1), " ln(V):", round(math.log(len(chars)), 1))
+print("不给 targets 时的 loss:", model(idx)[1], " lm_head 和 wte 共享权重:", model.lm_head.weight is model.wte.weight)
 --- starter
 class GPT(nn.Module):
     """要求:
@@ -785,6 +835,13 @@ ref: day4
 - `tied=True` 时 lm_head 和 wte 共用权重，不另算；`tied=False` 时再加 V·C
 
 测试拿 3 组 (V, C, L, block_size) 构造真模型数参数，和你的结果比。
+--- above
+# 上文：nanoGPT 训练莎士比亚字符模型时用的尺寸（第 3 天讲过：词表是 65 个字符）
+V, C, L, block_size = 65, 384, 6, 256     # 词表大小、每个 token 的维度、Block 层数、最长上下文
+--- below
+n = gpt_param_count(V, C, L, block_size)
+print(f"lm_head 和 wte 共享权重：{n:,} 个参数，约 {n / 1e6:.1f}M")
+print(f"不共享：{gpt_param_count(V, C, L, block_size, tied=False):,} 个参数")
 --- starter
 def gpt_param_count(V, C, L, block_size, tied=True):
     """按下面的结构手算参数量（不许构造模型去数）:
@@ -832,6 +889,17 @@ ChatGPT 一个词一个词往外蹦，背后就是这个循环。贪心（每步
 返回 `(B, T0 + max_new_tokens)`，前 T0 个就是原来的 idx。函数上已经有 `@torch.no_grad()`：生成时不需要梯度。
 
 测试会用 block_size=8 的模型从 3 个 token 生成 10 个（总长 13，超过 8，必须裁剪），还会检查两次生成结果完全一样。
+--- above
+# 上文：用户给出一段开头，模型接着往下写
+# GPT 是 d4-06 写的那个模型（这里用预先加载的参考版本，还没训练过）
+chars = sorted(set("hello world"))                                  # 字符词表，8 个字符
+model = GPT(vocab_size=len(chars), block_size=4, n_layer=1).eval()  # 一次最多看 4 个 token
+prompt = torch.tensor([[chars.index(ch) for ch in "hel"]])          # (1, 3)：开头的 3 个 token
+--- below
+out = generate_greedy(model, prompt, max_new_tokens=6, block_size=4)
+print("形状:", tuple(prompt.shape), "->", tuple(out.shape))
+print("token id:", out[0].tolist())
+print("变回文字:", "".join(chars[i] for i in out[0].tolist()))
 --- starter
 @torch.no_grad()
 def generate_greedy(model, idx, max_new_tokens, block_size):
@@ -881,6 +949,14 @@ attention 写错了往往不报错：形状全对，loss 也在降，只是模�
 - 不要改函数名和参数
 
 先对照公式 `softmax(q @ kᵀ / √hs + mask) @ v` 一行一行读，找到了再运行。
+--- above
+# 上文：GPT 某一层 attention 里拆好头的 q、k、v，形状 (B, nh, T, hs)
+q, k, v = (torch.randn(1, 2, 4, 16) for _ in range(3))    # 1 句话、2 个头、4 个 token、每头 16 维
+--- below
+out = attention_buggy(q, k, v)
+sdpa = F.scaled_dot_product_attention(q, k, v, is_causal=True)    # PyTorch 自带的版本
+print("输出:", tuple(out.shape), " 和 SDPA 的最大差:", round((out - sdpa).abs().max().item(), 4))
+print("第 0 个 token 的输出就是它自己的 v 吗？", torch.allclose(out[:, :, 0], v[:, :, 0]))
 --- starter
 def attention_buggy(q, k, v):
     T = q.size(-2)
@@ -926,6 +1002,15 @@ post-LN 和漏掉残差都不会报错，小模型甚至也能训；层数一多
 这个 Block 有 **2 处** bug，都在 `forward` 里（`__init__` 没问题）。把它修成正确的 pre-LN 残差 Block：每个子层都是 `x = x + 子层(LN(x))`。
 - `CausalSelfAttention` 和 `MLP` 是预先加载好的参考版本
 - 测试：attn 的 `proj` 和整个 MLP 清零后，Block 必须原样返回 x
+--- above
+# 上文：GPT 里的 x 沿着残差主干一层层往上走，到了中间几层，数值常常比 1 大不少
+n_embd, n_head, block_size = 12, 3, 8
+x = torch.randn(1, 4, n_embd) * 3        # 1 句话、4 个 token、每个 12 维，数值大约在 ±3
+--- below
+block = BlockBuggy(n_embd, n_head, block_size)
+y = block(x)
+print("输入 x，第 0 个 token 的前 4 维:", [round(t, 2) for t in x[0, 0, :4].tolist()])
+print("输出 y，第 0 个 token 的前 4 维:", [round(t, 2) for t in y[0, 0, :4].tolist()])
 --- starter
 class BlockBuggy(nn.Module):
     def __init__(self, n_embd, n_head, block_size):
@@ -1129,6 +1214,16 @@ ref: day4
 - 下三角 mask 用 `register_buffer` 存成 `"bias"`，形状 `(1, 1, block_size, block_size)`
 - forward：qkv → split → 拆头 → 缩放、mask、softmax → 乘 v → 合并头 → proj
 - T 可以比 block_size 短；必须满足因果性
+--- above
+# 上文：Block 里的 token 向量 x 过完 LayerNorm，就进这一层 attention
+x = torch.randn(2, 5, 16)              # (B, T, C)：2 句话，每句 5 个 token，每个 16 维
+x_edit = x.clone()
+x_edit[:, 3:] = 0.0                    # 同样的两句话，只把最后 2 个 token 换掉
+--- below
+attn = CausalSelfAttention(n_embd=16, n_head=4, block_size=8)    # 4 个头（每头 4 维），最多 8 个 token
+y, y_edit = attn(x), attn(x_edit)
+print("输入:", tuple(x.shape), " 输出:", tuple(y.shape))
+print("只改了最后 2 个 token，前 3 个位置的输出还一样吗？", torch.allclose(y[:, :3], y_edit[:, :3]))
 --- starter
 class CausalSelfAttention(nn.Module):
     def __init__(self, n_embd, n_head, block_size):
@@ -1194,6 +1289,16 @@ ref: day4
 - Linear 和 Embedding 的权重初始化成 N(0, 0.02)，Linear 的 bias 清零
 - `lm_head.weight` 和 `wte.weight` 共享（同一个对象）
 - `forward(idx, targets=None)` 返回 `(logits, loss)`；没有 targets 时 loss 是 None
+--- above
+# 上文：两句话按字符变成 token id，拼成一个 batch；答案是每个位置的下一个字符
+chars = sorted(set("hello world"))                                 # 8 个不同的字符，V = 8
+data = torch.tensor([[chars.index(ch) for ch in s] for s in ["hello world", "world hello"]])   # (2, 11)
+idx, targets = data[:, :-1], data[:, 1:]       # 输入是前 10 个，答案往后错一位
+--- below
+model = GPT(vocab_size=len(chars), block_size=16, n_layer=1)
+logits, loss = model(idx, targets)
+print("logits:", tuple(logits.shape), " 初始 loss:", round(loss.item(), 1), " ln(V):", round(math.log(len(chars)), 1))
+print("参数个数:", sum(p.numel() for p in model.parameters()), " lm_head 和 wte 共享权重:", model.lm_head.weight is model.wte.weight)
 --- starter
 class GPT(nn.Module):
     def __init__(self, vocab_size, block_size, n_layer=2, n_head=4, n_embd=32):

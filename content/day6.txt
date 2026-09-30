@@ -268,6 +268,15 @@ ref: day6
 `forward(x)`：返回 `base(x) + (x @ A.T @ B.T) * scaling`。x 的形状可以是 `(N, in)`，也可以是 `(B, T, in)`。
 
 `in_features` 和 `out_features` 可以从 `base.in_features`、`base.out_features` 读到。
+--- above
+# 上文：从开源模型里取出一层训练好的 Linear，给它加上 LoRA
+k_proj = nn.Linear(24, 12)        # 假装是预训练好的一层（attention 里算 k 的 Linear）：24 维进，12 维出
+x = torch.randn(2, 5, 24)         # 2 句话，每句 5 个 token，每个 token 24 维
+--- below
+lora = LoRALinear(k_proj, r=4, alpha=16)
+print("输出形状:", tuple(lora(x).shape), "  刚创建时和 k_proj(x) 一样吗:", torch.allclose(lora(x), k_proj(x)))
+print("A:", tuple(lora.A.shape), "  B:", tuple(lora.B.shape), "  scaling:", lora.scaling)
+print("可训练参数:", sum(p.numel() for p in lora.parameters() if p.requires_grad))
 --- starter
 class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, r=4, alpha=8):
@@ -342,6 +351,17 @@ ref: day6
 - 新层只有 weight 和 bias，不带 A、B
 
 往参数里写值，要放在 `with torch.no_grad():` 里，用 `.copy_(...)`。
+--- above
+# 上文：LoRA 训练完了，B 学到了非 0 的值；上线前要把它合并进原来的 Linear
+lora = LoRALinear(nn.Linear(10, 6), r=2, alpha=4)   # d6-01 写过的 LoRALinear，这里已经为你准备好了
+with torch.no_grad():
+    lora.B.normal_(0, 0.5)                          # 假装训练过：B 不再是全 0
+x = torch.randn(3, 10)                              # 3 个样本，每个 10 维
+--- below
+merged = merge_lora(lora)
+print("合并后:", merged)
+print("输出和 lora(x) 一样吗:", torch.allclose(merged(x), lora(x), atol=1e-5))
+print("参数量:", sum(p.numel() for p in lora.parameters()), "->", sum(p.numel() for p in merged.parameters()))
 --- starter
 def merge_lora(m: LoRALinear) -> nn.Linear:
     """把 LoRA 合并回一个普通 nn.Linear：W' = W + scaling * B @ A，bias 不变。"""
@@ -388,6 +408,13 @@ ref: day6
 - A：形状 `(r, in_f)`；B：形状 `(out_f, r)`
 
 例：`lora_ratio(4096, 4096, 8)` 约等于 0.0039。
+--- above
+# 上文：想给 Llama-7B 的 MLP 里的 up_proj 层加 LoRA，先算算要训练多少参数
+d_model, d_ff = 4096, 11008      # 这一层 4096 维进（d_model），11008 维出（d_ff）
+--- below
+for rank in [4, 8, 16]:
+    ratio = lora_ratio(d_model, d_ff, rank)
+    print("r =", rank, "  占比:", round(ratio, 5), f"({ratio:.2%})")
 --- starter
 def lora_ratio(in_f, out_f, r):
     """返回 LoRA 参数量 / 原权重参数量（不含 bias）。"""
@@ -424,6 +451,16 @@ SFT 时只该让模型学「怎么回答」，不该学「怎么复述问题」�
 - 不要改动传进来的 `input_ids`（先 clone 一份）。
 
 例：`input_ids = [5, 6, 7, 8, 9]`，`prompt_len = 3` → `[-100, -100, -100, 8, 9]`。
+--- above
+# 上文：tokenizer 把「问题 + 标准回答」切成 token id，拼成一条
+prompt_ids = torch.tensor([16, 10, 16, 28, 30])   # 问题「1+1=?」的 5 个 token
+answer_ids = torch.tensor([17, 50256])            # 回答「2」和结束符，2 个 token
+token_ids = torch.cat([prompt_ids, answer_ids])   # 拼成一条，一共 7 个
+--- below
+labels = build_sft_labels(token_ids, len(prompt_ids))
+print("input_ids:", token_ids.tolist())
+print("labels:   ", labels.tolist())
+print("是 torch.long 吗:", labels.dtype == torch.long)
 --- starter
 def build_sft_labels(input_ids, prompt_len, ignore_index=-100):
     """input_ids: (T,)，prompt + answer 的全部 token。
@@ -474,6 +511,16 @@ ref: day6
 ```
 '<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello<|im_end|>\n'
 ```
+--- above
+# 上文：聊天界面里的一段对话，发给模型之前要先拼成一段文字
+chat = [
+    {"role": "system", "content": "Be brief."},   # system：给模型的设定
+    {"role": "user", "content": "2+3=?"},         # user：用户的问题
+]
+--- below
+text = apply_chat_template(chat)
+print(text)
+print(repr(text))
 --- starter
 def apply_chat_template(messages, add_generation_prompt=True):
     """messages: [{"role": ..., "content": ...}, ...] -> 一个 ChatML 格式的字符串。"""
@@ -516,6 +563,18 @@ ref: day6
 - 返回字典 `{参数名: 梯度的 clone}`，用 `model.named_parameters()` 遍历。
 
 不需要优化器，也不要更新参数。
+--- above
+# 上文：训练循环里的一个 batch 有 12 个样本，但显存一次只放得下 4 个
+classifier = nn.Linear(5, 3)                 # 一个小分类器：5 个特征，3 个类别
+x_batch = torch.randn(12, 5)                 # 12 个样本，每个 5 个特征
+y_batch = torch.randint(0, 3, (12,))         # 每个样本的类别：0、1 或 2
+F.cross_entropy(classifier(x_batch), y_batch).backward()   # 对照：小例子一次喂 12 个也放得下；这个梯度还留在 .grad 里
+big = classifier.weight.grad.clone()                       # 存一份，下面拿来对照
+--- below
+grads = grad_accum_step(classifier, x_batch, y_batch, n_micro=3)
+print("返回的字典:", {k: tuple(g.shape) for k, g in grads.items()})
+print("weight 的梯度和一次喂 12 个的一样吗:", torch.allclose(grads["weight"], big, atol=1e-6))
+print("梯度大小是一次喂 12 个的几倍:", round((grads["weight"].norm() / big.norm()).item(), 4))
 --- starter
 def grad_accum_step(model, xs, ys, n_micro):
     """把大 batch 切成 n_micro 份，依次 forward/backward，累积出和大 batch 一样的梯度。
@@ -570,6 +629,14 @@ nanoGPT、Llama 这类大模型的训练脚本几乎都用 warmup + cosine。读
 3. `it > max_iters`：一直是 `min_lr`
 
 可以用 `math.cos` 和 `math.pi`。
+--- above
+# 上文：训练脚本开头的学习率设置（nanoGPT 的 train.py 里也有类似的变量）
+warmup_iters, max_iters = 10, 100     # 前 10 步升温，到第 100 步降到最低
+max_lr, min_lr = 1e-3, 1e-4           # 最高和最低的学习率
+--- below
+for it in [0, 5, 9, 10, 55, 100, 150]:
+    lr = get_lr(it, warmup_iters, max_iters, max_lr, min_lr)
+    print(f"it = {it}, lr = {lr:.6f}")
 --- starter
 def get_lr(it, warmup_iters, max_iters, max_lr, min_lr):
     """第 it 步的学习率：warmup 线性升 -> cosine 降 -> 保持 min_lr。"""
@@ -615,6 +682,12 @@ ref: day6
 - `"sgd_momentum"`：参数、梯度、动量 → 3 份
 
 例：10 亿参数、fp32、AdamW → 16,000,000,000 字节（16 GB）。
+--- above
+# 上文：想全量微调一个 7B 模型，先算算一张 80 GB 的卡放不放得下
+params_7b = 7_000_000_000         # 7B = 70 亿个参数，fp32 每个数 4 字节
+--- below
+for opt in ["adamw", "sgd_momentum", "sgd"]:
+    print(opt, "->", optimizer_memory_bytes(params_7b, optimizer=opt) / 1e9, "GB")
 --- starter
 def optimizer_memory_bytes(n_params, dtype_bytes=4, optimizer="adamw"):
     """参数 + 梯度 + 优化器状态 一共多少字节（不算激活值）。"""
@@ -652,6 +725,15 @@ ref: day6
 - 刚创建时，输出和 `base` 的输出完全一样
 - 只有 A 和 B 可训练（base 被冻结）
 - `scaling == alpha / r`
+--- above
+# 上文：同事的 LoRA 训练效果很差。拿一层 Linear 和一小批输入来检查它
+layer = nn.Linear(12, 6)         # 假装是预训练模型里训练好的一层：12 维进，6 维出
+x = torch.randn(2, 12)           # 2 个样本
+--- below
+m = LoRABuggy(layer, r=2, alpha=4)
+print("刚创建时和 layer(x) 一样吗:", torch.allclose(m(x), layer(x)))
+print("可训练参数:", sum(p.numel() for p in m.parameters() if p.requires_grad))
+print("scaling:", m.scaling)
 --- starter
 class LoRABuggy(nn.Module):
     def __init__(self, base, r=4, alpha=8):
@@ -823,6 +905,15 @@ LoRA 是今天最重要的结构，面试里常被要求当场手写。不看卡
 - `self.B`：`(out_features, r)`，全 0
 - `self.scaling = alpha / r`
 - `forward(x)` 返回 `base(x) + (x @ A.T @ B.T) * scaling`
+--- above
+# 上文：从开源模型里取出一层训练好的 Linear，给它加上 LoRA
+k_proj = nn.Linear(24, 12)        # 假装是预训练好的一层（attention 里算 k 的 Linear）：24 维进，12 维出
+x = torch.randn(2, 5, 24)         # 2 句话，每句 5 个 token，每个 token 24 维
+--- below
+lora = LoRALinear(k_proj, r=4, alpha=16)
+print("输出形状:", tuple(lora(x).shape), "  刚创建时和 k_proj(x) 一样吗:", torch.allclose(lora(x), k_proj(x)))
+print("A:", tuple(lora.A.shape), "  B:", tuple(lora.B.shape), "  scaling:", lora.scaling)
+print("可训练参数:", sum(p.numel() for p in lora.parameters() if p.requires_grad))
 --- starter
 class LoRALinear(nn.Module):
     def __init__(self, base, r=4, alpha=8):
@@ -892,6 +983,18 @@ ref: day6
 - 把 `(N, ...)` 的大 batch 按顺序平均切成 `n_micro` 份，每份 forward、算 `F.cross_entropy`、backward
 - 累积出的梯度要和一次喂整个大 batch 的梯度一样
 - 返回 `{参数名: grad.clone()}`
+--- above
+# 上文：训练循环里的一个 batch 有 12 个样本，但显存一次只放得下 4 个
+classifier = nn.Linear(5, 3)                 # 一个小分类器：5 个特征，3 个类别
+x_batch = torch.randn(12, 5)                 # 12 个样本，每个 5 个特征
+y_batch = torch.randint(0, 3, (12,))         # 每个样本的类别：0、1 或 2
+F.cross_entropy(classifier(x_batch), y_batch).backward()   # 对照：小例子一次喂 12 个也放得下；这个梯度还留在 .grad 里
+big = classifier.weight.grad.clone()                       # 存一份，下面拿来对照
+--- below
+grads = grad_accum_step(classifier, x_batch, y_batch, n_micro=3)
+print("返回的字典:", {k: tuple(g.shape) for k, g in grads.items()})
+print("weight 的梯度和一次喂 12 个的一样吗:", torch.allclose(grads["weight"], big, atol=1e-6))
+print("梯度大小是一次喂 12 个的几倍:", round((grads["weight"].norm() / big.norm()).item(), 4))
 --- starter
 def grad_accum_step(model, xs, ys, n_micro):
     raise todo()

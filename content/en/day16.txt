@@ -409,6 +409,17 @@ This bug raises no error and the loss goes down, but the model never learns: it 
 `regression_loss(model, x, y)`: `model(x)` outputs (B, 1) and `y` is (B,). Return one number: for each sample, its prediction minus **its own** label, squared, then averaged (MSE).
 
 The current code runs but computes the wrong thing. Fix it. Consider adding an assert so that different shapes raise an error right away.
+--- above
+# Where the input comes from: a regression model (3 features in, 1 number out) and a batch of 4 samples
+net = nn.Linear(3, 1)          # the last layer outputs 1 number, so the batch output is (4, 1)
+nn.init.ones_(net.weight)      # weights set by hand to all 1 and the bias to 0: prediction = sum of the 3 features
+nn.init.zeros_(net.bias)
+feats = torch.randn(4, 3)      # 4 samples, 3 features each
+targets = feats.sum(dim=1)     # the labels are also the sum of the 3 features, shape (4,): every prediction is right
+--- below
+loss = regression_loss(net, feats, targets)
+print("model output:", tuple(net(feats).shape), "  labels:", tuple(targets.shape))
+print("loss (every prediction is right, so it should be 0):", round(loss.item(), 4))
 --- starter
 def regression_loss(model, x, y):
     """model(x): (B, 1)   y: (B,)   returns the scalar MSE"""
@@ -485,6 +496,16 @@ sizes = {}
 assert_shape(logits, "B,T,V", sizes)
 assert_shape(labels, "B,T", sizes)   # B and T must match the ones from logits
 ```
+--- above
+# Where the input comes from: logits and labels of one language-model training step, checked before the loss
+logits = torch.zeros(2, 5, 10)                 # 2 sentences, 5 tokens each; each token scores all 10 words of the vocabulary
+labels = torch.zeros(2, 5, dtype=torch.long)   # the correct answer for each token (the id of a word)
+known = {}                                     # name -> size, one dict shared by several checks
+--- below
+out = assert_shape(logits, "B,T,V", known)
+assert_shape(labels, "B,T", known)
+print("returns logits itself:", out is logits)
+print("sizes stored:", known)
 --- starter
 def assert_shape(x, spec, sizes):
     """Check that x.shape matches spec (such as "B,T,C"): return x if it does, else raise ValueError.
@@ -596,6 +617,15 @@ Two functions:
 - `flatten_tokens(t)`: (B, N, C) → (B*N, C), one token per row (for example to compute a loss for each token). Row `b*N + n` is `t[b, n]`.
 
 Used together, the two functions raise no error now, because the reshape output is contiguous. Once you fix `image_to_tokens`, its output is no longer contiguous, and the view in `flatten_tokens` starts to fail. Fix both.
+--- above
+# Where the input comes from: in a ViT, the feature map (B, C, H, W) that a convolution made from the images
+feat = torch.arange(24.0).view(2, 3, 2, 2)   # 2 images, 3 channels, 2×2 pixels; the numbers are simply 0 to 23
+# image 0: channel 0 is [[0, 1], [2, 3]], channel 1 is [[4, 5], [6, 7]], channel 2 is [[8, 9], [10, 11]]
+--- below
+tokens = image_to_tokens(feat)
+print("tokens:", tuple(tokens.shape), " image 0:", tokens[0].tolist())
+rows = flatten_tokens(tokens)
+print("rows:", tuple(rows.shape), " row 5 (image 1, pixel (0, 1)):", rows[5].tolist())
 --- starter
 def image_to_tokens(x):
     """(B, C, H, W) -> (B, H*W, C)"""
@@ -725,6 +755,14 @@ Fixed tensors such as causal masks and position tables, when built inside forwar
 The current code gives the right numbers on the CPU in float32, but every forward builds a new float32 mask on the CPU. Change it: build the mask once in `__init__` for max_len, register it with `register_buffer` (`persistent=False` is a good idea), and slice `[:T, :T]` in forward.
 
 The checks convert the module to float64 and bfloat16, and move it to the meta device (standing in for a GPU).
+--- above
+# Where the input comes from: the attention scores (B, T, T), in bfloat16 during mixed-precision training
+att_scores = torch.zeros(1, 3, 3, dtype=torch.bfloat16)   # 1 sentence, 3 tokens; all scores are 0, so the mask is easy to see
+--- below
+causal = CausalMask(max_len=8).to(torch.bfloat16)   # when the whole model switches to bf16, this layer does too
+out = causal(att_scores)
+print("output dtype:", out.dtype, "  registered buffers:", len(list(causal.buffers())))
+print(out[0].tolist())
 --- starter
 class CausalMask(nn.Module):
     def __init__(self, max_len):
@@ -839,6 +877,17 @@ Data often comes from numpy or pandas, and that is where dtypes go wrong most: f
 - `accuracy(logits, y)`: `logits` is (B, C), `y` is (B,). Return a Python float: the fraction of correct predictions, between 0 and 1.
 
 There are three bugs. Fix them all.
+--- above
+# Where the input comes from: a small batch read with numpy / pandas, and a classifier that is not trained yet
+import numpy as np
+feats_np = np.array([[0.5, 1.0], [2.0, -1.0], [-1.5, 0.3], [0.2, -0.7]])   # 4 samples, 2 features each; numpy's default is float64
+label_list = [0, 2, 1, 0]                                                   # the class of each sample (3 classes in total)
+classifier = nn.Linear(2, 3)                                                # 2 features in, one score per class out
+--- below
+x, y = make_batch(feats_np, label_list)
+print("x:", x.dtype, "  y:", y.dtype)
+logits = classifier(x)
+print("loss:", round(F.cross_entropy(logits, y).item(), 4), "  accuracy:", accuracy(logits, y))
 --- starter
 def make_batch(features, labels):
     x = torch.from_numpy(features)
@@ -914,6 +963,20 @@ Write `move_to(batch, device, float_dtype=None)`:
 - Return a new structure; do not change the `batch` you were given.
 
 The checks use the meta device instead of a GPU, so you can test this without one.
+--- above
+# Where the input comes from: one batch from a DataLoader, with tensors inside a dict and a list, mixed with strings and numbers
+batch_cpu = {
+    "input_ids": torch.tensor([[11, 25, 3], [7, 42, 0]]),              # token ids of 2 sentences: long
+    "mask": torch.tensor([[True, True, True], [True, True, False]]),   # which positions are real tokens: bool
+    "pixels": torch.randn(2, 3, 4, 4),                                 # 2 small 3-channel 4×4 images: float32
+    "boxes": [torch.rand(1, 4), torch.rand(3, 4)],                     # each image has a different number of boxes, so a list: float32
+    "info": {"lengths": [3, 2], "names": ("cat.jpg", "dog.jpg")},      # not tensors
+}
+--- below
+out = move_to(batch_cpu, "meta", float_dtype=torch.float16)   # the "meta" device stands in for a GPU
+for key in ["input_ids", "mask", "pixels"]:
+    print(key, "->", out[key].device, out[key].dtype, "  before:", batch_cpu[key].device, batch_cpu[key].dtype)
+print("boxes[1] ->", out["boxes"][1].device, out["boxes"][1].dtype, "  info ->", out["info"])
 --- starter
 def move_to(batch, device, float_dtype=None):
     """Move every tensor in a nested batch to device; with float_dtype, convert only floating-point tensors."""
@@ -1028,6 +1091,21 @@ Write `trace_shapes(model, x)`, which returns `(records, error)`:
 - Whether it worked or failed, remove every hook before returning.
 
 (Layers whose output is not a tensor are not part of today's task.)
+--- above
+# Where the input comes from: a small CNN we just wrote; it raises a shape error and we want to know where
+cnn = nn.Sequential(
+    nn.Conv2d(3, 4, kernel_size=3, padding=1),
+    nn.ReLU(),
+    nn.MaxPool2d(2),
+    nn.Flatten(),
+    nn.Linear(4 * 8 * 8, 10),
+)
+images = torch.randn(2, 3, 8, 8)   # 2 small 3-channel 8×8 images
+--- below
+records, error = trace_shapes(cnn, images)
+for name, shape in records:
+    print(repr(name), shape)
+print("error:", repr(error))
 --- starter
 def trace_shapes(model, x):
     """Run model(x) once and return (records, error).
@@ -1124,6 +1202,19 @@ Without looking at the cards, write `trace_shapes(model, x)` from scratch. It re
 - `records`: one `(name, tuple(output.shape))` entry each time a leaf module runs, with `name` from `model.named_modules()`, in running order.
 - `error`: `None` normally; the exception object when forward raises one (catch it, do not let it escape).
 - Remove every hook before returning, also after an error.
+--- above
+# Where the input comes from: a small MLP built from two blocks; we want the output shape of every layer
+mlp = nn.Sequential(
+    nn.Sequential(nn.Linear(6, 16), nn.GELU()),
+    nn.Sequential(nn.Linear(16, 16), nn.GELU()),
+    nn.Linear(16, 3),
+)
+feats = torch.randn(4, 6)   # 4 samples, 6 features each
+--- below
+records, error = trace_shapes(mlp, feats)
+for name, shape in records:
+    print(repr(name), shape)
+print("error:", repr(error))
 --- starter
 def trace_shapes(model, x):
     raise todo()
@@ -1210,6 +1301,19 @@ Without looking at the cards, write `move_to(batch, device, float_dtype=None)` f
 - Tensors: `.to(device)`; when `float_dtype` is given, convert only floating-point tensors; integer and bool tensors keep their dtype.
 - Dicts / lists / tuples nested in any way, with container types kept; anything else comes back unchanged.
 - Return a new structure; do not change the `batch` you were given.
+--- above
+# Where the input comes from: a text-classification batch; the first line of the training loop moves it to the GPU
+batch_cpu = {
+    "input_ids": torch.tensor([[101, 7, 9, 102], [101, 5, 102, 0]]),   # token ids of 2 sentences: long
+    "labels": torch.tensor([0, 1]),                                     # class labels: long
+    "extra": [torch.randn(2, 8), None],                                 # extra features: one float32 tensor, one missing (None)
+    "texts": ("great movie", "boring"),                                 # the raw text, not tensors
+}
+--- below
+out = move_to(batch_cpu, "meta", float_dtype=torch.bfloat16)   # the "meta" device stands in for a GPU
+print("input_ids:", out["input_ids"].device, out["input_ids"].dtype, "  labels:", out["labels"].dtype)
+print("extra:", type(out["extra"]).__name__, out["extra"][0].device, out["extra"][0].dtype, out["extra"][1])
+print("texts:", out["texts"], "  original input_ids still on:", batch_cpu["input_ids"].device)
 --- starter
 def move_to(batch, device, float_dtype=None):
     raise todo()

@@ -279,6 +279,14 @@ ref: day3
 要求：`decode(encode(s)) == s`；id 都在 0 到 `vocab_size - 1` 之间；同一个字符永远是同一个 id。
 
 例子：`CharTokenizer("hello world")` 的 `vocab_size` 是 8；空格排在最前面，id 是 0；`encode("hello")` 是 `[3, 2, 4, 4, 5]`。
+--- above
+# 上文：nanoGPT 训练前先读进整份语料，这里用莎士比亚的一句代替
+corpus = "to be or not to be"
+--- below
+tok = CharTokenizer(corpus)
+ids = tok.encode("not to be")
+print("词表大小:", tok.vocab_size, "  encode('not to be'):", ids)
+print("decode 回来:", repr(tok.decode(ids)))
 --- starter
 class CharTokenizer:
     """用法:
@@ -355,6 +363,14 @@ pair_counts(["a","b","a","b","c"])      -> {("a","b"): 2, ("b","a"): 1, ("b","c"
 merge_pair(["a","b","a","b"], ("a","b")) -> ["ab", "ab"]
 merge_pair(["a","a","a"], ("a","a"))     -> ["aa", "a"]
 ```
+--- above
+# 上文：训练 BPE 的第一步，把语料拆成单个字符，每个字符是一个 token
+corpus = list("hug hugs")      # ['h', 'u', 'g', ' ', 'h', 'u', 'g', 's']
+--- below
+print("pair 计数:", pair_counts(corpus))
+step1 = merge_pair(corpus, ("h", "u"))
+print("合并 ('h','u'):", step1)
+print("再合并 ('hu','g'):", merge_pair(step1, ("hu", "g")))
 --- starter
 def pair_counts(tokens):
     """tokens: list[str]。统计所有相邻二元组出现次数。
@@ -419,6 +435,13 @@ API 按 token 收费，上下文窗口也按 token 算。压缩率（平均一�
 - 返回 字符数 ÷ token 数（一个 float）。
 
 例子：一个「两个字符一个 token」的 tokenizer，把 "abcdefgh"（8 个字符）编成 4 个 token，压缩率是 2.0。一个字符一个 token 时，压缩率是 1.0。
+--- above
+# 上文：GPT-2 的 BPE 从 UTF-8 字节开始合并。只按字节切，中文和英文的压缩率差多少？
+byte_encode = lambda s: list(s.encode("utf-8"))    # 一个字节一个 token
+english, chinese = "hello world", "你好世界"
+--- below
+print("英文按字节切:", round(compression_ratio(english, byte_encode), 2))
+print("中文按字节切:", round(compression_ratio(chinese, byte_encode), 2))
 --- starter
 def compression_ratio(text, encode_fn):
     """返回 字符数 / token 数。越大说明这个 tokenizer 对这段文本越高效。"""
@@ -457,6 +480,17 @@ ref: day3
 - 起点必须让 y 不越界：i 最大是 `len(data) - block_size - 1`。
 
 例子：`data = torch.arange(1000)` 时，y 应该处处等于 x + 1。
+--- above
+# 上文：语料先用 d3-01 的 CharTokenizer 编成 id（这里用的是参考实现）
+text = "to be or not to be, that is the question"
+tok = CharTokenizer(text)
+corpus_ids = torch.tensor(tok.encode(text))    # 1D LongTensor，40 个 token id
+g = torch.Generator().manual_seed(1)
+--- below
+x, y = get_batch(corpus_ids, 2, 8, generator=g)
+print("x 和 y 的 shape:", tuple(x.shape), tuple(y.shape), " dtype:", x.dtype)
+print("x 解码成文字:", [tok.decode(row) for row in x])
+print("y 解码成文字:", [tok.decode(row) for row in y])
 --- starter
 def get_batch(data, batch_size, block_size, generator=None):
     """data: 1D LongTensor（整段语料的 token id）
@@ -518,6 +552,17 @@ ref: day3
 2. `load_bin(path)`：用 `np.memmap` 以只读方式（`mode="r"`）打开，dtype 是 uint16，直接返回这个 memmap 对象。不要用 `np.fromfile` 之类的函数把整个文件读进内存。
 
 例子：存 1000 个 id（0 到 999）后，文件正好 2000 字节，`load_bin(path)[999] == 999`。
+--- above
+# 上文：预处理把整份语料编成 token id，要存成 train.bin（这里只存 5 个）
+import tempfile
+tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)    # 一个临时文件夹，用来放 train.bin
+bin_path = os.path.join(tmp.name, "train.bin")
+token_ids = [15, 50256, 7, 8, 42]       # 50256 是 GPT-2 的结束符 <|endoftext|>
+--- below
+save_bin(bin_path, token_ids)
+m = load_bin(bin_path)
+print("文件大小:", os.path.getsize(bin_path), "字节   读回来:", type(m).__name__, m.dtype, m.tolist())
+del m, tmp                              # 先关掉文件，再删掉临时文件夹
 --- starter
 def save_bin(path, ids):
     """把 ids(list[int] 或 1D ndarray) 以 uint16 存成二进制文件。"""
@@ -569,6 +614,15 @@ bigram 模型只用一张 V×V 的计数表猜下一个 token，是最简单的�
 - 不许用 Python 循环遍历 ids。用 `torch.bincount`（或者 `index_put_`、`scatter_add_`）。
 
 例子：`ids = [0, 1, 0, 1, 2]`、V = 3。相邻对是 (0,1) (1,0) (0,1) (1,2)，所以 `C[0,1] = 2`、`C[1,0] = 1`、`C[1,2] = 1`，其余都是 0。所有计数加起来是 `len(ids) - 1`。
+--- above
+# 上文：语料 "hello" 用 d3-01 的字符级 tokenizer 编成了 id：e=0, h=1, l=2, o=3
+token_ids = torch.tensor([1, 0, 2, 2, 3])     # h e l l o
+V = 4
+--- below
+C = bigram_counts(token_ids, V)
+print("shape:", tuple(C.shape), " 总次数:", C.sum().item())
+for ch, row in zip("ehlo", C.tolist()):
+    print(ch, "后面接 e/h/l/o 的次数:", row)
 --- starter
 def bigram_counts(ids, vocab_size):
     """ids: 1D LongTensor。返回 (V, V) 的计数矩阵 C，C[i, j] = i 后面紧跟 j 的次数。
@@ -609,6 +663,13 @@ ref: day3
 2. `is_broken(loss, vocab_size, tol=0.05)`：loss 离 `uniform_loss(vocab_size)` 的相对误差小于 tol，也就是 `|loss - base| / base < tol` 时，返回 True（训练了半天还在瞎猜）；否则返回 False。
 
 例子：V = 65 时基线约 4.17。训练很久后 loss 还是 4.17 → True；loss 是 1.48 → False。
+--- above
+# 上文：两次训练都跑了很久，这是日志里最后的 loss（用的是 Llama 的词表，V = 32000）
+V = 32000
+loss_a, loss_b = 10.31, 2.95
+--- below
+print("什么都没学到时的 loss:", round(uniform_loss(V), 4))
+print("A 坏了吗:", is_broken(loss_a, V), "   B 坏了吗:", is_broken(loss_b, V))
 --- starter
 def uniform_loss(vocab_size):
     """一个什么都没学到的模型，交叉熵应该是多少？返回这个数。"""
@@ -661,6 +722,14 @@ ids  = [[5, 6, 7], [8, -1, -1], [9, 10, -1]]
 mask = [[1, 1, 1], [1,  0,  0], [1,  1,  0]]
 pos  = [[0, 1, 2], [0,  0,  0], [0,  1,  0]]
 ```
+--- above
+# 上文：一个 batch 里的 3 句话，已经用 tokenizer 编成了 id，长短不一
+batch = [[12, 7, 30], [4, 9], [21, 5, 8, 16]]     # 分别是 3、2、4 个 token
+--- below
+ids, mask, pos = pad_batch(batch)
+print("ids: ", ids.tolist())
+print("mask:", mask.tolist())
+print("pos: ", pos.tolist())
 --- starter
 def pad_batch(seqs, pad_id=0):
     """seqs: list[list[int]]，返回 (ids, attn_mask, pos_ids)，都是 (B, Tmax) int64。
@@ -713,6 +782,16 @@ attention 靠 mask 忽略 pad。常见做法不是把权重乘 0，而是在 sof
 - 不许写 `(1 - mask) * float("-inf")`：真实位会算出 `0 * -inf = nan`。
 
 例子：`mask_to_bias(torch.tensor([[1, 1, 0]]))` 返回 `tensor([[[[0., 0., -inf]]]])`，形状 `(1, 1, 1, 3)`。
+--- above
+# 上文：pad_batch 给出的 attention mask：2 句话，第 2 句的后 2 个位置是 pad
+attn = torch.tensor([[1, 1, 1, 1],
+                     [1, 1, 0, 0]])
+scores = torch.zeros(2, 3, 4, 4)      # attention 分数 (B, nh, T, T)：2 句、3 个头；先假装全是 0
+--- below
+bias = mask_to_bias(attn)
+print("bias:", tuple(bias.shape), bias.flatten(1).tolist())
+w = (scores + bias).softmax(-1)
+print("权重:", tuple(w.shape), "  第 2 句、第 1 个头、第 1 行:", w[1, 0, 0].tolist())
 --- starter
 def mask_to_bias(attn_mask):
     """attn_mask: (B, T) 的 0/1  ->  (B, 1, 1, T) 的加性偏置:
@@ -753,6 +832,14 @@ ref: day3
 `get_batch_buggy(data, batch_size, block_size)` 应该和 d3-04 的 get_batch 做一样的事：随机选起点，x 是一段，y 是 x 右移一位，形状都是 `(batch_size, block_size)`，dtype int64。
 
 它有 3 处错。找出来改好，函数名和参数不要改。
+--- above
+# 上文：训练循环每一步都从语料里切一个 batch（这里的语料是 100 到 129 这 30 个 id）
+token_ids = torch.arange(100, 130)
+--- below
+x, y = get_batch_buggy(token_ids, 2, 6)
+print("x:", x.tolist())
+print("y:", y.tolist())
+print("dtype:", x.dtype, y.dtype)
 --- starter
 def get_batch_buggy(data, batch_size, block_size):
     ix = torch.randint(len(data), (batch_size,))
@@ -798,6 +885,13 @@ ref: day3
 - `pos = torch.arange(T)`，形状 `(T,)`。
 - 标量（只有一个数的 tensor）的 shape 是空 tuple `()`。
 - 可以直接写乘法，比如 `8 * 256`。键名不要改。
+--- above
+# 上文：GPT-2 small 训练时一个 step 的四个数
+B, T, V, C = 8, 256, 50257, 768     # batch 大小、block_size、词表大小、每个 token 向量的宽度
+--- below
+n = math.prod(BATCH_SHAPES["logits = lm_head(hidden)"])
+print("logits 一共有", n, "个数，fp32 每个 4 字节，约", round(n * 4 / 1e6), "MB")
+print("view 之后元素个数没变:", math.prod(BATCH_SHAPES["logits.view(-1, V)"]) == n)
 --- starter
 BATCH_SHAPES = {
     "x  (输入 token id)":        None,
@@ -957,6 +1051,14 @@ get_batch 是训练循环里最常写的函数，面试手写训练循环时几�
 - `data` 是 1D LongTensor；随机选 `batch_size` 个起点，`generator` 传给 `torch.randint`。
 - `x` 是从起点开始的 `block_size` 个 token，`y` 是 x 右移一位。
 - 返回 `(x, y)`，形状都是 `(batch_size, block_size)`，dtype int64；y 不能越界。
+--- above
+# 上文：整份语料编成了一长串 token id（这里用 50 到 69 这 20 个数代替，方便看出错位）
+token_ids = torch.arange(50, 70)
+--- below
+x, y = get_batch(token_ids, 3, 4, generator=torch.Generator().manual_seed(7))
+print("x:", x.tolist())
+print("y:", y.tolist())
+print("shape:", tuple(x.shape), " dtype:", x.dtype)
 --- starter
 def get_batch(data, batch_size, block_size, generator=None):
     raise todo()
@@ -1008,6 +1110,15 @@ exam: yes
 
 - `seqs` 是 `list[list[int]]`，返回 `(ids, attn_mask, pos_ids)`，形状都是 `(B, Tmax)`，dtype 都是 int64。
 - `ids` 右边补 `pad_id`；`attn_mask` 真实 token 是 1、pad 是 0；`pos_ids` 每句从 0 开始数真实 token，pad 位置填 0。
+--- above
+# 上文：推理服务一次收到 3 条请求，编成 id 后长短不一
+requests = [[31, 8], [2, 44, 17, 9, 5], [60]]
+PAD = 50256          # GPT-2 没有专门的 pad，常借用结束符 <|endoftext|> 的 id
+--- below
+ids, mask, pos = pad_batch(requests, pad_id=PAD)
+print("ids: ", ids.tolist())
+print("mask:", mask.tolist())
+print("pos: ", pos.tolist())
 --- starter
 def pad_batch(seqs, pad_id=0):
     raise todo()

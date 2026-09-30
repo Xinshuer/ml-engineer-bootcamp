@@ -308,6 +308,16 @@ d: (4, 6, 8, 8)   e: (64,)
 把 `SHAPES` 里每个 `None` 换成结果的 shape，写成 tuple，比如 `(8, 16)`。
 
 判题时，每个填错的表达式都会列出实际的 shape。对照着想清楚错在哪一步，这题的价值全在这里。算错了不丢人，没猜就直接抄才可惜。
+--- above
+# 上文：题目里的 5 个张量（全是 0，这题只看形状）
+a = torch.zeros(8, 16, 64)     # 比如 8 句话，每句 16 个 token，每个 token 64 维
+b = torch.zeros(64, 32)        # 比如一个把 64 维变成 32 维的权重矩阵
+c = torch.zeros(8, 1, 64)      # 每句话一个 64 维向量，中间多了一个长度为 1 的维
+d = torch.zeros(4, 6, 8, 8)    # 比如 4 句话、6 个头，每个头一张 8×8 的 attention 分数表
+e = torch.zeros(64)            # 一个 64 维的向量，比如 LayerNorm 的 g
+--- below
+right = [expr for expr in SHAPES if SHAPES[expr] == tuple(eval(expr).shape)]   # eval 把字符串当代码运行一遍
+print("猜对了", len(right), "/", len(SHAPES))
 --- starter
 SHAPES = {
     "a @ b":                                None,   # 矩阵乘：只看最后两维
@@ -383,6 +393,16 @@ GPT 里通常用一个 Linear 一次算出 q、k、v，拼成 (B, T, 3C)。把�
 - 每个头拿到 C 维里连续的一段：第 0 个头是第 0 到 hs-1 维，第 1 个头是接下来的 hs 维，依此类推
 
 例子：`B, T, C, n_head = 2, 5, 12, 3` 时，q、k、v 都是 `(2, 3, 5, 4)`。检查会核对 shape，也会核对 q、k、v 的内容来自正确的列。
+--- above
+# 上文：GPT 的 attention 里，一个 Linear 把每个 token 的向量一次变成 q、k、v，拼在一起就是 qkv
+n_head = 3                        # 3 个头
+x = torch.randn(2, 5, 12)         # (B, T, C)：2 句话，每句 5 个 token，每个 token 是 12 维的向量
+c_attn = nn.Linear(12, 3 * 12)    # 一次算出 q、k、v
+qkv = c_attn(x)                   # (2, 5, 36)：最后一维依次是 q、k、v，各 12 维
+--- below
+q, k, v = split_heads(qkv, n_head)
+print("qkv:", tuple(qkv.shape))
+print("q:", tuple(q.shape), " k:", tuple(k.shape), " v:", tuple(v.shape))
 --- starter
 def split_heads(qkv, n_head):
     """qkv: (B, T, 3*C)  ->  q, k, v，每个都是 (B, n_head, T, head_dim)
@@ -431,6 +451,15 @@ ref: day2
 例子：输入 `(2, 3, 5, 4)`，输出 `(2, 5, 12)`。输出的 `y[0, 1]` 应该等于 `x[0, 0, 1]`、`x[0, 1, 1]`、`x[0, 2, 1]` 三段拼起来。
 
 先想一想：transpose 之后直接 `view`，为什么会报错？
+--- above
+# 上文：多头 attention 的输出：每个头一份，叠在一起是 (B, n_head, T, hs)
+heads = torch.arange(24.0)          # 里面的数就是 0 到 23 的编号，方便看顺序
+heads = heads.view(2, 2, 3, 2)      # 2 句话、2 个头、每句 3 个 token，每个头的向量 2 维
+--- below
+out = flatten_heads(heads)
+print("合并前:", tuple(heads.shape), " 合并后:", tuple(out.shape))
+print("第 0 句第 0 个 token 在 2 个头里的向量:", heads[0, :, 0].tolist())
+print("合并后这个 token 的向量:", out[0, 0].tolist())
 --- starter
 def flatten_heads(x):
     """x: (B, n_head, T, head_dim)  ->  (B, T, n_head * head_dim)
@@ -473,6 +502,14 @@ nn.Linear 是模型里数量最多的层。加载别人的权重、写 LoRA、�
 - 返回 `(..., out)`
 
 用 `@` 写，不要调用 `nn.Linear` 或 `F.linear`。
+--- above
+# 上文：模型里的一个 nn.Linear，把每个 token 的 4 维向量变成 2 维
+layer = nn.Linear(4, 2)        # layer.weight 是 (2, 4)，layer.bias 是 (2,)
+hidden = torch.randn(3, 5, 4)  # 3 句话，每句 5 个 token，每个 token 4 维
+--- below
+out = my_linear(hidden, layer.weight, layer.bias)
+print("输入:", tuple(hidden.shape), " 输出:", tuple(out.shape))
+print("和 nn.Linear 的结果一样吗:", torch.allclose(out, layer(hidden)))
 --- starter
 def my_linear(x, W, b):
     """x: (..., in)   W: (out, in)   b: (out,)   ->  (..., out)"""
@@ -506,6 +543,15 @@ softmax 在 attention 和每个分类头里都有。logits 很大时直接 exp �
 - 不许用 `F.softmax`、`torch.softmax`、`x.softmax`，也不许用 `log_softmax`。判题时调用它们会直接失败
 - 必须数值稳定：输入 `[[1000., 1001., 1002.]]` 也要算对，不能出现 inf 或 nan
 - `dim` 参数要真的用上：检查会用 `dim=1` 再测一次
+--- above
+# 上文：分类头给 2 个样本各打出 3 个分数（logits），还不是概率
+logits = torch.tensor([[2.0, 1.0, 0.1],
+                       [100.0, 101.0, 103.0]])   # 第 2 个样本的分数很大，直接 exp 会溢出成 inf
+--- below
+probs = my_softmax(logits)
+print("样本 1 的概率:", [round(p, 3) for p in probs[0].tolist()])
+print("样本 2 的概率:", [round(p, 3) for p in probs[1].tolist()])
+print("每行加起来:", [round(s, 3) for s in probs.sum(dim=-1).tolist()])
 --- starter
 def my_softmax(x, dim=-1):
     """沿 dim 做 softmax。必须先减去最大值，否则大数会溢出。"""
@@ -550,6 +596,16 @@ ref: day2
 - 要数值稳定：不要写 `softmax(...).log()`
 
 检查里还有两条：logits 全是 0（完全平均地猜）时，loss 必须正好是 `ln V`；logits 是 `[[0., 200.]]`、正确答案是第 0 类时，loss 必须是 200，不能是 inf。
+--- above
+# 上文：分类头对 3 个样本、4 个类别的打分（logits），和每个样本的正确类别
+logits = torch.tensor([[2.0, 0.5, -1.0, 0.0],
+                       [0.1, 0.2, 3.0, -0.5],
+                       [1.0, 1.0, 1.0, 1.0]])   # 第 3 个样本 4 个分数一样：完全平均地猜
+labels = torch.tensor([0, 2, 3])                # 每个样本正确类别的下标，int64
+--- below
+loss = my_cross_entropy(logits, labels)
+print("你的 loss:", round(loss.item(), 4))
+print("F.cross_entropy:", round(F.cross_entropy(logits, labels).item(), 4))
 --- starter
 def my_cross_entropy(logits, target):
     """logits: (N, V) 未归一化；target: (N,) int64 类别下标。
@@ -601,6 +657,14 @@ ref: day2
 - 返回一个标量：所有 `B*T` 个位置的平均交叉熵
 
 这题可以用 `F.cross_entropy`。但它要求类别在第 1 维：输入 `(N, V)` 配标签 `(N,)`。直接把 `(B, T, V)` 传进去会报错。
+--- above
+# 上文：刚初始化的语言模型在每个位置预测下一个 token（词表只有 5 个词），打的分都接近 0
+logits = torch.randn(2, 3, 5) * 0.1                  # (B, T, V)：2 句话、每句 3 个位置、给 5 个词各打一个分
+next_tokens = torch.tensor([[1, 4, 2], [0, 3, 3]])   # (2, 3)：每个位置真正的下一个 token，int64
+--- below
+loss = seq_loss(logits, next_tokens)
+print("loss:", round(loss.item(), 4), " shape:", tuple(loss.shape))
+print("平均地猜 5 个词时，loss ≈ ln 5 =", round(math.log(5), 4))
 --- starter
 def seq_loss(logits, targets):
     """logits: (B, T, V)   targets: (B, T) int64  ->  标量 loss"""
@@ -640,6 +704,16 @@ ref: day2
 - `my_rmsnorm(x, g, eps=1e-6)`：不减均值，没有 b：`x / sqrt(mean(x²) + eps) * g`
 
 用 mean、var、sqrt 这些基本运算写，不要调用 `F.layer_norm` 或 `F.rms_norm`。检查会看：g 全是 1 时，RMSNorm 之后每个向量的均方值约等于 1；还会用随机的 g，把你的 RMSNorm 和上面的公式逐个元素对比。
+--- above
+# 上文：Transformer 块里，每个 token 的向量进 attention 之前先过归一化层
+hidden = torch.tensor([[1.0, 2.0, 3.0, 6.0],
+                       [2.0, 4.0, 6.0, 12.0]])   # 2 个 token，每个 4 维；第 2 个正好是第 1 个的 2 倍
+gain, bias = torch.ones(4), torch.zeros(4)       # 函数里的 g 和 b：刚初始化时 g 全是 1，b 全是 0
+--- below
+ln = my_layernorm(hidden, gain, bias)
+rms = my_rmsnorm(hidden, gain)
+print("LayerNorm:", [[round(v, 2) for v in row] for row in ln.tolist()])
+print("RMSNorm:  ", [[round(v, 2) for v in row] for row in rms.tolist()])
 --- starter
 def my_layernorm(x, g, b, eps=1e-5):
     """在最后一维上归一化。g, b 的 shape 都是 (C,)。"""
@@ -692,6 +766,14 @@ attention 的核心是 query 和 key 两两做点积。论文和开源代码里�
 - `attn_scores_einsum(q, k)`：必须用 `torch.einsum` 写（检查会看函数里有没有调用 einsum）
 
 两个函数的结果要完全一致。
+--- above
+# 上文：拆完头的 q 和 k（也就是 split_heads 的输出）
+q = torch.randn(1, 2, 3, 4)   # (B, n_head, T, hs)：1 句话、2 个头、3 个 token，每个头 4 维
+k = torch.randn(1, 2, 3, 4)
+--- below
+s1, s2 = attn_scores_matmul(q, k), attn_scores_einsum(q, k)
+print("分数表:", tuple(s1.shape), " 两种写法一样吗:", torch.allclose(s1, s2))
+print("第 0 个头里，第 0 个 query 对 3 个 key 的分数:", [round(v, 3) for v in s1[0, 0, 0].tolist()])
 --- starter
 def attn_scores_matmul(q, k):
     """q, k: (B, nh, T, hs) -> (B, nh, T, T)，用 @ 写，别忘了除以 sqrt(hs)"""
@@ -741,6 +823,15 @@ ref: day2
 例子：某个样本的 mask 是 `[1, 1, 0]`，它的结果就是前两个向量的平均。
 
 不许用 for 循环。可以假设每个样本至少有一个真实 token。
+--- above
+# 上文：一个 batch 的 2 句话，短的那句右边补了 pad
+vecs = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]],    # (2, 4, 2)：每个 token 一个 2 维向量
+                     [[2.0, 2.0], [4.0, 0.0], [9.0, 9.0], [9.0, 9.0]]])   # pad 位置的 9.0 是没有意义的数
+attention_mask = torch.tensor([[1, 1, 1, 1],
+                               [1, 1, 0, 0]])   # 1 是真 token，0 是 pad：第 2 句只有前 2 个是真的
+--- below
+print("跳过 pad 的平均:", masked_mean(vecs, attention_mask).tolist())
+print("连 pad 一起平均:", vecs.mean(dim=1).tolist())
 --- starter
 def masked_mean(x, mask):
     """x: (B, T, C)   mask: (B, T)，0/1，1 表示有效
@@ -780,6 +871,15 @@ ref: day2
 - 返回 `(B, T)`：`out[b, t] = logits[b, t, targets[b, t]]`
 
 用 `torch.gather` 写，不要写循环。
+--- above
+# 上文：语言模型输出的 logits (B, T, V)，和每个位置真正的下一个 token
+logits = torch.tensor([[[0.5, 2.0, -1.0, 0.0], [1.5, 0.0, 0.5, -0.5]],
+                       [[0.0, 0.0, 3.0, 1.0], [-1.0, 0.25, 0.0, 2.5]]])   # 2 句话、每句 2 个位置、词表 4 个词
+next_tokens = torch.tensor([[1, 0],
+                            [3, 1]])   # (2, 2)：每个位置正确答案的下标
+--- below
+picked = pick_target_logits(logits, next_tokens)
+print("shape:", tuple(picked.shape), " 取出的 logit:", picked.tolist())
 --- starter
 def pick_target_logits(logits, targets):
     """logits: (B, T, V)   targets: (B, T)  ->  (B, T)
@@ -820,6 +920,16 @@ ref: day2
 - `forward(x)`：`x` 是 `(N, dim)`。先更新 `running_max`：它和「x 沿第 0 维的最大值」逐元素取较大的那个；这一步不能进计算图。然后返回 `x * weight`
 
 检查会看：`state_dict()` 里正好是 `weight` 和 `running_max`；`named_parameters()` 里只有 `weight`；buffer 不需要梯度；跑一次 forward 之后 running_max 的值对不对。
+--- above
+# 上文：模型中间一层的输出，一个 batch 3 个样本，每个 4 维
+acts = torch.tensor([[1.0, -2.0, 0.5, 3.0],
+                     [0.0, 4.0, -1.0, 1.0],
+                     [2.0, 1.0, -3.0, -1.0]])
+--- below
+m = Scaler(4)
+m(acts)
+print("可学习的参数:", [name for name, _ in m.named_parameters()], " state_dict:", list(m.state_dict()))
+print("跑完一个 batch 后 running_max:", m.running_max.tolist())
 --- starter
 class Scaler(nn.Module):
     def __init__(self, dim):
@@ -872,6 +982,15 @@ backward 会帮你求导，但你要能手推简单的梯度去核对它：写�
 写 `manual_grad_mse(x, target)`：用公式直接算出 `d loss / d x` 并返回，shape 和 `x` 一样。不许调用 `backward` 或 `torch.autograd`。
 
 检查会先用 autograd 算出真正的梯度，再和你的公式对比。
+--- above
+# 上文：回归模型的 4 个预测值和对应的真实值，loss 用 MSE
+pred = torch.tensor([2.0, 0.5, -1.0, 3.0])
+truth = torch.tensor([1.0, 0.5, 1.0, 1.0])
+--- below
+p = pred.clone().requires_grad_(True)   # 让 autograd 也算一遍，用来对照
+((p - truth) ** 2).mean().backward()
+print("手推:    ", manual_grad_mse(pred, truth).tolist())
+print("autograd:", p.grad.tolist())
 --- starter
 def manual_grad_mse(x, target):
     """loss = mean((x - target)^2)，返回 d loss / d x 的解析式（不许用 backward）。"""
@@ -916,6 +1035,14 @@ x    = [[1, 2, 3], [4, 99, 99], [5, 6, 99]]
 mask = [[1, 1, 1], [1, 0, 0],   [1, 1, 0]]
 ```
 这题可以用 for 循环。
+--- above
+# 上文：分词器把 3 句话变成了 token id，长度各不相同
+token_ids = [torch.tensor([12, 7, 3, 9]), torch.tensor([5, 2]), torch.tensor([8])]
+--- below
+x, mask = collate(token_ids, pad_id=0)
+print("x:   ", x.tolist())
+print("mask:", mask.tolist())
+print("dtype:", x.dtype)
 --- starter
 def collate(samples, pad_id=0):
     """samples: list of 1D LongTensor，长度不一。
@@ -962,6 +1089,15 @@ ref: day2
 - 检查会跑 200 步，要求最后一步的 loss 比第一步低 10% 以上
 
 有的错会直接报错，有的不报错，只是结果不对。先运行一次，从报错开始改。
+--- above
+# 上文：一个 3 分类的小模型，和 32 条训练数据（每条 4 个特征）
+clf = nn.Linear(4, 3)
+features = torch.randn(32, 4)
+labels = torch.randint(0, 3, (32,))   # 每条数据的正确类别，int64
+--- below
+losses = train_one_epoch(clf, features, labels)
+print("losses 里存的是:", type(losses[0]).__name__)
+print("第 1 步的 loss:", round(losses[0], 4), " 最后一步:", round(losses[-1], 4))
 --- starter
 def train_one_epoch(model, xs, ys, lr=0.1, steps=200):
     opt = torch.optim.SGD(model.parameters, lr=lr)
@@ -1116,6 +1252,15 @@ ref: day2
 - 输入 `qkv`：`(B, T, 3*C)`，最后一维依次是 q、k、v，各占 C 列
 - 返回 `q, k, v`，每个都是 `(B, n_head, T, C // n_head)`
 - 每个头拿到 C 维里连续的一段
+--- above
+# 上文：attention 里的 c_attn（一个 Linear）一次算出 q、k、v，拼在一起就是 qkv
+n_head = 2                     # 2 个头
+x = torch.randn(1, 4, 8)       # (B, T, C)：1 句话，4 个 token，每个 token 8 维
+qkv = nn.Linear(8, 3 * 8)(x)   # (1, 4, 24)：最后一维依次是 q、k、v，各 8 维
+--- below
+q, k, v = split_heads(qkv, n_head)
+print("q:", tuple(q.shape), " k:", tuple(k.shape), " v:", tuple(v.shape))
+print("第 0 个头的 q 是 qkv 的前 4 列吗:", torch.equal(q[0, 0], qkv[0, :, :4]))
 --- starter
 def split_heads(qkv, n_head):
     raise todo()
@@ -1158,6 +1303,16 @@ ref: day2
 - `logits`：`(N, V)`；`target`：`(N,)`，int64
 - 返回标量：每个样本 `-log p(正确类别)` 的平均
 - 不许用 `F.cross_entropy` 和 `F.nll_loss`；要数值稳定（logits 差距很大时也不能出现 inf）
+--- above
+# 上文：语言模型在 3 个位置上给 5 个词打的分（logits），和每个位置真正的下一个词
+logits = torch.tensor([[4.0, 0.0, 1.0, 0.0, -1.0],
+                       [0.0, 0.0, 0.0, 0.0, 0.0],
+                       [0.5, 3.0, 0.0, 0.0, 2.0]])   # 第 2 行全是 0：完全平均地猜
+next_word = torch.tensor([0, 2, 4])                   # 每个位置正确答案的下标，int64
+--- below
+loss = my_cross_entropy(logits, next_word)
+print("你的 loss:", round(loss.item(), 4))
+print("F.cross_entropy:", round(F.cross_entropy(logits, next_word).item(), 4))
 --- starter
 def my_cross_entropy(logits, target):
     raise todo()

@@ -303,12 +303,23 @@ Write `file_sha256(path)`: return the sha256 of the file's contents as a 64-char
 
 - Open the file in binary mode `"rb"`: the hash is over bytes. Text mode turns Windows line endings `\r\n` into `\n`, and it gives you a string, not bytes.
 - Read in chunks: `f.read(1 << 20)` (1 MB) each time, call `h.update(chunk)` for every chunk, and stop when you get the empty `b""`.
+--- above
+# Where the input comes from: last run's training data and today's (two tiny CSVs, one label apart)
+import os, tempfile
+tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)    # a temporary folder, deleted after the run
+csv_paths = write_files(tmp.name, {                              # a course helper: writes the files, returns their paths
+    "train_old.csv": "text,label\ngreat phone,1\nbroke in a day,0\n",
+    "train_new.csv": "text,label\ngreat phone,1\nbroke in a day,1\n",   # only the last label changed
+})
 --- starter
 import hashlib
 
 def file_sha256(path):
     """path -> 64-character hexadecimal string"""
     raise todo()
+--- below
+for p in csv_paths:
+    print(os.path.basename(p), file_sha256(p))
 --- solution
 import hashlib
 
@@ -373,12 +384,24 @@ Write `data_fingerprint(paths)`: `paths` is a list of file paths; return a 64-ch
 3. Join them with a newline `"\n"`, turn the result into bytes with `.encode("utf-8")`, hash it once more with sha256 and return `hexdigest()`.
 
 Then: a different file order gives the same fingerprint; renamed files in another folder give the same fingerprint; changing one byte in any file changes it.
+--- above
+# Where the input comes from: a dataset of three files; glob may list them in a different order on each machine
+import tempfile
+tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)    # a temporary folder, deleted after the run
+dataset_files = write_files(tmp.name, {                          # a course helper: writes the files, returns their paths
+    "train.csv": "text,label\ngreat phone,1\nbroke in a day,0\n",
+    "val.csv": "text,label\nworks fine,1\n",
+    "test.csv": "text,label\nnever again,0\n",
+})
 --- starter
 import hashlib
 
 def data_fingerprint(paths):
     """a set of files -> one 64-character fingerprint, independent of file order and names"""
     raise todo()
+--- below
+print("original order:", data_fingerprint(dataset_files))
+print("reversed order:", data_fingerprint(dataset_files[::-1]))
 --- solution
 import hashlib
 
@@ -449,6 +472,16 @@ Write `make_run_record(run_id, config, git_commit, data_paths, seed, metrics)`. 
 - `"data_fingerprint"`: `data_fingerprint(data_paths)` (already written).
 - `"versions"`: `{"python": platform.python_version(), "torch": torch.__version__, "numpy": np.__version__}`.
 - `"metrics"`: every value turned into a Python number with `float(v)`. The values may arrive as 0-dim tensors or numpy float32, and those cannot be saved as JSON.
+--- above
+# Where the input comes from: a training run just finished; this is everything its record needs
+import json, tempfile
+import numpy as np
+tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)    # a temporary folder, deleted after the run
+csv_paths = write_files(tmp.name, {"train.csv": "text,label\ngreat phone,1\n",   # a course helper: writes
+                                   "val.csv": "text,label\nworks fine,1\n"})     # the files, returns their paths
+train_config = {"lr": 0.003, "batch_size": 64, "optim": {"name": "adamw", "weight_decay": 0.01}}
+commit = "7e2d9b4c1a0f3e8d6c5b4a39281706f5e4d3c2b1"                # what git rev-parse HEAD prints
+final_metrics = {"val_loss": torch.tensor(0.4375), "val_acc": np.float32(0.8125)}   # a 0-dim tensor, a numpy float32
 --- starter
 import copy
 import platform
@@ -457,6 +490,12 @@ import numpy as np
 def make_run_record(run_id, config, git_commit, data_paths, seed, metrics):
     """Return the record (a dict) of one run, ready to be saved as JSON."""
     raise todo()
+--- below
+rec = make_run_record("run-05", train_config, commit, csv_paths, 7, final_metrics)
+print("keys:", sorted(rec))
+print("metrics as JSON:", json.dumps(rec["metrics"]))
+train_config["optim"]["weight_decay"] = 0.1                      # later the training script changes config
+print("optim in the record:", rec["config"]["optim"])
 --- solution
 import copy
 import platform
@@ -621,6 +660,10 @@ Fix it so that:
 1. The same seed gives exactly the same weights and orders.
 2. Different seeds shuffle into different orders.
 3. Within one run, every epoch has a different order (the shuffle must still work).
+--- above
+# Where the input comes from: a little data the training script loaded: 16 samples, 3 features each
+x_train = torch.randn(16, 3)
+y_train = x_train @ torch.tensor([[2.0], [0.0], [-1.0]])       # the target to learn: a weighted sum, shape (16, 1)
 --- starter
 import random
 import numpy as np
@@ -644,6 +687,11 @@ def train_run(seed, x, y, epochs=2, batch_size=8):
             loss.backward()
             opt.step()
     return model.weight.detach().clone(), orders
+--- below
+w1, orders1 = train_run(0, x_train, y_train)
+w2, orders2 = train_run(0, x_train, y_train)                   # same seed, run it again
+print("run 1, epoch 1 order:", orders1[0])
+print("run 2, epoch 1 order:", orders2[0], "  same weights:", torch.equal(w1, w2))
 --- solution
 import random
 import numpy as np
@@ -754,6 +802,18 @@ Write two functions:
 2. `config_diff(a, b)`: compare two config dicts and return `{key: (value in a, value in b)}`, only for keys whose values differ. A key that appears on one side only counts as None on the other. Keys with equal values must not appear.
 
 The checks use the four records of `sample_runs()` (printed on the card).
+--- above
+# Where the input comes from: four run records read back by load_runs(folder) (only the fields we need)
+past_runs = [
+    {"run_id": "run-11", "config": {"lr": 0.001, "batch_size": 32},
+     "metrics": {"val_acc": 0.81, "val_loss": 0.52}},
+    {"run_id": "run-12", "config": {"lr": 0.01, "batch_size": 32, "dropout": 0.1},
+     "metrics": {}},                                            # crashed: the loss became nan before evaluation
+    {"run_id": "run-13", "config": {"lr": 0.003, "batch_size": 32, "dropout": 0.1},
+     "metrics": {"val_acc": 0.86, "val_loss": 0.49}},
+    {"run_id": "run-14", "config": {"lr": 0.003, "batch_size": 64},
+     "metrics": {"val_acc": 0.84, "val_loss": 0.46}},
+]
 --- starter
 def best_run(runs, metric, higher_is_better=True):
     """Return the record with the best metric; skip records without that metric"""
@@ -763,6 +823,11 @@ def best_run(runs, metric, higher_is_better=True):
 def config_diff(a, b):
     """{key: (value in a, value in b)}, only for keys whose values differ; a missing side is None"""
     raise todo()
+--- below
+print("highest val_acc:", best_run(past_runs, "val_acc")["run_id"])
+print("lowest val_loss:", best_run(past_runs, "val_loss", higher_is_better=False)["run_id"])
+diff = config_diff(past_runs[2]["config"], past_runs[3]["config"])    # run-13 against run-14
+print("config differences:", sorted(diff.items()))
 --- solution
 def best_run(runs, metric, higher_is_better=True):
     """Return the record with the best metric; skip records without that metric"""
@@ -862,6 +927,12 @@ To write:
 3. `promote(version)`: if that version number does not exist, `raise ValueError`; otherwise set `production` to it, append it to the end of `history`, and save.
 
 Every method that changes something starts with `self._load()` and ends with `self._save(data)`. Do not keep state on `self`: the checks create a new `Registry(folder)` to look.
+--- above
+# Where the input comes from: two finished runs go into the model registry (a registry.json in a folder)
+import tempfile
+tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)    # a temporary folder, deleted after the run
+registry_folder = tmp.name
+finished = {"run-21": {"val_acc": 0.83}, "run-22": {"val_acc": 0.86}}   # run_id -> that run's metrics
 --- starter
 class Registry(JsonStore):
     def register(self, run_id, metrics):
@@ -875,6 +946,12 @@ class Registry(JsonStore):
     def promote(self, version):
         """Make version the production version and record it in history"""
         raise todo()
+--- below
+reg = Registry(registry_folder)
+for run_id, run_metrics in finished.items():
+    print(run_id, "registered as version", reg.register(run_id, run_metrics), "  production:", reg.production())
+reg.promote(2)
+print("after promote(2), a new Registry sees production:", Registry(registry_folder).production())
 --- solution
 class Registry(JsonStore):
     def register(self, run_id, metrics):
@@ -983,6 +1060,17 @@ Without a gate, one command ships a worse model; without rollback, an incident m
 2. `rollback()`: with fewer than 2 versions in `history`, `raise ValueError`. Otherwise remove the last entry of `history`, set `production` to the new last entry, save, and return that version number. Rollback does **not** go through the gate.
 
 Use `self._load()` / `self._save(data)` to read and write.
+--- above
+# Where the input comes from: registry.json right now (v1, then v2 were promoted; v3 was just registered)
+import json, tempfile
+registry_now = {
+    "versions": [{"version": 1, "run_id": "run-31", "metrics": {"val_acc": 0.82}},
+                 {"version": 2, "run_id": "run-32", "metrics": {"val_acc": 0.88}},
+                 {"version": 3, "run_id": "run-33", "metrics": {"val_acc": 0.85}}],
+    "production": 2, "history": [1, 2],          # v2 is in production; history: promoted versions, in order
+}
+tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)    # a temporary folder, deleted after the run
+write_files(tmp.name, {"registry.json": json.dumps(registry_now)})   # a course helper: writes text to a file
 --- starter
 class Registry(BasicRegistry):
     def promote(self, version):
@@ -992,6 +1080,13 @@ class Registry(BasicRegistry):
     def rollback(self):
         """Go back to the previously promoted version; return its number"""
         raise todo()
+--- below
+reg = Registry(tmp.name)                         # by default it compares val_acc, higher is better
+try:
+    reg.promote(3)
+except ValueError:
+    print("promote(3) refused, production is still:", reg.production())
+print("rollback() went back to:", reg.rollback(), "  history:", reg._load()["history"])
 --- solution
 class Registry(BasicRegistry):
     def promote(self, version):
@@ -1212,9 +1307,25 @@ Write `make_run_record(run_id, config, git_commit, data_paths, seed, metrics)`. 
 - Deep-copy the config; compute the data fingerprint with the existing `data_fingerprint(data_paths)`.
 - versions holds three version strings: `"python"`, `"torch"`, `"numpy"`.
 - Turn every metric value into a Python float.
+--- above
+# Where the input comes from: another training run just finished and needs its record
+import json, tempfile
+import numpy as np
+tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)    # a temporary folder, deleted after the run
+csv_paths = write_files(tmp.name, {"train.csv": "text,label\nlove it,1\nwaste of money,0\n",   # a course helper:
+                                   "val.csv": "text,label\nokay I guess,1\n"})              # writes files, returns paths
+train_config = {"lr": 0.0005, "epochs": 20, "model": {"layers": 4, "hidden": 128}}
+commit = "c41f07a9e2b8d3561f0e9a7b2c4d6e8f10a3b5c7"                # what git rev-parse HEAD prints
+final_metrics = {"val_loss": torch.tensor(0.3125), "val_f1": np.float32(0.90625)}   # a 0-dim tensor, a numpy float32
 --- starter
 def make_run_record(run_id, config, git_commit, data_paths, seed, metrics):
     raise todo()
+--- below
+rec = make_run_record("run-06", train_config, commit, csv_paths, 123, final_metrics)
+print("keys:", sorted(rec))
+print("metrics as JSON:", json.dumps(rec["metrics"]))
+train_config["model"]["layers"] = 8                              # later a sweep script changes config
+print("model in the record:", rec["config"]["model"])
 --- solution
 import copy
 import platform
@@ -1310,6 +1421,17 @@ Write `promote(version)` and `rollback()` of `class Registry(BasicRegistry)`. Yo
 
 - `promote`: if a version is in production, the new version's `self.metric` must not be worse (the direction comes from `higher_is_better`). If it is worse, `raise ValueError` and leave the file unchanged; otherwise make it `production`, append it to `history`, save.
 - `rollback`: with fewer than 2 entries in `history`, `raise ValueError`; otherwise go back to the previously promoted version and return its number. Rollback does not go through the gate.
+--- above
+# Where the input comes from: a registry that compares val_loss (lower is better); v1 then v2 were promoted
+import json, tempfile
+registry_now = {
+    "versions": [{"version": 1, "run_id": "run-41", "metrics": {"val_loss": 0.52}},
+                 {"version": 2, "run_id": "run-42", "metrics": {"val_loss": 0.47}},
+                 {"version": 3, "run_id": "run-43", "metrics": {"val_loss": 0.49}}],
+    "production": 2, "history": [1, 2],          # v2 is in production; history: promoted versions, in order
+}
+tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)    # a temporary folder, deleted after the run
+write_files(tmp.name, {"registry.json": json.dumps(registry_now)})   # a course helper: writes text to a file
 --- starter
 class Registry(BasicRegistry):
     def promote(self, version):
@@ -1317,6 +1439,13 @@ class Registry(BasicRegistry):
 
     def rollback(self):
         raise todo()
+--- below
+reg = Registry(tmp.name, metric="val_loss", higher_is_better=False)
+try:
+    reg.promote(3)
+except ValueError:
+    print("promote(3) refused, production is still:", reg.production())
+print("rollback() went back to:", reg.rollback(), "  history:", reg._load()["history"])
 --- solution
 class Registry(BasicRegistry):
     def promote(self, version):

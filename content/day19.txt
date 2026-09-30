@@ -374,6 +374,14 @@ targets: model_bytes
 - `buffer_bytes`：所有 buffer 的字节数之和
 
 每个张量的字节数用 `numel() * element_size()` 算，不要把「4 字节」写死。共享的权重只算一次（`model.parameters()` 已经帮你去重了）。
+--- above
+# 上文：上线前，先把要部署的模型建好（或者从 checkpoint 加载进来）
+# 一个小分类器，中间有 BatchNorm
+clf = nn.Sequential(nn.Linear(32, 64), nn.BatchNorm1d(64), nn.ReLU(), nn.Linear(64, 3))
+--- below
+p, b = model_bytes(clf)
+print("参数:", p, "字节  buffer:", b, "字节")
+print("转成 half 以后 (参数, buffer):", model_bytes(clf.half()))
 --- starter
 def model_bytes(model):
     """返回 (参数的字节数, buffer 的字节数)。"""
@@ -446,6 +454,13 @@ precision   weights  grads  master  adam (m + v)
 - `total` 是前四项之和。
 - 其他的 `precision` 要 `raise ValueError`。
 - 例：`train_state_bytes(7_000_000_000, "fp32")["total"] == 112_000_000_000`
+--- above
+# 上文：参数个数看模型名字（1B、7B……），或者用 model.parameters() 数出来
+n = 1_000_000_000   # 一个 1B（10 亿参数）的模型：每个参数 1 字节，就是 1 GB
+--- below
+for p in ["fp32", "mixed", "bf16"]:
+    r = train_state_bytes(n, p)
+    print(p, "(GB):", {k: v / 1e9 for k, v in r.items()})
 --- starter
 def train_state_bytes(n_params, precision):
     """Adam 训练时，权重、梯度、主权重、Adam 状态各占多少字节，再加上总数。"""
@@ -529,6 +544,17 @@ OOM 常常不是模型放不下，而是激活放不下。先算出权重、梯�
 - 返回 int
 
 例：24 GB 的卡（`24_000_000_000`），静态部分 `19_327_352_832`（约 12 亿参数，混合精度 + Adam），seq=2048，hidden=2048，24 层，bf16（2 字节）→ 返回 1。
+--- above
+# 上文：一张 16 GB 的卡，要训练一个 3.5 亿参数的模型（混合精度 + Adam）
+gpu_mem = 16_000_000_000
+static_mem = 350_000_000 * 16                  # 权重、梯度、主权重、Adam 状态：每个参数 16 字节
+seq_len, hidden_dim, layers = 1024, 1024, 24   # 每条样本 1024 个 token，隐藏维 1024，24 层
+bf16 = 2                                       # 激活用 bf16 存，每个数 2 字节
+--- below
+print("每层存 16 份:", max_micro_batch(gpu_mem, static_mem, seq_len, hidden_dim, layers, bf16))
+print("序列长度翻倍:", max_micro_batch(gpu_mem, static_mem, 2 * seq_len, hidden_dim, layers, bf16))
+print("开了激活检查点，每层 1 份:",
+      max_micro_batch(gpu_mem, static_mem, seq_len, hidden_dim, layers, bf16, tensors_per_layer=1))
 --- starter
 def max_micro_batch(gpu_bytes, static_bytes, seq, hidden, n_layers, bytes_per_value, tensors_per_layer=16):
     """显存减去静态部分，剩下的最多放得下几个样本的激活。"""
@@ -581,6 +607,14 @@ targets: train_epoch
 
 - 返回 `(losses, mean_loss)`：`losses` 是每个 batch 的 loss，是 Python `float` 的列表；`mean_loss` 是它们的平均，也是 Python `float`
 - 训练的几步（zero_grad、backward、step）不要改
+--- above
+# 上文：一个小回归模型的训练脚本，每个 epoch 把这几个 batch 过一遍
+net = nn.Sequential(nn.Linear(3, 8), nn.ReLU(), nn.Linear(8, 1))
+optimizer = torch.optim.SGD(net.parameters(), lr=0.1)
+train_batches = [(torch.randn(5, 3), torch.randn(5, 1)) for _ in range(3)]   # 3 个 batch：x 是 (5, 3)，y 是 (5, 1)
+--- below
+losses, mean_loss = train_epoch(net, optimizer, train_batches)
+print("losses 里是:", [type(v).__name__ for v in losses], " mean_loss 是:", type(mean_loss).__name__)
 --- starter
 def train_epoch(model, opt, batches):
     losses = []
@@ -762,6 +796,13 @@ ref: day19
 4. 返回这 `runs` 个耗时的中位数（可以用 `statistics.median`）。
 
 读时间一定要用参数 `clock`，不要直接调 `time.perf_counter()`：测试会传一个假时钟进来，结果才每次都一样。
+--- above
+# 上文：要给模型的一次前向计时。这里用课程提供的 FakeGPU 代替真 GPU，时钟是假的
+# gpu.fn() 像跑一次 model(x)（只排队，马上返回）；gpu.sync() 像 torch.cuda.synchronize()；gpu.clock() 读时钟
+gpu = FakeGPU([9.0, 5.0, 1.2, 1.0, 1.1, 3.5, 1.0])   # 每次调用耗时几秒：头两次特别慢，第 6 次被别的程序打断
+--- below
+t = benchmark(gpu.fn, warmup=2, runs=5, clock=gpu.clock, sync=gpu.sync)
+print("中位数:", round(t, 4), "秒；fn 一共调用了", gpu.calls, "次")
 --- starter
 import statistics
 import time
@@ -835,6 +876,16 @@ ref: day19
 - 输出一样（block 里有 dropout，测试会固定随机种子）
 - 输入 x 不需要梯度时，参数的梯度也和不用检查点时完全一样
 - 为反向存下的字节数少了一半以上（用 `saved_bytes` 量）
+--- above
+# 上文：模型的几层 block 放在一个 nn.ModuleList 里，h 是送进第一层的一个 batch
+layers = nn.ModuleList([nn.Sequential(nn.Linear(8, 32), nn.GELU(), nn.Linear(32, 8)) for _ in range(3)])
+h = torch.randn(4, 8)   # 4 条样本，每条 8 维；这是数据，不需要梯度
+# saved_bytes 是卡片「激活值：随 batch 和长度一起涨」里的函数：返回 (输出, autograd 为反向存了几字节)
+--- below
+plain_out, plain_n = saved_bytes(nn.Sequential(*layers), h, skip=layers.parameters())   # 普通前向：一层接一层
+out, ckpt_n = saved_bytes(forward_checkpointed, layers, h, skip=layers.parameters())
+print("输出形状:", tuple(out.shape), " 和普通前向一样吗:", torch.allclose(out, plain_out))
+print("为反向存的字节：普通前向", plain_n, " 用检查点", ckpt_n)
 --- starter
 from torch.utils.checkpoint import checkpoint
 
@@ -963,6 +1014,13 @@ exam: yes
 计时函数是性能工作的地基：每次说「快了多少」都靠它。闭卷从空白写出来，确认预热、同步、中位数这三件事已经记住了。
 --- prompt
 从空白写出 `benchmark(fn, warmup=3, runs=10, clock=time.perf_counter, sync=None)`：预热 `warmup` 次不计时；再单独计时 `runs` 次；`sync` 不是 `None` 时，读开始时间前和读结束时间前都调用它；读时间只用 `clock`；返回耗时的中位数（秒）。
+--- above
+# 上文：要给 CPU 上的一次推理计时。这里用课程提供的 FakeGPU 代替，时钟是假的
+# async_=False 就像 CPU：cpu.fn() 返回时活已经干完，不用 sync；cpu.clock() 读时钟
+cpu = FakeGPU([30.0, 2.0, 2.4, 2.1, 9.0], async_=False)   # 每次调用耗时几秒：第 1 次特别慢，最后一次被打断
+--- below
+t = benchmark(cpu.fn, warmup=1, runs=4, clock=cpu.clock)
+print("中位数:", round(t, 4), "秒；fn 一共调用了", cpu.calls, "次")
 --- starter
 import statistics
 import time
@@ -1029,6 +1087,13 @@ exam: yes
 「7B 模型全量微调要多少显存」是面试高频题。闭卷写一遍，确认三种精度下每个参数几个字节已经记住了。
 --- prompt
 从空白写出 `train_state_bytes(n_params, precision)`，优化器是 Adam。返回 dict（字节，int），键是 `"weights"`、`"grads"`、`"master"`、`"adam"`、`"total"`；`precision` 是 `"fp32"`、`"mixed"` 或 `"bf16"`，其他值 `raise ValueError`。每种精度下每一项几个字节，要靠你自己记住。
+--- above
+# 上文：面试常问「全量微调一个 8B 模型，一张 80 GB 的卡放得下吗」
+n = 8_000_000_000         # 8B 就是 80 亿个参数
+gpu_mem = 80_000_000_000  # 一张 80 GB 的卡（比如 A100 80GB）
+--- below
+for p in ["fp32", "mixed", "bf16"]:
+    print(p, "+ Adam 放得下吗（不算激活）:", train_state_bytes(n, p)["total"] <= gpu_mem)
 --- starter
 def train_state_bytes(n_params, precision):
     raise todo()

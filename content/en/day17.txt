@@ -296,6 +296,16 @@ It already uses `torch.no_grad()`. It runs and raises no error. But the tests fo
 3. Every prediction changes BatchNorm's `running_mean`.
 
 Fix `predict` so that all three problems go away.
+--- above
+# Where the input comes from: the service receives a batch of requests for the classifier we just trained
+clf = make_classifier()          # today's small classifier: 8 inputs, 3 classes, with BatchNorm and Dropout
+                                 # a new model starts in train mode, just like right after training
+requests = torch.randn(4, 8)     # a batch of 4 requests, 8 features each
+--- below
+probs = predict(clf, requests)
+print("Request 0, probabilities of the 3 classes:", [round(p, 3) for p in probs[0].tolist()])
+print("Same batch predicted again, same result?", torch.equal(predict(clf, requests), probs))
+print("First 2 alone == first 2 inside the batch?", torch.allclose(predict(clf, requests[:2]), probs[:2], atol=1e-6))
 --- starter
 def predict(model, x):
     """x: (B, 8) -> probabilities (B, 3)"""
@@ -357,6 +367,18 @@ The evaluation part is correct: it uses `model.eval()` and `torch.no_grad()`. Th
 Fix it so that **every training step runs in train mode and every evaluation runs in eval mode.**
 
 The tests put a `ModeSpy` at the front of the model. It records which mode the model is in at every forward pass.
+--- above
+# Where the input comes from: a small regression model with Dropout, trained for 4 steps, evaluated every 2
+spy = ModeSpy()                  # today's small helper: passes the input on and records whether the model is in train mode
+net = nn.Sequential(spy, nn.Linear(4, 8), nn.Dropout(0.2), nn.Linear(8, 1))   # a new model starts in train mode
+train_data = [(torch.randn(3, 4), torch.randn(3, 1)) for _ in range(4)]   # 4 training batches of 3 rows
+val_data = (torch.randn(5, 4), torch.randn(5, 1))                         # a validation set of 5 rows
+# each entry of spy.log is (rows in this forward pass, train mode?): 3 rows = training, 5 rows = evaluation
+--- below
+val_losses = fit(net, train_data, val_data, eval_every=2)
+print("Validation losses:", [round(v, 3) for v in val_losses])
+print("Train mode during the 4 training steps?", [mode for n, mode in spy.log if n == 3])
+print("Train mode during the 2 evaluations?", [mode for n, mode in spy.log if n == 5])
 --- starter
 def fit(model, train_batches, val_batch, eval_every=2):
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -435,6 +457,14 @@ Computing the mean and standard deviation on all the data and splitting afterwar
 `normalize_split(x, n_train)`: `x` has shape (N, D); the first `n_train` rows are the training set and the rest is the test set. Normalise both parts with the **training set's** mean and standard deviation (per column, `.mean(0)` and `.std(0)` with the default unbiased estimate) and return `(x_train, x_test, mean, std)`.
 
 The current code runs, but the test data changes the training results. Fix it.
+--- above
+# Where the input comes from: a small tabular dataset, one sample per row, 2 features; 4 training rows, 2 test rows
+data = torch.tensor([[1.0, 50.0], [2.0, 70.0], [3.0, 40.0], [4.0, 60.0],   # training set
+                     [9.0, 55.0], [10.0, 65.0]])                          # test set: feature 0 has drifted up
+--- below
+x_train, x_test, mean, std = normalize_split(data, 4)
+print("mean:", [round(v, 3) for v in mean.tolist()], " std:", [round(v, 3) for v in std.tolist()])
+print("Test set after normalising:", [[round(v, 2) for v in row] for row in x_test.tolist()])
 --- starter
 def normalize_split(x, n_train):
     mean = x.mean(0)
@@ -484,6 +514,15 @@ A language model with unshifted labels shows a loss that falls fast, close to 0;
 `lm_loss(model, tokens)`: `tokens` has shape (B, T), dtype long. `model(inp)` turns (B, k) tokens into (B, k, V) logits, and the logits at position t are the guess for the **next** token. Return the mean cross-entropy over the batch (a scalar).
 
 The tests use two fake models: `NextModel` always guesses "current token + 1", and `CopyModel` always guesses "the current token". On data that counts up by 1 (0, 1, 2, 3, …), the first is a perfect language model and the second is useless. The current code says the opposite. Fix it.
+--- above
+# Where the input comes from: a batch of "counting" token sequences (10-word vocabulary) and today's two fake models
+token_batch = torch.tensor([[3, 4, 5, 6, 7, 8],
+                            [7, 8, 9, 0, 1, 2]])   # (2, 6), dtype long; the next token is always "current + 1", 9 wraps to 0
+next_model = NextModel(10)       # always guesses "current token + 1"
+copy_model = CopyModel(10)       # always guesses "the current token"
+--- below
+print("NextModel loss:", round(lm_loss(next_model, token_batch).item(), 4))
+print("CopyModel loss:", round(lm_loss(copy_model, token_batch).item(), 4))
 --- starter
 def lm_loss(model, tokens):
     logits = model(tokens)                       # (B, T, V)
@@ -535,6 +574,18 @@ With padding in the mean, the loss depends on how much padding there is. Change 
 The target at padding positions is 0, and 0 is also a real token id, so you cannot simply rely on `ignore_index`.
 
 Return the mean cross-entropy **over all real tokens** (averaged per token, one scalar). The current code already multiplies the padding losses by 0, yet the result is still wrong. Fix it.
+--- above
+# Where the input comes from: a language model's scores for a padded batch; sentence 2 has only 2 real tokens
+lm_logits = torch.randn(2, 4, 5)             # 2 sentences, 4 positions each, a 5-word vocabulary
+next_ids = torch.tensor([[1, 4, 2, 3],
+                         [2, 0, 0, 0]])       # the next token at each position; padding is 0 (sentence 2's first 0 is real)
+pad_mask = torch.tensor([[1., 1., 1., 1.],
+                         [1., 1., 0., 0.]])   # 1.0 = real token, 0.0 = padding
+--- below
+loss = masked_lm_loss(lm_logits, next_ids, pad_mask)
+# 3 more padding positions at the end of each sentence: F.pad adds zeros; (0, 0, 0, 3) pads dim -2 (positions) by 3
+more = masked_lm_loss(F.pad(lm_logits, (0, 0, 0, 3)), F.pad(next_ids, (0, 3)), F.pad(pad_mask, (0, 3)))
+print("loss:", round(loss.item(), 4), "  with 3 more padding positions per sentence:", round(more.item(), 4))
 --- starter
 def masked_lm_loss(logits, targets, mask):
     V = logits.size(-1)
@@ -593,6 +644,16 @@ Requirement: the result must be **exactly the same** as "compute `F.mse_loss` (d
 Careful: the micro-batches are not always the same size; the last one may be smaller (for example 4, 4, 2).
 
 The tests use SGD, because Adam hardly reacts to scaling the whole gradient and would hide this bug.
+--- above
+# Where the input comes from: the GPU only fits 3 rows at a time, so a batch of 8 is cut into parts of 3, 3 and 2
+net = nn.Linear(3, 1)
+sgd = torch.optim.SGD(net.parameters(), lr=0.1)
+x, y = torch.randn(8, 3), torch.randn(8, 1)        # the big batch: 8 rows
+parts = list(zip(x.split(3), y.split(3)))          # [(x, y), (x, y), (x, y)] with 3, 3 and 2 rows
+--- below
+full = F.mse_loss(net(x), y).item()                # for comparison: the loss on all 8 rows, before the update
+got = accum_step(net, sgd, parts)
+print("accum_step returns:", round(got, 4), "  loss on the big batch:", round(full, 4))
 --- starter
 def accum_step(model, opt, micro_batches):
     opt.zero_grad()
@@ -669,6 +730,16 @@ Almost every codebase that trains Transformers splits the parameters into a "dec
 - group 2: the parameters that do not (all biases and LayerNorm weights), `"weight_decay": 0.0`
 
 Every parameter must appear in exactly one group. The current code looks for biases by name. It runs, but LayerNorm's weight still gets decay. Switch to a reliable rule: **1-D parameters (`p.ndim < 2`) get no decay; parameters with 2 or more dimensions get decay.**
+--- above
+# Where the input comes from: a tiny language model's three layers; we group their parameters before building the optimizer
+tiny_lm = nn.ModuleDict({"emb": nn.Embedding(6, 4),    # ModuleDict only gives each layer a name
+                         "norm": nn.LayerNorm(4),
+                         "head": nn.Linear(4, 6)})
+--- below
+groups = param_groups(tiny_lm, 0.1)
+decay_ids = [id(p) for p in groups[0]["params"]]   # the id (object number) of each parameter in group 1 (decay)
+for name, p in tiny_lm.named_parameters():
+    print(f"{name:11s} shape {str(tuple(p.shape)):7s} ->", "decay" if id(p) in decay_ids else "no decay")
 --- starter
 def param_groups(model, weight_decay):
     decay, no_decay = [], []
@@ -738,6 +809,14 @@ A warmup schedule is designed in steps. Step it once per epoch and the learning 
 The schedule is a linear warmup: the learning rate at step s (counting from 0; every `opt.step()` is one step) is `lr * min(1, (s + 1) / warmup)`. So over the first 8 steps it rises from 0.0125 to 0.1, and then it stays at 0.1.
 
 The function returns the list of learning rates actually used by each `opt.step()`. The current code runs, but the learning rate rises too slowly. Fix it.
+--- above
+# Where the input comes from: a small regression model and 3 training batches; 2 epochs, 4 warmup steps
+net = nn.Linear(2, 1)
+loader = [(torch.randn(4, 2), torch.randn(4, 1)) for _ in range(3)]   # 3 batches of 4 rows
+--- below
+used = train_with_warmup(net, loader, epochs=2, lr=0.1, warmup=4)
+print("Learning rates used:", [round(v, 4) for v in used])
+print("Planned schedule:   ", [round(0.1 * min(1, (s + 1) / 4), 4) for s in range(6)])
 --- starter
 def train_with_warmup(model, batches, epochs, lr=0.1, warmup=8):
     opt = torch.optim.SGD(model.parameters(), lr=lr)
@@ -819,6 +898,15 @@ Write `check_causal(model, x)`, which checks whether a sequence model "peeks at 
 - Call `model.eval()` first and run inside `torch.no_grad()`: some models contain Dropout, whose randomness changes the outputs anyway.
 
 The tests use `CumMean` (causal), `TinyAttention(mask="causal" / "none" / "peek1")`, `SameConv` (a convolution with padding=1) and `PeekMiddle` (only position 2 peeks at position 3).
+--- above
+# Where the input comes from: before training, check two candidate sequence models on a small random batch
+seqs = torch.randn(1, 5, 8)      # 1 sentence, 5 positions (tokens), 8 numbers per position
+per_token = nn.Linear(8, 4)      # each position on its own: (1, 5, 8) -> (1, 5, 4)
+encoder = nn.TransformerEncoderLayer(8, nhead=2, dim_feedforward=16, batch_first=True)
+                                 # PyTorch's own Transformer layer (with Dropout), used here without a mask, like BERT
+--- below
+print("Linear on each position, causal?", check_causal(per_token, seqs))
+print("Transformer layer without a mask, causal?", check_causal(encoder, seqs))
 --- starter
 def check_causal(model, x):
     """model: (B, T, D) -> (B, T, D_out)   x: (B, T, D)
@@ -879,6 +967,16 @@ Write `check_batch_independent(f, x)`:
 - Do it inside `torch.no_grad()`.
 
 Careful: this check must **not** call `eval()`. What it checks is exactly how `f` behaves in its current state, for example whether your `predict` function forgot to switch the mode.
+--- above
+# Where the input comes from: a pre-release check that a request's result does not depend on its batch-mates
+requests = torch.randn(6, 4)     # a batch of 6 requests, 4 features each
+layer_norm = nn.LayerNorm(4)     # normalises each sample with its own mean and variance
+batch_norm = nn.BatchNorm1d(4)   # a new layer starts in train mode: it uses the whole batch's mean and variance
+--- below
+print("LayerNorm, samples independent?", check_batch_independent(layer_norm, requests))
+print("BatchNorm in train mode, samples independent?", check_batch_independent(batch_norm, requests))
+batch_norm.eval()                # switch to eval: use the stored statistics instead
+print("BatchNorm in eval mode, samples independent?", check_batch_independent(batch_norm, requests))
 --- starter
 def check_batch_independent(f, x):
     """f: (B, ...) -> (B, ...)   x: (B, ...)
@@ -957,6 +1055,18 @@ A loss with padding is code that everyone training NLP or speech models writes a
 Write `masked_lm_loss(logits, targets, mask)`: `logits` (B, T, V), `targets` (B, T) long, `mask` (B, T) float (1.0 = real token, 0.0 = padding; the target at padding positions is 0, which is also a valid token id).
 
 Return the mean cross-entropy over all real tokens (a scalar). Adding more columns of padding must not change the result.
+--- above
+# Where the input comes from: a batch of sentences padded to 3 positions; a language model scores 4 words at each
+scores = torch.randn(2, 3, 4)                # 2 sentences, 3 positions each, a 4-word vocabulary
+next_ids = torch.tensor([[3, 1, 2],
+                         [0, 0, 0]])          # sentence 2 has one real token (its id happens to be 0), then padding
+real = torch.tensor([[1., 1., 1.],
+                     [1., 0., 0.]])           # 1.0 = real token, 0.0 = padding
+--- below
+loss = masked_lm_loss(scores, next_ids, real)
+# 2 more padding positions at the end of each sentence: F.pad adds zeros; (0, 0, 0, 2) pads dim -2 (positions) by 2
+more = masked_lm_loss(F.pad(scores, (0, 0, 0, 2)), F.pad(next_ids, (0, 2)), F.pad(real, (0, 2)))
+print("loss:", round(loss.item(), 4), "  with 2 more padding positions per sentence:", round(more.item(), 4))
 --- starter
 def masked_lm_loss(logits, targets, mask):
     raise todo()
@@ -1009,6 +1119,15 @@ A causality check is among the most valuable few lines of test code for any sequ
 Write `check_causal(model, x)`: `model` maps (B, T, D) to (B, T, D_out); `x` is (B, T, D).
 
 For every position t = 0 … T-2, replace the inputs after t with random numbers; the outputs at 0..t must all stay the same (`atol=1e-5`). If they do, return `True`; otherwise `False`. The model may contain Dropout.
+--- above
+# Where the input comes from: two newly written model parts to check for causality, on a batch of random token vectors
+seqs = torch.randn(2, 4, 8)      # 2 sentences, 4 positions each, 8 numbers per position
+mlp = nn.Sequential(nn.Linear(8, 16), nn.GELU(), nn.Dropout(0.1), nn.Linear(16, 8))
+                                 # the MLP of a Transformer block: each position on its own, with Dropout
+seq_softmax = nn.Softmax(dim=1)  # softmax along the positions (dim=1): every output uses the whole sentence
+--- below
+print("MLP with Dropout, causal?", check_causal(mlp, seqs))
+print("Softmax along the positions, causal?", check_causal(seq_softmax, seqs))
 --- starter
 def check_causal(model, x):
     raise todo()

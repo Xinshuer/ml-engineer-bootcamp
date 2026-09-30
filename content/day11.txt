@@ -263,6 +263,13 @@ ref: day11
 - `n_samples(seconds, sr)`：时长（秒）→ 采样点数，结果取整（`int`）。例：`n_samples(0.5, 24000) == 12000`
 - `duration(n, sr)`：采样点数 → 时长（秒）。例：`duration(16000, 16000) == 1.0`
 - `AUDIO_FACTS`：把 4 个 `None` 换成整数，心算就行。「每秒多少帧」= sr ÷ hop，向下取整
+--- above
+# 上文：TTS 数据集清单里的一条录音：时长 3.5 秒，采样率 22050（每秒 22050 个点）
+clip_seconds, clip_sr = 3.5, 22050
+--- below
+n = n_samples(clip_seconds, clip_sr)
+print("采样点数:", n)
+print("换回秒数:", duration(n, clip_sr))
 --- starter
 def n_samples(seconds, sr):
     """时长（秒）-> 采样点数（取整）。"""
@@ -331,6 +338,12 @@ ref: day11
 - `center=False`：不补。第一帧从第 0 个点开始，每帧 `n_fft` 个点，最后凑不满一帧的尾巴丢掉
 
 检查会拿你的结果和真正的 `torch.stft(...).shape[-1]` 对比（`n_fft` 都是偶数）。
+--- above
+# 上文：一条 2 秒、16kHz 的语音；模型看到的序列长度就是 STFT 的帧数
+n_audio, fft_size, hop = 2 * 16000, 1024, 256     # 采样点数、n_fft、hop
+--- below
+print("center=True :", n_frames(n_audio, fft_size, hop, True), "帧")
+print("center=False:", n_frames(n_audio, fft_size, hop, False), "帧")
 --- starter
 def n_frames(n_sample, n_fft, hop_length, center=True):
     """返回 torch.stft 的帧数。"""
@@ -374,6 +387,16 @@ ref: day11
 - 返回幅度（实数、非负）：`(n_fft//2 + 1, 帧数)` 或 `(B, n_fft//2 + 1, 帧数)`
 
 例：16000 个点 → `(513, 63)`；`(2, 16000)` → `(2, 513, 63)`。
+--- above
+# 上文：从数据集读进来的 0.5 秒、16kHz 音频；这里用 440Hz 的纯音代替真实录音
+t = torch.arange(8000) / 16000               # 每个采样点的时刻（秒）
+clip = torch.sin(2 * math.pi * 440 * t)      # 一条音频：(8000,)
+clips = torch.stack([clip, 0.5 * clip])      # 一个 batch：(2, 8000)，第二条音量小一半
+--- below
+mag = stft_mag(clip)
+print("一条:", tuple(mag.shape), "  一个 batch:", tuple(stft_mag(clips).shape))
+k = mag[:, 10].argmax().item()               # 第 10 帧里最响的频点
+print("最响的频点:", k, "-> 约", round(k * 16000 / 1024), "Hz")
 --- starter
 def stft_mag(wav, n_fft=1024, hop_length=256):
     """wav: (T,) 或 (B, T) -> 幅度谱 (..., n_fft//2 + 1, 帧数)"""
@@ -417,6 +440,13 @@ mel 刻度让频率轴更接近人耳的感觉，所以语音模型几乎都用 
 
 - `hz_to_mel(f)`：`2595 * log10(1 + f / 700)`
 - `mel_to_hz(m)`：它的逆函数，满足 `mel_to_hz(hz_to_mel(f)) ≈ f`
+--- above
+# 上文：给 24kHz 的 TTS 音频搭 mel 滤波器组，频率范围取 0 到 12000 Hz
+f_min, f_max = 0.0, 12000.0
+--- below
+lo, hi = hz_to_mel(f_min), hz_to_mel(f_max)
+print("mel 范围:", round(lo, 1), "到", round(hi, 1))
+print("在 mel 上等距取 5 个点, 换回 Hz:", [round(mel_to_hz(lo + (hi - lo) * i / 4)) for i in range(5)])
 --- starter
 def hz_to_mel(f):
     """Hz -> mel"""
@@ -463,6 +493,15 @@ log-mel 是 Whisper 等语音模型的标准输入。取 log 把巨大的音量�
 - `mag`：幅度谱，`(n_freq, 帧数)` 或 `(B, n_freq, 帧数)`
 - `fb`：mel 滤波器组，`(n_mels, n_freq)`
 - 返回 `log(fb @ mag + eps)`，shape 是 `(n_mels, 帧数)` 或 `(B, n_mels, 帧数)`
+--- above
+# 上文：stft_mag 算出的幅度谱，加上 mel 滤波器组（都用随机数代替）
+mag_spec = torch.rand(257, 6) * 5     # 幅度谱：257 个频点（n_fft=512），6 帧
+mag_spec[:, 4:] = 0                   # 最后 2 帧是静音
+mel_fb = torch.rand(40, 257)          # 40 个 mel 滤波器，每个给 257 个频点加权
+--- below
+log_mel = to_log_mel(mag_spec, mel_fb)
+print("shape:", tuple(log_mel.shape))
+print("静音帧的值:", round(log_mel[0, 5].item(), 2))
 --- starter
 def to_log_mel(mag, fb, eps=1e-5):
     """mag: (..., n_freq, 帧数), fb: (n_mels, n_freq) -> (..., n_mels, 帧数)"""
@@ -508,6 +547,13 @@ ref: day11
 - 全零输入原样返回，不能出现 nan
 
 例：`[0.1, -0.4, 0.2]` 的峰值是 0.4，乘 0.95 / 0.4 后变成 `[0.2375, -0.95, 0.475]`。
+--- above
+# 上文：数据集里的两条录音：一条声音太小，一条是全静音的坏文件
+quiet_clip = torch.tensor([0.02, -0.05, 0.04, -0.01])    # 真实录音有几万个点，这里只放 4 个
+silent_clip = torch.zeros(4)
+--- below
+print("太小的那条:", [round(v, 3) for v in peak_normalize(quiet_clip).tolist()])
+print("静音的那条:", peak_normalize(silent_clip).tolist())
 --- starter
 def peak_normalize(wav, target=0.95):
     """把波形按峰值缩放到 target；全零输入原样返回。"""
@@ -549,6 +595,14 @@ ref: day11
 - 用 `tensor.unfold`，不要写循环
 
 例：`frame(torch.arange(10.), 4, 2)` 有 4 帧，第 1 帧是 `[2, 3, 4, 5]`。
+--- above
+# 上文：要分帧的一段波形，比如要按帧算音量、做语音活动检测
+clip = torch.arange(12.)       # 真实音频 1 秒有 16000 个点；这里用 0 到 11，一眼看出每帧取了哪几个点
+--- below
+frames = frame(clip, 5, 3)     # 帧长 5，hop 3
+print("shape:", tuple(frames.shape))
+print("每一帧:", frames.tolist())
+print("每帧的平均音量:", frames.abs().mean(dim=1).tolist())
 --- starter
 def frame(wav, frame_len, hop):
     """(T,) -> (帧数, frame_len)"""
@@ -603,6 +657,14 @@ ref: day11
 写 `mel_to_image(mel)`：`(B, n_mels, 帧数)` → `(B, 1, n_mels, 帧数)`，也就是在第 1 维插入一个长度为 1 的通道维。
 
 检查会把结果直接喂给 `nn.Conv2d(1, 16, 3, 1, 1)`。
+--- above
+# 上文：一个 batch 的 log-mel：2 条音频，每条 40 个 mel、50 帧（随机数代替）
+mel_batch = torch.randn(2, 40, 50)
+--- below
+x = mel_to_image(mel_batch)
+conv = nn.Conv2d(1, 8, 3, padding=1)      # 图像模型的第一层：1 个输入通道，8 个输出通道
+print("加通道维:", tuple(mel_batch.shape), "->", tuple(x.shape))
+print("Conv2d 输出:", tuple(conv(x).shape))
 --- starter
 def mel_to_image(mel):
     """(B, n_mels, 帧数) -> (B, 1, n_mels, 帧数)"""
@@ -640,6 +702,15 @@ ref: day11
 - `mask`：`(B, Tmax)`，真实帧为 1，padding 帧为 0（用 long 类型）
 
 例：帧数 3、5、1 的三条 mel → `batch` 是 `(3, n_mels, 5)`，mask 第一行是 `[1, 1, 1, 0, 0]`。
+--- above
+# 上文：一个 batch 里 3 条长短不一的 log-mel（每条 2 个 mel，帧数分别是 4、2、3）
+# 为了好认，每条里的数都一样：第 1 条全是 0.5，第 2 条全是 1.5，第 3 条全是 2.5
+clip_mels = [torch.full((2, 4), 0.5), torch.full((2, 2), 1.5), torch.full((2, 3), 2.5)]
+--- below
+batch, mask = pad_mels(clip_mels)
+print("batch:", tuple(batch.shape), " mask:", tuple(mask.shape))
+print("第 2 条的第 1 个 mel:", batch[1, 0].tolist())
+print("mask:", mask.tolist())
 --- starter
 def pad_mels(mels, pad_value=-11.5):
     """mels: list of (n_mels, T_i) -> batch (B, n_mels, Tmax), mask (B, Tmax)"""
@@ -687,6 +758,13 @@ ref: day11
 
 - 「喂进 Conv2d 前」指 batch 大小为 1、加好通道维之后的 4 维张量
 - 只有一个维度的 tuple 要带逗号：`(16000,)`
+--- above
+# 上文：特征提取的配置：1 秒 16kHz 单声道，n_fft=1024，hop=256，80 个 mel
+sr, seconds, n_fft, hop, n_mels = 16000, 1, 1024, 256, 80
+--- below
+shapes = list(AUDIO_SHAPES.values())
+print("5 项都写成了 tuple:", all(isinstance(s, tuple) for s in shapes))
+print("每一项有几维:", [len(s) if s else None for s in shapes])
 --- starter
 AUDIO_SHAPES = {
     "waveform":       None,
@@ -734,6 +812,15 @@ ref: day11
 `log_mel_buggy(wav, fb)` 想算 log-mel，可它的输出里有 nan，数值也和正确做法（先 d11-03 的 `stft_mag`，再 d11-05 的 `to_log_mel`，eps = 1e-5）对不上。
 
 有两行写错了。改好它们，让输出和正确做法一致（容差 1e-4）。函数名和参数不要改。
+--- above
+# 上文：一条 16kHz 录音，前一半在说话、后一半是静音；再加一个 mel 滤波器组
+recording = torch.cat([torch.randn(5000) * 0.1, torch.zeros(5000)])   # (10000,)
+mel_fb = torch.rand(64, 513)          # 64 个 mel 滤波器（随机数代替，只看 shape）
+--- below
+out = log_mel_buggy(recording, mel_fb)
+print("shape:", tuple(out.shape), " 全是正常的数（没有 nan / -inf）:", torch.isfinite(out).all().item())
+# stft_mag、to_log_mel 就是 d11-03、d11-05 的正确做法，这里已经准备好
+print("和正确做法一致:", torch.allclose(out, to_log_mel(stft_mag(recording), mel_fb), atol=1e-4))
 --- starter
 def log_mel_buggy(wav, fb, n_fft=1024, hop=256):
     spec = torch.stft(wav, n_fft, hop, window=torch.hann_window(n_fft), return_complex=True)
@@ -884,6 +971,13 @@ ref: day11
 - 输入 `(T,)` 或 `(B, T)`
 - Hann 窗（和 wav 在同一个 device 上），`center=True`
 - 返回实数、非负的幅度谱：`(n_fft//2 + 1, 帧数)` 或 `(B, n_fft//2 + 1, 帧数)`
+--- above
+# 上文：DataLoader 给出的一个 batch：3 条 0.25 秒、16kHz 的音频（随机数假装是声音）
+clips = torch.randn(3, 4000)
+--- below
+mag = stft_mag(clips)
+print("shape:", tuple(mag.shape), " dtype:", mag.dtype)
+print("最小值 >= 0:", mag.min().item() >= 0)
 --- starter
 def stft_mag(wav, n_fft=1024, hop_length=256):
     raise todo()
@@ -923,6 +1017,13 @@ ref: day11
 
 - `mels`：list，每个元素 `(n_mels, T_i)`，长度不一
 - 返回 `(batch, mask)`：`batch` 是 `(B, n_mels, Tmax)`，每条靠左放，右边填 `pad_value`；`mask` 是 `(B, Tmax)`，真实帧 1、padding 帧 0（long 类型）
+--- above
+# 上文：DataLoader 取出的 2 条 log-mel，长短不一（每条 3 个 mel，帧数 2 和 4）
+clip_mels = [torch.randn(3, 2), torch.randn(3, 4)]
+--- below
+batch, mask = pad_mels(clip_mels)
+print("batch:", tuple(batch.shape), " mask:", mask.tolist())
+print("第 1 条补出来的部分:", batch[0, :, 2:].tolist())
 --- starter
 def pad_mels(mels, pad_value=-11.5):
     raise todo()

@@ -378,6 +378,15 @@ ref: day21
 - 返回模型的输出（形状 `(B, 3)`）
 
 测试会传进来一个 `trained_net()`，它处在 train 模式。
+--- above
+# 上文：训练刚结束，模型还在 train 模式；线上一次来了 5 个请求
+model = trained_net()           # 准备代码里的小分类器 Net：8 个特征 -> 3 类，训练过
+batch = torch.randn(5, 8)       # 5 个样本，每个 8 个特征
+--- below
+a = predict(model, batch)
+b = predict(model, batch)       # 同一批请求再来一次
+print("输出形状:", tuple(a.shape), " 预测的类别:", a.argmax(dim=1).tolist())
+print("两次结果一样吗:", torch.equal(a, b), " 输出要梯度吗:", a.requires_grad)
 --- starter
 def predict(model, x):
     """上线时的一次预测。传进来的 model 可能还在 train 模式。"""
@@ -436,6 +445,16 @@ timeout: 120
 - 返回 `path`
 
 测试会传进来一个 train 模式的 `trained_net()`、一个 `(2, 8)` 的示例输入，和临时文件夹里的一个路径。导出要 1～3 秒。
+--- above
+# 上文：模型训练好了，要导出成 ONNX 交给推理团队；导出还要一个示例输入
+import os, tempfile
+model = trained_net()           # 准备代码里的小分类器 Net（8 个特征 -> 3 类），还在 train 模式
+example = torch.randn(2, 8)     # 示例输入：2 个样本，每个 8 个特征。导出时拿它把 forward 跑一遍
+--- below
+with tempfile.TemporaryDirectory() as folder:          # 临时文件夹，用完自动删掉
+    path = export_onnx(model, example, os.path.join(folder, "net.onnx"))
+    print("写出的文件:", os.path.basename(path), os.path.getsize(path), "字节", " 模型还在 train 模式吗:", model.training)
+    print("onnxruntime 跑示例输入，输出形状:", run_onnx(path, example).shape)   # run_onnx：准备代码里的小工具
 --- starter
 def export_onnx(model, example, path):
     """把 model 导出成一个 .onnx 文件，写到 path，返回 path。"""
@@ -532,6 +551,16 @@ timeout: 120
 - 导出前 `model.eval()`，写到 `path`，返回 `path`
 
 测试会用 batch = 1、5、64 去跑导出的文件，并和 PyTorch 对拍。`Net.forward` 的参数名是 `x`。
+--- above
+# 上文：训练好的模型要导出上线，线上每次请求的样本数都不一样
+import os, tempfile
+model = trained_net()           # 准备代码里的小分类器 Net（8 个特征 -> 3 类）
+example = torch.randn(2, 8)     # 导出用的示例输入：2 个样本，每个 8 个特征
+--- below
+with tempfile.TemporaryDirectory() as folder:          # 临时文件夹，用完自动删掉
+    path = export_onnx_dynamic(model, example, os.path.join(folder, "net.onnx"))
+    for n in (1, 3, 50):                                # 线上一次来 1 个、3 个、50 个请求
+        print(f"{n} 个样本进去，onnxruntime 输出的形状:", run_onnx(path, torch.randn(n, 8)).shape)   # run_onnx：准备代码里的小工具
 --- starter
 def export_onnx_dynamic(model, example, path):
     """导出一个 batch 维可变的 ONNX 文件：输入叫 x，输出叫 logits。"""
@@ -620,6 +649,19 @@ timeout: 120
 - 否则返回这个最大误差（Python 的 float）
 
 测试会给你一个已经导出好的文件（batch 维可变）。
+--- above
+# 上文：发布前，拿训练好的模型和刚导出的 ONNX 文件对拍
+model = trained_net()                    # 准备代码里的小分类器 Net（8 个特征 -> 3 类）
+example = torch.randn(2, 8)              # 导出时用的示例输入：2 个样本，每个 8 个特征
+onnx_data = onnx_bytes(model, example)   # 准备代码里的小工具：导出成 ONNX（batch 可变），返回文件的内容（bytes）
+--- below
+with onnx_file(onnx_data) as path:       # 准备代码里的小工具：把这些 bytes 写成一个临时的 .onnx 文件
+    err = verify_export(model, path, example)
+    print("对拍通过，最大误差:", f"{err:.1e}", " 类型:", type(err).__name__)
+    try:
+        verify_export(model, path, example, tol=1e-12)   # 故意把容差定得极严
+    except AssertionError as e:
+        print("容差 1e-12 时报错:", e)
 --- starter
 import numpy as np
 import onnxruntime as ort
@@ -756,6 +798,15 @@ timeout: 120
 - 输入形状是 `(B, D)`，B 可变
 
 不要改类名和 `__init__`。
+--- above
+# 上文：研究代码里的一批向量，每行是一个样本（向量的长度 = L2 范数）
+vectors = torch.tensor([[6.0, 8.0],       # 长度 10
+                        [1.0, -2.0],      # 长度约 2.24
+                        [0.0, -20.0]])    # 长度 20
+--- below
+clip = ClipNorm(max_norm=5.0)
+print("限制长度后:", clip(vectors).tolist())
+print("导出报错:", export_error(clip, vectors))   # export_error：准备代码里的小工具，None = 导出成功
 --- starter
 class ClipNorm(nn.Module):
     def __init__(self, max_norm=1.0):
@@ -867,6 +918,15 @@ ref: day21
 - 返回 `(q, scale)`
 
 用的时候 `q.float() * scale` 就能还原（反量化），每个数的误差不超过它那一行的 `scale / 2`。
+--- above
+# 上文：从一层 nn.Linear 里拿出来的权重 (out, in)，要存成 int8
+weight = torch.tensor([[1.3, -2.54, 0.4, 0.7],              # 第 1 行（第 1 个输出通道）的数比较大
+                       [0.042, -0.127, 0.0083, 0.0634]])   # 第 2 行的数小得多
+--- below
+q, scale = quantize_int8(weight)
+print("q:", q.tolist(), q.dtype)
+print("scale 的形状:", tuple(scale.shape), " 每行的 scale:", [round(s, 5) for s in scale.flatten().tolist()])
+print("第 2 行还原回来:", [round(v, 4) for v in (q.float() * scale)[1].tolist()])
 --- starter
 def quantize_int8(w):
     """w: (out, in) 小数 -> (q: (out, in) int8, scale: (out, 1) 小数)，每行一个 scale。"""
@@ -927,6 +987,13 @@ ref: day21
 `buf.getbuffer().nbytes` 或 `len(buf.getvalue())` 都能拿到字节数。
 
 测试会量一个 fp32 模型，和它的 int8 量化版。
+--- above
+# 上文：一个训练好的分类器和它的 int8 量化版，上线前比比谁更小
+model = nn.Sequential(nn.Linear(512, 128), nn.ReLU(), nn.Linear(128, 4)).eval()      # 全是 fp32 的小分类器
+q_model = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)   # 把 Linear 换成 int8 版
+--- below
+print("parameters() 里的数:", sum(p.numel() for p in model.parameters()), "->", sum(p.numel() for p in q_model.parameters()))
+print("存下来的字节数:", model_size_bytes(model), "->", model_size_bytes(q_model))
 --- starter
 import io
 
@@ -980,6 +1047,14 @@ ref: day21
 2. `"size_ratio"`：`model_size_bytes(model) / model_size_bytes(q)`（`model_size_bytes` 已经准备好了）
 3. `"max_diff"`：`(a - b).abs().max()`
 4. `"agree"`：argmax 相同的比例（0～1）
+--- above
+# 上文：想把线上的分类器换成 int8 版，先拿一批数据出一份报告
+model = nn.Sequential(nn.Linear(128, 256), nn.ReLU(), nn.Linear(256, 4)).eval()   # 全是 fp32 的小分类器
+batch = torch.randn(32, 128)    # 32 个样本，每个 128 个特征
+--- below
+r = quantize_report(model, batch)
+print(r["model"][0])            # 量化模型的第 1 层
+print("小了几倍:", round(r["size_ratio"], 2), " 最大误差:", round(r["max_diff"], 4), " 预测一致的比例:", r["agree"])
 --- starter
 def quantize_report(model, x):
     """动态 int8 量化 model，返回 {"model", "size_ratio", "max_diff", "agree"}。"""
@@ -1083,6 +1158,16 @@ timeout: 120
 - 用 `torch.onnx.export` 导出（`dynamo=True`，`verbose=False`），示例输入是 `example`
 - 输入名 `"x"`，输出名 `"logits"`；第 0 维（batch）可变，名字叫 `"batch"`（forward 的参数名是 `x`）
 - 写到 `path`，返回 `path`
+--- above
+# 上文：训练好的模型要导出上线，线上每次请求的样本数都不一样
+import os, tempfile
+model = trained_net()           # 准备代码里的小分类器 Net（8 个特征 -> 3 类）
+example = torch.randn(2, 8)     # 导出用的示例输入：2 个样本，每个 8 个特征
+--- below
+with tempfile.TemporaryDirectory() as folder:          # 临时文件夹，用完自动删掉
+    path = export_onnx_dynamic(model, example, os.path.join(folder, "net.onnx"))
+    for n in (1, 3, 50):                                # 线上一次来 1 个、3 个、50 个请求
+        print(f"{n} 个样本进去，onnxruntime 输出的形状:", run_onnx(path, torch.randn(n, 8)).shape)   # run_onnx：准备代码里的小工具
 --- starter
 def export_onnx_dynamic(model, example, path):
     raise todo()
@@ -1164,6 +1249,19 @@ timeout: 120
 - 用 onnxruntime（CPU）打开 `path`，输入名从文件里读
 - 对每个 batch 大小 b，用 `torch.randn(b, *example.shape[1:])` 造输入，PyTorch（不建计算图）和 onnxruntime 各跑一遍，算最大绝对误差
 - 最大的误差超过 `tol` 就 `raise AssertionError`，否则返回它（Python float）
+--- above
+# 上文：发布前，拿训练好的模型和刚导出的 ONNX 文件对拍
+model = trained_net()                    # 准备代码里的小分类器 Net（8 个特征 -> 3 类）
+example = torch.randn(2, 8)              # 导出时用的示例输入：2 个样本，每个 8 个特征
+onnx_data = onnx_bytes(model, example)   # 准备代码里的小工具：导出成 ONNX（batch 可变），返回文件的内容（bytes）
+--- below
+with onnx_file(onnx_data) as path:       # 准备代码里的小工具：把这些 bytes 写成一个临时的 .onnx 文件
+    err = verify_export(model, path, example)
+    print("对拍通过，最大误差:", f"{err:.1e}", " 类型:", type(err).__name__)
+    try:
+        verify_export(model, path, example, tol=1e-12)   # 故意把容差定得极严
+    except AssertionError as e:
+        print("容差 1e-12 时报错:", e)
 --- starter
 import numpy as np
 import onnxruntime as ort

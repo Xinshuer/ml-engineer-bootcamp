@@ -281,6 +281,14 @@ Write two functions:
 - `tokens_per_second(frame_rate, n_q)`: how many tokens one second of audio is for a language model (one code = one token).
 
 Example: 24 kHz EnCodec, frame_rate = 75, n_q = 8, codebook_size = 1024 gives 6000.0 bps and 600 tokens per second.
+--- above
+# Where the input comes from: the codec settings in a config file (24 kHz EnCodec at 3 kbps, 4 codebooks)
+frame_rate, n_q, codebook_size = 75, 4, 1024   # 75 frames per second, 4 codes per frame, 1024 entries per codebook
+clip_seconds = 10                              # the clip we have is 10 seconds long
+--- below
+print("bitrate:", codec_bitrate(frame_rate, n_q, codebook_size), "bps")
+print("tokens per second:", tokens_per_second(frame_rate, n_q))
+print("tokens in the 10-second clip:", clip_seconds * tokens_per_second(frame_rate, n_q))
 --- starter
 def codec_bitrate(frame_rate, n_q, codebook_size):
     """bits per second = frame_rate * n_q * log2(codebook_size)"""
@@ -325,6 +333,15 @@ Write `code_shape(seconds, frame_rate, n_q)`. It returns the shape of the code m
 Example: 2 seconds, 75 frames per second, 8 codebooks gives (8, 150).
 
 Return a plain Python tuple, not a tensor.
+--- above
+# Where the input comes from: two speech clips in the dataset, their length and the codec used
+clips = [
+    ("hello.wav", 3.2, 75, 4),      # (file name, seconds, frame_rate, n_q): 24 kHz EnCodec, 4 codebooks
+    ("reply.wav", 3.0, 12.5, 8),    # another codec (Mimi): only 12.5 frames per second, 8 codebooks
+]
+--- below
+for name, seconds, frame_rate, n_q in clips:
+    print(name, "->", code_shape(seconds, frame_rate, n_q))
 --- starter
 def code_shape(seconds, frame_rate, n_q):
     """Return the tuple (n_q, T) with T = int(seconds * frame_rate)."""
@@ -365,6 +382,17 @@ Example (B = 1, n_q = 2, T = 3, pad_id = 0):
 [[1, 2, 3],        [[1, 2, 3, 0],
  [4, 5, 6]]   ->    [0, 4, 5, 6]]
 ```
+--- above
+# Where the input comes from: the codec turned a short clip into 3 codebooks x 4 frames of integers
+clip_codes = torch.tensor([[[311, 87, 902, 45],     # codebook 0
+                            [12, 640, 3, 777],      # codebook 1
+                            [505, 29, 118, 960]]])  # codebook 2      shape (B=1, n_q=3, T=4)
+PAD = 1024                                          # codes are 0 to 1023, so 1024 is free to be the pad
+--- below
+delayed = build_delay(clip_codes, PAD)
+print("shape:", tuple(clip_codes.shape), "->", tuple(delayed.shape))
+for row in delayed[0].tolist():
+    print(row)
 --- starter
 def build_delay(codes, pad_id):
     """codes: (B, n_q, T) -> (B, n_q, T + n_q - 1)
@@ -409,6 +437,18 @@ Write `undo_delay(delayed, T)`, the inverse of build_delay:
 - Requirement: for any codes, `undo_delay(build_delay(codes, pad_id), T)` equals codes exactly
 
 build_delay is already in the hidden setup (the reference version); the check uses it for the round trip.
+--- above
+# Where the input comes from: the audio LM finished generating with the delay pattern (1024 is the pad)
+generated = torch.tensor([[[88, 431, 7, 1002, 1024, 1024],
+                           [1024, 256, 19, 640, 333, 1024],
+                           [1024, 1024, 71, 900, 45, 128]]])   # (B=1, n_q=3, T + n_q - 1 = 6)
+n_frames = 4                                                    # the real number of frames, T
+# the last try-it line delays the result again with build_delay (the reference version in the hidden setup) and compares
+--- below
+aligned = undo_delay(generated, n_frames)
+print("shape:", tuple(generated.shape), "->", tuple(aligned.shape))
+print("aligned:", aligned[0].tolist())
+print("build_delay again gives back the input:", torch.equal(build_delay(aligned, 1024), generated))
 --- starter
 def undo_delay(delayed, T):
     """The inverse of build_delay: (B, n_q, T + n_q - 1) -> (B, n_q, T)"""
@@ -446,6 +486,16 @@ Write `CodeEmbedding(n_q, vocab, dim)`:
 - The parameter count must be exactly n_q × vocab × dim
 
 The check changes the codes of each codebook in turn: whichever codebook changes, the output must change too (proof that every table is used).
+--- above
+# Where the input comes from: codes from the codec, about to enter AudioLM's first layer (values 0 to 1023)
+audio_codes = torch.tensor([[[311, 87, 902, 45, 12],
+                             [640, 3, 777, 505, 29],
+                             [118, 960, 7, 256, 431]]])   # (B=1, n_q=3, T=5): 1 clip, 3 codebooks, 5 frames each
+--- below
+emb = CodeEmbedding(3, 1024, 16)        # n_q=3, vocab=1024, dim=16
+x = emb(audio_codes)
+print("codes:", tuple(audio_codes.shape), "-> x:", tuple(x.shape))
+print("parameters:", sum(p.numel() for p in emb.parameters()))
 --- starter
 class CodeEmbedding(nn.Module):
     """n_q nn.Embedding(vocab, dim) tables; forward(codes) looks up each codebook and **adds** the results.
@@ -504,6 +554,14 @@ Write `MultiHead(dim, n_q, vocab)`:
 - Of the n_q·vocab numbers at each time step, piece k (numbers k·vocab to (k+1)·vocab − 1) holds the logits of codebook k
 
 The check does not only look at the shape: it also verifies that out[:, k, t] really is piece k of frame t.
+--- above
+# Where the input comes from: the output of AudioLM's last Transformer layer (after ln_f), one vector per time step
+hidden = torch.randn(1, 5, 16)          # (B=1, T=5, dim=16): 1 clip, 5 time steps
+--- below
+head = MultiHead(16, 3, 1024)           # dim=16, n_q=3, vocab=1024
+logits = head(hidden)
+print("hidden:", tuple(hidden.shape), "-> logits:", tuple(logits.shape))
+print("last step, best-scoring code per codebook:", logits[0, :, -1].argmax(-1).tolist())
 --- starter
 class MultiHead(nn.Module):
     """One Linear(dim, n_q * vocab); the output becomes (B, n_q, T, vocab)."""
@@ -560,6 +618,15 @@ Write `codebook_loss(logits, targets, ignore_index=-100)`:
 - Return a scalar (a 0-dimensional tensor)
 
 Positions whose target equals ignore_index do not count in the loss, nor in the average's denominator.
+--- above
+# Where the input comes from: AudioLM's scores and the right answers (delay pads already set to -100)
+model_logits = torch.randn(1, 2, 4, 10) * 0.1   # (B=1, n_q=2, T=4, V=10): freshly initialised, all scores near 0
+target_codes = torch.tensor([[[3, 7, 1, -100],   # codebook 0: the last position is a pad
+                              [-100, 5, 0, 9]]]) # codebook 1: the first position is a pad
+--- below
+loss = codebook_loss(model_logits, target_codes)
+print("loss:", round(loss.item(), 4), "| ln(10):", round(math.log(10), 4))
+print("positions in the loss:", (target_codes != -100).sum().item(), "of", target_codes.numel())
 --- starter
 def codebook_loss(logits, targets, ignore_index=-100):
     """logits: (B, n_q, T, V)   targets: (B, n_q, T)
@@ -609,6 +676,16 @@ Write `AudioLM(n_q=4, vocab=50, dim=64, n_layer=2, n_head=4, max_len=256)`:
 `forward(codes)`: codes is (B, n_q, T). Embedding + position embedding → each Block in turn → ln_f → head; return (B, n_q, T, vocab).
 
 CodeEmbedding, MultiHead and Block are already in the hidden setup (reference versions); just use them. The check looks at three things: the output shape; causality (changing later codes does not change earlier predictions); and a freshly initialised loss near ln(50) ≈ 3.91.
+--- above
+# Where the input comes from: a clip encoded by the codec, then delayed: 2 codebooks, 6 steps (1024 is the pad)
+audio_codes = torch.tensor([[[311, 87, 902, 45, 12, 1024],
+                             [1024, 640, 3, 777, 505, 29]]])   # (B=1, n_q=2, T=6)
+# codebook_loss in the try-it part is the function from d13-07; the hidden setup has it
+--- below
+model = AudioLM(n_q=2, vocab=1025, dim=32)       # vocab = 1024 codes + 1 pad; the other arguments keep their defaults
+logits = model(audio_codes)
+print("codes:", tuple(audio_codes.shape), "-> logits:", tuple(logits.shape))
+print("initial loss within 1 of ln(1025) ≈ 6.93:", abs(codebook_loss(logits, audio_codes).item() - math.log(1025)) < 1)
 --- starter
 class AudioLM(nn.Module):
     """Structure:
@@ -682,6 +759,16 @@ Write `text_cross_attn(audio_h, text_emb, wq, wk, wv, n_head)`:
 - Merge the heads and return (B, Ta, C)
 
 Compare it with day 9's cross_attention: apart from the variable names, the code is the same.
+--- above
+# Where the input comes from: MusicGen at step 6; the text encoder turned "happy piano tune" into 3 vectors
+audio_hidden = torch.randn(1, 6, 8)           # (B=1, Ta=6, C=8): the audio being generated, one vector per step
+text_hidden = torch.randn(1, 3, 8)            # (B=1, Tt=3, C=8): the text encoder's output
+w_q, w_k, w_v = torch.randn(3, 8, 8) * 0.1    # the 3 trained projection matrices, each (C, C) = (8, 8)
+--- below
+out = text_cross_attn(audio_hidden, text_hidden, w_q, w_k, w_v, 2)          # n_head=2
+print("audio:", tuple(audio_hidden.shape), " text:", tuple(text_hidden.shape), "-> out:", tuple(out.shape))
+longer = text_cross_attn(audio_hidden, torch.randn(1, 10, 8), w_q, w_k, w_v, 2)
+print("with 10 text tokens -> out:", tuple(longer.shape))
 --- starter
 def text_cross_attn(audio_h, text_emb, wq, wk, wv, n_head):
     """audio_h: (B, Ta, C)   text_emb: (B, Tt, C)
@@ -735,6 +822,16 @@ Write `generate_codes(model, prompt, n_new, vocab)` (greedy generation):
 - Keep the `@torch.no_grad()` above the function
 
 The check's model is the reference AudioLM. The vocab argument is not needed here; just leave it in the signature.
+--- above
+# Where the input comes from: an untrained audio LM (its codes mean nothing) and a few codes to start from
+audio_lm = AudioLM(n_q=2, vocab=1025, dim=32, n_layer=1).eval()   # the AudioLM from d13-08; the hidden setup has it
+prompt_codes = torch.tensor([[[311, 87, 902, 45],
+                              [1024, 640, 3, 777]]])               # (1, n_q=2, T0=4); 1024 is the pad
+--- below
+out = generate_codes(audio_lm, prompt_codes, 3, 1025)       # generate 3 more steps
+print("prompt:", tuple(prompt_codes.shape), "-> out:", tuple(out.shape))
+for row in out[0].tolist():
+    print(row)
 --- starter
 @torch.no_grad()
 def generate_codes(model, prompt, n_new, vocab):
@@ -914,6 +1011,18 @@ Without looking at the cards, write `build_delay(codes, pad_id)`:
 - codes is an integer tensor of shape (B, n_q, T)
 - Return (B, n_q, T + n_q − 1): codebook k shifted right by k, the gaps filled with pad_id
 - Same dtype and device as the input
+--- above
+# Where the input comes from: the first 3 frames of a song, from MusicGen's codec (4 codebooks, 2048 entries each)
+music_codes = torch.tensor([[[1532, 88, 2011],
+                             [7, 1999, 640],
+                             [345, 1060, 12],
+                             [876, 50, 1300]]])   # (B=1, n_q=4, T=3)
+PAD = 2048                                         # codes are 0 to 2047, so 2048 is the pad
+--- below
+delayed = build_delay(music_codes, PAD)
+print("shape:", tuple(music_codes.shape), "->", tuple(delayed.shape))
+for row in delayed[0].tolist():
+    print(row)
 --- starter
 def build_delay(codes, pad_id):
     raise todo()
@@ -954,6 +1063,19 @@ Without looking at the cards, write `AudioLM(n_q=4, vocab=50, dim=64, n_layer=2,
 - Include a position embedding (up to max_len positions), n_layer Blocks and a final LayerNorm
 
 Same check as d13-08: output shape, causality, and an initial loss near ln(50).
+--- above
+# Where the input comes from: a batch of 2 clips, encoded by the codec and delayed (1024 is the pad)
+audio_codes = torch.tensor([[[311, 87, 902, 1024, 1024],
+                             [1024, 640, 3, 777, 1024],
+                             [1024, 1024, 118, 960, 7]],
+                            [[45, 12, 505, 1024, 1024],
+                             [1024, 29, 431, 256, 1024],
+                             [1024, 1024, 88, 19, 71]]])   # (B=2, n_q=3, T=5): 2 clips, 3 codebooks, 5 steps
+--- below
+model = AudioLM(n_q=3, vocab=1025, dim=48, n_head=4)    # vocab = 1024 codes + 1 pad
+logits = model(audio_codes)
+print("codes:", tuple(audio_codes.shape), "-> logits:", tuple(logits.shape))
+print("parameters:", sum(p.numel() for p in model.parameters()))
 --- starter
 class AudioLM(nn.Module):
     def __init__(self, n_q=4, vocab=50, dim=64, n_layer=2, n_head=4, max_len=256):

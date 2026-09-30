@@ -268,6 +268,15 @@ In `__init__`:
 `forward(x)`: return `base(x) + (x @ A.T @ B.T) * scaling`. x can have shape `(N, in)` or `(B, T, in)`.
 
 You can read `in_features` and `out_features` from `base.in_features` and `base.out_features`.
+--- above
+# Where the input comes from: a trained Linear taken out of an open model, which we wrap with LoRA
+k_proj = nn.Linear(24, 12)        # pretend it is a pretrained layer (the Linear that computes k in attention): 24 in, 12 out
+x = torch.randn(2, 5, 24)         # 2 sentences, 5 tokens each, each token a 24-dim vector
+--- below
+lora = LoRALinear(k_proj, r=4, alpha=16)
+print("output shape:", tuple(lora(x).shape), "  same as k_proj(x) right after creation?", torch.allclose(lora(x), k_proj(x)))
+print("A:", tuple(lora.A.shape), "  B:", tuple(lora.B.shape), "  scaling:", lora.scaling)
+print("trainable parameters:", sum(p.numel() for p in lora.parameters() if p.requires_grad))
 --- starter
 class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, r=4, alpha=8):
@@ -342,6 +351,17 @@ Write `merge_lora(m)`. It takes a trained `LoRALinear` (the class is already def
 - only weight and bias; no A and B
 
 Write values into the parameters with `.copy_(...)` inside `with torch.no_grad():`.
+--- above
+# Where the input comes from: a trained LoRA (B is no longer 0), to be merged into the original Linear before deployment
+lora = LoRALinear(nn.Linear(10, 6), r=2, alpha=4)   # the LoRALinear from d6-01, already defined for you
+with torch.no_grad():
+    lora.B.normal_(0, 0.5)                          # pretend it was trained: B is no longer all zeros
+x = torch.randn(3, 10)                              # 3 samples, 10 dims each
+--- below
+merged = merge_lora(lora)
+print("merged:", merged)
+print("same output as lora(x)?", torch.allclose(merged(x), lora(x), atol=1e-5))
+print("parameters:", sum(p.numel() for p in lora.parameters()), "->", sum(p.numel() for p in merged.parameters()))
 --- starter
 def merge_lora(m: LoRALinear) -> nn.Linear:
     """Merge the LoRA back into a plain nn.Linear: W' = W + scaling * B @ A, bias unchanged."""
@@ -388,6 +408,13 @@ Write `lora_ratio(in_f, out_f, r)`. Return "LoRA's parameter count / the origina
 - A: shape `(r, in_f)`; B: shape `(out_f, r)`
 
 Example: `lora_ratio(4096, 4096, 8)` is about 0.0039.
+--- above
+# Where the input comes from: we want to add LoRA to the up_proj layer in Llama-7B's MLP; how many parameters will we train?
+d_model, d_ff = 4096, 11008      # this layer takes 4096 dims in (d_model) and gives 11008 out (d_ff)
+--- below
+for rank in [4, 8, 16]:
+    ratio = lora_ratio(d_model, d_ff, rank)
+    print("r =", rank, "  share:", round(ratio, 5), f"({ratio:.2%})")
 --- starter
 def lora_ratio(in_f, out_f, r):
     """Return LoRA's parameter count / the original weight's parameter count (no bias)."""
@@ -424,6 +451,16 @@ Write `build_sft_labels(input_ids, prompt_len, ignore_index=-100)`.
 - Do not change the `input_ids` you were given (clone it first).
 
 Example: `input_ids = [5, 6, 7, 8, 9]`, `prompt_len = 3` → `[-100, -100, -100, 8, 9]`.
+--- above
+# Where the input comes from: the tokenizer cuts "question + reference answer" into token ids and joins them into one row
+prompt_ids = torch.tensor([16, 10, 16, 28, 30])   # the question "1+1=?": 5 tokens
+answer_ids = torch.tensor([17, 50256])            # the answer "2" and the end-of-text token: 2 tokens
+token_ids = torch.cat([prompt_ids, answer_ids])   # joined into one row of 7
+--- below
+labels = build_sft_labels(token_ids, len(prompt_ids))
+print("input_ids:", token_ids.tolist())
+print("labels:   ", labels.tolist())
+print("torch.long?", labels.dtype == torch.long)
 --- starter
 def build_sft_labels(input_ids, prompt_len, ignore_index=-100):
     """input_ids: (T,), all the tokens of prompt + answer.
@@ -474,6 +511,16 @@ Example: the user says Hi and the assistant says Hello. With `add_generation_pro
 ```
 '<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello<|im_end|>\n'
 ```
+--- above
+# Where the input comes from: a conversation from a chat app, which must become one string before it goes to the model
+chat = [
+    {"role": "system", "content": "Be brief."},   # system: instructions for the model
+    {"role": "user", "content": "2+3=?"},         # user: the user's question
+]
+--- below
+text = apply_chat_template(chat)
+print(text)
+print(repr(text))
 --- starter
 def apply_chat_template(messages, add_generation_prompt=True):
     """messages: [{"role": ..., "content": ...}, ...] -> one string in the ChatML format."""
@@ -516,6 +563,18 @@ Write `grad_accum_step(model, xs, ys, n_micro)`.
 - Return a dict `{parameter name: a clone of its gradient}`, walking `model.named_parameters()`.
 
 No optimizer, and do not update the parameters.
+--- above
+# Where the input comes from: one batch of the training loop has 12 samples, but the GPU only fits 4 at a time
+classifier = nn.Linear(5, 3)                 # a small classifier: 5 features, 3 classes
+x_batch = torch.randn(12, 5)                 # 12 samples, 5 features each
+y_batch = torch.randint(0, 3, (12,))         # the class of each sample: 0, 1 or 2
+F.cross_entropy(classifier(x_batch), y_batch).backward()   # for comparison (a toy fits all 12 at once); this gradient stays in .grad
+big = classifier.weight.grad.clone()                       # keep a copy to compare with below
+--- below
+grads = grad_accum_step(classifier, x_batch, y_batch, n_micro=3)
+print("returned dict:", {k: tuple(g.shape) for k, g in grads.items()})
+print("weight gradient same as feeding all 12 at once?", torch.allclose(grads["weight"], big, atol=1e-6))
+print("gradient size relative to feeding all 12 at once:", round((grads["weight"].norm() / big.norm()).item(), 4))
 --- starter
 def grad_accum_step(model, xs, ys, n_micro):
     """Cut the big batch into n_micro chunks and run forward/backward on each, so the accumulated
@@ -570,6 +629,14 @@ Write `get_lr(it, warmup_iters, max_iters, max_lr, min_lr)`. Return the learning
 3. `it > max_iters`: always `min_lr`
 
 You can use `math.cos` and `math.pi`.
+--- above
+# Where the input comes from: the learning-rate settings at the top of a training script (nanoGPT's train.py has similar ones)
+warmup_iters, max_iters = 10, 100     # warm up for 10 steps, reach the lowest lr at step 100
+max_lr, min_lr = 1e-3, 1e-4           # the highest and the lowest learning rate
+--- below
+for it in [0, 5, 9, 10, 55, 100, 150]:
+    lr = get_lr(it, warmup_iters, max_iters, max_lr, min_lr)
+    print(f"it = {it}, lr = {lr:.6f}")
 --- starter
 def get_lr(it, warmup_iters, max_iters, max_lr, min_lr):
     """Learning rate at step it: linear warmup -> cosine decay -> stay at min_lr."""
@@ -615,6 +682,12 @@ Each number takes `dtype_bytes` bytes (4 for fp32). How many copies per paramete
 - `"sgd_momentum"`: parameter, gradient, momentum → 3 copies
 
 Example: 1 billion parameters, fp32, AdamW → 16,000,000,000 bytes (16 GB).
+--- above
+# Where the input comes from: before fully fine-tuning a 7B model, check whether it fits on one 80 GB GPU
+params_7b = 7_000_000_000         # 7B = 7 billion parameters; fp32 takes 4 bytes per number
+--- below
+for opt in ["adamw", "sgd_momentum", "sgd"]:
+    print(opt, "->", optimizer_memory_bytes(params_7b, optimizer=opt) / 1e9, "GB")
 --- starter
 def optimizer_memory_bytes(n_params, dtype_bytes=4, optimizer="adamw"):
     """Bytes for parameters + gradients + optimizer states (no activations)."""
@@ -652,6 +725,15 @@ After the fix:
 - right after creation, the output is exactly the output of `base`
 - only A and B are trainable (the base is frozen)
 - `scaling == alpha / r`
+--- above
+# Where the input comes from: a colleague's LoRA trains badly; we check it on one Linear and a small batch
+layer = nn.Linear(12, 6)         # pretend it is a trained layer of a pretrained model: 12 in, 6 out
+x = torch.randn(2, 12)           # 2 samples
+--- below
+m = LoRABuggy(layer, r=2, alpha=4)
+print("same as layer(x) right after creation?", torch.allclose(m(x), layer(x)))
+print("trainable parameters:", sum(p.numel() for p in m.parameters() if p.requires_grad))
+print("scaling:", m.scaling)
 --- starter
 class LoRABuggy(nn.Module):
     def __init__(self, base, r=4, alpha=8):
@@ -823,6 +905,15 @@ Write `LoRALinear(base, r=4, alpha=8)` from blank:
 - `self.B`: `(out_features, r)`, all zeros
 - `self.scaling = alpha / r`
 - `forward(x)` returns `base(x) + (x @ A.T @ B.T) * scaling`
+--- above
+# Where the input comes from: a trained Linear taken out of an open model, which we wrap with LoRA
+k_proj = nn.Linear(24, 12)        # pretend it is a pretrained layer (the Linear that computes k in attention): 24 in, 12 out
+x = torch.randn(2, 5, 24)         # 2 sentences, 5 tokens each, each token a 24-dim vector
+--- below
+lora = LoRALinear(k_proj, r=4, alpha=16)
+print("output shape:", tuple(lora(x).shape), "  same as k_proj(x) right after creation?", torch.allclose(lora(x), k_proj(x)))
+print("A:", tuple(lora.A.shape), "  B:", tuple(lora.B.shape), "  scaling:", lora.scaling)
+print("trainable parameters:", sum(p.numel() for p in lora.parameters() if p.requires_grad))
 --- starter
 class LoRALinear(nn.Module):
     def __init__(self, base, r=4, alpha=8):
@@ -892,6 +983,18 @@ Write `grad_accum_step(model, xs, ys, n_micro)` from blank:
 - cut the `(N, ...)` batch, in order, into `n_micro` equal chunks; for each: forward, `F.cross_entropy`, backward
 - the accumulated gradients must equal those of feeding the whole batch at once
 - return `{parameter name: grad.clone()}`
+--- above
+# Where the input comes from: one batch of the training loop has 12 samples, but the GPU only fits 4 at a time
+classifier = nn.Linear(5, 3)                 # a small classifier: 5 features, 3 classes
+x_batch = torch.randn(12, 5)                 # 12 samples, 5 features each
+y_batch = torch.randint(0, 3, (12,))         # the class of each sample: 0, 1 or 2
+F.cross_entropy(classifier(x_batch), y_batch).backward()   # for comparison (a toy fits all 12 at once); this gradient stays in .grad
+big = classifier.weight.grad.clone()                       # keep a copy to compare with below
+--- below
+grads = grad_accum_step(classifier, x_batch, y_batch, n_micro=3)
+print("returned dict:", {k: tuple(g.shape) for k, g in grads.items()})
+print("weight gradient same as feeding all 12 at once?", torch.allclose(grads["weight"], big, atol=1e-6))
+print("gradient size relative to feeding all 12 at once:", round((grads["weight"].norm() / big.norm()).item(), 4))
 --- starter
 def grad_accum_step(model, xs, ys, n_micro):
     raise todo()

@@ -261,6 +261,14 @@ Write `RMSNorm(nn.Module)`:
 - `forward(self, x)`: x has shape (..., dim). Over the last dimension compute `y = x / sqrt(mean(x²) + eps) * weight` and return y with the same shape.
 
 Do not subtract the mean; that is exactly the difference from LayerNorm.
+--- above
+# Where the input comes from: each Llama block normalises the hidden states h before attention
+h = torch.randn(2, 3, 6) * 4 + 2   # (B=2, T=3, C=6): 2 sentences, 3 tokens each, 6 dims per token, largish values
+--- below
+norm = RMSNorm(6)
+y = norm(h)
+print("parameters:", sum(p.numel() for p in norm.parameters()), " output shape:", tuple(y.shape))
+print("mean(y²) of each token in sentence 1:", [round(v, 4) for v in y[0].pow(2).mean(-1).tolist()])
 --- starter
 class RMSNorm(nn.Module):
     """y = x / sqrt(mean(x^2) + eps) * weight
@@ -315,6 +323,14 @@ Write `precompute_freqs(head_dim, max_seq_len, theta=10000.0)` that returns `(co
 - Return the cos and sin of this table of angles.
 
 Example: with head_dim = 8, ω = [1, 0.1, 0.01, 0.001], so cos[3, 0] = cos(3) and sin[5, 0] = sin(5). No Python loops.
+--- above
+# Where the input comes from: when a Llama model is built, the cos/sin table is computed once from the head width and max length
+head_dim, max_seq_len = 4, 6   # one head has 4 dims (2 pairs), at most 6 positions
+--- below
+cos, sin = precompute_freqs(head_dim, max_seq_len)
+print("cos:", tuple(cos.shape), " sin:", tuple(sin.shape))
+print("position 0, cos:", cos[0].tolist(), " sin:", sin[0].tolist())
+print("position 2, cos:", [round(v, 4) for v in cos[2].tolist()])
 --- starter
 def precompute_freqs(head_dim, max_seq_len, theta=10000.0):
     """Returns (cos, sin), both of shape (max_seq_len, head_dim // 2).
@@ -365,6 +381,15 @@ out[..., 2i+1] = a * sin[i] + b * cos[i]
 - Use slicing to do it all at once; no Python loops.
 
 Besides the shape, "no turn at position 0" and "length unchanged", the grader checks RoPE's most important property: the dot product of q at position 3 and k at position 5 equals that of q at 20 and k at 22.
+--- above
+# Where the input comes from: in attention, q is split into heads, then RoPE runs before the scores
+q = torch.tensor([1.0, 0.0, 1.0, 0.0]).repeat(1, 2, 3, 1)   # (B=1, nh=2, T=3, hd=4): the same vector at 3 positions
+cos, sin = precompute_freqs(4, 3)                          # given (exercise d5-02): the cos/sin table, shape (3, 2)
+--- below
+q_rot = apply_rope(q, cos, sin)
+print("shape:", tuple(q_rot.shape))
+for t in range(3):
+    print(f"position {t}:", [round(v, 2) for v in q_rot[0, 0, t].tolist()])
 --- starter
 def apply_rope(x, cos, sin):
     """x: (B, nh, T, hd)   cos/sin: (T, hd//2)  ->  (B, nh, T, hd)
@@ -438,6 +463,16 @@ Write `apply_rope_complex(x, freqs)`:
 - Use `torch.view_as_complex`, `torch.polar` and `torch.view_as_real`.
 - The result must equal `apply_rope(x, freqs.cos(), freqs.sin())` (`apply_rope` is provided; the grader compares against it).
 - Return shape (B, nh, T, hd), with the same dtype as x.
+--- above
+# Where the input comes from: Meta's original Llama code stores the angle table freqs, not cos/sin
+k = torch.randn(1, 2, 3, 4)                            # (B=1, nh=2, T=3, hd=4): k inside attention
+omega = torch.tensor([1.0, 0.01])                      # angular speed ω of the 2 pairs when hd = 4
+freqs = torch.outer(torch.arange(3).float(), omega)    # (T=3, hd/2=2): angle t·ω_i of pair i at position t
+--- below
+k_rot = apply_rope_complex(k, freqs)
+print("shape:", tuple(k_rot.shape), " dtype:", k_rot.dtype)
+# apply_rope is given: the real-number version from exercise d5-03
+print("same as the real-number apply_rope:", torch.allclose(k_rot, apply_rope(k, freqs.cos(), freqs.sin()), atol=1e-6))
 --- starter
 def apply_rope_complex(x, freqs):
     """x: (B, nh, T, hd)   freqs: (T, hd//2) **angles** (not cos/sin)
@@ -477,6 +512,15 @@ The FFN of Llama, Mistral and Qwen is SwiGLU. A common interview question: "Why 
 Write two things:
 1. `swiglu_hidden(n_embd, multiple_of=256)`: compute `int(2 * (4 * n_embd) / 3)` (2/3 of 4C), then round it **up** to a multiple of `multiple_of`. `swiglu_hidden(4096, 256)` should be 11008 and `swiglu_hidden(64, 8)` should be 176.
 2. `SwiGLU(nn.Module)`: `__init__(self, n_embd, hidden)` creates three `nn.Linear` layers without bias, named as in Llama: `w1` (C → H), `w3` (C → H), `w2` (H → C). `forward(x)` returns `w2(silu(w1(x)) * w3(x))`. Input (B, T, C), output (B, T, C).
+--- above
+# Where the input comes from: in each Llama block, the FFN that follows attention is SwiGLU
+C = 40
+h = torch.randn(2, 3, C)   # (B=2, T=3, C=40): 2 sentences, 3 tokens each, 40 dims per token
+--- below
+H = swiglu_hidden(C, multiple_of=16)
+ffn = SwiGLU(C, H)
+print(f"hidden width H = {H} (GPT-2 uses 4C = {4 * C})")
+print("output shape:", tuple(ffn(h).shape), " parameters:", sum(p.numel() for p in ffn.parameters()))
 --- starter
 def swiglu_hidden(n_embd, multiple_of=256):
     """Llama's hidden size: take 2/3 of 4*C (= 8C/3), then round up to a multiple of multiple_of."""
@@ -544,6 +588,15 @@ Write `repeat_kv(x, n_rep)`:
 - Repeat each kv head n_rep times **back to back**: with n_kv_head = 2 and n_rep = 3 the head order is 0,0,0,1,1,1, not 0,1,0,1,0,1.
 - With n_rep = 1, return x unchanged.
 - Use `expand` + `reshape`, not a loop with `torch.cat`.
+--- above
+# Where the input comes from: in GQA attention, q has 8 heads but k has only 2 kv heads
+n_head, n_kv_head = 8, 2
+k = torch.randn(1, n_kv_head, 3, 4)   # (B=1, n_kv_head=2, T=3, hd=4)
+--- below
+k_rep = repeat_kv(k, n_head // n_kv_head)
+print("shape:", tuple(k.shape), "->", tuple(k_rep.shape))
+print("first number of the 2 original heads:", [round(v, 2) for v in k[0, :, 0, 0].tolist()])
+print("first number of the 8 copied heads:", [round(v, 2) for v in k_rep[0, :, 0, 0].tolist()])
 --- starter
 def repeat_kv(x, n_rep):
     """x: (B, n_kv_head, T, hd)  ->  (B, n_kv_head*n_rep, T, hd)
@@ -587,6 +640,15 @@ Write a `KVCache` class (a plain Python class, not an nn.Module):
 - `update(k, v)`: k and v have shape (B, nh, T_new, hd). Append them to the cache along the **time dimension** (dim=-2) and return the complete `(k_all, v_all)`. On the first call the cache is empty, so just store them.
 - `length`: a property (used as `c.length`, no brackets) that returns how many time steps are cached. 0 when empty.
 - `reset()`: empty the cache.
+--- above
+# Where the input comes from: generation first runs the 4 prompt tokens together, then 1 new token per step
+k_prompt, v_prompt = torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8)   # (B=1, nh=2, T=4, hd=8): k and v of the prompt
+k_new, v_new = torch.randn(1, 2, 1, 8), torch.randn(1, 2, 1, 8)         # the next new token: T=1
+--- below
+cache = KVCache()
+cache.update(k_prompt, v_prompt)
+k_all, v_all = cache.update(k_new, v_new)
+print("after 4 + 1 steps, length =", cache.length, " k_all:", tuple(k_all.shape), " v_all:", tuple(v_all.shape))
 --- starter
 class KVCache:
     """Usage:
@@ -662,6 +724,15 @@ Write `attn_step(q, k_all, v_all)`:
 - q: (B, nh, 1, hd), just the current step. k_all, v_all: (B, nh, T, hd), the whole history (including the current step).
 - Return (B, nh, 1, hd): ordinary scaled dot-product attention, `softmax(q · kᵀ / sqrt(hd)) · v`, **with no mask**.
 - Write it yourself; don't call `F.scaled_dot_product_attention` (the grader uses it to check your answer).
+--- above
+# Where the input comes from: when generating token 6, the cache holds 6 steps of k and v; the new token has one q
+q_new = torch.randn(1, 2, 1, 8)                                       # (B=1, nh=2, 1, hd=8): q of the newest step
+cache_k, cache_v = torch.randn(1, 2, 6, 8), torch.randn(1, 2, 6, 8)   # k and v of the 6 steps in the cache (this one included)
+--- below
+out = attn_step(q_new, cache_k, cache_v)
+ref = F.scaled_dot_product_attention(q_new, cache_k, cache_v)   # PyTorch's built-in attention, no mask
+print("output shape:", tuple(out.shape))
+print("same as PyTorch's built-in:", torch.allclose(out, ref, atol=1e-6))
 --- starter
 def attn_step(q, k_all, v_all):
     """q: (B, nh, 1, hd) only the current step; k_all/v_all: (B, nh, T, hd) the whole history.
@@ -712,6 +783,17 @@ Write `incremental_attention(x, wq, wk, wv, cos, sin)` that returns the same (B,
 - x: (B, T, C). wq, wk, wv: (C, C). 2 heads, hd = C // 2. cos, sin: (max_len, hd/2).
 - For t = 0, 1, …, T − 1: compute this step's q, k, v from `x[:, t:t+1]` only (shape (B, 2, 1, hd)), apply RoPE, put k and v into a `KVCache`, compute this step's output with `attn_step`, and turn it back into (B, 1, C).
 - Finally join the outputs of all steps along the time dimension.
+--- above
+# Where the input comes from: two sentences (5 tokens each) go through one attention layer with 2 heads
+B, T, C = 2, 5, 12
+h = torch.randn(B, T, C)                  # hidden states: 2 sentences, 5 tokens each, 12 dims per token
+wq, wk, wv = torch.randn(3, C, C) * 0.3   # the layer's three weight matrices for q, k, v, (12, 12) each
+cos, sin = precompute_freqs(C // 2, 16)   # given: RoPE's cos/sin table, hd = C // 2 = 6
+--- below
+out = incremental_attention(h, wq, wk, wv, cos, sin)
+full = _full_attention(h, wq, wk, wv, cos, sin)   # given: the whole sequence in one go (with the causal mask)
+print("one token at a time:", tuple(out.shape), " all at once:", tuple(full.shape))
+print("same result:", torch.allclose(out, full, atol=1e-5))
 --- starter
 def incremental_attention(x, wq, wk, wv, cos, sin):
     """Feed one token at a time and reproduce _full_attention's output with KVCache + attn_step.
@@ -767,6 +849,15 @@ Write three functions. The input logits have shape (..., V); each returns new lo
 3. `top_p_filter(logits, p)`: sort by softmax probability, largest first. Keep tokens until the running total **first reaches ≥ p** (keep that token too) and set everything after it to -inf. Always keep at least 1. Return the logits in their **original order**.
 
 Example: probabilities [0.5, 0.3, 0.15, 0.05] with p = 0.7 → keep the first 2 (0.5 + 0.3 = 0.8 is the first total ≥ 0.7).
+--- above
+# Where the input comes from: the logits the model outputs at the last position, with a vocabulary of only 5 words
+next_logits = torch.tensor([[2.0, 1.0, 0.5, 3.0, -1.0]])   # (B=1, V=5): the raw score of each word
+# after softmax the probabilities are about [0.23, 0.08, 0.05, 0.62, 0.01]
+--- below
+print("temperature 0.5:", apply_temperature(next_logits, 0.5).tolist())
+print("t = 0 (greedy):", apply_temperature(next_logits, 0).tolist())
+print("top-k = 2:", top_k_filter(next_logits, 2).tolist())
+print("top-p = 0.9:", top_p_filter(next_logits, 0.9).tolist())
 --- starter
 def apply_temperature(logits, t):
     """Smaller t = more certain. t may be 0: then it becomes argmax (everything but the maximum is -inf)."""
@@ -838,6 +929,15 @@ Write `repetition_penalty(logits, prev_ids, penalty=1.2)`:
 - Return a new tensor. No Python loop over the batch.
 
 Example: logits [2, −2, 1], tokens 0 and 1 have appeared, penalty = 2 → [1, −4, 1].
+--- above
+# Where the input comes from: two sentences are generated together; the model's logits at this step, and the tokens each sentence already has
+next_logits = torch.tensor([[1.5, 0.5, -1.0, 3.0, 0.0],
+                            [0.0, 2.0, 1.0, -0.5, 1.5]])   # (B=2, V=5): next-word scores of each sentence, 5-word vocabulary
+generated = torch.tensor([[3, 2], [1, 3]])                 # (B=2, T=2): token ids each sentence has already produced
+--- below
+out = repetition_penalty(next_logits, generated, penalty=2.0)
+print("sentence 1:", out[0].tolist())
+print("sentence 2:", out[1].tolist())
 --- starter
 def repetition_penalty(logits, prev_ids, penalty=1.2):
     """logits: (B, V)   prev_ids: (B, T) tokens generated so far.
@@ -876,6 +976,15 @@ RoPE has two pairing conventions. Move weights from one implementation to the ot
 `apply_rope_buggy` below should give exactly the same result as `apply_rope` (neighbouring pairs, provided). But it was written with HuggingFace's "half-and-half" convention: with hd = 8, x0 is paired with x4, x1 with x5, and so on.
 
 Change it to neighbouring pairs (x0 with x1, x2 with x3, …) so its output equals `apply_rope(x, cos, sin)`. Keep the function name and arguments. There are two places to fix.
+--- above
+# Where the input comes from: q in attention, about to go through RoPE copied from HuggingFace; Meta's weights expect neighbouring pairs
+q = torch.tensor([1.0, 2.0, 3.0, 4.0]).repeat(1, 1, 2, 1)   # (B=1, nh=1, T=2, hd=4): the same q at positions 0 and 1
+cos, sin = precompute_freqs(4, 2)                          # given: the cos/sin table, shape (2, 2)
+--- below
+out = apply_rope_buggy(q, cos, sin)
+print("position 1:", [round(v, 2) for v in out[0, 0, 1].tolist()])
+# apply_rope is given: the correct version with neighbouring pairs
+print("same as apply_rope:", torch.allclose(out, apply_rope(q, cos, sin), atol=1e-6))
 --- starter
 def apply_rope_buggy(x, cos, sin):
     hd = x.size(-1)
@@ -1005,6 +1114,16 @@ Without notes, write `apply_rope(x, cos, sin)`:
 - No Python loops.
 
 The checks are the same as in exercise d5-03: shape, no turn at position 0, length unchanged, dot product depends only on the distance, neighbouring pairs.
+--- above
+# Where the input comes from: in attention, q and k are split into heads and then both go through RoPE
+cos, sin = precompute_freqs(4, 8)   # given: the cos/sin table, hd = 4, at most 8 positions
+q = torch.randn(1, 1, 1, 4)         # one q vector (B=1, nh=1, T=1, hd=4)
+k = torch.randn(1, 1, 1, 4)         # one k vector
+--- below
+score_1_3 = (apply_rope(q, cos[1:2], sin[1:2]) * apply_rope(k, cos[3:4], sin[3:4])).sum()
+score_5_7 = (apply_rope(q, cos[5:6], sin[5:6]) * apply_rope(k, cos[7:8], sin[7:8])).sum()
+print("score, q at 1 and k at 3:", round(score_1_3.item(), 4))
+print("score, q at 5 and k at 7:", round(score_5_7.item(), 4))
 --- starter
 def apply_rope(x, cos, sin):
     raise todo()
@@ -1080,6 +1199,17 @@ def _full_attention(x, wq, wk, wv, cos, sin):
     return F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(B, T, C)
 ```
 Your function must return the same (B, T, C) but feed one token at a time: each step uses only `x[:, t:t+1]`, puts k and v into a `KVCache`, computes the step's output with `attn_step`, and at the end the outputs are joined along the time dimension.
+--- above
+# Where the input comes from: two sentences (4 tokens each) go through one attention layer with 2 heads
+B, T, C = 2, 4, 16
+h = torch.randn(B, T, C)                  # hidden states: 2 sentences, 4 tokens each, 16 dims per token
+wq, wk, wv = torch.randn(3, C, C) * 0.3   # the layer's three weight matrices for q, k, v, (16, 16) each
+cos, sin = precompute_freqs(C // 2, 16)   # given: RoPE's cos/sin table, hd = C // 2 = 8
+--- below
+out = incremental_attention(h, wq, wk, wv, cos, sin)
+full = _full_attention(h, wq, wk, wv, cos, sin)   # given: the whole sequence in one go (with the causal mask)
+print("one token at a time:", tuple(out.shape), " all at once:", tuple(full.shape))
+print("same result:", torch.allclose(out, full, atol=1e-5))
 --- starter
 def incremental_attention(x, wq, wk, wv, cos, sin):
     raise todo()

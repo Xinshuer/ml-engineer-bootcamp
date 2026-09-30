@@ -263,6 +263,13 @@ Write two functions and fill in one dictionary:
 - `n_samples(seconds, sr)`: duration in seconds → number of samples, as an `int`. Example: `n_samples(0.5, 24000) == 12000`
 - `duration(n, sr)`: number of samples → duration in seconds. Example: `duration(16000, 16000) == 1.0`
 - `AUDIO_FACTS`: replace the 4 `None`s with integers; mental arithmetic is enough. "Frames per second" = sr ÷ hop, rounded down
+--- above
+# Where the input comes from: one entry of a TTS dataset manifest, a 3.5 s clip at 22050 samples per second
+clip_seconds, clip_sr = 3.5, 22050
+--- below
+n = n_samples(clip_seconds, clip_sr)
+print("samples:", n)
+print("back to seconds:", duration(n, clip_sr))
 --- starter
 def n_samples(seconds, sr):
     """Duration in seconds -> number of samples (an int)."""
@@ -331,6 +338,12 @@ Write `n_frames(n_sample, n_fft, hop_length, center=True)`. It returns the numbe
 - `center=False`: no padding. The first frame starts at sample 0, each frame has `n_fft` samples, and a tail too short for a full frame is dropped
 
 The check compares your result with the real `torch.stft(...).shape[-1]` (every `n_fft` is even).
+--- above
+# Where the input comes from: a 2 s, 16 kHz speech clip; its STFT frame count is the model's sequence length
+n_audio, fft_size, hop = 2 * 16000, 1024, 256     # number of samples, n_fft, hop
+--- below
+print("center=True :", n_frames(n_audio, fft_size, hop, True), "frames")
+print("center=False:", n_frames(n_audio, fft_size, hop, False), "frames")
 --- starter
 def n_frames(n_sample, n_fft, hop_length, center=True):
     """Return the number of frames torch.stft produces."""
@@ -374,6 +387,16 @@ Write `stft_mag(wav, n_fft=1024, hop_length=256)`:
 - return the magnitude (real, non-negative): `(n_fft//2 + 1, n_frames)` or `(B, n_fft//2 + 1, n_frames)`
 
 Example: 16000 samples → `(513, 63)`; `(2, 16000)` → `(2, 513, 63)`.
+--- above
+# Where the input comes from: a 0.5 s, 16 kHz clip from the dataset; a 440 Hz pure tone stands in for it
+t = torch.arange(8000) / 16000               # the time of each sample, in seconds
+clip = torch.sin(2 * math.pi * 440 * t)      # one clip: (8000,)
+clips = torch.stack([clip, 0.5 * clip])      # a batch: (2, 8000); the second clip is half as loud
+--- below
+mag = stft_mag(clip)
+print("one clip:", tuple(mag.shape), "  a batch:", tuple(stft_mag(clips).shape))
+k = mag[:, 10].argmax().item()               # the loudest frequency bin in frame 10
+print("loudest bin:", k, "-> about", round(k * 16000 / 1024), "Hz")
 --- starter
 def stft_mag(wav, n_fft=1024, hop_length=256):
     """wav: (T,) or (B, T) -> magnitude (..., n_fft//2 + 1, n_frames)"""
@@ -417,6 +440,13 @@ Write two functions. Inputs and outputs are plain Python numbers (`math` is enou
 
 - `hz_to_mel(f)`: `2595 * log10(1 + f / 700)`
 - `mel_to_hz(m)`: its inverse, so that `mel_to_hz(hz_to_mel(f)) ≈ f`
+--- above
+# Where the input comes from: the frequency range of a mel filterbank for 24 kHz TTS audio, 0 to 12000 Hz
+f_min, f_max = 0.0, 12000.0
+--- below
+lo, hi = hz_to_mel(f_min), hz_to_mel(f_max)
+print("mel range:", round(lo, 1), "to", round(hi, 1))
+print("5 evenly spaced mel points, back in Hz:", [round(mel_to_hz(lo + (hi - lo) * i / 4)) for i in range(5)])
 --- starter
 def hz_to_mel(f):
     """Hz -> mel"""
@@ -463,6 +493,15 @@ Write `to_log_mel(mag, fb, eps=1e-5)`:
 - `mag`: a magnitude spectrogram, `(n_freq, n_frames)` or `(B, n_freq, n_frames)`
 - `fb`: a mel filterbank, `(n_mels, n_freq)`
 - return `log(fb @ mag + eps)`, with shape `(n_mels, n_frames)` or `(B, n_mels, n_frames)`
+--- above
+# Where the input comes from: a magnitude spectrogram from stft_mag plus a mel filterbank (random stand-ins)
+mag_spec = torch.rand(257, 6) * 5     # magnitude: 257 frequency bins (n_fft=512), 6 frames
+mag_spec[:, 4:] = 0                   # the last 2 frames are silent
+mel_fb = torch.rand(40, 257)          # 40 mel filters, each one weights the 257 bins
+--- below
+log_mel = to_log_mel(mag_spec, mel_fb)
+print("shape:", tuple(log_mel.shape))
+print("value in a silent frame:", round(log_mel[0, 5].item(), 2))
 --- starter
 def to_log_mel(mag, fb, eps=1e-5):
     """mag: (..., n_freq, n_frames), fb: (n_mels, n_freq) -> (..., n_mels, n_frames)"""
@@ -508,6 +547,13 @@ Write `peak_normalize(wav, target=0.95)`:
 - return an all-zero input unchanged; no nan allowed
 
 Example: `[0.1, -0.4, 0.2]` has peak 0.4; times 0.95 / 0.4 it becomes `[0.2375, -0.95, 0.475]`.
+--- above
+# Where the input comes from: two dataset clips, one recorded too quietly and one broken file of pure silence
+quiet_clip = torch.tensor([0.02, -0.05, 0.04, -0.01])    # real clips have tens of thousands of samples; 4 will do here
+silent_clip = torch.zeros(4)
+--- below
+print("the quiet one:", [round(v, 3) for v in peak_normalize(quiet_clip).tolist()])
+print("the silent one:", peak_normalize(silent_clip).tolist())
 --- starter
 def peak_normalize(wav, target=0.95):
     """Scale the waveform so its peak is target; return all-zero input unchanged."""
@@ -549,6 +595,14 @@ Write `frame(wav, frame_len, hop)`:
 - use `tensor.unfold`, no loops
 
 Example: `frame(torch.arange(10.), 4, 2)` has 4 frames, and frame 1 is `[2, 3, 4, 5]`.
+--- above
+# Where the input comes from: a waveform to cut into frames, e.g. for per-frame loudness or voice detection
+clip = torch.arange(12.)       # real audio: 16000 samples per second; 0 to 11 shows which samples each frame takes
+--- below
+frames = frame(clip, 5, 3)     # frame length 5, hop 3
+print("shape:", tuple(frames.shape))
+print("frames:", frames.tolist())
+print("average loudness per frame:", frames.abs().mean(dim=1).tolist())
 --- starter
 def frame(wav, frame_len, hop):
     """(T,) -> (n_frames, frame_len)"""
@@ -603,6 +657,14 @@ Many audio models (sound classification, speech enhancement, diffusion-based TTS
 Write `mel_to_image(mel)`: `(B, n_mels, n_frames)` → `(B, 1, n_mels, n_frames)`, i.e. insert a channel dimension of size 1 at position 1.
 
 The check feeds your result straight into `nn.Conv2d(1, 16, 3, 1, 1)`.
+--- above
+# Where the input comes from: a batch of log-mels, 2 clips with 40 mels and 50 frames each (random numbers)
+mel_batch = torch.randn(2, 40, 50)
+--- below
+x = mel_to_image(mel_batch)
+conv = nn.Conv2d(1, 8, 3, padding=1)      # first layer of an image model: 1 input channel, 8 output channels
+print("channel dim added:", tuple(mel_batch.shape), "->", tuple(x.shape))
+print("Conv2d output:", tuple(conv(x).shape))
 --- starter
 def mel_to_image(mel):
     """(B, n_mels, n_frames) -> (B, 1, n_mels, n_frames)"""
@@ -640,6 +702,15 @@ Write `pad_mels(mels, pad_value=-11.5)`:
 - `mask`: `(B, Tmax)`, 1 for real frames and 0 for padding (dtype long)
 
 Example: three mels with 3, 5 and 1 frames → `batch` is `(3, n_mels, 5)` and the first row of the mask is `[1, 1, 1, 0, 0]`.
+--- above
+# Where the input comes from: 3 log-mels of different lengths in one batch (2 mels each; 4, 2 and 3 frames)
+# To make them easy to tell apart, each one holds a single value: 0.5, 1.5 and 2.5
+clip_mels = [torch.full((2, 4), 0.5), torch.full((2, 2), 1.5), torch.full((2, 3), 2.5)]
+--- below
+batch, mask = pad_mels(clip_mels)
+print("batch:", tuple(batch.shape), " mask:", tuple(mask.shape))
+print("clip 2, mel 1:", batch[1, 0].tolist())
+print("mask:", mask.tolist())
 --- starter
 def pad_mels(mels, pad_value=-11.5):
     """mels: list of (n_mels, T_i) -> batch (B, n_mels, Tmax), mask (B, Tmax)"""
@@ -687,6 +758,13 @@ Replace each `None` in `AUDIO_SHAPES` with the shape of that tensor, written as 
 
 - "Conv2d input" means the 4-D tensor with batch size 1 and the channel dimension added
 - a one-element tuple needs a comma: `(16000,)`
+--- above
+# Where the input comes from: feature settings for 1 s of mono 16 kHz audio (n_fft=1024, hop=256, 80 mels)
+sr, seconds, n_fft, hop, n_mels = 16000, 1, 1024, 256, 80
+--- below
+shapes = list(AUDIO_SHAPES.values())
+print("all 5 written as tuples:", all(isinstance(s, tuple) for s in shapes))
+print("number of dimensions of each:", [len(s) if s else None for s in shapes])
 --- starter
 AUDIO_SHAPES = {
     "waveform":                   None,
@@ -734,6 +812,15 @@ These are the two most common bugs in real audio code: using the real part of a 
 `log_mel_buggy(wav, fb)` is meant to compute a log-mel, but its output contains nan, and the values do not match the correct recipe (`stft_mag` from d11-03, then `to_log_mel` from d11-05, eps = 1e-5).
 
 Two lines are wrong. Fix them so the output matches the correct recipe (tolerance 1e-4). Keep the function name and arguments.
+--- above
+# Where the input comes from: a 16 kHz recording (speech first, then silence) and a mel filterbank
+recording = torch.cat([torch.randn(5000) * 0.1, torch.zeros(5000)])   # (10000,)
+mel_fb = torch.rand(64, 513)          # 64 mel filters (random numbers, only the shape matters)
+--- below
+out = log_mel_buggy(recording, mel_fb)
+print("shape:", tuple(out.shape), " all finite (no nan / -inf):", torch.isfinite(out).all().item())
+# stft_mag and to_log_mel: the correct recipe from d11-03 and d11-05, provided here
+print("matches the correct recipe:", torch.allclose(out, to_log_mel(stft_mag(recording), mel_fb), atol=1e-4))
 --- starter
 def log_mel_buggy(wav, fb, n_fft=1024, hop=256):
     spec = torch.stft(wav, n_fft, hop, window=torch.hann_window(n_fft), return_complex=True)
@@ -884,6 +971,13 @@ Write `stft_mag(wav, n_fft=1024, hop_length=256)`:
 - input `(T,)` or `(B, T)`
 - a Hann window (on the same device as wav), `center=True`
 - return the real, non-negative magnitude: `(n_fft//2 + 1, n_frames)` or `(B, n_fft//2 + 1, n_frames)`
+--- above
+# Where the input comes from: a DataLoader batch of 3 clips, 0.25 s at 16 kHz (random numbers stand in for sound)
+clips = torch.randn(3, 4000)
+--- below
+mag = stft_mag(clips)
+print("shape:", tuple(mag.shape), " dtype:", mag.dtype)
+print("min >= 0:", mag.min().item() >= 0)
 --- starter
 def stft_mag(wav, n_fft=1024, hop_length=256):
     raise todo()
@@ -923,6 +1017,13 @@ Write `pad_mels(mels, pad_value=-11.5)`:
 
 - `mels`: a list whose elements have shape `(n_mels, T_i)`, with different lengths
 - return `(batch, mask)`: `batch` is `(B, n_mels, Tmax)` with each mel on the left and `pad_value` on the right; `mask` is `(B, Tmax)`, 1 for real frames and 0 for padding (dtype long)
+--- above
+# Where the input comes from: 2 log-mels from the DataLoader, different lengths (3 mels each; 2 and 4 frames)
+clip_mels = [torch.randn(3, 2), torch.randn(3, 4)]
+--- below
+batch, mask = pad_mels(clip_mels)
+print("batch:", tuple(batch.shape), " mask:", mask.tolist())
+print("the padded part of clip 1:", batch[0, :, 2:].tolist())
 --- starter
 def pad_mels(mels, pad_value=-11.5):
     raise todo()

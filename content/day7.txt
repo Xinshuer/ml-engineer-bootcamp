@@ -277,6 +277,14 @@ ref: day7
 2. **先脑算，别跑代码**：把 `CONV_SHAPES` 里的每个 `None` 换成你算出来的输出边长。字典的 key 是 `(H, kernel, stride, padding)`。
 
 检查会先用真的 `nn.Conv2d` 验证你的公式，再逐个对比你脑算的数。
+--- above
+# 上文：一张 256x256 的图，依次过 3 层卷积（第 4 题 Encoder 的搭法）
+side = 256
+layers = [(4, 2, 1), (4, 2, 1), (3, 1, 1)]     # 每一层的 (kernel, stride, padding)
+--- below
+for kernel, stride, padding in layers:
+    side = conv_out(side, kernel, stride, padding)
+    print("过了", (kernel, stride, padding), "的卷积，边长变成", side)
 --- starter
 def conv_out(H, kernel, stride, padding):
     """一张 H x H 的图经过 Conv2d(kernel, stride, padding) 之后的边长。"""
@@ -340,6 +348,15 @@ VAE 训练时要从 encoder 给出的分布里采样 z。直接采样，梯度�
 - 不许用 `torch.normal` 或 `torch.distributions` 的 `.sample()`：梯度传不回 `mu` 和 `logvar`。
 
 检查会抽 2 万个样本，看均值和标准差对不对，再确认梯度能传回 `mu` 和 `logvar`。
+--- above
+# 上文：encoder 看了一张图，给 3 个潜变量维度各输出一个 mu 和 logvar
+mu = torch.tensor([[0.5, -1.0, 2.0]])        # (1, 3)：1 张图，3 个维度
+logvar = torch.tensor([[0.0, -2.0, 1.0]])    # 方差的对数：方差 = exp(logvar)
+--- below
+z = reparameterize(mu.repeat(10000, 1), logvar.repeat(10000, 1))   # 同一张图复制 1 万份
+print("z:", tuple(z.shape))
+print("每一维的均值:", [round(v, 2) for v in z.mean(0).tolist()])
+print("每一维的标准差:", [round(v, 2) for v in z.std(0).tolist()])
 --- starter
 def reparameterize(mu, logvar):
     """z = mu + std * eps，其中 std = exp(0.5 * logvar)，eps ~ N(0, 1)。"""
@@ -390,6 +407,14 @@ VAE 的 loss 里有一项 KL，把 encoder 给出的分布拉向标准正态。�
 - 每个样本把所有维度的 KL 加起来，返回形状 `(B,)`。
 
 第二项检查会用 40 万个样本做蒙特卡洛估计，和你的闭式解对比。
+--- above
+# 上文：encoder 看了 3 张图，每张图给 2 个潜变量维度各算出 mu 和 logvar
+mu = torch.tensor([[0.1, -0.2], [2.0, 1.0], [0.0, 0.5]])        # (3, 2)：3 张图，每张 2 维
+logvar = torch.tensor([[0.0, 0.1], [-1.0, 0.0], [0.5, -0.5]])   # 第 1 张图很接近 N(0, 1)
+--- below
+kl = kl_normal(mu, logvar)
+print("kl 的形状:", tuple(kl.shape))
+print("每张图的 KL:", [round(v, 4) for v in kl.tolist()])
 --- starter
 def kl_normal(mu, logvar):
     """KL( N(mu, exp(logvar)) || N(0, 1) )，每个样本对所有维度求和，返回 (B,)。"""
@@ -448,6 +473,14 @@ Conv2d(64 -> 2*z_ch,  kernel 3, stride 1, padding 1)   8x8 不变
 ```
 
 `forward(x)`：`x` 的形状是 `(B, 3, 32, 32)`。把最后一层输出的 `2*z_ch` 个通道切成两半：前 `z_ch` 个是 `mu`，后 `z_ch` 个是 `logvar`。返回 `(mu, logvar)`，两个的形状都是 `(B, z_ch, 8, 8)`。
+--- above
+# 上文：训练 VAE 时，从数据集取出一批 32x32 的彩色图，像素已缩放到 [-1, 1]
+images = torch.rand(5, 3, 32, 32) * 2 - 1     # (5 张图, 3 个颜色通道 RGB, 高 32, 宽 32)
+--- below
+encoder = Encoder(z_ch=4)
+mu, logvar = encoder(images)
+print("images:", tuple(images.shape), "-> mu:", tuple(mu.shape), " logvar:", tuple(logvar.shape))
+print("可学习的参数个数:", sum(p.numel() for p in encoder.parameters()))
 --- starter
 class Encoder(nn.Module):
     def __init__(self, z_ch=4):
@@ -508,6 +541,14 @@ Conv2d(32 -> 3,    kernel 3, stride 1, padding 1), Tanh    32x32
 放大用 `nn.Upsample(scale_factor=2, mode="nearest")`，不用 `ConvTranspose2d`。
 
 `forward(z)`：`z` 的形状是 `(B, z_ch, 8, 8)`，返回形状 `(B, 3, 32, 32)` 的图片，数值在 [-1, 1] 之间。
+--- above
+# 上文：Encoder 编码、重参数化采样之后，每张图变成一块 (4, 8, 8) 的潜变量 z
+z = torch.randn(5, 4, 8, 8)     # 5 张图的 z：4 个通道，8x8
+--- below
+decoder = Decoder(z_ch=4)
+images = decoder(z)
+print("z:", tuple(z.shape), "-> images:", tuple(images.shape))
+print("像素最小值:", round(images.min().item(), 2), " 最大值:", round(images.max().item(), 2))
 --- starter
 class Decoder(nn.Module):
     def __init__(self, z_ch=4):
@@ -560,6 +601,17 @@ VAE 的 loss 由重建误差和 KL 两项组成。两项的量级要配平，β 
 - `total = recon + beta * kl`。
 
 第 3 题的 `kl_normal(mu, logvar)` 已经准备好了，可以直接调用（它返回 `(B,)`）。
+--- above
+# 上文：训练中的一步：原图 x、decoder 还原的 x_hat、encoder 给的 mu 和 logvar
+x = torch.rand(4, 3, 32, 32) * 2 - 1       # 4 张 32x32 的彩色图，数值在 [-1, 1]
+x_hat = x + 0.1 * torch.randn_like(x)      # 还原得不错，每个像素差一点
+mu = torch.randn(4, 4, 8, 8) * 0.5         # 每张图的潜变量是 (4, 8, 8)
+logvar = torch.randn(4, 4, 8, 8) * 0.1
+--- below
+total, recon, kl = vae_loss(x, x_hat, mu, logvar, beta=1.0)
+print("recon:", round(recon.item(), 2), " kl:", round(kl.item(), 2), " total:", round(total.item(), 2))
+total_b4, _, _ = vae_loss(x, x_hat, mu, logvar, beta=4.0)
+print("beta=4 时的 total:", round(total_b4.item(), 2))
 --- starter
 def vae_loss(x, x_hat, mu, logvar, beta=1.0):
     """返回 (total, recon, kl)，三个都是标量。"""
@@ -602,6 +654,13 @@ Stable Diffusion 不在像素上做扩散，而是在 VAE 的潜空间里做。�
 - 图片形状 `(C_img, H, W)`，元素个数 = H × W × C_img。
 - 潜变量形状 `(C_z, h, w)`，元素个数 = h × w × C_z。
 - 返回一个数（可以是小数）。例如 32x32x3 压到 8x8x4 是 12 倍。
+--- above
+# 上文：SDXL 和 FLUX 的 VAE 都把 1024x1024 的彩色图压成 128x128 的潜变量
+img_h, img_w, img_ch = 1024, 1024, 3     # 图片：高、宽、3 个颜色通道
+lat_h, lat_w = 128, 128                  # 潜变量的高、宽；通道数：SDXL 4 个，FLUX 16 个
+--- below
+print("SDXL（潜变量 4 个通道）:", compression(img_h, img_w, img_ch, lat_h, lat_w, 4), "倍")
+print("FLUX（潜变量 16 个通道）:", compression(img_h, img_w, img_ch, lat_h, lat_w, 16), "倍")
 --- starter
 def compression(H, W, C_img, h, w, C_z):
     """返回 图片元素个数 / 潜变量元素个数。"""
@@ -634,6 +693,14 @@ Stable Diffusion 的代码里到处是 0.18215。它把 VAE 的潜变量缩放�
 写 `fit_scaling_factor(latents)`：输入一批 VAE 编码出来的潜变量（任意形状的张量），返回一个 Python 浮点数 `s`，使 `latents * s` 的整体标准差约等于 1。
 
 检查会用一批标准差约 5.49 的潜变量来测，你应该得到约 0.182。这就是 Stable Diffusion 里 0.18215 的来历。
+--- above
+# 上文：换了一个 VAE（比如 SDXL 的），先编码一批图，看看潜变量的标准差有多大
+latents = torch.randn(16, 4, 8, 8) * 7.68     # 16 张图的潜变量，标准差大约 7.7
+--- below
+s = fit_scaling_factor(latents)
+print("s:", round(s, 4))
+print("乘 s 之前的 std:", round(latents.std().item(), 2))
+print("乘 s 之后的 std:", round((latents * s).std().item(), 2))
 --- starter
 def fit_scaling_factor(latents):
     """返回 s，使 (latents * s).std() ≈ 1。"""
@@ -673,6 +740,14 @@ ref: day7
 - 平均 KL 小于 `thresh` 的维度算坍塌，数一数有几个。
 
 这里不能直接用 `kl_normal`：它把所有维度加在一起了，你需要每一维分开看。
+--- above
+# 上文：训练了一阵的 VAE 看了 200 张图，每张图输出 5 维的 mu 和 logvar
+scale = torch.tensor([1.2, 0.02, 0.9, 0.0, 0.5])    # 每一维的 mu 随图片变化的幅度
+mu = torch.randn(200, 5) * scale                    # (200, 5)
+logvar = torch.tensor([-1.0, 0.0, -0.8, 0.0, 0.0]).repeat(200, 1)   # (200, 5)，每张图都一样
+--- below
+print("坍塌的维度个数:", collapsed_dims(mu, logvar))
+print("阈值放宽到 0.2 时:", collapsed_dims(mu, logvar, thresh=0.2))
 --- starter
 def collapsed_dims(mu, logvar, thresh=0.01):
     """mu, logvar: (B, D)。返回平均 KL < thresh 的维度个数。"""
@@ -716,6 +791,17 @@ ref: day7
 它有 **3 处错**。找出来改掉，函数名和返回值 `(loss, z)` 不要改。
 
 检查会拿你的 loss 和正确的 `vae_loss`（已准备好）对比，再看采样出的 `z` 的标准差对不对。
+--- above
+# 上文：训练中的一步：原图 x、decoder 还原的 x_hat、encoder 给的 mu 和 logvar
+x = torch.rand(500, 3, 8, 8) * 2 - 1           # 500 张 8x8 的小彩色图
+x_hat = x + 0.1 * torch.randn_like(x)          # 还原得不错，每个像素差一点
+mu = torch.randn(500, 4) * 0.5                 # 每张图 4 个潜变量维度
+logvar = torch.full((500, 4), math.log(0.25))  # 方差都是 0.25
+--- below
+loss, z = vae_step_buggy(x, x_hat, mu, logvar, beta=1.0)
+total, recon, kl = vae_loss(x, x_hat, mu, logvar, beta=1.0)    # 正确的版本，已经准备好
+print("你的 loss:", round(loss.item(), 2), "  vae_loss:", round(total.item(), 2))
+print("z 围绕 mu 散开的标准差:", round((z - mu).std().item(), 2))
 --- starter
 def vae_step_buggy(x, x_hat, mu, logvar, beta=1.0):
     std = torch.exp(logvar)
@@ -870,6 +956,15 @@ ref: day7
 闭卷重写。重参数化是 VAE 能训练的前提，面试时经常要当场写出来。
 --- prompt
 不看笔记，写 `reparameterize(mu, logvar)`：从均值 `mu`、对数方差 `logvar` 的正态分布里采样 `z`（形状和 `mu` 一样），并且梯度要能传回 `mu` 和 `logvar`。
+--- above
+# 上文：encoder 给一张图算出的 mu 和 logvar；训练时要对它们求梯度
+mu = torch.tensor([[1.0, 0.0, -0.5]], requires_grad=True)       # (1, 3)：1 张图，3 个维度
+logvar = torch.tensor([[0.0, 0.5, -1.0]], requires_grad=True)   # 方差的对数
+--- below
+z = reparameterize(mu, logvar)
+z.sum().backward()                  # 训练时是 loss.backward()，这里用 z.sum() 代替 loss
+print("mu 的梯度:", mu.grad[0].tolist())
+print("logvar 的梯度:", [round(v, 3) for v in logvar.grad[0].tolist()])
 --- starter
 def reparameterize(mu, logvar):
     raise todo()
@@ -913,6 +1008,14 @@ ref: day7
 闭卷重写。高斯分布之间的 KL 闭式解是 VAE 面试的高频题，要能不看笔记写对。
 --- prompt
 不看笔记，写 `kl_normal(mu, logvar)`：返回 N(mu, exp(logvar)) 相对 N(0, 1) 的 KL 散度。输入形状 `(B, ...)`，每个样本对所有维度求和，返回 `(B,)`。
+--- above
+# 上文：第 4 题的 Encoder 编码 2 张图，得到的 mu、logvar 形状都是 (2, 4, 8, 8)
+mu = torch.randn(2, 4, 8, 8) * 0.5
+logvar = torch.randn(2, 4, 8, 8) * 0.3
+--- below
+kl = kl_normal(mu, logvar)
+print("kl 的形状:", tuple(kl.shape))
+print("每张图的 KL:", [round(v, 2) for v in kl.tolist()])
 --- starter
 def kl_normal(mu, logvar):
     raise todo()

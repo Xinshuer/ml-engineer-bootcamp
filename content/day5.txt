@@ -261,6 +261,14 @@ Llama、Mistral、Qwen 这些模型的每一层都用 RMSNorm 代替 LayerNorm�
 - `forward(self, x)`：x 的形状是 (..., dim)。在最后一维上算 `y = x / sqrt(mean(x²) + eps) * weight`，返回同样形状的 y。
 
 不要减均值，这正是它和 LayerNorm 的区别。
+--- above
+# 上文：Llama 每层 block 先把隐藏状态 h 做 norm，再送进 attention
+h = torch.randn(2, 3, 6) * 4 + 2   # (B=2, T=3, C=6)：2 句话，每句 3 个 token，每个 6 维，数值偏大
+--- below
+norm = RMSNorm(6)
+y = norm(h)
+print("参数个数:", sum(p.numel() for p in norm.parameters()), " 输出形状:", tuple(y.shape))
+print("第 1 句每个 token 的 mean(y²):", [round(v, 4) for v in y[0].pow(2).mean(-1).tolist()])
 --- starter
 class RMSNorm(nn.Module):
     """y = x / sqrt(mean(x^2) + eps) * weight
@@ -315,6 +323,14 @@ RoPE 的 cos/sin 表在建模型时算一次，之后每层、每一步都查它
 - 返回这张角度表的 cos 和 sin。
 
 例：head_dim = 8 时 ω = [1, 0.1, 0.01, 0.001]，所以 cos[3, 0] = cos(3)，sin[5, 0] = sin(5)。不要写 Python 循环。
+--- above
+# 上文：建 Llama 模型时，按 head 的宽度和最长长度，算一次 cos/sin 表
+head_dim, max_seq_len = 4, 6   # 一个 head 4 维（2 对），最多 6 个位置
+--- below
+cos, sin = precompute_freqs(head_dim, max_seq_len)
+print("cos:", tuple(cos.shape), " sin:", tuple(sin.shape))
+print("位置 0 的 cos:", cos[0].tolist(), " sin:", sin[0].tolist())
+print("位置 2 的 cos:", [round(v, 4) for v in cos[2].tolist()])
 --- starter
 def precompute_freqs(head_dim, max_seq_len, theta=10000.0):
     """返回 (cos, sin)，形状都是 (max_seq_len, head_dim // 2)。
@@ -365,6 +381,15 @@ out[..., 2i+1] = a * sin[i] + b * cos[i]
 - 用切片一次算完，不要写 Python 循环。
 
 判题除了查形状、位置 0 不转、长度不变，还会查 RoPE 最重要的性质：q 在位置 3、k 在位置 5 的内积，等于 q 在 20、k 在 22 的内积。
+--- above
+# 上文：attention 里把 q 拆成多个 head 以后，先做 RoPE，再算分数
+q = torch.tensor([1.0, 0.0, 1.0, 0.0]).repeat(1, 2, 3, 1)   # (B=1, nh=2, T=3, hd=4)：同一个向量放在 3 个位置上
+cos, sin = precompute_freqs(4, 3)                          # 已经提供（练习 d5-02）：cos/sin 表，形状 (3, 2)
+--- below
+q_rot = apply_rope(q, cos, sin)
+print("形状:", tuple(q_rot.shape))
+for t in range(3):
+    print(f"位置 {t}:", [round(v, 2) for v in q_rot[0, 0, t].tolist()])
 --- starter
 def apply_rope(x, cos, sin):
     """x: (B, nh, T, hd)   cos/sin: (T, hd//2)  ->  (B, nh, T, hd)
@@ -438,6 +463,16 @@ Meta 原版 Llama 代码用复数写 RoPE：一对数当一个复数，乘 e^(i�
 - 用 `torch.view_as_complex`、`torch.polar`、`torch.view_as_real` 实现。
 - 结果要和 `apply_rope(x, freqs.cos(), freqs.sin())` 一样（`apply_rope` 已经提供，判题就拿它对答案）。
 - 返回形状 (B, nh, T, hd)，dtype 和 x 一样。
+--- above
+# 上文：Meta 原版 Llama 代码里存的是角度表 freqs，不是 cos/sin
+k = torch.randn(1, 2, 3, 4)                            # (B=1, nh=2, T=3, hd=4)：attention 里的 k
+omega = torch.tensor([1.0, 0.01])                      # hd = 4 时，2 对维度的角速度 ω
+freqs = torch.outer(torch.arange(3).float(), omega)    # (T=3, hd/2=2)：位置 t、第 i 对的角度 t·ω_i
+--- below
+k_rot = apply_rope_complex(k, freqs)
+print("形状:", tuple(k_rot.shape), " dtype:", k_rot.dtype)
+# apply_rope 已经提供：练习 d5-03 的实数版
+print("和实数版 apply_rope 一样吗:", torch.allclose(k_rot, apply_rope(k, freqs.cos(), freqs.sin()), atol=1e-6))
 --- starter
 def apply_rope_complex(x, freqs):
     """x: (B, nh, T, hd)   freqs: (T, hd//2) 的**角度**（不是 cos/sin）
@@ -477,6 +512,15 @@ Llama、Mistral、Qwen 的 FFN 都是 SwiGLU。面试常问「Llama-7B 的 FFN �
 写两样东西：
 1. `swiglu_hidden(n_embd, multiple_of=256)`：先算 `int(2 * (4 * n_embd) / 3)`（4C 的 2/3），再**向上**取整到 `multiple_of` 的倍数。`swiglu_hidden(4096, 256)` 应该是 11008，`swiglu_hidden(64, 8)` 应该是 176。
 2. `SwiGLU(nn.Module)`：`__init__(self, n_embd, hidden)` 建三个没有 bias 的 `nn.Linear`，按 Llama 的习惯叫 `w1`（C → H）、`w3`（C → H）、`w2`（H → C）。`forward(x)` 返回 `w2(silu(w1(x)) * w3(x))`。输入 (B, T, C)，输出 (B, T, C)。
+--- above
+# 上文：Llama 每层 block 里，attention 后面接的 FFN 就是 SwiGLU
+C = 40
+h = torch.randn(2, 3, C)   # (B=2, T=3, C=40)：2 句话，每句 3 个 token，每个 40 维
+--- below
+H = swiglu_hidden(C, multiple_of=16)
+ffn = SwiGLU(C, H)
+print(f"隐层宽度 H = {H}（GPT-2 用的是 4C = {4 * C}）")
+print("输出形状:", tuple(ffn(h).shape), " 参数个数:", sum(p.numel() for p in ffn.parameters()))
 --- starter
 def swiglu_hidden(n_embd, multiple_of=256):
     """Llama 的隐层宽度: 先取 4*C 的 2/3（= 8C/3），再向上取整到 multiple_of 的倍数。"""
@@ -544,6 +588,15 @@ ref: day5
 - 每个 kv head **连续**重复 n_rep 次：n_kv_head = 2、n_rep = 3 时，head 的顺序是 0,0,0,1,1,1，不是 0,1,0,1,0,1。
 - n_rep = 1 时原样返回 x。
 - 用 `expand` + `reshape`，不要用循环加 `torch.cat`。
+--- above
+# 上文：GQA 的 attention 里，q 有 8 个 head，k 只有 2 个 kv head
+n_head, n_kv_head = 8, 2
+k = torch.randn(1, n_kv_head, 3, 4)   # (B=1, n_kv_head=2, T=3, hd=4)
+--- below
+k_rep = repeat_kv(k, n_head // n_kv_head)
+print("形状:", tuple(k.shape), "->", tuple(k_rep.shape))
+print("原来 2 个 head 的第一个数:", [round(v, 2) for v in k[0, :, 0, 0].tolist()])
+print("复制后 8 个 head 的第一个数:", [round(v, 2) for v in k_rep[0, :, 0, 0].tolist()])
 --- starter
 def repeat_kv(x, n_rep):
     """x: (B, n_kv_head, T, hd)  ->  (B, n_kv_head*n_rep, T, hd)
@@ -587,6 +640,15 @@ ref: day5
 - `update(k, v)`：k、v 的形状是 (B, nh, T_new, hd)。把它们沿**时间维**（dim=-2）接到已有缓存的后面，返回接好以后完整的 `(k_all, v_all)`。第一次调用时缓存是空的，直接存下来。
 - `length`：一个属性（用的时候写 `c.length`，没有括号），返回现在缓存了多少个时间步。空的时候是 0。
 - `reset()`：清空缓存。
+--- above
+# 上文：生成时先把 prompt 的 4 个 token 一起算，之后每步只算 1 个新 token
+k_prompt, v_prompt = torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8)   # (B=1, nh=2, T=4, hd=8)：prompt 的 k、v
+k_new, v_new = torch.randn(1, 2, 1, 8), torch.randn(1, 2, 1, 8)         # 下一步的新 token：T=1
+--- below
+cache = KVCache()
+cache.update(k_prompt, v_prompt)
+k_all, v_all = cache.update(k_new, v_new)
+print("4 + 1 步以后 length =", cache.length, " k_all:", tuple(k_all.shape), " v_all:", tuple(v_all.shape))
 --- starter
 class KVCache:
     """用法:
@@ -662,6 +724,15 @@ ref: day5
 - q：(B, nh, 1, hd)，只有当前这一步。k_all、v_all：(B, nh, T, hd)，是全部历史（包括当前这一步）。
 - 返回 (B, nh, 1, hd)：普通的缩放点积 attention，`softmax(q · kᵀ / sqrt(hd)) · v`，**不加 mask**。
 - 自己写，不要调用 `F.scaled_dot_product_attention`（判题拿它来对答案）。
+--- above
+# 上文：生成第 6 个 token 时，缓存里有 6 步的 k、v，新 token 只有 1 个 q
+q_new = torch.randn(1, 2, 1, 8)                                       # (B=1, nh=2, 1, hd=8)：最新这一步的 q
+cache_k, cache_v = torch.randn(1, 2, 6, 8), torch.randn(1, 2, 6, 8)   # 缓存里 6 步的 k、v（包括这一步）
+--- below
+out = attn_step(q_new, cache_k, cache_v)
+ref = F.scaled_dot_product_attention(q_new, cache_k, cache_v)   # PyTorch 自带的 attention，不加 mask
+print("输出形状:", tuple(out.shape))
+print("和 PyTorch 自带的一样吗:", torch.allclose(out, ref, atol=1e-6))
 --- starter
 def attn_step(q, k_all, v_all):
     """q: (B, nh, 1, hd) 只有当前这一步；k_all/v_all: (B, nh, T, hd) 全部历史。
@@ -712,6 +783,17 @@ def _full_attention(x, wq, wk, wv, cos, sin):
 - x：(B, T, C)。wq、wk、wv：(C, C)。2 个 head，hd = C // 2。cos、sin：(max_len, hd/2)。
 - 对 t = 0, 1, …, T − 1：只用 `x[:, t:t+1]` 算这一步的 q、k、v（形状 (B, 2, 1, hd)），做 RoPE，把 k、v 放进一个 `KVCache`，用 `attn_step` 算出这一步的输出，再变回 (B, 1, C)。
 - 最后把每一步的输出沿时间维拼起来。
+--- above
+# 上文：两句话（各 5 个 token）走进一层有 2 个 head 的 attention
+B, T, C = 2, 5, 12
+h = torch.randn(B, T, C)                  # 隐藏状态：2 句话，每句 5 个 token，每个 12 维
+wq, wk, wv = torch.randn(3, C, C) * 0.3   # 这一层算 q、k、v 的三个权重矩阵，各 (12, 12)
+cos, sin = precompute_freqs(C // 2, 16)   # 已经提供：RoPE 的 cos/sin 表，hd = C // 2 = 6
+--- below
+out = incremental_attention(h, wq, wk, wv, cos, sin)
+full = _full_attention(h, wq, wk, wv, cos, sin)   # 已经提供：一次算完整个序列（带 causal mask）
+print("逐 token:", tuple(out.shape), " 一次算完:", tuple(full.shape))
+print("两种算法结果一样吗:", torch.allclose(out, full, atol=1e-5))
 --- starter
 def incremental_attention(x, wq, wk, wv, cos, sin):
     """一次喂一个 token，用 KVCache + attn_step 复现 _full_attention 的输出。
@@ -767,6 +849,15 @@ ref: day5
 3. `top_p_filter(logits, p)`：按 softmax 概率从大到小排，累计概率**第一次 ≥ p** 的那个 token 也保留，它后面的全部 -inf。至少保留 1 个。返回的 logits 要在**原来的顺序**上。
 
 例：概率 [0.5, 0.3, 0.15, 0.05]，p = 0.7 → 保留前 2 个（0.5 + 0.3 = 0.8，第一次 ≥ 0.7）。
+--- above
+# 上文：模型在最后一个位置输出的 logits，假设词表只有 5 个词
+next_logits = torch.tensor([[2.0, 1.0, 0.5, 3.0, -1.0]])   # (B=1, V=5)：每个词的原始分数
+# softmax 以后的概率约是 [0.23, 0.08, 0.05, 0.62, 0.01]
+--- below
+print("temperature 0.5:", apply_temperature(next_logits, 0.5).tolist())
+print("t = 0（贪心）:", apply_temperature(next_logits, 0).tolist())
+print("top-k = 2:", top_k_filter(next_logits, 2).tolist())
+print("top-p = 0.9:", top_p_filter(next_logits, 0.9).tolist())
 --- starter
 def apply_temperature(logits, t):
     """t 越小越确定。t 可能是 0，此时退化成 argmax（把最大值以外全设 -inf）。"""
@@ -838,6 +929,15 @@ ref: day5
 - 返回新张量。不要用 Python 循环遍历 batch。
 
 例：logits [2, −2, 1]，出现过 token 0 和 1，penalty = 2 → [1, −4, 1]。
+--- above
+# 上文：两句话一起生成，这一步模型给出的 logits，和每句已经生成过的 token
+next_logits = torch.tensor([[1.5, 0.5, -1.0, 3.0, 0.0],
+                            [0.0, 2.0, 1.0, -0.5, 1.5]])   # (B=2, V=5)：每句下一个词的分数，词表 5 个词
+generated = torch.tensor([[3, 2], [1, 3]])                 # (B=2, T=2)：每句已经生成过的 token id
+--- below
+out = repetition_penalty(next_logits, generated, penalty=2.0)
+print("第 1 句:", out[0].tolist())
+print("第 2 句:", out[1].tolist())
 --- starter
 def repetition_penalty(logits, prev_ids, penalty=1.2):
     """logits: (B, V)   prev_ids: (B, T) 已生成的 token。
@@ -876,6 +976,15 @@ RoPE 有两种配对约定。把权重从一种实现搬到另一种却没调整
 下面的 `apply_rope_buggy` 应该和 `apply_rope`（相邻两维配对，已经提供）给出完全一样的结果。但它是按 HuggingFace 的「前后对半」约定写的：hd = 8 时 x0 和 x4 配对、x1 和 x5 配对……
 
 把它改成相邻配对（x0 和 x1、x2 和 x3……），让输出和 `apply_rope(x, cos, sin)` 一致。函数名和参数不要改。一共有两处要改。
+--- above
+# 上文：attention 里的 q 要过一遍从 HuggingFace 抄来的 RoPE，可 Meta 的权重是按相邻配对训练的
+q = torch.tensor([1.0, 2.0, 3.0, 4.0]).repeat(1, 1, 2, 1)   # (B=1, nh=1, T=2, hd=4)：同一个 q 放在位置 0 和 1
+cos, sin = precompute_freqs(4, 2)                          # 已经提供：cos/sin 表，形状 (2, 2)
+--- below
+out = apply_rope_buggy(q, cos, sin)
+print("位置 1:", [round(v, 2) for v in out[0, 0, 1].tolist()])
+# apply_rope 已经提供：相邻配对的正确版本
+print("和 apply_rope 一样吗:", torch.allclose(out, apply_rope(q, cos, sin), atol=1e-6))
 --- starter
 def apply_rope_buggy(x, cos, sin):
     hd = x.size(-1)
@@ -1005,6 +1114,16 @@ RoPE 是今天最重要的零件，也是面试手写题的常客。不看资料
 - 不要写 Python 循环。
 
 判题和练习 d5-03 一样：形状、位置 0 不转、长度不变、内积只看相对距离、相邻两维配对。
+--- above
+# 上文：attention 里，q 和 k 拆成 head 以后都要先做 RoPE
+cos, sin = precompute_freqs(4, 8)   # 已经提供：cos/sin 表，hd = 4，最多 8 个位置
+q = torch.randn(1, 1, 1, 4)         # 一个 q 向量 (B=1, nh=1, T=1, hd=4)
+k = torch.randn(1, 1, 1, 4)         # 一个 k 向量
+--- below
+score_1_3 = (apply_rope(q, cos[1:2], sin[1:2]) * apply_rope(k, cos[3:4], sin[3:4])).sum()
+score_5_7 = (apply_rope(q, cos[5:6], sin[5:6]) * apply_rope(k, cos[7:8], sin[7:8])).sum()
+print("q 在 1、k 在 3 的分数:", round(score_1_3.item(), 4))
+print("q 在 5、k 在 7 的分数:", round(score_5_7.item(), 4))
 --- starter
 def apply_rope(x, cos, sin):
     raise todo()
@@ -1080,6 +1199,17 @@ def _full_attention(x, wq, wk, wv, cos, sin):
     return F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(B, T, C)
 ```
 你的函数要返回和它一样的 (B, T, C)，但一次只喂一个 token：每一步只用 `x[:, t:t+1]`，k、v 放进 `KVCache`，用 `attn_step` 算这一步的输出，最后沿时间维拼起来。
+--- above
+# 上文：两句话（各 4 个 token）走进一层有 2 个 head 的 attention
+B, T, C = 2, 4, 16
+h = torch.randn(B, T, C)                  # 隐藏状态：2 句话，每句 4 个 token，每个 16 维
+wq, wk, wv = torch.randn(3, C, C) * 0.3   # 这一层算 q、k、v 的三个权重矩阵，各 (16, 16)
+cos, sin = precompute_freqs(C // 2, 16)   # 已经提供：RoPE 的 cos/sin 表，hd = C // 2 = 8
+--- below
+out = incremental_attention(h, wq, wk, wv, cos, sin)
+full = _full_attention(h, wq, wk, wv, cos, sin)   # 已经提供：一次算完整个序列（带 causal mask）
+print("逐 token:", tuple(out.shape), " 一次算完:", tuple(full.shape))
+print("两种算法结果一样吗:", torch.allclose(out, full, atol=1e-5))
 --- starter
 def incremental_attention(x, wq, wk, wv, cos, sin):
     raise todo()

@@ -456,6 +456,10 @@ Today's model takes 4 numbers per row (`FEATURES = 4`). Write a pydantic class `
 - each number must be a finite float: reject NaN, inf, the string `"abc"` and `None`.
 
 For invalid input, `PredictRequest.model_validate(...)` must raise `ValidationError`. The last check puts your class into today's prepared service and makes sure bad requests get 422.
+--- above
+# Where the input comes from: the JSON a client sends to /predict, read into Python as a dict
+good = {"rows": [[6.1, 2.8, 4.7, 1.2], [5.0, 3.4, 1.5, 0.2]]}   # 2 rows of 4 numbers
+short = {"rows": [[6.1, 2.8, 4.7]]}                             # this row is missing a number
 --- starter
 from typing import Annotated
 from pydantic import BaseModel, Field, FiniteFloat
@@ -465,6 +469,11 @@ MAX_ROWS = 32
 
 class PredictRequest(BaseModel):
     rows: list[list[float]]
+--- below
+print("rows read from the good request:", PredictRequest.model_validate(good).rows)
+# create_app and make_model are prepared today; this service checks the body with your PredictRequest
+client = TestClient(create_app(make_model), raise_server_exceptions=False)
+print("status code for the request with a missing number:", client.post("/predict", json=short).status_code)
 --- solution
 from typing import Annotated
 from pydantic import BaseModel, Field, FiniteFloat
@@ -537,6 +546,10 @@ Calling `load_model()` inside the handler is the most common performance acciden
 The results are right. But a test with a counting `load_model` found that the model is not loaded at all at start-up, and is then loaded once for every request.
 
 Change it: **load the model once in `create_app`; all requests share that one model.**
+--- above
+# Where the input comes from: a real load_model reads the weights from disk; here CountingLoader stands in
+load = CountingLoader()                    # prepared today: each call of load() "loads" a model and adds 1 to calls
+body = {"rows": [[6.3, 2.5, 5.0, 1.9]]}    # one request from a client: 1 row of 4 numbers
 --- starter
 def create_app(load_model):
     app = FastAPI()
@@ -555,6 +568,11 @@ def create_app(load_model):
         return {"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}
 
     return app
+--- below
+client = TestClient(create_app(load))
+print("model loads after start-up:", load.calls)
+print("labels of 3 requests:", [client.post("/predict", json=body).json()["labels"] for _ in range(3)])
+print("model loads after 3 requests:", load.calls)
 --- solution
 def create_app(load_model):
     model = load_model()             # load once at start-up; the handler below uses it through the closure
@@ -619,6 +637,11 @@ This `create_app(load_model)` already loads the model only once at start-up, but
 2. The forward pass is not inside `torch.inference_mode()`, so every request builds a computation graph.
 
 Fix it: the forward pass of a request must run in eval mode and inside `torch.inference_mode()`. The test's `load_model` returns a `SpyModel` that records the modes of every forward call.
+--- above
+# Where the input comes from: load_model gives a freshly loaded model (in train mode); CountingLoader stands in
+load = CountingLoader()                    # prepared today; it loads a SpyModel, which writes every forward call into its log
+body = {"rows": [[6.3, 2.5, 5.0, 1.9]]}    # one request from a client: 1 row of 4 numbers
+# in the log: training = in train mode?, inference = inside inference_mode?, grad = is autograd on?
 --- starter
 def create_app(load_model):
     model = load_model()
@@ -635,6 +658,11 @@ def create_app(load_model):
         return {"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}
 
     return app
+--- below
+client = TestClient(create_app(load))
+first, second = [client.post("/predict", json=body).json()["probs"] for _ in range(2)]
+print("same request twice, same result?", first == second)
+print("log of the last forward call:", load.models[0].log[-1])
 --- solution
 def create_app(load_model):
     model = load_model()
@@ -700,10 +728,18 @@ Write `warm_up(model, batch_sizes, clock)`:
 - measure each run with `clock()` (it returns milliseconds) and return a dict `{B: milliseconds}`, for example `{1: 502.25, 8: 504.0, 32: 510.0}`. The service writes it to its log at start-up.
 
 The test uses `SlowStartModel(clock)`: the first forward for each new batch size costs an extra 500 ms; a normal one costs 2 + 0.25·B ms. The time is added to the fake clock `FakeClock`.
+--- above
+# Where the input comes from: at start-up the service runs fake batches in the sizes it will serve
+clock = FakeClock()             # today's fake clock, in milliseconds; it only moves while the model runs
+model = SlowStartModel(clock)   # today's model: the first run of each new batch size costs 500 ms extra
+sizes = [4, 16]                 # the batch sizes the service sees most
 --- starter
 def warm_up(model, batch_sizes, clock):
     """Run all-zero fake data once per batch size; return {B: milliseconds that run took}."""
     raise todo()
+--- below
+print("first warm-up, ms per batch size:", warm_up(model, sizes, clock))
+print("run it again, ms per batch size: ", warm_up(model, sizes, clock))
 --- solution
 def warm_up(model, batch_sizes, clock):
     """Run all-zero fake data once per batch size; return {B: milliseconds that run took}."""
@@ -775,9 +811,19 @@ Write `create_app(load_model)`, which returns a FastAPI app:
 3. `POST /predict`: check the body with `PredictRequest` (already prepared: `rows` is 1 to 32 rows of 4 finite numbers). Compute the softmax probabilities inside `torch.inference_mode()` and answer `{"labels": [...], "probs": [[...], ...]}`: `probs` holds the probabilities of the 3 classes for each row, `labels` the name of the most likely class for each row (the names are in `LABELS`).
 
 Names you can use directly: `FastAPI`, `torch`, `PredictRequest`, `LABELS`, `FEATURES`.
+--- above
+# Where the input comes from: a real load_model reads the weights from disk; here we use today's make_model
+# make_model() returns a TinyClassifier with the same weights every time (in train mode): 4 numbers -> 3 classes
+body = {"rows": [[6.3, 2.5, 5.0, 1.9], [4.9, 3.1, 1.5, 0.1]]}   # the JSON a client sends: 2 rows of 4 numbers
+bad = {"rows": [[6.3, 2.5]]}                                    # a bad request: this row has only 2 numbers
 --- starter
 def create_app(load_model):
     raise todo()
+--- below
+client = TestClient(create_app(make_model))
+print("/health:", client.get("/health").json())
+print("/predict labels:", client.post("/predict", json=body).json()["labels"])
+print("status code of the bad request:", client.post("/predict", json=bad).status_code)
 --- solution
 def create_app(load_model):
     model = load_model()                         # load once at start-up
@@ -874,6 +920,13 @@ Right now it answers 200 whatever happens. Change it:
 - Everything else as before: 200 and `{"probs": ...}`.
 
 Use `raise HTTPException(status_code=..., detail=..., headers=...)`.
+--- above
+# Where the input comes from: today's ServiceState: ready (done loading?) and predict (runs the model)
+body = {"rows": [[6.3, 2.5, 5.0, 1.9]]}     # one request from a client
+# a service that is still loading its model (reference_probs gives today's model's probabilities)
+loading = ServiceState(lambda rows: reference_probs(rows).tolist(), ready=False)
+# a service whose model has a bug: the matrix shapes do not match, so every run raises a RuntimeError
+broken = ServiceState(lambda rows: torch.zeros(1, 5) @ torch.zeros(3, 3), ready=True)
 --- starter
 def create_status_app(state):
     app = FastAPI()
@@ -895,6 +948,11 @@ def create_status_app(state):
         return {"probs": probs}
 
     return app
+--- below
+r = TestClient(create_status_app(loading)).post("/predict", json=body)
+print("still loading:", r.status_code, r.text, " Retry-After:", r.headers.get("retry-after"))
+r = TestClient(create_status_app(broken), raise_server_exceptions=False).post("/predict", json=body)
+print("model failed:", r.status_code, r.text)
 --- solution
 def create_status_app(state):
     app = FastAPI()
@@ -990,6 +1048,17 @@ Each request is a `Ticket` (already prepared): `Ticket(x, arrived)`, with `.x`, 
   - Return the Ticket.
 
 `clock` is the fake clock `FakeClock`; the test uses it to control time without sleeping.
+--- above
+# Where the input comes from: one model on the GPU, one request at a time; these 3 requests arrive together
+clock = FakeClock()                        # today's fake clock, in milliseconds; it never moves by itself
+
+def gpu_model(x):                          # stands in for the model on the GPU: one request takes 150 ms
+    clock.advance(150)
+    return x * 2
+
+inputs = [torch.tensor([1.0, 2.0, 3.0, 4.0]),
+          torch.tensor([0.5, 0.5, 0.5, 0.5]),
+          torch.tensor([9.0, 8.0, 7.0, 6.0])]
 --- starter
 class RequestQueue:
     def __init__(self, model_fn, clock, max_waiting=4, timeout_ms=100):
@@ -1004,6 +1073,11 @@ class RequestQueue:
 
     def run_next(self):
         raise todo()
+--- below
+q = RequestQueue(gpu_model, clock, max_waiting=2, timeout_ms=100)
+tickets = [q.submit(x) for x in inputs]
+print("run_next 3 times:", q.run_next(), q.run_next(), q.run_next())
+print("status of the 3 requests:", [t.status for t in tickets], " result of the 1st:", tickets[0].result.tolist())
 --- solution
 class RequestQueue:
     def __init__(self, model_fn, clock, max_waiting=4, timeout_ms=100):
@@ -1120,11 +1194,18 @@ Write `latency_report(times_ms)`: `times_ms` is a list of latencies (millisecond
 3. the answer is the k-th value of the sorted list (counting from 1, so `s[k - 1]`).
 
 Do not use `numpy.percentile` / `torch.quantile` (by default they interpolate linearly, which gives different numbers). Do not change the list you are given.
+--- above
+# Where the input comes from: latencies (ms) of 20 requests from a load test, in finishing order, not sorted
+latencies = [23, 19, 21, 480, 20, 22, 18, 25, 21, 20,
+             19, 95, 22, 20, 24, 21, 19, 20, 23, 22]
 --- starter
 import math
 
 def latency_report(times_ms):
     raise todo()
+--- below
+print("average:", sum(latencies) / len(latencies), "ms")
+print("percentiles:", latency_report(latencies))
 --- solution
 import math
 
@@ -1219,6 +1300,13 @@ Complete `MicroBatcher` (`__init__` is written):
 - `flush()`: take all requests out of `pending` (it becomes empty), stack their inputs with `torch.stack` into (B, 4), call `run_batch` **only once** to get B output rows, and give row i to Ticket i: `ticket.result = out[i]`, `ticket.status = 200`. If `pending` is empty, do nothing.
 
 In the tests, `run_batch` records the size of every batch and `clock` is a `FakeClock`.
+--- above
+# Where the input comes from: requests of 4 numbers arrive one by one; the server batches them for the GPU
+clock = FakeClock()                                  # today's fake clock, in milliseconds
+# stands in for the model: (B, 4) in, the sum of each row out; BatchRecorder (prepared today) records each batch size
+recorder = BatchRecorder(lambda xb: xb.sum(dim=1))
+inputs = [torch.tensor([1.0, 2.0, 3.0, 4.0]), torch.tensor([0.0, 0.0, 1.0, 1.0]),
+          torch.tensor([5.0, 5.0, 5.0, 5.0]), torch.tensor([2.0, 0.0, 2.0, 0.0])]
 --- starter
 class MicroBatcher:
     def __init__(self, run_batch, max_batch, max_wait_ms, clock):
@@ -1236,6 +1324,12 @@ class MicroBatcher:
 
     def flush(self):
         raise todo()
+--- below
+batcher = MicroBatcher(recorder, max_batch=3, max_wait_ms=5, clock=clock)
+tickets = [batcher.submit(x) for x in inputs]      # 4 requests arrive together
+clock.advance(5)                                   # 5 ms later, the server loop calls poll once
+batcher.poll()
+print("batch sizes:", recorder.sizes, " result each request got back:", [t.result.item() for t in tickets])
 --- solution
 class MicroBatcher:
     def __init__(self, run_batch, max_batch, max_wait_ms, clock):
@@ -1427,9 +1521,18 @@ Write `create_app(load_model)`, which returns a FastAPI app:
 3. `POST /predict`: check the body with `PredictRequest`; compute softmax probabilities inside `torch.inference_mode()`; answer `{"labels": [most likely class name per row], "probs": [[3 probabilities], ...]}`, with class names from `LABELS`.
 
 Names you can use directly: `FastAPI`, `torch`, `PredictRequest`, `LABELS`, `FEATURES`.
+--- above
+# Where the input comes from: a real load_model reads the weights from disk; here CountingLoader stands in
+load = CountingLoader()                    # prepared today: each call of load() "loads" a model and adds 1 to calls
+body = {"rows": [[5.7, 2.8, 4.1, 1.3]]}    # the JSON a client sends: 1 row of 4 numbers
 --- starter
 def create_app(load_model):
     raise todo()
+--- below
+client = TestClient(create_app(load))
+print("/health:", client.get("/health").json(), " model loads:", load.calls)
+answer = client.post("/predict", json=body).json()
+print("/predict:", answer["labels"], [round(p, 3) for p in answer["probs"][0]])
 --- solution
 def create_app(load_model):
     model = load_model()                         # load once at start-up
@@ -1519,11 +1622,17 @@ When someone asks "how fast is your service?", you should give p50 / p95 / p99 a
 Write `latency_report(times_ms)`: `times_ms` is a list of latencies (milliseconds, at least one, not sorted). Return `{"p50": ..., "p95": ..., "p99": ...}` with the nearest-rank method: sort, k = ⌈q × n / 100⌉, take value number k (counting from 1).
 
 Do not use `numpy.percentile` / `torch.quantile`; do not change the list you are given.
+--- above
+# Where the input comes from: latencies (ms) of the last 10 requests, from the service log, not sorted
+latencies = [105, 98, 110, 102, 99, 870, 101, 97, 104, 100]
 --- starter
 import math
 
 def latency_report(times_ms):
     raise todo()
+--- below
+print("percentiles:", latency_report(latencies))
+print("latencies after the call, first 3:", latencies[:3])
 --- solution
 import math
 

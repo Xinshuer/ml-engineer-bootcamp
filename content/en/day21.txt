@@ -378,6 +378,15 @@ Write `predict(model, x)`: one prediction in production.
 - Return the model's output (shape `(B, 3)`)
 
 The tests pass in a `trained_net()`, which is in train mode.
+--- above
+# Where the input comes from: training just finished, the model is still in train mode; 5 requests arrive
+model = trained_net()           # the exercise's small classifier Net: 8 features -> 3 classes, already trained
+batch = torch.randn(5, 8)       # 5 examples, 8 features each
+--- below
+a = predict(model, batch)
+b = predict(model, batch)       # the same batch of requests again
+print("output shape:", tuple(a.shape), " predicted classes:", a.argmax(dim=1).tolist())
+print("same result both times?", torch.equal(a, b), " output requires grad?", a.requires_grad)
 --- starter
 def predict(model, x):
     """One prediction in production. The model passed in may still be in train mode."""
@@ -436,6 +445,16 @@ Write `export_onnx(model, example, path)`:
 - Return `path`
 
 The tests pass in a `trained_net()` in train mode, a `(2, 8)` example input, and a path inside a temporary folder. An export takes 1–3 seconds.
+--- above
+# Where the input comes from: the trained model goes to the inference team as ONNX; export needs an example input
+import os, tempfile
+model = trained_net()           # the exercise's small classifier Net (8 features -> 3 classes), still in train mode
+example = torch.randn(2, 8)     # example input: 2 examples, 8 features each; export runs forward on it once
+--- below
+with tempfile.TemporaryDirectory() as folder:          # a temporary folder, deleted when the block ends
+    path = export_onnx(model, example, os.path.join(folder, "net.onnx"))
+    print("file written:", os.path.basename(path), os.path.getsize(path), "bytes", " model still in train mode?", model.training)
+    print("onnxruntime on the example input, output shape:", run_onnx(path, example).shape)   # run_onnx: a helper from the setup code
 --- starter
 def export_onnx(model, example, path):
     """Export model to one .onnx file at path; return path."""
@@ -532,6 +551,16 @@ The `export_onnx_dynamic` below already exports, but the batch dimension is fixe
 - `model.eval()` before exporting, write to `path`, return `path`
 
 The tests run the exported file with batch = 1, 5 and 64 and compare with PyTorch. The argument of `Net.forward` is called `x`.
+--- above
+# Where the input comes from: the trained model is exported for serving, and each request has a different batch size
+import os, tempfile
+model = trained_net()           # the exercise's small classifier Net (8 features -> 3 classes)
+example = torch.randn(2, 8)     # example input for the export: 2 examples, 8 features each
+--- below
+with tempfile.TemporaryDirectory() as folder:          # a temporary folder, deleted when the block ends
+    path = export_onnx_dynamic(model, example, os.path.join(folder, "net.onnx"))
+    for n in (1, 3, 50):                                # requests with 1, 3 and 50 examples
+        print(f"batch of {n}: onnxruntime output shape", run_onnx(path, torch.randn(n, 8)).shape)   # run_onnx: a helper from the setup code
 --- starter
 def export_onnx_dynamic(model, example, path):
     """Export an ONNX file whose batch size can change: the input is x, the output is logits."""
@@ -620,6 +649,19 @@ Write `verify_export(model, path, example, batch_sizes=(1, 4, 16), tol=1e-4)`:
 - Otherwise return that largest difference (a Python float)
 
 The tests give you a file that is already exported (with a variable batch size).
+--- above
+# Where the input comes from: before release, compare the trained model with the ONNX file just exported
+model = trained_net()                    # the exercise's small classifier Net (8 features -> 3 classes)
+example = torch.randn(2, 8)              # the example input used for the export: 2 examples, 8 features each
+onnx_data = onnx_bytes(model, example)   # a helper from the setup code: exports to ONNX (variable batch), returns the file's bytes
+--- below
+with onnx_file(onnx_data) as path:       # a helper from the setup code: writes the bytes to a temporary .onnx file
+    err = verify_export(model, path, example)
+    print("check passed, largest difference:", f"{err:.1e}", " type:", type(err).__name__)
+    try:
+        verify_export(model, path, example, tol=1e-12)   # a deliberately strict tolerance
+    except AssertionError as e:
+        print("with tol 1e-12 it raises:", e)
 --- starter
 import numpy as np
 import onnxruntime as ort
@@ -757,6 +799,15 @@ Its results in PyTorch are correct, but `torch.onnx.export(dynamo=True)` fails o
 - The input has shape `(B, D)`, and B can change
 
 Do not change the class name or `__init__`.
+--- above
+# Where the input comes from: a batch of vectors in research code, one example per row (length = L2 norm)
+vectors = torch.tensor([[6.0, 8.0],       # length 10
+                        [1.0, -2.0],      # length about 2.24
+                        [0.0, -20.0]])    # length 20
+--- below
+clip = ClipNorm(max_norm=5.0)
+print("after clipping:", clip(vectors).tolist())
+print("export error:", export_error(clip, vectors))   # export_error: a helper from the setup code, None = export works
 --- starter
 class ClipNorm(nn.Module):
     def __init__(self, max_norm=1.0):
@@ -868,6 +919,15 @@ Write `quantize_int8(w)`: symmetric int8 quantization of an `(out, in)` weight m
 - Return `(q, scale)`
 
 To use the weights, `q.float() * scale` brings them back (dequantization); each number is off by at most its row's `scale / 2`.
+--- above
+# Where the input comes from: the weight matrix (out, in) of one nn.Linear, to be stored as int8
+weight = torch.tensor([[1.3, -2.54, 0.4, 0.7],              # row 1 (output channel 1) has large numbers
+                       [0.042, -0.127, 0.0083, 0.0634]])   # row 2 has much smaller ones
+--- below
+q, scale = quantize_int8(weight)
+print("q:", q.tolist(), q.dtype)
+print("scale shape:", tuple(scale.shape), " scale of each row:", [round(s, 5) for s in scale.flatten().tolist()])
+print("row 2 restored:", [round(v, 4) for v in (q.float() * scale)[1].tolist()])
 --- starter
 def quantize_int8(w):
     """w: (out, in) decimals -> (q: (out, in) int8, scale: (out, 1) decimals), one scale per row."""
@@ -928,6 +988,13 @@ Write `model_size_bytes(model)`: save `model.state_dict()` with `torch.save` int
 Both `buf.getbuffer().nbytes` and `len(buf.getvalue())` give you the byte count.
 
 The tests measure an fp32 model and its int8-quantized version.
+--- above
+# Where the input comes from: a trained classifier and its int8 version; before serving, compare their sizes
+model = nn.Sequential(nn.Linear(512, 128), nn.ReLU(), nn.Linear(128, 4)).eval()      # a small classifier, all fp32
+q_model = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)   # its Linear layers swapped for int8 ones
+--- below
+print("numbers in parameters():", sum(p.numel() for p in model.parameters()), "->", sum(p.numel() for p in q_model.parameters()))
+print("bytes when saved:", model_size_bytes(model), "->", model_size_bytes(q_model))
 --- starter
 import io
 
@@ -981,6 +1048,14 @@ Write `quantize_report(model, x)`:
 2. `"size_ratio"`: `model_size_bytes(model) / model_size_bytes(q)` (`model_size_bytes` is provided)
 3. `"max_diff"`: `(a - b).abs().max()`
 4. `"agree"`: the share of rows where the argmax is the same (0 to 1)
+--- above
+# Where the input comes from: before switching the live classifier to int8, write a report on one batch
+model = nn.Sequential(nn.Linear(128, 256), nn.ReLU(), nn.Linear(256, 4)).eval()   # a small classifier, all fp32
+batch = torch.randn(32, 128)    # 32 examples, 128 features each
+--- below
+r = quantize_report(model, batch)
+print(r["model"][0])            # the first layer of the quantized model
+print("times smaller:", round(r["size_ratio"], 2), " largest difference:", round(r["max_diff"], 4), " share of same predictions:", r["agree"])
 --- starter
 def quantize_report(model, x):
     """Dynamic int8 quantization of model; return {"model", "size_ratio", "max_diff", "agree"}."""
@@ -1084,6 +1159,16 @@ Write `export_onnx_dynamic(model, example, path)` from blank:
 - Export with `torch.onnx.export` (`dynamo=True`, `verbose=False`), with `example` as the example input
 - Input name `"x"`, output name `"logits"`; dimension 0 (the batch) can change and is called `"batch"` (forward's argument is called `x`)
 - Write to `path`, return `path`
+--- above
+# Where the input comes from: the trained model is exported for serving, and each request has a different batch size
+import os, tempfile
+model = trained_net()           # the exercise's small classifier Net (8 features -> 3 classes)
+example = torch.randn(2, 8)     # example input for the export: 2 examples, 8 features each
+--- below
+with tempfile.TemporaryDirectory() as folder:          # a temporary folder, deleted when the block ends
+    path = export_onnx_dynamic(model, example, os.path.join(folder, "net.onnx"))
+    for n in (1, 3, 50):                                # requests with 1, 3 and 50 examples
+        print(f"batch of {n}: onnxruntime output shape", run_onnx(path, torch.randn(n, 8)).shape)   # run_onnx: a helper from the setup code
 --- starter
 def export_onnx_dynamic(model, example, path):
     raise todo()
@@ -1165,6 +1250,19 @@ Write `verify_export(model, path, example, batch_sizes=(1, 4, 16), tol=1e-4)` fr
 - Open `path` with onnxruntime (CPU) and read the input name from the file
 - For each batch size b, make an input with `torch.randn(b, *example.shape[1:])`, run it through PyTorch (without building a graph) and through onnxruntime, and compute the largest absolute difference
 - If the largest difference is above `tol`, `raise AssertionError`; otherwise return it (a Python float)
+--- above
+# Where the input comes from: before release, compare the trained model with the ONNX file just exported
+model = trained_net()                    # the exercise's small classifier Net (8 features -> 3 classes)
+example = torch.randn(2, 8)              # the example input used for the export: 2 examples, 8 features each
+onnx_data = onnx_bytes(model, example)   # a helper from the setup code: exports to ONNX (variable batch), returns the file's bytes
+--- below
+with onnx_file(onnx_data) as path:       # a helper from the setup code: writes the bytes to a temporary .onnx file
+    err = verify_export(model, path, example)
+    print("check passed, largest difference:", f"{err:.1e}", " type:", type(err).__name__)
+    try:
+        verify_export(model, path, example, tol=1e-12)   # a deliberately strict tolerance
+    except AssertionError as e:
+        print("with tol 1e-12 it raises:", e)
 --- starter
 import numpy as np
 import onnxruntime as ort

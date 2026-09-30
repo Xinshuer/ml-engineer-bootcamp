@@ -381,6 +381,15 @@ For T=3 the last two dimensions should be:
  [0.,   0., -inf],
  [0.,   0.,   0.]]
 ```
+--- above
+# Where the input comes from: a 5-token sentence enters attention, and each head computes a 5×5 score matrix
+T = 5
+scores = torch.randn(1, 2, T, T)     # (B, nh, T, T): 1 sentence, 2 heads
+--- below
+mask = causal_bias(T)
+print("mask:", tuple(mask.shape), " added to the scores:", tuple((scores + mask).shape))
+for row in mask[0, 0].tolist():
+    print(row)
 --- starter
 def causal_bias(T, device=None):
     """Return a (1, 1, T, T) additive mask: 0.0 where allowed, -inf where forbidden.
@@ -424,6 +433,14 @@ Write `attention(q, k, v, causal=True)`:
 The tests do two things:
 1. Reference comparison: match `F.scaled_dot_product_attention`, both causal and non-causal (difference < 1e-4)
 2. Causality test: change only the k and v of the last 2 positions; the outputs of the first 4 positions must not change at all
+--- above
+# Where the input comes from: after splitting into heads, each head has its own q, k, v: (B, nh, T, hs)
+q, k, v = (torch.randn(1, 2, 4, 8) for _ in range(3))    # 1 sentence, 2 heads, 4 tokens, 8 dims per head
+--- below
+out = attention(q, k, v)
+sdpa = F.scaled_dot_product_attention(q, k, v, is_causal=True)    # PyTorch's built-in version
+print("output:", tuple(out.shape), " max difference from SDPA:", round((out - sdpa).abs().max().item(), 4))
+print("is token 0's output just its own v?", torch.allclose(out[:, :, 0], v[:, :, 0]))
 --- starter
 def attention(q, k, v, causal=True):
     """q, k, v: (B, nh, T, hs)  ->  (B, nh, T, hs)
@@ -490,6 +507,13 @@ In `__init__`:
 4. merge the heads back to `(B, T, C)`, then apply `proj`
 
 The parameter count must be exactly 3C² + C² (neither Linear has a bias). The tests also check that a T shorter than block_size works, and that changing the last few positions of x leaves the earlier outputs unchanged.
+--- above
+# Where the input comes from: in each GPT Block, the token vectors x go through LayerNorm, then this layer
+x = torch.randn(2, 5, 12)             # (B, T, C): 2 sentences, 5 tokens each, 12 dims per token
+--- below
+attn = CausalSelfAttention(n_embd=12, n_head=3, block_size=8)    # 3 heads (4 dims each), at most 8 tokens
+print("input:", tuple(x.shape), " output:", tuple(attn(x).shape))
+print("parameters:", sum(p.numel() for p in attn.parameters()), " buffers:", [name for name, _ in attn.named_buffers()])
 --- starter
 class CausalSelfAttention(nn.Module):
     """Requirements:
@@ -563,6 +587,14 @@ Write GPT-2's `MLP(n_embd)` (also called the feed-forward layer):
 - `F.gelu` or `nn.GELU()`, either is fine
 
 The tests check the output shape and the parameter count: with C=16 it should be 16·64 + 64 + 64·16 + 16 = 2128.
+--- above
+# Where the input comes from: in a Block, after attention, each token's vector goes through the MLP on its own
+n_embd = 8
+x = torch.randn(1, 3, n_embd)      # 1 sentence, 3 tokens, 8 dims each
+--- below
+mlp = MLP(n_embd)
+print("input:", tuple(x.shape), " output:", tuple(mlp(x).shape))
+print("parameters:", sum(p.numel() for p in mlp.parameters()))
 --- starter
 class MLP(nn.Module):
     """Standard GPT-2 MLP: Linear(C, 4C) -> GELU -> Linear(4C, C), both with a bias."""
@@ -613,6 +645,14 @@ x = x + self.mlp(self.ln2(x))
 - pre-LN: the LayerNorm is **inside** the residual branch; the `x` on the main road is not normalised
 
 The test: zero the attention's `proj` and all MLP parameters, so both sub-layers output 0. Then the Block must return x unchanged.
+--- above
+# Where the input comes from: GPT adds token and position embeddings to get x, then runs x through the Blocks
+n_embd, n_head, block_size = 12, 3, 8
+x = torch.randn(2, 5, n_embd)          # 2 sentences, 5 tokens each, 12 dims per token
+--- below
+block = Block(n_embd, n_head, block_size)
+print("input:", tuple(x.shape), " output:", tuple(block(x).shape))
+print("parameters:", sum(p.numel() for p in block.parameters()), " formula 12*C*C + 9*C =", 12 * n_embd * n_embd + 9 * n_embd)
 --- starter
 class Block(nn.Module):
     """x = x + attn(ln1(x));  x = x + mlp(ln2(x))
@@ -690,6 +730,16 @@ Write the full `GPT(vocab_size, block_size, n_layer=2, n_head=4, n_embd=32)` (be
 - when `targets` is None, `loss` is None; otherwise `loss` is the `F.cross_entropy` value (a scalar)
 
 The tests: a freshly initialised model's loss must be near ln(17) ≈ 2.83 (±0.7); `lm_head.weight` and `wte.weight` must be the same object; with n_layer=1 the parameter count must be exactly 13696.
+--- above
+# Where the input comes from: text as one token id per character (day 3's tokenizer); targets shifted by one
+chars = sorted(set("hello world"))                                 # 8 different characters, so V = 8
+data = torch.tensor([[chars.index(ch) for ch in "hello world"]])   # (1, 11): 1 sentence, 11 token ids
+idx, targets = data[:, :-1], data[:, 1:]       # input: the first 10; answer at each position: the next one
+--- below
+model = GPT(vocab_size=len(chars), block_size=16)
+logits, loss = model(idx, targets)
+print("logits:", tuple(logits.shape), " initial loss:", round(loss.item(), 1), " ln(V):", round(math.log(len(chars)), 1))
+print("loss without targets:", model(idx)[1], " lm_head shares wte's weight:", model.lm_head.weight is model.wte.weight)
 --- starter
 class GPT(nn.Module):
     """Requirements:
@@ -785,6 +835,13 @@ Write `gpt_param_count(V, C, L, block_size, tied=True)` using **arithmetic only*
 - with `tied=True`, lm_head shares wte's weight and adds nothing; with `tied=False`, add V·C
 
 The test builds real models for 3 settings of (V, C, L, block_size), counts their parameters and compares with your result.
+--- above
+# Where the input comes from: the size of nanoGPT's Shakespeare character model (65 characters, see day 3)
+V, C, L, block_size = 65, 384, 6, 256     # vocabulary size, dims per token, number of Blocks, longest context
+--- below
+n = gpt_param_count(V, C, L, block_size)
+print(f"lm_head shares wte's weight: {n:,} parameters, about {n / 1e6:.1f}M")
+print(f"not shared: {gpt_param_count(V, C, L, block_size, tied=False):,} parameters")
 --- starter
 def gpt_param_count(V, C, L, block_size, tied=True):
     """Count the parameters by hand from this structure (don't build a model to count):
@@ -832,6 +889,17 @@ Write `generate_greedy(model, idx, max_new_tokens, block_size)`. `idx` holds the
 Return `(B, T0 + max_new_tokens)`; the first T0 tokens are the original idx. The function already has `@torch.no_grad()`: generation needs no gradients.
 
 The test uses a model with block_size=8 to generate 10 tokens after 3 (13 in total, more than 8, so cropping is required), and checks that two runs give exactly the same result.
+--- above
+# Where the input comes from: the user gives the start of a text and the model continues it
+# GPT is the model from d4-06 (here the preloaded reference version, not trained yet)
+chars = sorted(set("hello world"))                                  # character vocabulary, 8 characters
+model = GPT(vocab_size=len(chars), block_size=4, n_layer=1).eval()  # sees at most 4 tokens at a time
+prompt = torch.tensor([[chars.index(ch) for ch in "hel"]])          # (1, 3): the first 3 tokens
+--- below
+out = generate_greedy(model, prompt, max_new_tokens=6, block_size=4)
+print("shape:", tuple(prompt.shape), "->", tuple(out.shape))
+print("token ids:", out[0].tolist())
+print("as text:", "".join(chars[i] for i in out[0].tolist()))
 --- starter
 @torch.no_grad()
 def generate_greedy(model, idx, max_new_tokens, block_size):
@@ -881,6 +949,14 @@ This causal attention has **3** bugs. Fix it so it matches `F.scaled_dot_product
 - keep the function name and arguments
 
 Read it line by line against the formula `softmax(q @ kᵀ / √hs + mask) @ v` first; run it once you think you have found them.
+--- above
+# Where the input comes from: q, k, v of one GPT attention layer, already split into heads: (B, nh, T, hs)
+q, k, v = (torch.randn(1, 2, 4, 16) for _ in range(3))    # 1 sentence, 2 heads, 4 tokens, 16 dims per head
+--- below
+out = attention_buggy(q, k, v)
+sdpa = F.scaled_dot_product_attention(q, k, v, is_causal=True)    # PyTorch's built-in version
+print("output:", tuple(out.shape), " max difference from SDPA:", round((out - sdpa).abs().max().item(), 4))
+print("is token 0's output just its own v?", torch.allclose(out[:, :, 0], v[:, :, 0]))
 --- starter
 def attention_buggy(q, k, v):
     T = q.size(-2)
@@ -926,6 +1002,15 @@ Post-LN and a missing residual raise no error, and a small model may even train;
 This Block has **2** bugs, both in `forward` (`__init__` is fine). Fix it into a correct pre-LN residual Block, where every sub-layer is `x = x + sublayer(LN(x))`.
 - `CausalSelfAttention` and `MLP` are preloaded reference versions
 - the test: after zeroing the attention's `proj` and the whole MLP, the Block must return x unchanged
+--- above
+# Where the input comes from: x on a GPT's residual stream; a few layers in, its values are often well above 1
+n_embd, n_head, block_size = 12, 3, 8
+x = torch.randn(1, 4, n_embd) * 3        # 1 sentence, 4 tokens, 12 dims each, values around ±3
+--- below
+block = BlockBuggy(n_embd, n_head, block_size)
+y = block(x)
+print("input x, first 4 dims of token 0: ", [round(t, 2) for t in x[0, 0, :4].tolist()])
+print("output y, first 4 dims of token 0:", [round(t, 2) for t in y[0, 0, :4].tolist()])
 --- starter
 class BlockBuggy(nn.Module):
     def __init__(self, n_embd, n_head, block_size):
@@ -1129,6 +1214,16 @@ From blank, write `CausalSelfAttention(n_embd, n_head, block_size)`; input and o
 - keep the lower-triangular mask in a buffer named `"bias"` (`register_buffer`), shape `(1, 1, block_size, block_size)`
 - forward: qkv → split → split heads → scale, mask, softmax → multiply by v → merge heads → proj
 - T may be shorter than block_size; it must be causal
+--- above
+# Where the input comes from: in a Block, the token vectors x enter this attention layer after LayerNorm
+x = torch.randn(2, 5, 16)              # (B, T, C): 2 sentences, 5 tokens each, 16 dims per token
+x_edit = x.clone()
+x_edit[:, 3:] = 0.0                    # the same two sentences with only the last 2 tokens replaced
+--- below
+attn = CausalSelfAttention(n_embd=16, n_head=4, block_size=8)    # 4 heads (4 dims each), at most 8 tokens
+y, y_edit = attn(x), attn(x_edit)
+print("input:", tuple(x.shape), " output:", tuple(y.shape))
+print("only the last 2 tokens changed; are the first 3 outputs still the same?", torch.allclose(y[:, :3], y_edit[:, :3]))
 --- starter
 class CausalSelfAttention(nn.Module):
     def __init__(self, n_embd, n_head, block_size):
@@ -1194,6 +1289,16 @@ From blank, write `GPT(vocab_size, block_size, n_layer=2, n_head=4, n_embd=32)` 
 - initialise Linear and Embedding weights from N(0, 0.02), Linear biases to zero
 - `lm_head.weight` and `wte.weight` are shared (the same object)
 - `forward(idx, targets=None)` returns `(logits, loss)`; without targets the loss is None
+--- above
+# Where the input comes from: two sentences turned into character token ids, stacked into one batch
+chars = sorted(set("hello world"))                                 # 8 different characters, so V = 8
+data = torch.tensor([[chars.index(ch) for ch in s] for s in ["hello world", "world hello"]])   # (2, 11)
+idx, targets = data[:, :-1], data[:, 1:]       # input: the first 10; targets: shifted by one
+--- below
+model = GPT(vocab_size=len(chars), block_size=16, n_layer=1)
+logits, loss = model(idx, targets)
+print("logits:", tuple(logits.shape), " initial loss:", round(loss.item(), 1), " ln(V):", round(math.log(len(chars)), 1))
+print("parameters:", sum(p.numel() for p in model.parameters()), " lm_head shares wte's weight:", model.lm_head.weight is model.wte.weight)
 --- starter
 class GPT(nn.Module):
     def __init__(self, vocab_size, block_size, n_layer=2, n_head=4, n_embd=32):

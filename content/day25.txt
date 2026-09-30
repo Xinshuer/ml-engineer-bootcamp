@@ -373,6 +373,10 @@ PSI 是业界监控输入漂移最常用的指标。风控、推荐系统里，�
 1. 分箱边界只用 `ref` 定：`torch.quantile(ref, torch.linspace(0, 1, bins + 1))[1:-1]`（去掉头尾，剩 bins − 1 个边界）。
 2. `torch.bucketize(x, edges)` 得到每个值在第几个箱（0 到 bins − 1）；`torch.bincount(..., minlength=bins)` 数个数，再除以长度，得到比例 e（ref 的）和 a（live 的）。
 3. 两个比例都 `clamp_min(eps)`，然后 PSI = Σ (a − e) × ln(a / e)。
+--- above
+# 上文：训练数据里的一列特征（用户年龄），和今天线上收到的同一列
+train_age = torch.randn(2000) * 10 + 35    # 训练时：2000 个用户，平均 35 岁
+today_age = torch.randn(500) * 10 + 28     # 今天线上：500 个用户，一次推广后来了很多年轻人
 --- starter
 def psi(ref, live, bins=10, eps=1e-4):
     """ref: 训练时的一个特征 (N,)；live: 线上的同一个特征 (M,)。返回 PSI（Python float）。"""
@@ -380,6 +384,9 @@ def psi(ref, live, bins=10, eps=1e-4):
     e = ...          # 2. ref 在每个箱里的比例，长度 bins
     a = ...          #    live 在每个箱里的比例，长度 bins
     raise todo()     # 3. clamp_min(eps)，套公式，返回 float
+--- below
+print("训练数据和自己比:", round(psi(train_age, train_age), 4))
+print("今天和训练时比:", round(psi(train_age, today_age), 4))
 --- solution
 def psi(ref, live, bins=10, eps=1e-4):
     edges = torch.quantile(ref, torch.linspace(0, 1, bins + 1))[1:-1]     # 边界只来自训练数据
@@ -447,6 +454,10 @@ ref: day25
 训练时跑一次 `fit_reference`：定好分箱边界，记下训练数据在每个箱里的比例，和模型一起存下来。上线后每天跑一次 `daily_psi`，比较今天的数据和训练时的数据。
 
 这个监控上线半年，PSI 每天都接近 0，哪怕今天的数据明显变了。找出 bug 并修好：`daily_psi(fit_reference(train), today)` 要和第 4 题的 `psi(train, today)` 算得一样。
+--- above
+# 上文：训练时的一列特征（每笔订单的金额），和上线后某一天的同一列
+train_amount = torch.rand(3000) * 100          # 训练时：3000 笔订单，金额在 0 到 100 美元之间
+today_amount = torch.rand(800) * 100 + 15      # 今天：800 笔订单，大促之后金额整体高了 15 美元
 --- starter
 def fit_reference(train_values, bins=10):
     """训练时跑一次：定好分箱边界，记下训练数据在每个箱里的比例。"""
@@ -463,6 +474,10 @@ def daily_psi(reference, today_values, eps=1e-4):
     e = reference["shares"]
     a, e = a.clamp_min(eps), e.clamp_min(eps)
     return float(((a - e) * torch.log(a / e)).sum())
+--- below
+reference = fit_reference(train_amount)        # 训练时跑一次，和模型一起存下来
+print("存下的边界:", [round(v, 1) for v in reference["edges"].tolist()])
+print("今天的 PSI:", round(daily_psi(reference, today_amount), 4))
 --- solution
 def fit_reference(train_values, bins=10):
     edges = torch.quantile(train_values, torch.linspace(0, 1, bins + 1))[1:-1]
@@ -552,10 +567,17 @@ KS 统计量不用分箱，结果总在 0 到 1 之间，监控连续特征很�
 2. 要看的位置：两份数据合在一起，`torch.cat([a, b])`。
 3. 在这些位置上算两条累积曲线：`torch.searchsorted(排好序的 a, 位置, right=True) / len(a)`，b 也一样。
 4. 返回两条曲线之差的绝对值的最大值。
+--- above
+# 上文：一个特征（每条请求的字数）在训练数据里和今天线上的值
+train_len = torch.tensor([12., 30., 25., 18., 40., 22.])   # 训练数据里的 6 条请求，没有排序
+today_len = torch.tensor([35., 50., 28., 45.])            # 今天线上的 4 条请求，个数不一样，普遍更长
 --- starter
 def ks_statistic(a, b):
     """两份一维数据的 KS 统计量：两条经验累积曲线的最大竖直距离，在 0 到 1 之间。"""
     raise todo()
+--- below
+print("和倒过来的自己比:", ks_statistic(train_len, train_len.flip(0)))
+print("今天和训练时比:", round(ks_statistic(train_len, today_len), 4))
 --- solution
 def ks_statistic(a, b):
     a = torch.sort(a).values                   # searchsorted 要求排好序
@@ -617,6 +639,10 @@ ref: day25
 
 - `class_shares(pred, num_classes)`：pred 是一维 long 张量，每个元素是预测的类别（0 到 num_classes − 1）。返回长度为 num_classes 的 float 张量：每个类别占的比例。某个类一次都没出现，它的比例就是 0，长度不能变短。
 - `prediction_psi(ref_pred, live_pred, num_classes, eps=1e-4)`：e 是 ref_pred 的比例，a 是 live_pred 的比例；两个都 `clamp_min(eps)`，再算 Σ (a − e) × ln(a / e)，返回 Python float。
+--- above
+# 上文：欺诈检测模型的预测（0 正常，1 转人工，2 欺诈），上线第一周和今天各抽一些
+week1_pred = torch.tensor([0, 0, 1, 0, 2, 0, 0, 1, 0, 0])   # 第一周的 10 个预测
+today_pred = torch.tensor([0, 1, 1, 0, 1, 0, 1, 0])         # 今天的 8 个预测：一个「欺诈」都没有
 --- starter
 def class_shares(pred, num_classes):
     """每个类别被预测的比例，长度 num_classes。"""
@@ -626,6 +652,10 @@ def class_shares(pred, num_classes):
 def prediction_psi(ref_pred, live_pred, num_classes, eps=1e-4):
     """上线初期的预测 vs 今天的预测：PSI（float）。"""
     raise todo()
+--- below
+print("第一周每类的比例:", [round(v, 3) for v in class_shares(week1_pred, 3).tolist()])
+print("今天每类的比例:  ", [round(v, 3) for v in class_shares(today_pred, 3).tolist()])
+print("预测的 PSI:", round(prediction_psi(week1_pred, today_pred, 3), 4))
 --- solution
 def class_shares(pred, num_classes):
     return torch.bincount(pred, minlength=num_classes) / len(pred)     # minlength：没出现的类也占一个位置
@@ -684,6 +714,10 @@ ref: day25
 
 - `record(t, is_error)`：记下一个请求。t 是时间（秒，越来越大），is_error 是 True / False。存进 `self.events`。
 - `firing(now)`：只看最近 window_s 秒内的请求，也就是 now − window_s < t ≤ now 的那些。先把更旧的从 `self.events` 左边 `popleft` 扔掉，这样内存不会一直涨。窗口里的请求数 ≥ min_count，**并且**错误率 > threshold，才返回 True；否则返回 False（窗口里一个请求都没有时也是 False）。
+--- above
+# 上文：服务的请求日志，每条是 (第几秒进来的, 有没有出错)，按时间排好
+request_log = [(1, True), (2, True),                                           # 开头：只来了 2 个请求，都出错了
+               (30, False), (31, True), (32, False), (33, True), (34, True)]   # 过了一会儿：请求多起来，错误也多
 --- starter
 from collections import deque
 
@@ -699,6 +733,11 @@ class ErrorRateAlert:
 
     def firing(self, now):
         raise todo()
+--- below
+alert = ErrorRateAlert(window_s=10, threshold=0.2, min_count=5)   # 只看最近 10 秒；至少 5 个请求、错误率 > 20% 才报
+for t, is_error in request_log:
+    alert.record(t, is_error)
+    print(f"第 {t:2d} 秒（出错: {is_error}）-> 报警: {alert.firing(t)}，窗口里有 {len(alert.events)} 个请求")
 --- solution
 from collections import deque
 
@@ -785,6 +824,13 @@ ref: day25
 4. prod 自己出错：不要接住，让它照常抛出去。
 
 `disagreement_rate(stats)`：返回 disagree / rows；rows 为 0（还没比过）时返回 None。
+--- above
+# 上文：线上正在用的旧模型，和准备替换它的新模型，都是 4 个特征进、3 个类别出
+prod_model = nn.Linear(4, 3)         # 旧模型：用户拿到的答案都来自它
+new_model = nn.Linear(4, 3)          # 新模型：权重不一样，有些请求会判得和旧模型不同
+broken_model = nn.Linear(5, 3)       # 写错了的新模型：要 5 个特征，请求只有 4 个，一跑就报错
+requests = torch.randn(10, 4)        # 10 个线上请求，每个 4 个特征
+shadow_stats = {"rows": 0, "disagree": 0, "shadow_errors": 0}   # 调用方建好的计数器
 --- starter
 def serve_with_shadow(x, prod, shadow, stats):
     """返回 prod 的预测（给用户）；shadow 只拿来比较，出错也不能影响用户。"""
@@ -793,6 +839,11 @@ def serve_with_shadow(x, prod, shadow, stats):
 
 def disagreement_rate(stats):
     raise todo()
+--- below
+answer = serve_with_shadow(requests, prod_model, new_model, shadow_stats)
+serve_with_shadow(requests, prod_model, broken_model, shadow_stats)   # 同一批请求再来一次，这次影子崩了
+print("用户拿到的答案:", answer.tolist())
+print("计数器:", shadow_stats, " 分歧率:", disagreement_rate(shadow_stats))
 --- solution
 def serve_with_shadow(x, prod, shadow, stats):
     with torch.inference_mode():
@@ -928,6 +979,9 @@ ref: day25
 1. `base_n < min_n` 或 `canary_n < min_n`：返回 "wait"。（先判断这一条，这时连除法都不用做。）
 2. 否则算 p_base、p_canary，以及 se = sqrt(p_base(1 − p_base)/base_n + p_canary(1 − p_canary)/canary_n)。p_canary − p_base > z × se 时，返回 "rollback"。
 3. 其他情况：返回 "promote"。
+--- above
+# 上文：发布系统从监控里数出来的请求数和失败数；基线就是一直在跑的旧模型
+baseline_failed, baseline_total = 100, 5000   # 基线：5000 个请求，失败 100 个（2.0%）
 --- starter
 def canary_decision(base_errors, base_n, canary_errors, canary_n, min_n=1000, z=2.0):
     p_base = base_errors / base_n
@@ -935,6 +989,10 @@ def canary_decision(base_errors, base_n, canary_errors, canary_n, min_n=1000, z=
     if p_canary > p_base:              # 金丝雀的错误率比基线高，就回滚
         return "rollback"
     return "promote"
+--- below
+print("金丝雀刚接了 12 个请求，失败 1 个:", canary_decision(baseline_failed, baseline_total, 1, 12))
+print("金丝雀接了 5000 个请求，失败 110 个 (2.2%):", canary_decision(baseline_failed, baseline_total, 110, 5000))
+print("金丝雀接了 5000 个请求，失败 175 个 (3.5%):", canary_decision(baseline_failed, baseline_total, 175, 5000))
 --- solution
 def canary_decision(base_errors, base_n, canary_errors, canary_n, min_n=1000, z=2.0):
     if base_n < min_n or canary_n < min_n:
@@ -1031,9 +1089,16 @@ PSI 是今天最重要的一个函数：面试里问「怎么发现数据漂移�
 不看卡片，写出 `psi(ref, live, bins=10, eps=1e-4)`，返回 Python float：分箱边界只用 ref 的分位数定（bins − 1 个），ref 和 live 都用这套边界数出每个箱的比例（长度都是 bins），两边都 clamp_min(eps)，PSI = Σ (a − e) × ln(a / e)。
 
 检查和第 4 题一样。
+--- above
+# 上文：训练数据里的一列特征（信用分），和今天线上同一列的值
+train_score = torch.randn(3000) * 50 + 650    # 训练时：3000 个申请人，信用分平均 650
+today_score = torch.randn(600) * 80 + 650     # 今天：600 个申请人，平均没变，但分数散得更开了
 --- starter
 def psi(ref, live, bins=10, eps=1e-4):
     raise todo()
+--- below
+print("今天和训练时比:", round(psi(train_score, today_score), 4))
+print("只分 5 个箱:", round(psi(train_score, today_score, bins=5), 4))
 --- solution
 def psi(ref, live, bins=10, eps=1e-4):
     edges = torch.quantile(ref, torch.linspace(0, 1, bins + 1))[1:-1]
@@ -1105,6 +1170,11 @@ ref: day25
 - `firing(now)` 先从左边扔掉 t ≤ now − window_s 的请求，然后：窗口里的请求数 ≥ min_count 并且错误率 > threshold 时返回 True，否则返回 False（没有请求时也是 False）。
 
 检查和第 9 题一样。
+--- above
+# 上文：服务的请求日志，每条是 (第几秒进来的, 有没有出错)，按时间排好
+request_log = [(5, True),                                                        # 开头：只来了 1 个请求，出错了
+               (40, False), (41, False), (42, True), (43, True), (44, False),   # 过了一会儿：错误多起来
+               (80, False)]                                                     # 又过了一会儿：一个成功的请求
 --- starter
 from collections import deque
 
@@ -1117,6 +1187,11 @@ class ErrorRateAlert:
 
     def firing(self, now):
         raise todo()
+--- below
+alert = ErrorRateAlert(window_s=30, threshold=0.25, min_count=4)   # 只看最近 30 秒；至少 4 个请求、错误率 > 25% 才报
+for t, is_error in request_log:
+    alert.record(t, is_error)
+    print(f"第 {t:2d} 秒（出错: {is_error}）-> 报警: {alert.firing(t)}，窗口里有 {len(alert.events)} 个请求")
 --- solution
 from collections import deque
 

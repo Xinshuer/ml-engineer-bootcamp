@@ -303,12 +303,23 @@ ref: day24
 
 - 用二进制模式 `"rb"` 打开：哈希算的是字节。文本模式会把 Windows 的换行 `\r\n` 改成 `\n`，读出来的也是字符串，不是字节。
 - 分块读：每次 `f.read(1 << 20)`（1 MB），每块都 `h.update(chunk)`，读到空的 `b""` 就停。
+--- above
+# 上文：上次训练用的数据和这次的（两个小 CSV，只差一个标签）
+import os, tempfile
+tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)    # 临时文件夹，运行完自动删掉
+csv_paths = write_files(tmp.name, {                              # 课程写好的小工具：写文件，返回路径的 list
+    "train_old.csv": "text,label\ngreat phone,1\nbroke in a day,0\n",
+    "train_new.csv": "text,label\ngreat phone,1\nbroke in a day,1\n",   # 只改了最后一个标签
+})
 --- starter
 import hashlib
 
 def file_sha256(path):
     """path -> 64 个字符的十六进制字符串"""
     raise todo()
+--- below
+for p in csv_paths:
+    print(os.path.basename(p), file_sha256(p))
 --- solution
 import hashlib
 
@@ -373,12 +384,24 @@ ref: day24
 3. 用换行 `"\n"` 连起来，`.encode("utf-8")` 变成字节，再算一次 sha256，返回 `hexdigest()`。
 
 这样：文件顺序变了，指纹不变；文件改名、换文件夹，指纹也不变；任何一个文件改了一个字节，指纹就变。
+--- above
+# 上文：一份数据集有三个文件，glob 找到它们的顺序每台机器可能不一样
+import tempfile
+tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)    # 临时文件夹，运行完自动删掉
+dataset_files = write_files(tmp.name, {                          # 课程写好的小工具：写文件，返回路径的 list
+    "train.csv": "text,label\ngreat phone,1\nbroke in a day,0\n",
+    "val.csv": "text,label\nworks fine,1\n",
+    "test.csv": "text,label\nnever again,0\n",
+})
 --- starter
 import hashlib
 
 def data_fingerprint(paths):
     """一组文件 -> 一个 64 个字符的指纹，和文件顺序、文件名都无关"""
     raise todo()
+--- below
+print("原来的顺序:  ", data_fingerprint(dataset_files))
+print("倒过来的顺序:", data_fingerprint(dataset_files[::-1]))
 --- solution
 import hashlib
 
@@ -449,6 +472,16 @@ ref: day24
 - `"data_fingerprint"`：`data_fingerprint(data_paths)`（已经写好了）。
 - `"versions"`：`{"python": platform.python_version(), "torch": torch.__version__, "numpy": np.__version__}`。
 - `"metrics"`：每个值都用 `float(v)` 转成 Python 数字。传进来的可能是 0 维张量，或者 numpy 的 float32，它们存不进 JSON。
+--- above
+# 上文：一次训练刚跑完，手上有这些东西，要存成一份实验记录
+import json, tempfile
+import numpy as np
+tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)    # 临时文件夹，运行完自动删掉
+csv_paths = write_files(tmp.name, {"train.csv": "text,label\ngreat phone,1\n",   # 课程写好的小工具：
+                                   "val.csv": "text,label\nworks fine,1\n"})     # 写文件，返回路径的 list
+train_config = {"lr": 0.003, "batch_size": 64, "optim": {"name": "adamw", "weight_decay": 0.01}}
+commit = "7e2d9b4c1a0f3e8d6c5b4a39281706f5e4d3c2b1"                # git rev-parse HEAD 打印的那一串
+final_metrics = {"val_loss": torch.tensor(0.4375), "val_acc": np.float32(0.8125)}   # 0 维张量、numpy 的 float32
 --- starter
 import copy
 import platform
@@ -457,6 +490,12 @@ import numpy as np
 def make_run_record(run_id, config, git_commit, data_paths, seed, metrics):
     """返回一次实验的记录（dict），能直接存成 JSON。"""
     raise todo()
+--- below
+rec = make_run_record("run-05", train_config, commit, csv_paths, 7, final_metrics)
+print("key:", sorted(rec))
+print("metrics 存成 JSON:", json.dumps(rec["metrics"]))
+train_config["optim"]["weight_decay"] = 0.1                      # 训练脚本后来又改了 config
+print("记录里的 optim:", rec["config"]["optim"])
 --- solution
 import copy
 import platform
@@ -621,6 +660,10 @@ ref: day24
 1. 同一个 seed，得到完全一样的权重和顺序。
 2. 不同的 seed，打乱出不同的顺序。
 3. 同一次训练里，每个 epoch 的顺序也不一样（打乱不能失效）。
+--- above
+# 上文：训练脚本读进来的一小份数据：16 个样本，每个 3 个特征
+x_train = torch.randn(16, 3)
+y_train = x_train @ torch.tensor([[2.0], [0.0], [-1.0]])       # 要学的目标：特征的加权和，形状 (16, 1)
 --- starter
 import random
 import numpy as np
@@ -644,6 +687,11 @@ def train_run(seed, x, y, epochs=2, batch_size=8):
             loss.backward()
             opt.step()
     return model.weight.detach().clone(), orders
+--- below
+w1, orders1 = train_run(0, x_train, y_train)
+w2, orders2 = train_run(0, x_train, y_train)                   # 同一个 seed，再跑一次
+print("第 1 次，epoch 1 的顺序:", orders1[0])
+print("第 2 次，epoch 1 的顺序:", orders2[0], "  权重一样吗:", torch.equal(w1, w2))
 --- solution
 import random
 import numpy as np
@@ -754,6 +802,18 @@ ref: day24
 2. `config_diff(a, b)`：比较两个 config dict，返回 `{key: (a 的值, b 的值)}`，只放值不一样的 key。只在一边出现的 key，另一边记成 None。值一样的 key 不要放进去。
 
 测试用 `sample_runs()` 的四条记录（卡片里打印过）。
+--- above
+# 上文：load_runs(folder) 读回来的四份实验记录（只留了要用的字段）
+past_runs = [
+    {"run_id": "run-11", "config": {"lr": 0.001, "batch_size": 32},
+     "metrics": {"val_acc": 0.81, "val_loss": 0.52}},
+    {"run_id": "run-12", "config": {"lr": 0.01, "batch_size": 32, "dropout": 0.1},
+     "metrics": {}},                                            # 崩掉了：loss 变成 nan，没评估就停了
+    {"run_id": "run-13", "config": {"lr": 0.003, "batch_size": 32, "dropout": 0.1},
+     "metrics": {"val_acc": 0.86, "val_loss": 0.49}},
+    {"run_id": "run-14", "config": {"lr": 0.003, "batch_size": 64},
+     "metrics": {"val_acc": 0.84, "val_loss": 0.46}},
+]
 --- starter
 def best_run(runs, metric, higher_is_better=True):
     """返回 metric 最好的那条记录；没有这个指标的记录跳过"""
@@ -763,6 +823,11 @@ def best_run(runs, metric, higher_is_better=True):
 def config_diff(a, b):
     """{key: (a 的值, b 的值)}，只放值不一样的 key；缺的一边是 None"""
     raise todo()
+--- below
+print("val_acc 最高: ", best_run(past_runs, "val_acc")["run_id"])
+print("val_loss 最低:", best_run(past_runs, "val_loss", higher_is_better=False)["run_id"])
+diff = config_diff(past_runs[2]["config"], past_runs[3]["config"])    # run-13 和 run-14 比
+print("config 差在:", sorted(diff.items()))
 --- solution
 def best_run(runs, metric, higher_is_better=True):
     """返回 metric 最好的那条记录；没有这个指标的记录跳过"""
@@ -862,6 +927,12 @@ ref: day24
 3. `promote(version)`：这个版本号不存在，就 `raise ValueError`；否则把 `production` 设成它，追加到 `history` 末尾，保存。
 
 每个会改东西的方法，都从 `self._load()` 开始，以 `self._save(data)` 结束。不要把状态存在 `self` 上：测试会新建一个 `Registry(folder)` 来检查。
+--- above
+# 上文：两次实验跑完了，要登记进模型注册表（就是文件夹里的一个 registry.json）
+import tempfile
+tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)    # 临时文件夹，运行完自动删掉
+registry_folder = tmp.name
+finished = {"run-21": {"val_acc": 0.83}, "run-22": {"val_acc": 0.86}}   # run_id -> 这次实验的指标
 --- starter
 class Registry(JsonStore):
     def register(self, run_id, metrics):
@@ -875,6 +946,12 @@ class Registry(JsonStore):
     def promote(self, version):
         """把 version 设成线上版本，并记进 history"""
         raise todo()
+--- below
+reg = Registry(registry_folder)
+for run_id, run_metrics in finished.items():
+    print(run_id, "注册成版本", reg.register(run_id, run_metrics), "  线上:", reg.production())
+reg.promote(2)
+print("promote(2) 之后，新建一个 Registry 来看，线上:", Registry(registry_folder).production())
 --- solution
 class Registry(JsonStore):
     def register(self, run_id, metrics):
@@ -983,6 +1060,17 @@ ref: day24
 2. `rollback()`：`history` 里少于 2 个版本时 `raise ValueError`。否则去掉 `history` 的最后一个，`production` 设成新的最后一个，保存，返回这个版本号。回滚**不过门槛**。
 
 用 `self._load()` / `self._save(data)` 读写。
+--- above
+# 上文：注册表文件 registry.json 现在的内容：v1、v2 先后上过线，v3 刚注册
+import json, tempfile
+registry_now = {
+    "versions": [{"version": 1, "run_id": "run-31", "metrics": {"val_acc": 0.82}},
+                 {"version": 2, "run_id": "run-32", "metrics": {"val_acc": 0.88}},
+                 {"version": 3, "run_id": "run-33", "metrics": {"val_acc": 0.85}}],
+    "production": 2, "history": [1, 2],          # 线上是 v2；history：上线过的版本，按时间顺序
+}
+tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)    # 临时文件夹，运行完自动删掉
+write_files(tmp.name, {"registry.json": json.dumps(registry_now)})   # 课程写好的小工具：把文字写成文件
 --- starter
 class Registry(BasicRegistry):
     def promote(self, version):
@@ -992,6 +1080,13 @@ class Registry(BasicRegistry):
     def rollback(self):
         """回到上一个上线过的版本，返回它的版本号"""
         raise todo()
+--- below
+reg = Registry(tmp.name)                         # 默认比 val_acc，越大越好
+try:
+    reg.promote(3)
+except ValueError:
+    print("promote(3) 被拒绝，线上还是:", reg.production())
+print("rollback() 回到:", reg.rollback(), "  history:", reg._load()["history"])
 --- solution
 class Registry(BasicRegistry):
     def promote(self, version):
@@ -1212,9 +1307,25 @@ ref: day24
 - config 要深拷贝；数据指纹用已经写好的 `data_fingerprint(data_paths)`。
 - versions 里有 `"python"`、`"torch"`、`"numpy"` 三个版本号。
 - metrics 的每个值转成 Python float。
+--- above
+# 上文：又一次训练跑完了，要给它留一份实验记录
+import json, tempfile
+import numpy as np
+tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)    # 临时文件夹，运行完自动删掉
+csv_paths = write_files(tmp.name, {"train.csv": "text,label\nlove it,1\nwaste of money,0\n",   # 课程写好的小工具：
+                                   "val.csv": "text,label\nokay I guess,1\n"})              # 写文件，返回路径的 list
+train_config = {"lr": 0.0005, "epochs": 20, "model": {"layers": 4, "hidden": 128}}
+commit = "c41f07a9e2b8d3561f0e9a7b2c4d6e8f10a3b5c7"                # git rev-parse HEAD 打印的那一串
+final_metrics = {"val_loss": torch.tensor(0.3125), "val_f1": np.float32(0.90625)}   # 0 维张量、numpy 的 float32
 --- starter
 def make_run_record(run_id, config, git_commit, data_paths, seed, metrics):
     raise todo()
+--- below
+rec = make_run_record("run-06", train_config, commit, csv_paths, 123, final_metrics)
+print("key:", sorted(rec))
+print("metrics 存成 JSON:", json.dumps(rec["metrics"]))
+train_config["model"]["layers"] = 8                              # 扫参的代码后来又改了 config
+print("记录里的 model:", rec["config"]["model"])
 --- solution
 import copy
 import platform
@@ -1310,6 +1421,17 @@ ref: day24
 
 - `promote`：线上已有版本时，新版本的 `self.metric` 不能更差（方向看 `higher_is_better`），更差就 `raise ValueError`、文件不改；否则设成 `production`、追加到 `history`、保存。
 - `rollback`：`history` 少于 2 个就 `raise ValueError`；否则回到上一个上线过的版本，返回它的版本号。回滚不过门槛。
+--- above
+# 上文：注册表比 val_loss（越小越好），v1、v2 先后上过线，v3 刚注册
+import json, tempfile
+registry_now = {
+    "versions": [{"version": 1, "run_id": "run-41", "metrics": {"val_loss": 0.52}},
+                 {"version": 2, "run_id": "run-42", "metrics": {"val_loss": 0.47}},
+                 {"version": 3, "run_id": "run-43", "metrics": {"val_loss": 0.49}}],
+    "production": 2, "history": [1, 2],          # 线上是 v2；history：上线过的版本，按时间顺序
+}
+tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)    # 临时文件夹，运行完自动删掉
+write_files(tmp.name, {"registry.json": json.dumps(registry_now)})   # 课程写好的小工具：把文字写成文件
 --- starter
 class Registry(BasicRegistry):
     def promote(self, version):
@@ -1317,6 +1439,13 @@ class Registry(BasicRegistry):
 
     def rollback(self):
         raise todo()
+--- below
+reg = Registry(tmp.name, metric="val_loss", higher_is_better=False)
+try:
+    reg.promote(3)
+except ValueError:
+    print("promote(3) 被拒绝，线上还是:", reg.production())
+print("rollback() 回到:", reg.rollback(), "  history:", reg._load()["history"])
 --- solution
 class Registry(BasicRegistry):
     def promote(self, version):

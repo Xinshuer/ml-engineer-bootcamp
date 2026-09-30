@@ -278,6 +278,15 @@ Write two functions:
 - `to_spatial(tok, H, W)`: input (B, H*W, C), output (B, C, H, W). It undoes `to_tokens`: `to_spatial(to_tokens(x), H, W)` must equal x exactly.
 
 Example: x has shape (2, 8, 4, 6); `to_tokens(x)` is (2, 24, 8).
+--- above
+# Where the input comes from: the feature map (B, C, H, W) that reaches an attention layer in the UNet
+feat = torch.arange(12.).reshape(1, 2, 2, 3)   # 1 image, 2 channels, 2 rows, 3 columns
+# channel 0 holds 0..5 and channel 1 holds 6..11, in order, so you can see where each number goes
+--- below
+tok = to_tokens(feat)
+print("tokens:", tuple(tok.shape))
+print("each token:", tok[0].tolist())
+print("back to the same map:", torch.equal(to_spatial(tok, 2, 3), feat))
 --- starter
 def to_tokens(x):
     """(B, C, H, W) -> (B, H*W, C). After this, the image is "a sentence"."""
@@ -325,6 +334,19 @@ Write `cross_attention(x, ctx, wq, wk, wv, n_head)`:
 - Return (B, Tx, C).
 
 The check compares with a reference at Tc=7, then switches to Tc=77 and checks the shape.
+--- above
+# Where the input comes from: a cross-attention layer in the UNet; image tokens from a feature map, text from CLIP
+B, Tx, Tc, C, Cc, heads = 1, 4, 3, 8, 6, 2
+img_tokens = torch.randn(B, Tx, C)    # 4 image tokens (a flattened 2x2 feature map), 8 numbers each
+text_emb = torch.randn(B, Tc, Cc)     # the prompt's 3 tokens, 6 numbers each
+Wq = torch.randn(C, C) * 0.1          # image: 8 -> 8 numbers
+Wk = torch.randn(Cc, C) * 0.1         # text: 6 -> 8 numbers
+Wv = torch.randn(Cc, C) * 0.1         # text: 6 -> 8 numbers
+--- below
+out = cross_attention(img_tokens, text_emb, Wq, Wk, Wv, heads)
+print("image:", tuple(img_tokens.shape), " text:", tuple(text_emb.shape), " -> output:", tuple(out.shape))
+longer = torch.randn(B, 10, Cc)       # a different prompt, 10 tokens long
+print("text with 10 tokens -> output:", tuple(cross_attention(img_tokens, longer, Wq, Wk, Wv, heads).shape))
 --- starter
 def cross_attention(x, ctx, wq, wk, wv, n_head):
     """x:   (B, Tx, C)    image tokens
@@ -380,6 +402,15 @@ For class-conditional generation ("draw a 7") the simplest way in is to add the 
 Write `combine_cond(t_emb, class_emb)`: both inputs are (B, D); return their element-wise sum, shape (B, D).
 
 This one is short. When it passes, think: why does a sum let the later layers know both "which step is this" and "what to draw"?
+--- above
+# Where the input comes from: class-conditional digits; 2 samples at the same timestep, one a "7", one a "3"
+time_emb = timestep_embedding(torch.tensor([0, 0]), 4)   # day 8's time embedding, (2, 4); at t=0 it is [1, 1, 0, 0]
+digit_emb = torch.tensor([[0.5, 0.0, 2.0, -1.0],         # class embedding of "7" (really a row of an nn.Embedding)
+                          [0.0, 1.5, -0.5, 0.0]])        # class embedding of "3"
+--- below
+emb = combine_cond(time_emb, digit_emb)
+print("time embeddings:", time_emb.tolist())
+print("after the sum:  ", emb.tolist())
 --- starter
 def combine_cond(t_emb, class_emb):
     """The simplest class conditioning: add the class embedding to the time embedding.
@@ -417,6 +448,15 @@ Write `drop_cond(cond_emb, null_emb, p, generator=None)`:
 - Pass the generator when you draw random numbers: `torch.rand(..., generator=generator)`. When it is None, the global random generator is used.
 
 The check uses B=4000 and p=0.1: the fraction of dropped rows must be between 0.08 and 0.12.
+--- above
+# Where the input comes from: the condition embeddings of one training batch, 6 samples of 2 numbers each
+# row 1 is all 1s, row 2 all 2s, and so on, so you can tell the rows apart
+batch_cond = torch.tensor([[1., 1.], [2., 2.], [3., 3.], [4., 4.], [5., 5.], [6., 6.]])
+null_vec = torch.tensor([-1., -1.])      # the "no condition" embedding (a learned vector in a real model)
+gen = torch.Generator().manual_seed(1)   # a fixed random generator: every run drops the same rows
+--- below
+out = drop_cond(batch_cond, null_vec, 0.5, generator=gen)   # p=0.5 so the effect shows; training usually uses 0.1
+print("after dropout:", out.tolist())
 --- starter
 def drop_cond(cond_emb, null_emb, p, generator=None):
     """With probability p, replace a sample's whole condition with null_emb (the unconditional embedding).
@@ -471,6 +511,13 @@ Both eps have the same shape; scale is a float. The checks verify:
 - scale=0 gives exactly eps_uncond
 - scale=1 gives exactly eps_cond
 - a larger scale lands further from eps_uncond
+--- above
+# Where the input comes from: at one sampling step the model predicts the noise twice (only 3 numbers shown)
+eps_u = torch.tensor([0.5, -1.0, 2.0])   # prediction with the null condition (unconditional)
+eps_c = torch.tensor([1.0, -1.0, 1.0])   # prediction with the prompt (conditional)
+--- below
+for scale in [0.0, 1.0, 7.5]:
+    print("scale", scale, "->", cfg_combine(eps_u, eps_c, scale).tolist())
 --- starter
 def cfg_combine(eps_uncond, eps_cond, scale):
     """eps = eps_uncond + scale * (eps_cond - eps_uncond)
@@ -524,6 +571,18 @@ Write `cfg_forward(model, x, t, cond, null_cond, scale)`:
 - Split the output into (eps_uncond, eps_cond), combine them with `cfg_combine(eps_uncond, eps_cond, scale)` (already given), and return (B, C, H, W).
 
 The check uses a fake model whose output is the mean of the condition vector: null is all 0, cond is all 2, scale=3, so the result should be 0 + 3 × (2 - 0) = 6 everywhere.
+--- above
+# Where the input comes from: one CFG sampling step; 2 noisy images, 2 prompt conditions, 1 "no condition" vector
+# a fake noise model (already loaded): output shaped like x, every number is the mean of the condition
+unet = _FakeEps()
+noisy = torch.randn(2, 1, 2, 2)    # 2 noisy images, 1 channel, 2x2 each
+t_now = torch.tensor([500, 500])   # both images are at step 500
+prompt_emb = torch.tensor([[1.0, 2.0], [4.0, 4.0]])   # conditions of 2 prompts, means 1.5 and 4.0
+null_emb = torch.tensor([1.0, 0.0])                   # the "no condition" vector, mean 0.5
+--- below
+out = cfg_forward(unet, noisy, t_now, prompt_emb, null_emb, 2.0)
+print("output:", tuple(out.shape))
+print("the 4 numbers of each image:", out.flatten(1).tolist())
 --- starter
 def cfg_forward(model, x, t, cond, null_cond, scale):
     """Do not run the model twice. Duplicate x, stack the conditions as [null, cond], run once, split.
@@ -588,6 +647,14 @@ Examples:
 - T=1000, steps=5: tensor([800, 600, 400, 200, 0])
 - T=1000, steps=50: [980, 960, …, 20, 0]
 - T=100, steps=30: k=3, [87, 84, …, 3, 0], exactly 30 values
+--- above
+# Where the input comes from: the model was trained with T=1000 steps; the sampler is set to 8 sampling steps
+T_train, n_steps = 1000, 8
+--- below
+ts = ddim_timesteps(T_train, n_steps)
+print("timesteps:", ts.tolist())
+print("count:", len(ts), "| dtype:", ts.dtype)
+print("3 steps out of 1000 (does not divide evenly):", ddim_timesteps(1000, 3).tolist())
 --- starter
 def ddim_timesteps(T, steps):
     """Take steps evenly spaced timesteps from [0, T); return them largest first as a 1D LongTensor.
@@ -636,6 +703,18 @@ Write `ddim_step(x_t, t, t_prev, eps_pred, sched)` (eta=0: no new random noise):
 - t_prev can be -1 (meaning "done"). Then use ab_prev = 1, so the result is x0_pred.
 
 Day 8's `linear_schedule`, `q_sample` and `extract` are already loaded.
+--- above
+# Where the input comes from: day 8's noising; a clean image plus noise gives the noisy image at step 700
+schedule = linear_schedule(1000)                      # day 8's linear schedule (already loaded)
+clean = torch.tensor([[[[0.5, -0.5], [1.0, -1.0]]]])  # a clean image with 1 channel, 2x2, shape (1, 1, 2, 2)
+noise = torch.randn(1, 1, 2, 2)                       # the noise that was added
+t_now, t_300 = torch.tensor([700]), torch.tensor([300])   # timesteps are (B,) tensors; here B=1
+noisy = q_sample(clean, t_now, noise, schedule)       # day 8's q_sample: noise it to step 700
+--- below
+x_300 = ddim_step(noisy, t_now, t_300, noise, schedule)   # suppose the model guessed the noise exactly
+print("700 -> 300 matches noising to 300:", torch.allclose(x_300, q_sample(clean, t_300, noise, schedule), atol=1e-4))
+x_end = ddim_step(noisy, t_now, torch.tensor([-1]), noise, schedule)  # t_prev=-1: all the way to the end
+print("700 -> -1 gives:", [round(v, 3) for v in x_end.flatten().tolist()])
 --- starter
 def ddim_step(x_t, t, t_prev, eps_pred, sched):
     """x0_pred = (x_t - sqrt(1-ab_t) * eps) / sqrt(ab_t)
@@ -695,6 +774,18 @@ Write `ddim_sample(model, shape, sched, steps=10, device="cpu")`:
 5. Return the final x, with shape equal to shape.
 
 `ddim_timesteps` and `ddim_step` are given (reference versions). Keep the `@torch.no_grad()` above the function: sampling needs no gradients.
+--- above
+# Where the input comes from: day 8's MiniUNet predicts the noise (untrained here: only the loop matters)
+schedule = linear_schedule(100)          # day 8's schedule dict: T=100, holds "betas" and "alphas_cumprod"
+unet = MiniUNet(in_ch=1).eval()          # day 8's UNet (already loaded): unet(x, t) -> noise shaped like x
+seen_t = []                              # the timestep of every model call
+def eps_model(x, t):
+    seen_t.append(int(t[0]))
+    return unet(x, t)
+--- below
+img = ddim_sample(eps_model, (2, 1, 8, 8), schedule, steps=5)
+print("generated images:", tuple(img.shape))
+print("the model was called at these timesteps:", seen_t)
 --- starter
 @torch.no_grad()
 def ddim_sample(model, shape, sched, steps=10, device="cpu"):
@@ -777,6 +868,11 @@ The setting (Stable Diffusion 1.x):
 - CLIP text embeddings: 77 tokens of 768 numbers each
 
 Work it out in your head first, then run. The card's example uses batch 2 and 256×256: different numbers, same rules.
+--- below
+print("not filled in yet:", [name for name, shape in LDM_SHAPES.items() if shape is None])
+latent = torch.zeros(LDM_SHAPES["latent"])                                  # a latent with your shape (all zeros)
+tokens = nn.Conv2d(4, 320, 3, padding=1)(latent).flatten(2).transpose(1, 2)  # UNet's first layer, then flatten
+print("computed token shape == your latent_tokens:", tuple(tokens.shape) == tuple(LDM_SHAPES["latent_tokens"]))
 --- starter
 LDM_SHAPES = {
     "image":          None,   # 512x512 RGB images, batch 4
@@ -835,6 +931,18 @@ CFG bugs raise no error; they only make the images worse, so they are hard to sp
 `cfg_sample_buggy` should do exactly what `cfg_forward` does: one forward pass, conditions **null in the first half, cond in the second half**, then combine with `eps_u + scale * (eps_c - eps_u)`. It has 2 bugs. Find and fix them; keep the function name.
 
 Two checks: the result matches `cfg_forward`, and the conditions passed to the model really are null first, cond second.
+--- above
+# Where the input comes from: one CFG sampling step; 2 noisy images, 2 prompt conditions, 1 "no condition" vector
+# a fake noise model (already loaded): output shaped like x, every number is the mean of the condition
+unet = _FakeEps()
+noisy = torch.randn(2, 1, 2, 2)         # 2 noisy images, 1 channel, 2x2 each
+t_now = torch.tensor([500, 500])        # both images are at step 500
+prompt_emb = torch.tensor([[1.0, 1.0, 1.0], [2.0, 3.0, 4.0]])   # conditions of 2 prompts, means 1.0 and 3.0
+null_emb = torch.tensor([0.5, 0.5, 0.5])                        # the "no condition" vector, mean 0.5
+--- below
+out = cfg_sample_buggy(unet, noisy, t_now, prompt_emb, null_emb, 2.0)
+print("output:", tuple(out.shape))
+print("the 4 numbers of each image:", out.flatten(1).tolist())
 --- starter
 def cfg_sample_buggy(model, x, t, cond, null_cond, scale):
     both_x = torch.cat([x, x])
@@ -1007,6 +1115,18 @@ Without the cards, write `cfg_forward(model, x, t, cond, null_cond, scale)`:
 - Split into (eps_uncond, eps_cond) and return `eps_uncond + scale * (eps_cond - eps_uncond)`, shape (B, C, H, W).
 
 You may use `cfg_combine` or write the formula directly.
+--- above
+# Where the input comes from: one CFG sampling step; 3 noisy images, 3 prompt conditions, 1 "no condition" vector
+# a fake noise model (already loaded): output shaped like x, every number is the mean of the condition
+unet = _FakeEps()
+noisy = torch.randn(3, 1, 2, 2)           # 3 noisy images, 1 channel, 2x2 each
+t_now = torch.tensor([200, 200, 200])     # all three images are at step 200
+prompt_emb = torch.tensor([[1.0, 1.0], [2.0, 4.0], [0.0, -1.0]])   # 3 prompt conditions, means 1.0, 3.0, -0.5
+null_emb = torch.tensor([0.5, 0.5])                                # the "no condition" vector, mean 0.5
+--- below
+out = cfg_forward(unet, noisy, t_now, prompt_emb, null_emb, 3.0)
+print("output:", tuple(out.shape))
+print("the 4 numbers of each image:", out.flatten(1).tolist())
 --- starter
 def cfg_forward(model, x, t, cond, null_cond, scale):
     raise todo()
@@ -1062,6 +1182,18 @@ Without the cards, write `ddim_step(x_t, t, t_prev, eps_pred, sched)` (eta=0):
 - t_prev can be -1; then use ab_prev = 1 (return x0_pred).
 
 `extract`, `linear_schedule` and `q_sample` are available.
+--- above
+# Where the input comes from: day 8's noising; a clean image plus noise gives the noisy image at step 500
+schedule = linear_schedule(1000)                      # day 8's linear schedule (already loaded)
+clean = torch.tensor([[[[2.0, 0.5], [-0.5, -2.0]]]])  # a clean image with 1 channel, 2x2, shape (1, 1, 2, 2)
+noise = torch.randn(1, 1, 2, 2)                       # the noise that was added
+t_now, t_100 = torch.tensor([500]), torch.tensor([100])   # timesteps are (B,) tensors; here B=1
+noisy = q_sample(clean, t_now, noise, schedule)       # day 8's q_sample: noise it to step 500
+--- below
+x_100 = ddim_step(noisy, t_now, t_100, noise, schedule)   # suppose the model guessed the noise exactly
+print("500 -> 100 matches noising to 100:", torch.allclose(x_100, q_sample(clean, t_100, noise, schedule), atol=1e-4))
+x_end = ddim_step(noisy, t_now, torch.tensor([-1]), noise, schedule)  # t_prev=-1: all the way to the end
+print("500 -> -1 gives:", [round(v, 3) for v in x_end.flatten().tolist()])
 --- starter
 def ddim_step(x_t, t, t_prev, eps_pred, sched):
     raise todo()

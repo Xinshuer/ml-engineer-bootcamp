@@ -424,6 +424,19 @@ Write `strip_prefix(sd, prefixes=("module.", "_orig_mod."))`:
 - If a key starts with one of the prefixes, remove it. There may be several layers (for example `_orig_mod.module.head.weight`): keep removing until the key no longer starts with one of them.
 - Remove prefixes only at the **start**. The `module.` in the middle of `encoder.module.weight` is a real submodule name; keep it.
 - Put the values (tensors) into the new dict unchanged, in the same order.
+--- above
+# Where the input comes from: the state_dict of a model trained with DDP, then torch.compile'd
+ckpt_sd = {
+    "_orig_mod.module.body.weight": torch.randn(8, 4),   # outer wrapper from compile, inner one from DDP
+    "_orig_mod.module.body.bias": torch.randn(8),
+    "_orig_mod.module.head.weight": torch.randn(2, 8),
+    "_orig_mod.module.head.bias": torch.randn(2),
+}
+--- below
+clean = strip_prefix(ckpt_sd)
+print("after stripping:", list(clean))
+print("the original dict is unchanged, its first key is still:", list(ckpt_sd)[0])
+print("loaded into the plain Net:", Net().load_state_dict(clean))   # Net: today's small model from the cards, no wrappers
 --- starter
 def strip_prefix(sd, prefixes=("module.", "_orig_mod.")):
     """Return a new dict: each key without the prefixes at its start (maybe several layers); values unchanged."""
@@ -518,6 +531,20 @@ Write `load_strict(model, sd)`:
 1. **Check first; do not load first.** Compare the keys of `model.state_dict()` (including buffers such as BatchNorm's `running_mean`) with the keys of `sd` and find three kinds of problems: missing (in the model, not in sd), unexpected (in sd, not in the model), and shape mismatches (in both, with different shapes).
 2. If there is any problem at all, `raise ValueError(...)` with a message that names every key with a problem. In that case **no weight of the model may change**.
 3. Only if everything matches, call `model.load_state_dict(sd)` and return `model`.
+--- above
+# Where the input comes from: the Net we are about to serve, and an old checkpoint (its last layer was called classifier)
+model_to_serve = Net()                        # Net: today's small model from the cards (body: Linear 4→8, head: Linear 8→2)
+old_ckpt = {                                  # name -> tensor
+    "body.weight": torch.randn(8, 4),
+    "body.bias": torch.randn(8),
+    "classifier.weight": torch.randn(2, 8),   # in today's Net this layer is called head
+    "classifier.bias": torch.randn(2),
+}
+--- below
+try:
+    print("loaded:", load_strict(model_to_serve, old_ckpt) is model_to_serve)
+except ValueError as e:
+    print("ValueError:", e)
 --- starter
 def load_strict(model, sd):
     """Check first; load only if everything matches. Otherwise raise ValueError naming every bad key."""
@@ -624,6 +651,22 @@ The function below "works", but the head is never loaded. Fix it:
 
 - replace the old name `classifier.` at the start of a key with the new name `head.`;
 - load with strict=True (the default), so that any future mismatch raises right away instead of quietly running a half-random model.
+--- above
+# Where the input comes from: the checkpoint saved by v1, when the last layer was still called classifier
+import os, tempfile
+v1_weights = {
+    "body.weight": torch.randn(8, 4),
+    "body.bias": torch.randn(8),
+    "classifier.weight": torch.randn(2, 8),
+    "classifier.bias": torch.randn(2),
+}
+run_dir = tempfile.TemporaryDirectory()      # a temporary folder instead of the project's checkpoints/; deleted afterwards
+v1_path = os.path.join(run_dir.name, "v1.pt")
+torch.save(v1_weights, v1_path)
+--- below
+v2 = load_v1_checkpoint(Net(), v1_path)      # Net: the refactored model, its last layer is called head
+print("body uses the v1 weights:", torch.equal(v2.body.weight, v1_weights["body.weight"]))
+print("head uses the v1 weights:", torch.equal(v2.head.weight, v1_weights["classifier.weight"]))
 --- starter
 def load_v1_checkpoint(model, path):
     sd = torch.load(path, weights_only=True)
@@ -702,6 +745,18 @@ Write two functions (`save_file`, `load_file` and `safe_open` are already import
 
 - `save_weights(model, path, step)`: save `model.state_dict()` as safetensors with `save_file`, with the metadata `{"step": "<step>"}`.
 - `load_weights(model, path)`: read the tensors with `load_file` and load them strictly into `model`; then read the metadata with `safe_open` and return the step as an int.
+--- above
+# Where the input comes from: training reached step 3000; now the weights are published as model.safetensors
+import os, tempfile
+trained = Net()                               # Net: today's small model from the cards; pretend it is trained
+deployed = Net()                              # on the serving side: a model built from code, waiting for the numbers
+run_dir = tempfile.TemporaryDirectory()       # a temporary folder, deleted afterwards
+weights_path = os.path.join(run_dir.name, "model.safetensors")
+--- below
+save_weights(trained, weights_path, 3000)
+step = load_weights(deployed, weights_path)
+print("step read back:", step, "| type:", type(step).__name__)
+print("deployed model == trained model:", torch.equal(deployed.head.weight, trained.head.weight))
 --- starter
 def save_weights(model, path, step):
     raise todo()
@@ -773,6 +828,17 @@ In `TinyLM`, `head.weight` and `emb.weight` are the same Parameter. The `save_lm
 - loading is still strict: do not paper over it with `strict=False`.
 
 Besides `save_file` / `load_file`, `safetensors.torch` has `save_model` / `load_model`; all four are already imported.
+--- above
+# Where the input comes from: a trained small language model whose embedding and output layer share one weight (like GPT-2)
+import os, tempfile
+lm = TinyLM()                                 # TinyLM: today's model from the cards; lm.head.weight is lm.emb.weight (10×8)
+run_dir = tempfile.TemporaryDirectory()       # a temporary folder, deleted afterwards
+lm_path = os.path.join(run_dir.name, "lm.safetensors")
+--- below
+save_lm(lm, lm_path)
+print("tensors in the file:", list(load_file(lm_path)))
+fresh = load_lm(TinyLM(), lm_path)
+print("still shared after loading:", fresh.head.weight is fresh.emb.weight, "| same numbers:", torch.equal(fresh.emb.weight, lm.emb.weight))
 --- starter
 def save_lm(model, path):
     save_file(model.state_dict(), path)
@@ -880,6 +946,21 @@ Write two functions:
 What to save: the `state_dict()` of the model, the optimizer and the scheduler, the step, and the RNG states (at least `torch.get_rng_state()`; with a GPU also `torch.cuda.get_rng_state_all()`; if you use the `random` module, also `random.getstate()`).
 
 The checks run this experiment: A trains 5 steps without stopping; B trains 3 steps → saves → scrambles the RNG and builds brand-new objects → loads → trains 2 more steps. A and B must have **exactly** the same losses and final weights. Training uses `make_run()` (Net + AdamW + StepLR) and `train_step()` (data made on the spot with `torch.randn`, dropout in the model) from the card.
+--- above
+# Where the input comes from: training ran 3 steps, then the machine was reclaimed; training must continue on another one
+import os, tempfile
+net, optimizer, scheduler = make_run()        # make_run: the trio from the card (Net + AdamW + StepLR)
+for _ in range(3):
+    train_step(net, optimizer, scheduler)     # train_step: "one training step" from the card
+new_net, new_opt, new_sched = make_run()      # a brand-new trio on the new machine, with fresh random weights
+run_dir = tempfile.TemporaryDirectory()       # a temporary folder instead of the project's checkpoints/; deleted afterwards
+ckpt_path = os.path.join(run_dir.name, "ckpt.pt")
+--- below
+save_checkpoint(ckpt_path, net, optimizer, scheduler, 3)
+not_stopped = [round(train_step(net, optimizer, scheduler), 4) for _ in range(3)]    # never stopped: train steps 4-6 directly
+print("resumed at step:", load_checkpoint(ckpt_path, new_net, new_opt, new_sched))
+resumed = [round(train_step(new_net, new_opt, new_sched), 4) for _ in range(3)]      # resumed: train steps 4-6 as well
+print("loss of steps 4-6, never stopped:", not_stopped, "| resumed:", resumed)
 --- starter
 import random
 
@@ -988,6 +1069,19 @@ Turn `atomic_save(obj, path)` into an atomic save:
 1. First write to the temporary file `tmp = path + ".tmp"` with `torch.save(obj, tmp)` (in **the same folder** as `path`).
 2. Once it is completely written, swap it in with `os.replace(tmp, path)` (this overwrites an existing target).
 3. If anything fails on the way: delete the temporary file, then re-raise the error unchanged (`raise`). The old `path` must not be touched.
+--- above
+# Where the input comes from: during training, a checkpoint is saved every so often to the same ckpt.pt, overwriting the last one
+import os, tempfile
+run_dir = tempfile.TemporaryDirectory()       # a temporary folder instead of the project's checkpoints/; deleted afterwards
+ckpt_path = os.path.join(run_dir.name, "ckpt.pt")
+torch.save({"step": 500, "w": torch.ones(3)}, ckpt_path)                  # the last good checkpoint
+next_ckpt = {"step": 1000, "w": torch.zeros(3), "log_fn": lambda s: s}    # this one has a lambda in it by mistake, which pickle cannot save
+--- below
+try:
+    atomic_save(next_ckpt, ckpt_path)
+except Exception as e:
+    print("this save failed:", type(e).__name__)
+print("step in ckpt.pt:", torch.load(ckpt_path, weights_only=True)["step"], "| files in the folder:", sorted(os.listdir(run_dir.name)))
 --- starter
 import os
 
@@ -1108,6 +1202,21 @@ This is today's most important skill: after an interruption, training continues 
 Without looking at the cards, write `save_checkpoint(path, model, opt, sched, step)` and `load_checkpoint(path, model, opt, sched)` (which returns the step).
 
 The checks are the same as in item 11: the checkpoint loads with `weights_only=True`; train 3 steps → save → scramble the RNG and build brand-new objects → load → train 2 more steps, and the result must be exactly the same as 5 steps without stopping.
+--- above
+# Where the input comes from: training reached step 4 and saved a checkpoint; if the process is killed, the restart must continue from there
+import os, tempfile
+net, optimizer, scheduler = make_run()        # make_run: the trio from the card (Net + AdamW + StepLR)
+for _ in range(4):
+    train_step(net, optimizer, scheduler)     # train_step: "one training step" from the card
+new_net, new_opt, new_sched = make_run()      # a brand-new trio after the restart, with fresh random weights
+run_dir = tempfile.TemporaryDirectory()       # a temporary folder, deleted afterwards
+ckpt_path = os.path.join(run_dir.name, "ckpt.pt")
+--- below
+save_checkpoint(ckpt_path, net, optimizer, scheduler, 4)
+not_stopped = [round(train_step(net, optimizer, scheduler), 4) for _ in range(2)]    # never killed: train steps 5 and 6 directly
+print("resumed at step:", load_checkpoint(ckpt_path, new_net, new_opt, new_sched), "| learning rate:", new_opt.param_groups[0]["lr"])
+resumed = [round(train_step(new_net, new_opt, new_sched), 4) for _ in range(2)]      # after the restart: train steps 5 and 6 as well
+print("loss of steps 5 and 6, never killed:", not_stopped, "| after the restart:", resumed)
 --- starter
 import random
 
@@ -1206,6 +1315,20 @@ ref: day20
 When loading weights before going live, the worst case is "it loaded fine, but one layer is random". Checking first, reporting every problem at once and loading only when all is well stops a whole class of production incidents.
 --- prompt
 Without looking at the cards, write `load_strict(model, sd)`: compare the keys of `model.state_dict()` (buffers included) with `sd` and find the missing, unexpected and wrong-shape keys. If there is any problem, `raise ValueError` with a message naming every bad key, and leave every number of the model unchanged. Only if everything matches, load and return `model`.
+--- above
+# Where the input comes from: the Net we are about to serve, and a colleague's checkpoint trained with a 5-class head
+model_to_serve = Net()                        # Net: today's small model from the cards; its head outputs 2 classes
+colleague_ckpt = {                            # name -> tensor
+    "body.weight": torch.randn(8, 4),
+    "body.bias": torch.randn(8),
+    "head.weight": torch.randn(5, 8),         # 5 classes; today's Net needs (2, 8)
+    "head.bias": torch.randn(5),
+}
+--- below
+try:
+    print("loaded:", load_strict(model_to_serve, colleague_ckpt) is model_to_serve)
+except ValueError as e:
+    print("ValueError:", e)
 --- starter
 def load_strict(model, sd):
     raise todo()

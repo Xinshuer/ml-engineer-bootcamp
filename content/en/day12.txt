@@ -223,6 +223,18 @@ Write `length_regulator(x, durations, max_len=None)`.
 Example: the 3 characters' features are [1], [2], [3] and durations = [2, 0, 3] → [1, 1, 3, 3, 3].
 
 You can use `repeat_interleave`; a Python loop over the batch is fine.
+--- above
+# Where the input comes from: the text encoder's vector for each character, and the duration predictor's frame counts
+# (a real C is 192; here C = 2 and the numbers are simple, so the copying is easy to see)
+enc_out = torch.tensor([[[1., 1.], [2., 2.], [3., 3.], [4., 4.]],
+                        [[5., 5.], [6., 6.], [7., 7.], [0., 0.]]])   # (2, 4, 2): 2 sentences, 4 slots each
+dur = torch.tensor([[1, 2, 0, 2],     # sentence 0: character 2 is punctuation, 0 frames
+                    [2, 1, 1, 0]])    # sentence 1: 3 characters, then a padding slot (0 frames)
+--- below
+frames = length_regulator(enc_out, dur)
+print("output shape:", tuple(frames.shape))
+print("channel 0 of each frame:", frames[..., 0].tolist())
+print("with max_len=3:", length_regulator(enc_out, dur, max_len=3)[..., 0].tolist())
 --- starter
 def length_regulator(x, durations, max_len=None):
     """x: (B, Tt, C)   durations: (B, Tt) int64
@@ -284,6 +296,16 @@ Write two functions. Both handle one sentence, with no batch dimension.
 
 1. `duration_to_boundaries(durations)`: (Tt,) → (Tt, 2). Row i is character i's [start frame, end frame), half-open: the start is included, the end is not. Example: [2, 0, 3] → [[0, 2], [2, 2], [2, 5]] (a character with duration 0 has start == end).
 2. `frame_to_text_index(durations, n_frames)`: returns (n_frames,); number f is "which character frame f belongs to". Example: [2, 0, 3], n_frames=5 → [0, 0, 2, 2, 2]. `n_frames` is never more than the sum of the durations; when it is smaller, keep only the first `n_frames`.
+--- above
+# Where the input comes from: a forced aligner (e.g. MFA) says how many frames each phoneme lasts
+phonemes = ["n", "i", "h", "ao", ","]    # phonemes of "ni hao," (Chinese "hello"), then a comma
+dur = torch.tensor([3, 4, 2, 5, 0])      # the comma is silent: 0 frames
+mel_frames = 14                          # this sentence's mel has 14 frames in total
+--- below
+print("boundaries [start, end):", duration_to_boundaries(dur).tolist())
+owner = frame_to_text_index(dur, mel_frames)
+print("phoneme index of each frame:", owner.tolist())
+print("phoneme of each frame:", [phonemes[i] for i in owner.tolist()])
 --- starter
 def duration_to_boundaries(durations):
     """(Tt,) -> (Tt, 2), each row is [start frame, end frame).
@@ -338,6 +360,15 @@ Write `make_decoder_inputs(mel)`.
 - In other words, shift everything right by one along the time axis (dim=1); the last target frame drops off
 
 Example: target frames [a, b, c] → inputs [0, a, b].
+--- above
+# Where the input comes from: a batch of target mels for training Tacotron 2 (from real recordings)
+target_mel = torch.tensor([[[1., 1.], [2., 2.], [3., 3.], [4., 4.]],
+                           [[5., 5.], [6., 6.], [7., 7.], [8., 8.]]])   # (2, 4, 2): 2 sentences, 4 frames each, n_mels=2 (really 80)
+--- below
+dec_in = make_decoder_inputs(target_mel)
+print("shape:", tuple(dec_in.shape))
+print("target mel,    sentence 0:", target_mel[0].tolist())
+print("decoder input, sentence 0:", dec_in[0].tolist())
 --- starter
 def make_decoder_inputs(mel):
     """mel: (B, Tm, n_mels) is the target.
@@ -381,6 +412,15 @@ Write `make_stop_labels(lengths, max_len)`.
 Example: lengths = [3, 5], max_len = 5 → [[0, 0, 1, 0, 0], [0, 0, 0, 0, 1]].
 
 It must be float because the BCE loss needs float labels.
+--- above
+# Where the input comes from: the real mel frame counts of the 3 sentences in a batch
+mel_lengths = torch.tensor([6, 4, 2])    # real frames in each sentence
+padded_len = 6                           # after padding, every sentence has 6 frames
+--- below
+stop = make_stop_labels(mel_lengths, padded_len)
+print("dtype:", stop.dtype)
+for n, row in zip(mel_lengths.tolist(), stop.tolist()):
+    print("length", n, "->", row)
 --- starter
 def make_stop_labels(lengths, max_len):
     """lengths: (B,) real frame counts.
@@ -424,6 +464,16 @@ Write `masked_mel_loss(pred, target, mask)`.
 - The denominator is "real frames × n_mels", the number of elements that really count
 
 Changing the target at padding positions must not change the result. Do not use `F.l1_loss`: it averages the padding in too.
+--- above
+# Where the input comes from: a batch of predicted mels and real mels; sentence 1 is shorter, so it is padded
+pred_mel = torch.zeros(2, 3, 4)                              # 2 sentences, 3 frames each (with padding), n_mels=4
+true_mel = torch.full((2, 3, 4), 0.5)                        # the real mel: 0.5 on every real frame
+true_mel[1, 2] = 9.0                                         # sentence 1, frame 2 is padding: junk values
+mel_mask = torch.tensor([[1, 1, 1],
+                         [1, 1, 0]])                         # (2, 3): 1 on real frames, 0 on padding
+--- below
+print("masked loss:", round(masked_mel_loss(pred_mel, true_mel, mel_mask).item(), 4))
+print("compare F.l1_loss (padding counted too):", round(F.l1_loss(pred_mel, true_mel).item(), 4))
 --- starter
 def masked_mel_loss(pred, target, mask):
     """pred/target: (B, T, n_mels)   mask: (B, T), 1 on real frames.
@@ -477,6 +527,17 @@ Write two functions.
 - Then compute the MSE over real positions only: the sum of squared errors ÷ the number of real positions
 
 2. `duration_from_log(log_pred)`: the inverse, for inference. `exp(log_pred) − 1`, rounded, with anything below 0 set to 0, returned as int64.
+--- above
+# Where the input comes from: the duration predictor's log-domain output, and the aligner's frame counts
+dur_log_pred = torch.tensor([[1.1, 1.8, 0.2, 2.0],
+                             [1.4, 1.3, 0.6, -1.0]])   # the model's output; it can be negative
+true_dur = torch.tensor([[2, 5, 0, 7],
+                         [3, 3, 1, 0]])                # real frame counts (integers)
+text_mask = torch.tensor([[1., 1., 1., 1.],
+                          [1., 1., 1., 0.]])           # the last slot of sentence 1 is padding
+--- below
+print("duration loss:", round(duration_loss(dur_log_pred, true_dur, text_mask).item(), 4))
+print("back to frames at inference:", duration_from_log(dur_log_pred).tolist())
 --- starter
 def duration_loss(log_pred, target_dur, mask):
     """log_pred: (B, Tt)   target_dur: (B, Tt) integers   mask: (B, Tt)
@@ -530,6 +591,16 @@ Write `predict_mel_len(log_pred, mask)`.
 - Return (B,) int64: the predicted total number of mel frames of each sentence
 
 First convert to whole frames with `duration_from_log` (already available: it is the function from the previous exercise). Frames predicted at padding positions must not count.
+--- above
+# Where the input comes from: at inference, the duration predictor's output for a batch (log domain)
+dur_log_pred = torch.tensor([[2.0, 2.3, 1.6, 2.6],
+                             [1.4, 0.9, 3.0, 2.5]])   # at padding slots the model outputs junk too
+text_mask = torch.tensor([[1, 1, 1, 1],
+                          [1, 1, 0, 0]])              # sentence 1: 2 characters, then 2 padding slots
+--- below
+mel_len = predict_mel_len(dur_log_pred, text_mask)
+print("mel frames per sentence:", mel_len.tolist())
+print("about how many seconds (hop=256, 22050 Hz):", [round(n * 256 / 22050, 2) for n in mel_len.tolist()])
 --- starter
 def predict_mel_len(log_pred, mask):
     """(B, Tt) -> (B,): predicted total frames per sentence, counting real text positions only."""
@@ -574,6 +645,15 @@ Example: durations = [2, 1, 2], n_frames = 5 →
  [0, 0, 1]]
 ```
 You can call `frame_to_text_index` from d12-02 (already available).
+--- above
+# Where the input comes from: an aligner's durations for 4 phonemes; the sentence's mel has 6 frames
+dur = torch.tensor([1, 3, 0, 2])      # phoneme 2 is silent: 0 frames
+mel_frames = 6
+--- below
+A = alignment_matrix(dur, mel_frames)
+for f, row in enumerate(A.long().tolist()):
+    print(f"frame {f}:", row)
+print("column sums:", A.sum(0).tolist())
 --- starter
 def alignment_matrix(durations, n_frames):
     """durations: (Tt,) -> a 0/1 matrix (n_frames, Tt); A[f, i] = 1 means frame f comes from character i."""
@@ -617,6 +697,20 @@ Write `ar_decode(step_fn, n_mels, max_steps, stop_thresh=0.5)`. The `@torch.no_g
 Each step: call `step_fn(prev)` → keep the new frame → append it to `prev` → stop if `sigmoid(stop_logit) > stop_thresh`. Call it at most `max_steps` times.
 
 Return the generated mel, shape (1, T, n_mels), where T is the number of frames made. The go frame is **not** included; the frame that triggered the stop is kept.
+--- above
+# Where the input comes from: one Tacotron 2 decoder step: frames so far in, next frame + stop logit out
+# A fake decoder stands in for the real network: next frame = last frame + 1;
+# it says "stop" once prev has 5 frames (go frame included)
+n_mels = 2                                    # really 80; 2 is easier to read
+def decoder_step(prev):                       # prev: (1, t, n_mels)
+    mel_next = prev[:, -1] + 1                # (1, n_mels)
+    stop_logit = torch.tensor([5.0]) if prev.size(1) >= 5 else torch.tensor([-5.0])   # (1,)
+    return mel_next, stop_logit
+--- below
+generated = ar_decode(decoder_step, n_mels, max_steps=50)
+print("shape:", tuple(generated.shape))
+print("generated frames:", generated[0].tolist())
+print("with max_steps=3:", tuple(ar_decode(decoder_step, n_mels, max_steps=3).shape))
 --- starter
 @torch.no_grad()
 def ar_decode(step_fn, n_mels, max_steps, stop_thresh=0.5):
@@ -684,6 +778,15 @@ Replace every `None` in the dictionary `TTS_SHAPES` with a tuple. The setup:
 - the waveform is mono: write it as (batch, samples), with no channel dimension
 
 You may write arithmetic, for example `(4, 160 * 256)`.
+--- above
+# Where the input comes from: a few numbers from the model's config file; they decide every shape
+batch, n_chars, C, n_mels = 4, 20, 192, 80
+frames_per_char, hop, sample_rate = 8, 256, 22050
+--- below
+# take the 6 shapes out of the dictionary, in order
+ids_shape, enc_shape, dur_shape, lr_shape, mel_shape, wave_shape = TTS_SHAPES.values()
+print("mel frames:", mel_shape[1], "| waveform samples:", wave_shape[1])
+print("each sentence lasts about", round(wave_shape[1] / sample_rate, 2), "seconds")
 --- starter
 TTS_SHAPES = {
     "text token ids":                    None,   # batch=4, 20 characters per sentence
@@ -742,6 +845,19 @@ Arguments:
 - All zeros stand in for the model's mel prediction here, so the mel loss compares `torch.zeros_like(mel)` with `mel`
 
 The functions you wrote earlier, `make_decoder_inputs`, `masked_mel_loss` and `duration_loss`, are available: you can call them.
+--- above
+# Where the input comes from: one training batch: target mel, real lengths, predicted and real durations
+target_mel = torch.tensor([[[1.], [2.], [3.], [4.]],
+                           [[5.], [6.], [0.], [0.]]])   # (2, 4, 1), n_mels=1; sentence 1: 2 frames, then padding
+mel_lengths = torch.tensor([4, 2])                      # real frame count of each sentence
+true_dur = torch.tensor([[1, 2, 1], [1, 1, 0]])         # frames per character; sentence 1 ends in padding
+dur_log_pred = torch.log(true_dur.float() + 1)          # pretend the predictor got every real duration right
+dur_log_pred[1, 2] = 1.5                                # at the padding slot the model outputs junk
+text_mask = torch.tensor([[1., 1., 1.], [1., 1., 0.]])  # 1 on real text positions
+--- below
+dec_in, mask, mel_l, dur_l = tts_step_buggy(target_mel, mel_lengths, dur_log_pred, true_dur, text_mask)
+print("decoder input:", dec_in[..., 0].tolist())
+print("mel loss:", round(mel_l.item(), 4), "| duration loss:", round(dur_l.item(), 4))
 --- starter
 def tts_step_buggy(mel, lengths, log_dur_pred, durations, dur_mask):
     T = mel.size(1)
@@ -910,6 +1026,17 @@ Write `length_regulator(x, durations, max_len=None)`.
 - Return (B, Tm, C): each character's feature vector repeated by its duration; characters with duration 0 are skipped
 - Tm: if `max_len` is given, Tm = `max_len` (cut what is longer); otherwise Tm = the largest duration sum in the batch
 - Sentences with fewer than Tm frames are padded with 0 on the right
+--- above
+# Where the input comes from: in FastSpeech 2, the text encoder's output and each character's duration
+enc_out = torch.tensor([[[1., 1.], [2., 2.], [3., 3.]],
+                        [[4., 4.], [5., 5.], [6., 6.]]])   # (2, 3, 2): 2 sentences, 3 characters each, C=2
+dur = torch.tensor([[2, 1, 2],
+                    [1, 0, 1]])                           # how many frames each character lasts
+--- below
+out = length_regulator(enc_out, dur)
+print("output shape:", tuple(out.shape))
+print("channel 0 of each frame:", out[..., 0].tolist())
+print("with max_len=3:", length_regulator(enc_out, dur, max_len=3)[..., 0].tolist())
 --- starter
 def length_regulator(x, durations, max_len=None):
     raise todo()
@@ -969,6 +1096,20 @@ Write `ar_decode(step_fn, n_mels, max_steps, stop_thresh=0.5)`. The `@torch.no_g
 - `step_fn(prev)` returns `(mel_next, stop_logit)`: `prev` is (1, t, n_mels) and its first frame is the all-zero go frame (t = 1 on the first call); `mel_next` is (1, n_mels); `stop_logit` is (1,)
 - At each step append the new frame to `prev`; stop when `sigmoid(stop_logit) > stop_thresh`; call it at most `max_steps` times
 - Return (1, T, n_mels): all generated frames, without the go frame, with the frame that triggered the stop
+--- above
+# Where the input comes from: one autoregressive decoder step: frames so far in, next frame + stop logit out
+# A fake decoder stands in for the real network: next frame = last frame × 2 + 1;
+# it says "stop" once prev has 3 frames (go frame included)
+n_mels = 2
+def fake_step(prev):                          # prev: (1, t, n_mels)
+    mel_next = prev[:, -1] * 2 + 1            # (1, n_mels)
+    stop_logit = torch.tensor([3.0]) if prev.size(1) >= 3 else torch.tensor([-3.0])   # (1,)
+    return mel_next, stop_logit
+--- below
+generated = ar_decode(fake_step, n_mels, max_steps=100)
+print("shape:", tuple(generated.shape))
+print("generated frames:", generated[0].tolist())
+print("with max_steps=2:", tuple(ar_decode(fake_step, n_mels, max_steps=2).shape))
 --- starter
 @torch.no_grad()
 def ar_decode(step_fn, n_mels, max_steps, stop_thresh=0.5):

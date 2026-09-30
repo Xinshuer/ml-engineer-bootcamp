@@ -296,6 +296,16 @@ ref: day17
 3. 每预测一次，BatchNorm 的 `running_mean` 就被改一次。
 
 修好 `predict`，让这三个问题都消失。
+--- above
+# 上文：线上服务收到一批请求，交给刚训练完的分类器预测
+clf = make_classifier()          # 今天准备好的小分类器：8 维进、3 类出，里面有 BatchNorm 和 Dropout
+                                 # 新建的模型默认在 train 模式，和刚训练完时一样
+requests = torch.randn(4, 8)     # 一批 4 条请求，每条 8 个特征
+--- below
+probs = predict(clf, requests)
+print("第 0 条请求的 3 类概率:", [round(p, 3) for p in probs[0].tolist()])
+print("同一批请求再预测一次，结果一样吗:", torch.equal(predict(clf, requests), probs))
+print("前 2 条单独预测 == 放在整批里预测:", torch.allclose(predict(clf, requests[:2]), probs[:2], atol=1e-6))
 --- starter
 def predict(model, x):
     """x: (B, 8) -> 概率 (B, 3)"""
@@ -357,6 +367,18 @@ ref: day17
 修好它，做到：**每一步训练都在 train 模式下做，每一次评估都在 eval 模式下做。**
 
 测试会在模型最前面放一个 `ModeSpy`，它记下每次 forward 时模型处在哪个模式。
+--- above
+# 上文：一个带 Dropout 的小回归模型，训练 4 步，每 2 步在验证集上评估一次
+spy = ModeSpy()                  # 今天准备好的小工具：输入原样传下去，只记下每次 forward 时模型是不是 train 模式
+net = nn.Sequential(spy, nn.Linear(4, 8), nn.Dropout(0.2), nn.Linear(8, 1))   # 新建的模型默认在 train 模式
+train_data = [(torch.randn(3, 4), torch.randn(3, 1)) for _ in range(4)]   # 4 个训练 batch，每个 3 条
+val_data = (torch.randn(5, 4), torch.randn(5, 1))                         # 验证集 5 条
+# spy.log 里每一项是 (这次 forward 的条数, 是不是 train 模式)：3 条是训练，5 条是评估
+--- below
+val_losses = fit(net, train_data, val_data, eval_every=2)
+print("验证 loss:", [round(v, 3) for v in val_losses])
+print("4 步训练时是 train 模式吗:", [mode for n, mode in spy.log if n == 3])
+print("2 次评估时是 train 模式吗:", [mode for n, mode in spy.log if n == 5])
 --- starter
 def fit(model, train_batches, val_batch, eval_every=2):
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -435,6 +457,14 @@ ref: day17
 `normalize_split(x, n_train)`：`x` 形状 (N, D)，前 `n_train` 行是训练集，其余是测试集。用**训练集的**均值和标准差（按列，`.mean(0)` 和 `.std(0)`，用默认的无偏估计）标准化两部分，返回 `(x_train, x_test, mean, std)`。
 
 现在的代码能跑，但测试集的数据会影响训练集的结果。修好它。
+--- above
+# 上文：一个小表格数据集，每行一个样本、2 个特征；前 4 行是训练集，后 2 行是测试集
+data = torch.tensor([[1.0, 50.0], [2.0, 70.0], [3.0, 40.0], [4.0, 60.0],   # 训练集
+                     [9.0, 55.0], [10.0, 65.0]])                          # 测试集：第 0 个特征偏大了
+--- below
+x_train, x_test, mean, std = normalize_split(data, 4)
+print("mean:", [round(v, 3) for v in mean.tolist()], " std:", [round(v, 3) for v in std.tolist()])
+print("测试集标准化后:", [[round(v, 2) for v in row] for row in x_test.tolist()])
 --- starter
 def normalize_split(x, n_train):
     mean = x.mean(0)
@@ -484,6 +514,15 @@ ref: day17
 `lm_loss(model, tokens)`：`tokens` 形状 (B, T)，dtype long。`model(inp)` 把 (B, k) 的 token 变成 (B, k, V) 的 logits，位置 t 的 logits 用来猜**下一个** token。返回整个 batch 的平均 cross-entropy（一个标量）。
 
 测试用两个假模型：`NextModel` 永远猜「当前 token + 1」，`CopyModel` 永远猜「就是当前 token」。在 0,1,2,3… 这样一路加 1 的数据上，前者是完美的语言模型，后者一无是处。可是现在的代码给出的结论正好反过来。修好它。
+--- above
+# 上文：一批「数数」的 token 序列（词表 10 个词），和今天准备好的两个假模型
+token_batch = torch.tensor([[3, 4, 5, 6, 7, 8],
+                            [7, 8, 9, 0, 1, 2]])   # (2, 6)，dtype long；下一个永远是「当前 + 1」，9 后面绕回 0
+next_model = NextModel(10)       # 永远猜「当前 token + 1」
+copy_model = CopyModel(10)       # 永远猜「就是当前 token」
+--- below
+print("NextModel 的 loss:", round(lm_loss(next_model, token_batch).item(), 4))
+print("CopyModel 的 loss:", round(lm_loss(copy_model, token_batch).item(), 4))
 --- starter
 def lm_loss(model, tokens):
     logits = model(tokens)                       # (B, T, V)
@@ -535,6 +574,18 @@ padding 算进平均后，loss 会随 padding 的多少而变。换一个 batch 
 padding 位置的 target 填的是 0，而 0 也是一个真实的 token id，所以不能直接靠 `ignore_index`。
 
 返回**所有真 token 上**的平均 cross-entropy（按 token 平均，一个标量）。现在的代码已经把 padding 的 loss 乘成了 0，可结果还是不对。修好它。
+--- above
+# 上文：语言模型对一批补齐了的句子打的分；第 2 句只有 2 个真 token，后面补了 padding
+lm_logits = torch.randn(2, 4, 5)             # 2 句话、每句 4 个位置、词表 5 个词
+next_ids = torch.tensor([[1, 4, 2, 3],
+                         [2, 0, 0, 0]])       # 每个位置的下一个 token；padding 处填 0（第 2 句的第一个 0 是真 token）
+pad_mask = torch.tensor([[1., 1., 1., 1.],
+                         [1., 1., 0., 0.]])   # 1.0 = 真 token，0.0 = padding
+--- below
+loss = masked_lm_loss(lm_logits, next_ids, pad_mask)
+# 每句末尾再补 3 个 padding：F.pad 在末尾补 0，(0, 0, 0, 3) 是在倒数第 2 维（位置）后面补 3 个
+more = masked_lm_loss(F.pad(lm_logits, (0, 0, 0, 3)), F.pad(next_ids, (0, 3)), F.pad(pad_mask, (0, 3)))
+print("loss:", round(loss.item(), 4), "  每句再补 3 个 padding 后:", round(more.item(), 4))
 --- starter
 def masked_lm_loss(logits, targets, mask):
     V = logits.size(-1)
@@ -593,6 +644,16 @@ ref: day17
 注意：小 batch 不一定一样大，最后一个可能更小（比如 4, 4, 2）。
 
 测试用 SGD，因为 Adam 对梯度的整体缩放几乎不敏感，会把这个 bug 藏起来。
+--- above
+# 上文：显存一次只放得下 3 条，于是把 8 条的大 batch 切成 3、3、2 三份
+net = nn.Linear(3, 1)
+sgd = torch.optim.SGD(net.parameters(), lr=0.1)
+x, y = torch.randn(8, 3), torch.randn(8, 1)        # 大 batch：8 条
+parts = list(zip(x.split(3), y.split(3)))          # [(x, y), (x, y), (x, y)]，分别是 3、3、2 条
+--- below
+full = F.mse_loss(net(x), y).item()                # 对照：参数更新前，直接在 8 条上算的 loss
+got = accum_step(net, sgd, parts)
+print("accum_step 返回的 loss:", round(got, 4), "  直接在大 batch 上算:", round(full, 4))
 --- starter
 def accum_step(model, opt, micro_batches):
     opt.zero_grad()
@@ -669,6 +730,16 @@ ref: day17
 - 第二组：不要 weight decay 的参数（所有 bias 和 LayerNorm 的 weight），`"weight_decay": 0.0`
 
 每个参数必须恰好出现在一组里。现在的代码按名字找 bias，能跑，可 LayerNorm 的 weight 还是被 decay 了。改成可靠的规则：**1 维的参数（`p.ndim < 2`）不 decay，2 维及以上的 decay。**
+--- above
+# 上文：一个极小语言模型的三层，建优化器前要先给参数分组
+tiny_lm = nn.ModuleDict({"emb": nn.Embedding(6, 4),    # ModuleDict 只是给每层起个名字
+                         "norm": nn.LayerNorm(4),
+                         "head": nn.Linear(4, 6)})
+--- below
+groups = param_groups(tiny_lm, 0.1)
+decay_ids = [id(p) for p in groups[0]["params"]]   # 第一组（要 decay）里每个参数的 id（对象的编号）
+for name, p in tiny_lm.named_parameters():
+    print(f"{name:11s} 形状 {str(tuple(p.shape)):7s} ->", "decay" if id(p) in decay_ids else "不 decay")
 --- starter
 def param_groups(model, weight_decay):
     decay, no_decay = [], []
@@ -738,6 +809,14 @@ warmup 调度按「步」设计，却每个 epoch 才走一步，学习率就会
 学习率计划是线性 warmup：第 s 步（从 0 开始数，每做一次 `opt.step()` 算一步）的学习率是 `lr * min(1, (s + 1) / warmup)`。也就是前 8 步从 0.0125 升到 0.1，之后一直是 0.1。
 
 函数返回每一步 `opt.step()` 实际用到的学习率列表。现在的代码能跑，但学习率涨得太慢。修好它。
+--- above
+# 上文：一个小回归模型和 3 个训练 batch；训练 2 个 epoch，前 4 步 warmup
+net = nn.Linear(2, 1)
+loader = [(torch.randn(4, 2), torch.randn(4, 1)) for _ in range(3)]   # 3 个 batch，每个 4 条
+--- below
+used = train_with_warmup(net, loader, epochs=2, lr=0.1, warmup=4)
+print("实际的学习率:", [round(v, 4) for v in used])
+print("计划的学习率:", [round(0.1 * min(1, (s + 1) / 4), 4) for s in range(6)])
 --- starter
 def train_with_warmup(model, batches, epochs, lr=0.1, warmup=8):
     opt = torch.optim.SGD(model.parameters(), lr=lr)
@@ -819,6 +898,15 @@ attention mask 方向写反、多放了一个位置、卷积的 padding 让模�
 - 检查前先 `model.eval()`，并在 `torch.no_grad()` 里跑：有些模型带 Dropout，它的随机性会让输出本来就在变。
 
 测试会用到 `CumMean`（因果）、`TinyAttention(mask="causal" / "none" / "peek1")`、`SameConv`（padding=1 的卷积）和 `PeekMiddle`（只有位置 2 偷看了位置 3）。
+--- above
+# 上文：训练前，拿一小批随机输入检查两个准备用的序列模型
+seqs = torch.randn(1, 5, 8)      # 1 句话、5 个位置（token）、每个位置 8 维
+per_token = nn.Linear(8, 4)      # 每个位置各算各的：(1, 5, 8) -> (1, 5, 4)
+encoder = nn.TransformerEncoderLayer(8, nhead=2, dim_feedforward=16, batch_first=True)
+                                 # PyTorch 自带的 Transformer 层（带 Dropout），这里没加 mask，像 BERT
+--- below
+print("每个位置各算各的 Linear，是因果的吗:", check_causal(per_token, seqs))
+print("没加 mask 的 Transformer 层，是因果的吗:", check_causal(encoder, seqs))
 --- starter
 def check_causal(model, x):
     """model: (B, T, D) -> (B, T, D_out)   x: (B, T, D)
@@ -879,6 +967,16 @@ ref: day17
 - 在 `torch.no_grad()` 里做。
 
 注意：这个检查**不要**调用 `eval()`。它要检查的正是 `f` 在当前状态下的行为，比如你写的 `predict` 函数有没有忘了切模式。
+--- above
+# 上文：上线前检查：一条请求的结果，不能取决于它和谁分在同一个 batch
+requests = torch.randn(6, 4)     # 一批 6 条请求，每条 4 个特征
+layer_norm = nn.LayerNorm(4)     # 每条样本用它自己的均值和方差来归一化
+batch_norm = nn.BatchNorm1d(4)   # 新建的层默认在 train 模式：用整个 batch 的均值和方差
+--- below
+print("LayerNorm，样本互不影响吗:", check_batch_independent(layer_norm, requests))
+print("train 模式的 BatchNorm，样本互不影响吗:", check_batch_independent(batch_norm, requests))
+batch_norm.eval()                # 切到 eval：改用存下来的统计量
+print("eval 模式的 BatchNorm，样本互不影响吗:", check_batch_independent(batch_norm, requests))
 --- starter
 def check_batch_independent(f, x):
     """f: (B, ...) -> (B, ...)   x: (B, ...)
@@ -957,6 +1055,18 @@ ref: day17
 写 `masked_lm_loss(logits, targets, mask)`：`logits` (B, T, V)，`targets` (B, T) long，`mask` (B, T) float（1.0 = 真 token，0.0 = padding；padding 位置的 target 是 0，也是一个合法的 token id）。
 
 返回所有真 token 上的平均 cross-entropy（一个标量）。多补几列 padding，结果必须不变。
+--- above
+# 上文：一批补齐到 3 个位置的句子，语言模型在每个位置给 4 个词打分
+scores = torch.randn(2, 3, 4)                # 2 句话、每句 3 个位置、词表 4 个词
+next_ids = torch.tensor([[3, 1, 2],
+                         [0, 0, 0]])          # 第 2 句只有第 1 个是真 token（它的 id 正好是 0），后面是 padding
+real = torch.tensor([[1., 1., 1.],
+                     [1., 0., 0.]])           # 1.0 = 真 token，0.0 = padding
+--- below
+loss = masked_lm_loss(scores, next_ids, real)
+# 每句末尾再补 2 个 padding：F.pad 在末尾补 0，(0, 0, 0, 2) 是在倒数第 2 维（位置）后面补 2 个
+more = masked_lm_loss(F.pad(scores, (0, 0, 0, 2)), F.pad(next_ids, (0, 2)), F.pad(real, (0, 2)))
+print("loss:", round(loss.item(), 4), "  每句再补 2 个 padding 后:", round(more.item(), 4))
 --- starter
 def masked_lm_loss(logits, targets, mask):
     raise todo()
@@ -1009,6 +1119,15 @@ ref: day17
 写 `check_causal(model, x)`：`model` 把 (B, T, D) 变成 (B, T, D_out)，`x` 是 (B, T, D)。
 
 对每个位置 t = 0 … T-2，把 t 之后的输入换成随机数，位置 0..t 的输出都必须不变（`atol=1e-5`）。都不变返回 `True`，否则 `False`。模型可能带 Dropout。
+--- above
+# 上文：给新写的两个模型组件做因果性检查，输入是一小批随机的 token 向量
+seqs = torch.randn(2, 4, 8)      # 2 句话、每句 4 个位置、每个位置 8 维
+mlp = nn.Sequential(nn.Linear(8, 16), nn.GELU(), nn.Dropout(0.1), nn.Linear(16, 8))
+                                 # Transformer 块里的 MLP：每个位置各算各的，带 Dropout
+seq_softmax = nn.Softmax(dim=1)  # 沿着位置这一维（dim=1）做 softmax：每个位置的输出都用到了整句话
+--- below
+print("带 Dropout 的 MLP，是因果的吗:", check_causal(mlp, seqs))
+print("沿位置做的 softmax，是因果的吗:", check_causal(seq_softmax, seqs))
 --- starter
 def check_causal(model, x):
     raise todo()

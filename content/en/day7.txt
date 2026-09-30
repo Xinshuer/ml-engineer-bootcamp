@@ -277,6 +277,14 @@ Two things:
 2. **Work these out in your head first, do not run code**: replace every `None` in `CONV_SHAPES` with the output side length. The keys are `(H, kernel, stride, padding)`.
 
 The check first tests your formula against a real `nn.Conv2d`, then compares each of your mental answers.
+--- above
+# Where the input comes from: a 256x256 image through 3 conv layers (like the Encoder of exercise 4)
+side = 256
+layers = [(4, 2, 1), (4, 2, 1), (3, 1, 1)]     # (kernel, stride, padding) of each layer
+--- below
+for kernel, stride, padding in layers:
+    side = conv_out(side, kernel, stride, padding)
+    print("after the", (kernel, stride, padding), "conv, the side is", side)
 --- starter
 def conv_out(H, kernel, stride, padding):
     """Side length of an H x H image after Conv2d(kernel, stride, padding)."""
@@ -340,6 +348,15 @@ Write `reparameterize(mu, logvar)`:
 - Do not use `torch.normal` or `.sample()` from `torch.distributions`: the gradient would not reach `mu` and `logvar`.
 
 The check draws 20,000 samples to test the mean and the standard deviation, then makes sure gradients reach `mu` and `logvar`.
+--- above
+# Where the input comes from: for one image, the encoder gives a mu and a logvar per latent dimension
+mu = torch.tensor([[0.5, -1.0, 2.0]])        # (1, 3): 1 image, 3 dimensions
+logvar = torch.tensor([[0.0, -2.0, 1.0]])    # log of the variance: variance = exp(logvar)
+--- below
+z = reparameterize(mu.repeat(10000, 1), logvar.repeat(10000, 1))   # 10,000 copies of the image
+print("z:", tuple(z.shape))
+print("mean of each dimension:", [round(v, 2) for v in z.mean(0).tolist()])
+print("std of each dimension:", [round(v, 2) for v in z.std(0).tolist()])
 --- starter
 def reparameterize(mu, logvar):
     """z = mu + std * eps, where std = exp(0.5 * logvar) and eps ~ N(0, 1)."""
@@ -390,6 +407,14 @@ Write `kl_normal(mu, logvar)`: return the KL divergence of q = N(mu, exp(logvar)
 - For each sample, add up the KL over all its dimensions. Return shape `(B,)`.
 
 The second check compares your closed form with a Monte Carlo estimate from 400,000 samples.
+--- above
+# Where the input comes from: for 3 images, the encoder gives a mu and a logvar per latent dimension
+mu = torch.tensor([[0.1, -0.2], [2.0, 1.0], [0.0, 0.5]])        # (3, 2): 3 images, 2 dims each
+logvar = torch.tensor([[0.0, 0.1], [-1.0, 0.0], [0.5, -0.5]])   # the first image is close to N(0, 1)
+--- below
+kl = kl_normal(mu, logvar)
+print("shape of kl:", tuple(kl.shape))
+print("KL of each image:", [round(v, 4) for v in kl.tolist()])
 --- starter
 def kl_normal(mu, logvar):
     """KL( N(mu, exp(logvar)) || N(0, 1) ), summed over all dimensions of each sample; returns (B,)."""
@@ -448,6 +473,14 @@ Conv2d(64 -> 2*z_ch,  kernel 3, stride 1, padding 1)   8x8 stays 8x8
 ```
 
 `forward(x)`: `x` has shape `(B, 3, 32, 32)`. Cut the `2*z_ch` output channels of the last layer in two: the first `z_ch` are `mu`, the last `z_ch` are `logvar`. Return `(mu, logvar)`, both of shape `(B, z_ch, 8, 8)`.
+--- above
+# Where the input comes from: a batch of 32x32 color images for training, pixels scaled to [-1, 1]
+images = torch.rand(5, 3, 32, 32) * 2 - 1     # (5 images, 3 RGB channels, height 32, width 32)
+--- below
+encoder = Encoder(z_ch=4)
+mu, logvar = encoder(images)
+print("images:", tuple(images.shape), "-> mu:", tuple(mu.shape), " logvar:", tuple(logvar.shape))
+print("learnable parameters:", sum(p.numel() for p in encoder.parameters()))
 --- starter
 class Encoder(nn.Module):
     def __init__(self, z_ch=4):
@@ -508,6 +541,14 @@ Conv2d(32 -> 3,    kernel 3, stride 1, padding 1), Tanh    32x32
 Upsample with `nn.Upsample(scale_factor=2, mode="nearest")`, not with `ConvTranspose2d`.
 
 `forward(z)`: `z` has shape `(B, z_ch, 8, 8)`. Return an image of shape `(B, 3, 32, 32)` with values in [-1, 1].
+--- above
+# Where the input comes from: after the Encoder and sampling, each image is a (4, 8, 8) latent z
+z = torch.randn(5, 4, 8, 8)     # z of 5 images: 4 channels, 8x8
+--- below
+decoder = Decoder(z_ch=4)
+images = decoder(z)
+print("z:", tuple(z.shape), "-> images:", tuple(images.shape))
+print("smallest pixel:", round(images.min().item(), 2), " largest:", round(images.max().item(), 2))
 --- starter
 class Decoder(nn.Module):
     def __init__(self, z_ch=4):
@@ -560,6 +601,17 @@ Write `vae_loss(x, x_hat, mu, logvar, beta=1.0)`. It returns three scalars `(tot
 - `total = recon + beta * kl`.
 
 `kl_normal(mu, logvar)` from exercise 3 is already defined for you; call it directly (it returns `(B,)`).
+--- above
+# Where the input comes from: one training step: x, the decoder's x_hat, the encoder's mu and logvar
+x = torch.rand(4, 3, 32, 32) * 2 - 1       # 4 color images of 32x32, values in [-1, 1]
+x_hat = x + 0.1 * torch.randn_like(x)      # a good reconstruction, each pixel a little off
+mu = torch.randn(4, 4, 8, 8) * 0.5         # each image's latent is (4, 8, 8)
+logvar = torch.randn(4, 4, 8, 8) * 0.1
+--- below
+total, recon, kl = vae_loss(x, x_hat, mu, logvar, beta=1.0)
+print("recon:", round(recon.item(), 2), " kl:", round(kl.item(), 2), " total:", round(total.item(), 2))
+total_b4, _, _ = vae_loss(x, x_hat, mu, logvar, beta=4.0)
+print("total with beta=4:", round(total_b4.item(), 2))
 --- starter
 def vae_loss(x, x_hat, mu, logvar, beta=1.0):
     """Return (total, recon, kl), all three scalars."""
@@ -602,6 +654,13 @@ Write `compression(H, W, C_img, h, w, C_z)`: return "number of elements in the i
 - The image has shape `(C_img, H, W)`: H × W × C_img elements.
 - The latent has shape `(C_z, h, w)`: h × w × C_z elements.
 - Return a number (a decimal is fine). For example, 32x32x3 squeezed into 8x8x4 is 12 times.
+--- above
+# Where the input comes from: the VAEs of SDXL and FLUX turn a 1024x1024 image into a 128x128 latent
+img_h, img_w, img_ch = 1024, 1024, 3     # the image: height, width, 3 color channels
+lat_h, lat_w = 128, 128                  # latent height and width; channels: SDXL 4, FLUX 16
+--- below
+print("SDXL (4 latent channels):", compression(img_h, img_w, img_ch, lat_h, lat_w, 4), "times")
+print("FLUX (16 latent channels):", compression(img_h, img_w, img_ch, lat_h, lat_w, 16), "times")
 --- starter
 def compression(H, W, C_img, h, w, C_z):
     """Return image elements / latent elements."""
@@ -634,6 +693,14 @@ Stable Diffusion code is full of 0.18215. It scales the VAE latents to a standar
 Write `fit_scaling_factor(latents)`: given a batch of latents from a VAE encoder (a tensor of any shape), return a Python float `s` such that the overall standard deviation of `latents * s` is about 1.
 
 The check uses latents with a standard deviation of about 5.49, and you should get about 0.182. That is where Stable Diffusion's 0.18215 comes from.
+--- above
+# Where the input comes from: a new VAE (SDXL's, say) encoded a batch of images
+latents = torch.randn(16, 4, 8, 8) * 7.68     # latents of 16 images, std about 7.7
+--- below
+s = fit_scaling_factor(latents)
+print("s:", round(s, 4))
+print("std before multiplying by s:", round(latents.std().item(), 2))
+print("std after multiplying by s:", round((latents * s).std().item(), 2))
 --- starter
 def fit_scaling_factor(latents):
     """Return s such that (latents * s).std() ≈ 1."""
@@ -673,6 +740,14 @@ Write `collapsed_dims(mu, logvar, thresh=0.01)`: return the number of collapsed 
 - A dimension whose average KL is below `thresh` has collapsed. Count them.
 
 You cannot use `kl_normal` here: it adds all dimensions together, and you need to look at each dimension separately.
+--- above
+# Where the input comes from: a VAE trained for a while, 200 images, 5-dim mu and logvar per image
+scale = torch.tensor([1.2, 0.02, 0.9, 0.0, 0.5])    # how much each dim's mu varies across images
+mu = torch.randn(200, 5) * scale                    # (200, 5)
+logvar = torch.tensor([-1.0, 0.0, -0.8, 0.0, 0.0]).repeat(200, 1)   # (200, 5), same for every image
+--- below
+print("collapsed dimensions:", collapsed_dims(mu, logvar))
+print("with a looser thresh=0.2:", collapsed_dims(mu, logvar, thresh=0.2))
 --- starter
 def collapsed_dims(mu, logvar, thresh=0.01):
     """mu, logvar: (B, D). Return the number of dimensions whose average KL < thresh."""
@@ -716,6 +791,17 @@ Bugs like these raise no error: the loss is still a number and training still ru
 It has **3 bugs**. Find and fix them. Keep the function name and the return value `(loss, z)`.
 
 The check compares your loss with the correct `vae_loss` (already defined), then tests the standard deviation of the sampled `z`.
+--- above
+# Where the input comes from: one training step: x, the decoder's x_hat, the encoder's mu and logvar
+x = torch.rand(500, 3, 8, 8) * 2 - 1           # 500 small 8x8 color images
+x_hat = x + 0.1 * torch.randn_like(x)          # a good reconstruction, each pixel a little off
+mu = torch.randn(500, 4) * 0.5                 # 4 latent dimensions per image
+logvar = torch.full((500, 4), math.log(0.25))  # every variance is 0.25
+--- below
+loss, z = vae_step_buggy(x, x_hat, mu, logvar, beta=1.0)
+total, recon, kl = vae_loss(x, x_hat, mu, logvar, beta=1.0)    # the correct one, already defined
+print("your loss:", round(loss.item(), 2), "  vae_loss:", round(total.item(), 2))
+print("std of z around mu:", round((z - mu).std().item(), 2))
 --- starter
 def vae_step_buggy(x, x_hat, mu, logvar, beta=1.0):
     std = torch.exp(logvar)
@@ -870,6 +956,15 @@ ref: day7
 Closed-book rewrite. Reparameterization is what makes a VAE trainable, and interviews often ask you to write it on the spot.
 --- prompt
 Without notes, write `reparameterize(mu, logvar)`: sample `z` (same shape as `mu`) from the normal distribution with mean `mu` and log-variance `logvar`, in a way that lets gradients reach `mu` and `logvar`.
+--- above
+# Where the input comes from: the encoder's mu and logvar for one image; training needs their gradients
+mu = torch.tensor([[1.0, 0.0, -0.5]], requires_grad=True)       # (1, 3): 1 image, 3 dimensions
+logvar = torch.tensor([[0.0, 0.5, -1.0]], requires_grad=True)   # log of the variance
+--- below
+z = reparameterize(mu, logvar)
+z.sum().backward()                  # in training this is loss.backward(); z.sum() stands in for the loss
+print("gradient of mu:", mu.grad[0].tolist())
+print("gradient of logvar:", [round(v, 3) for v in logvar.grad[0].tolist()])
 --- starter
 def reparameterize(mu, logvar):
     raise todo()
@@ -913,6 +1008,14 @@ ref: day7
 Closed-book rewrite. The closed-form KL between Gaussians is one of the most frequent VAE interview questions; you should get it right without notes.
 --- prompt
 Without notes, write `kl_normal(mu, logvar)`: return the KL divergence of N(mu, exp(logvar)) from N(0, 1). The input shape is `(B, ...)`; sum over all dimensions of each sample and return `(B,)`.
+--- above
+# Where the input comes from: the Encoder of exercise 4 gives mu and logvar of shape (2, 4, 8, 8)
+mu = torch.randn(2, 4, 8, 8) * 0.5
+logvar = torch.randn(2, 4, 8, 8) * 0.3
+--- below
+kl = kl_normal(mu, logvar)
+print("shape of kl:", tuple(kl.shape))
+print("KL of each image:", [round(v, 2) for v in kl.tolist()])
 --- starter
 def kl_normal(mu, logvar):
     raise todo()

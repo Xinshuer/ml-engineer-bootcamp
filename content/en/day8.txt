@@ -330,6 +330,14 @@ Write `linear_schedule(T, beta_start=1e-4, beta_end=0.02)`. It returns a dict wi
 - `"alphas_cumprod"`: the cumulative product of alphas (alpha_bar). Entry i = alphas[0] × alphas[1] × … × alphas[i]
 
 Each one is a single torch call. You do not need a for loop.
+--- above
+# Where the input comes from: a training script first sets the number of steps and the beta range
+# Only 6 steps on purpose, so you can check by hand (real runs: 1000 steps, beta 0.0001 to 0.02)
+num_steps, first_beta, last_beta = 6, 0.05, 0.3
+--- below
+sched = linear_schedule(num_steps, first_beta, last_beta)
+for name in ("betas", "alphas", "alphas_cumprod"):
+    print(f"{name}:", [round(v, 3) for v in sched[name].tolist()])
 --- starter
 def linear_schedule(T, beta_start=1e-4, beta_end=0.02):
     """Returns {"betas": (T,), "alphas": (T,), "alphas_cumprod": (T,)}"""
@@ -376,6 +384,16 @@ Write `cosine_schedule(T, s=0.008)`. It returns a dict with the same structure a
 5. `alphas = 1 - betas`
 
 Use the result of step 3 directly as `"alphas_cumprod"`. `linear_schedule` is provided (a check compares against it).
+--- above
+# Where the input comes from: before training on 32×32 images, you compare linear and cosine
+num_steps = 1000
+check_steps = [0, 200, 400, 600, 800, 999]   # a few timesteps: how much signal is left at each?
+lin = linear_schedule(num_steps)             # the reference version of item 1's linear schedule
+--- below
+sched = cosine_schedule(num_steps)
+print("linear alpha_bar:", [round(lin["alphas_cumprod"][i].item(), 3) for i in check_steps])
+print("cosine alpha_bar:", [round(sched["alphas_cumprod"][i].item(), 3) for i in check_steps])
+print("cosine, last beta:", round(sched["betas"][-1].item(), 3))
 --- starter
 def cosine_schedule(T, s=0.008):
     """Returns {"betas": (T,), "alphas": (T,), "alphas_cumprod": (T,)}, with alphas_cumprod from the cosine curve"""
@@ -427,6 +445,16 @@ Return each sample's coefficient `arr[t]`, reshaped to `(B, 1, 1, 1)` (the numbe
 Example: arr = [0, 1, …, 9], t = [3, 7], x_shape = (2, 3, 4, 4) → shape (2, 1, 1, 1) with values 3 and 7; x_shape = (2, 5) → shape (2, 1).
 
 First move arr to t's device: `arr.to(t.device)`.
+--- above
+# Where the input comes from: in training, each image in the batch has its own t
+alphas_cumprod = torch.tensor([0.99, 0.9, 0.7, 0.4, 0.1])   # a very short coefficient table (T = 5)
+timesteps = torch.tensor([4, 0, 2])                         # the t of each of the 3 images
+images = torch.randn(3, 1, 8, 8)                            # 3 grayscale 8×8 images: (B, C, H, W)
+--- below
+coef = extract(alphas_cumprod, timesteps, images.shape)
+print("coefficients:", [round(v, 2) for v in coef.flatten().tolist()], " shape:", tuple(coef.shape))
+print("shape of coef * images:", tuple((coef * images).shape))
+print("when x has shape (3, 16):", tuple(extract(alphas_cumprod, timesteps, (3, 16)).shape))
 --- starter
 def extract(arr, t, x_shape):
     """arr (T,), t (B,) -> (B, 1, 1, ...), broadcastable against a tensor of shape x_shape"""
@@ -473,6 +501,17 @@ x_t = sqrt(alpha_bar_t) * x0 + sqrt(1 - alpha_bar_t) * noise
 - the result has the same shape as x0
 
 The second check first noises 20,000 samples step by step for 61 steps, then jumps there with your q_sample and compares the means and standard deviations.
+--- above
+# Where the input comes from: in training, a batch of clean images, a random t each, and noise
+schedule = linear_schedule(1000)             # the reference version of item 1's schedule
+images = torch.ones(3, 1, 32, 32)            # 3 grayscale 32×32 images, every pixel 1.0 (easy to read)
+timesteps = torch.tensor([10, 400, 900])     # each image's own t
+eps = torch.randn_like(images)               # standard Gaussian noise
+--- below
+noisy = q_sample(images, timesteps, eps, schedule)
+print("shape:", tuple(noisy.shape))
+print("mean of each image:", [round(v, 2) for v in noisy.mean(dim=(1, 2, 3)).tolist()])
+print("std of each image:", [round(v, 2) for v in noisy.std(dim=(1, 2, 3)).tolist()])
 --- starter
 def q_sample(x0, t, noise, sched):
     """x0, noise: (B, C, H, W); t: (B,)  ->  x_t, same shape as x0"""
@@ -550,6 +589,14 @@ Write `timestep_embedding(t, dim, max_period=10000)`: t holds integer timesteps 
 4. return `cat([cos(args), sin(args)], dim=-1)`: **cos first, then sin**
 
 Give `torch.arange` a `device=t.device`. Without it you still pass the checks on the CPU, but as soon as the model moves to a GPU you get "Expected all tensors to be on the same device".
+--- above
+# Where the input comes from: each image in a batch has an integer t; the UNet needs vectors
+timesteps = torch.tensor([0, 250, 999])      # the t of each of the 3 images
+--- below
+emb = timestep_embedding(timesteps, 8)
+print("shape:", tuple(emb.shape))
+for t_val, row in zip(timesteps.tolist(), emb.tolist()):
+    print(f"t={t_val}:", [round(v, 2) for v in row])
 --- starter
 def timestep_embedding(t, dim, max_period=10000):
     """t: (B,) integer timesteps  ->  (B, dim); first half cos, second half sin"""
@@ -598,6 +645,15 @@ Write `class FiLM(nn.Module)`:
   3. return `h * (1 + scale) + shift`
 
 A check sets all of the Linear layer's weights and biases to zero; the output must then be exactly h.
+--- above
+# Where the input comes from: one UNet layer's conv features h and the batch's time vectors emb
+features = torch.randn(2, 16, 8, 8)                       # 2 images, 16 channels, 8×8
+t_emb = timestep_embedding(torch.tensor([10, 900]), 32)   # (2, 32); the reference version of item 5
+--- below
+film = FiLM(32, 16)
+out = film(features, t_emb)
+print("h:", tuple(features.shape), " emb:", tuple(t_emb.shape), " output:", tuple(out.shape))
+print("number of FiLM parameters:", sum(p.numel() for p in film.parameters()))
 --- starter
 class FiLM(nn.Module):
     """emb (B, t_dim) -> a scale and a shift per channel; output h * (1 + scale) + shift"""
@@ -656,6 +712,15 @@ return h + skip(x)
 - `skip`: `nn.Conv2d(in_ch, out_ch, 1)` when in_ch ≠ out_ch, otherwise `nn.Identity()`
 - x is `(B, in_ch, H, W)`, emb is `(B, t_dim)`, the output is `(B, out_ch, H, W)`
 - `FiLM` is provided (the reference version)
+--- above
+# Where the input comes from: MiniUNet's encoder, features after downsampling, plus time vectors
+features = torch.randn(2, 32, 16, 16)        # 2 images, 32 channels, 16×16
+t_emb = torch.randn(2, 128)                  # time vectors, t_dim = 128
+--- below
+for channels in (32, 64):
+    block = ResBlock(32, channels, 128)
+    n_params = sum(p.numel() for p in block.parameters())
+    print(f"ResBlock(32, {channels}, 128) output:", tuple(block(features, t_emb).shape), " parameters:", n_params)
 --- starter
 class ResBlock(nn.Module):
     """x (B, in_ch, H, W), emb (B, t_dim) -> (B, out_ch, H, W)"""
@@ -714,6 +779,15 @@ Write `unet_skip_concat(up_feat, skip_feat)`:
 - return their concatenation along the channel dimension, `(B, C1+C2, H, W)`, with up_feat first and skip_feat second
 
 If H' or W' is smaller than the skip's size (after downsampling and upsampling an odd size they are often 1 short), first pad up_feat with zeros on the right and at the bottom until it matches skip_feat, then concatenate.
+--- above
+# Where the input comes from: the UNet decoder joins upsampled features with the encoder's saved ones
+enc_feat = torch.randn(1, 32, 15, 15)        # features the encoder saved: 32 channels, 15×15 (odd)
+dec_feat = torch.randn(1, 64, 7, 7)          # this decoder level's features: 64 channels, 7×7
+upsampled = nn.Upsample(scale_factor=2, mode="nearest")(dec_feat)   # upsampled to 14×14, one short of 15
+--- below
+merged = unet_skip_concat(upsampled, enc_feat)
+print("upsampled:", tuple(upsampled.shape), " skip:", tuple(enc_feat.shape))
+print("concatenated:", tuple(merged.shape))
 --- starter
 def unet_skip_concat(up_feat, skip_feat):
     """(B, C1, H', W') + (B, C2, H, W) -> (B, C1+C2, H, W)"""
@@ -771,6 +845,15 @@ out   : GroupNorm(8, 32) -> SiLU -> Conv2d(32, in_ch, 3, 1, 1)
 - `timestep_embedding`, `ResBlock` and `unet_skip_concat` are provided (reference versions)
 
 Checks: the output has x's shape; a different t must change the output (proof that the time conditioning is wired in).
+--- above
+# Where the input comes from: in training, noisy images and their t go in; the UNet guesses the noise
+noisy = torch.randn(2, 3, 32, 32)            # 2 noisy RGB 32×32 images, so in_ch = 3
+timesteps = torch.tensor([50, 800])
+--- below
+model = MiniUNet(in_ch=3)
+eps_pred = model(noisy, timesteps)
+print("input:", tuple(noisy.shape), " predicted noise:", tuple(eps_pred.shape))
+print("parameters:", sum(p.numel() for p in model.parameters()))
 --- starter
 class MiniUNet(nn.Module):
     """forward(x, t): x (B, in_ch, 32, 32), t (B,) -> same shape as x (the predicted noise). Structure: see the task."""
@@ -843,6 +926,17 @@ Write `ddpm_loss(model, x0, sched, T)`, which returns a scalar loss:
 4. return the MSE between `model(x_t, t)` and `noise`: the target is the noise, not x0
 
 One check uses a model that always outputs 0. Its loss should be about the variance of the noise, which is 1.
+--- above
+# Where the input comes from: each step of the training loop takes a batch of clean images
+num_steps = 1000
+schedule = linear_schedule(num_steps)        # the reference version of item 1's schedule
+unet = MiniUNet(in_ch=1)                     # the reference version of item 9's UNet, not trained yet
+zero_model = lambda x, t: torch.zeros_like(x)   # a "model" that always outputs 0, as a baseline
+images = torch.rand(8, 1, 32, 32) * 2 - 1    # 8 grayscale 32×32 images, pixels scaled to [-1, 1]
+--- below
+loss = ddpm_loss(unet, images, schedule, num_steps)
+print("untrained UNet: loss =", round(loss.item(), 1), " shape:", tuple(loss.shape))
+print("always-0 model: loss =", round(ddpm_loss(zero_model, images, schedule, num_steps).item(), 1))
 --- starter
 def ddpm_loss(model, x0, sched, T):
     """Returns a scalar loss: mse(model(x_t, t), noise)"""
@@ -897,6 +991,18 @@ x_0     = mean                            # t == 0: no noise on the last step
 - `t`: `(B,)`, and each sample may differ. So decide "add noise or not" per sample (a `(B, 1, 1, 1)` switch of 0s and 1s); do not write one Python `if` for the whole batch
 - if `noise` is None, sample it yourself with `torch.randn_like(x_t)`
 - get beta_t, alpha_t and alpha_bar_t from `sched["betas"]`, `sched["alphas"]` and `sched["alphas_cumprod"]` with `extract`
+--- above
+# Where the input comes from: one sampling step; you hold a noisy x_t and the predicted noise
+schedule = linear_schedule(1000)                          # the reference version of item 1's schedule
+clean = torch.ones(2, 1, 8, 8)                            # pretend we know the clean image (all 1.0) to compare
+true_eps = torch.randn_like(clean)
+timesteps = torch.tensor([0, 10])                         # image 0 is at the last step, image 1 has 10 to go
+noisy = q_sample(clean, timesteps, true_eps, schedule)    # the reference version of item 4's noising
+--- below
+prev = p_sample_step(noisy, timesteps, true_eps, schedule)   # as if the UNet guessed the noise perfectly
+print("shape:", tuple(prev.shape))
+gap = (prev - clean).abs().mean(dim=(1, 2, 3))                # how far each image is from the clean one
+print("mean distance from the clean image:", [round(v, 3) for v in gap.tolist()])
 --- starter
 def p_sample_step(x_t, t, eps_pred, sched, noise=None):
     """One DDPM reverse step: x_t -> x_{t-1}. t: (B,); samples with t == 0 get no noise"""
@@ -968,6 +1074,14 @@ SNR(t) = alpha_bar_t / (1 - alpha_bar_t)
 - `sched`: the dict from item 1; alpha_bar is `sched["alphas_cumprod"]`
 - `t`: timesteps of shape `(B,)`
 - return `(B,)` (no reshape to `(B, 1, 1, 1)` here)
+--- above
+# Where the input comes from: to compare two schedules, you look at each one's SNR at the same t
+timesteps = torch.tensor([100, 500, 900])
+linear = linear_schedule(1000)               # the reference version of item 1
+cosine = cosine_schedule(1000)               # the reference version of item 2
+--- below
+print("linear SNR:", [round(v, 4) for v in snr(linear, timesteps).tolist()])
+print("cosine SNR:", [round(v, 4) for v in snr(cosine, timesteps).tolist()])
 --- starter
 def snr(sched, t):
     """t: (B,) -> (B,)"""
@@ -1000,6 +1114,16 @@ ref: day8
 This code runs, raises no error and even gets the shape right, yet the model will never train well. Bugs like this are only caught by comparing against a reference implementation.
 --- prompt
 The noising function below has **2** mistakes. Fix it so its output is exactly the same as the correct `q_sample` (the check compares them at t = 0, 300 and 999). Do not rename the function.
+--- above
+# Where the input comes from: before training, you try the noising function on a batch of images
+schedule = linear_schedule(1000)             # the reference version of item 1's schedule
+images = torch.ones(3, 1, 32, 32)            # 3 grayscale 32×32 images, every pixel 1.0
+timesteps = torch.tensor([50, 500, 950])
+eps = torch.randn_like(images)               # standard Gaussian noise
+--- below
+noisy = q_sample_buggy(images, timesteps, eps, schedule)
+print("mean of each image:", [round(v, 2) for v in noisy.mean(dim=(1, 2, 3)).tolist()])
+print("std of each image:", [round(v, 2) for v in noisy.std(dim=(1, 2, 3)).tolist()])
 --- starter
 def q_sample_buggy(x0, t, noise, sched):
     a = extract(sched["alphas"], t, x0.shape)
@@ -1124,6 +1248,17 @@ Without notes, write `q_sample(x0, t, noise, sched)`: compute the noisy image x_
 - `x0`, `noise`: `(B, C, H, W)`; `t`: `(B,)`, and each sample may have a different t
 - `sched`: the dict returned by `linear_schedule`, with `"betas"`, `"alphas"` and `"alphas_cumprod"`
 - you may use `extract`
+--- above
+# Where the input comes from: in the training loop, each RGB image in the batch got its own t
+schedule = linear_schedule(1000)             # the reference version of item 1's schedule
+images = torch.full((2, 3, 16, 16), 2.0)     # 2 RGB 16×16 images, every pixel 2.0
+timesteps = torch.tensor([100, 700])
+eps = torch.randn_like(images)               # standard Gaussian noise
+--- below
+noisy = q_sample(images, timesteps, eps, schedule)
+print("shape:", tuple(noisy.shape))
+print("mean of each image:", [round(v, 2) for v in noisy.mean(dim=(1, 2, 3)).tolist()])
+print("std of each image:", [round(v, 2) for v in noisy.std(dim=(1, 2, 3)).tolist()])
 --- starter
 def q_sample(x0, t, noise, sched):
     raise todo()
@@ -1198,6 +1333,17 @@ Without notes, write `p_sample_step(x_t, t, eps_pred, sched, noise=None)`: one D
 - `t`: `(B,)`, and each sample may differ. Samples with t > 0 get sqrt(beta_t) times the noise added; samples with t = 0 get none
 - if `noise` is None, sample it yourself
 - `sched` has `"betas"`, `"alphas"` and `"alphas_cumprod"`; you may use `extract`
+--- above
+# Where the input comes from: near the end of sampling, the images in the batch are at different steps
+schedule = linear_schedule(1000)                          # the reference version of item 1's schedule
+clean = torch.full((3, 1, 8, 8), -0.5)                    # pretend we know the clean image, to compare
+true_eps = torch.randn_like(clean)
+timesteps = torch.tensor([50, 1, 0])
+noisy = q_sample(clean, timesteps, true_eps, schedule)    # the reference noising, up to each image's t
+--- below
+prev = p_sample_step(noisy, timesteps, true_eps, schedule)   # as if the UNet guessed the noise perfectly
+gap = (prev - clean).abs().mean(dim=(1, 2, 3))                # how far each image is from the clean one
+print("mean distance from the clean image:", [round(v, 3) for v in gap.tolist()])
 --- starter
 def p_sample_step(x_t, t, eps_pred, sched, noise=None):
     raise todo()

@@ -424,6 +424,19 @@ DDP 存下的权重带 `module.`，torch.compile 过的模型带 `_orig_mod.`，
 - key 以 prefixes 里的某一个开头，就把它去掉。可能套了好几层（比如 `_orig_mod.module.head.weight`），要一直去到开头不再是这些前缀为止。
 - 只去**开头**的前缀。`encoder.module.weight` 中间的 `module.` 是真的子模块名字，要保留。
 - 值（张量）原样放进新 dict，顺序不变。
+--- above
+# 上文：多卡（DDP）训练、又 torch.compile 过的模型，存下来的 state_dict
+ckpt_sd = {
+    "_orig_mod.module.body.weight": torch.randn(8, 4),   # 外层是 compile 的壳，里层是 DDP 的壳
+    "_orig_mod.module.body.bias": torch.randn(8),
+    "_orig_mod.module.head.weight": torch.randn(2, 8),
+    "_orig_mod.module.head.bias": torch.randn(2),
+}
+--- below
+clean = strip_prefix(ckpt_sd)
+print("去掉前缀后:", list(clean))
+print("原来的 dict 没被改，第一个 key 还是:", list(ckpt_sd)[0])
+print("加载进推理用的 Net:", Net().load_state_dict(clean))   # Net：今天卡片里的小模型，没有壳
 --- starter
 def strip_prefix(sd, prefixes=("module.", "_orig_mod.")):
     """返回一个新 dict：每个 key 去掉开头的 prefixes（可能好几层），值不变。"""
@@ -518,6 +531,20 @@ checkpoint 加载失败时，最费时间的是搞清楚「到底哪里对不上
 1. **先检查，不要先加载。** 拿 `model.state_dict()` 的 key（包括 BatchNorm 的 `running_mean` 这类 buffer）和 `sd` 的 key 比较，找出三种问题：missing（模型有、sd 里没有）、unexpected（sd 里有、模型没有）、shape 不同（两边都有，但 shape 不一样）。
 2. 只要有任何一种问题，就 `raise ValueError(...)`，消息里写出所有出问题的 key 的名字。这时模型的权重**一个都不能变**。
 3. 全都对得上，才 `model.load_state_dict(sd)`，然后返回 `model`。
+--- above
+# 上文：要上线的 Net，和一个旧 checkpoint（旧版本的最后一层叫 classifier）
+model_to_serve = Net()                        # Net：今天卡片里的小模型（body: Linear 4→8，head: Linear 8→2）
+old_ckpt = {                                  # 名字 -> 张量
+    "body.weight": torch.randn(8, 4),
+    "body.bias": torch.randn(8),
+    "classifier.weight": torch.randn(2, 8),   # 现在的 Net 里，这一层叫 head
+    "classifier.bias": torch.randn(2),
+}
+--- below
+try:
+    print("加载成功:", load_strict(model_to_serve, old_ckpt) is model_to_serve)
+except ValueError as e:
+    print("ValueError:", e)
 --- starter
 def load_strict(model, sd):
     """先检查，全部对得上才加载。对不上就 raise ValueError，消息里列出所有出问题的 key。"""
@@ -624,6 +651,22 @@ v1 的代码里最后一层叫 `classifier`，所以旧 checkpoint 的 key 是 `
 
 - 把开头的旧名字 `classifier.` 换成新名字 `head.`；
 - 用 strict=True 加载（默认就是）：以后再有对不上的 key，立刻报错，而不是悄悄跑一个半随机的模型。
+--- above
+# 上文：v1 训练时存下的 checkpoint，那时最后一层还叫 classifier
+import os, tempfile
+v1_weights = {
+    "body.weight": torch.randn(8, 4),
+    "body.bias": torch.randn(8),
+    "classifier.weight": torch.randn(2, 8),
+    "classifier.bias": torch.randn(2),
+}
+run_dir = tempfile.TemporaryDirectory()      # 临时文件夹，代替真实项目里的 checkpoints/，用完会自动删掉
+v1_path = os.path.join(run_dir.name, "v1.pt")
+torch.save(v1_weights, v1_path)
+--- below
+v2 = load_v1_checkpoint(Net(), v1_path)      # Net：重构后的模型，最后一层叫 head
+print("body 用的是 v1 的权重:", torch.equal(v2.body.weight, v1_weights["body.weight"]))
+print("head 用的是 v1 的权重:", torch.equal(v2.head.weight, v1_weights["classifier.weight"]))
 --- starter
 def load_v1_checkpoint(model, path):
     sd = torch.load(path, weights_only=True)
@@ -702,6 +745,18 @@ Hugging Face 上的模型几乎都是 model.safetensors：只有张量、没有�
 
 - `save_weights(model, path, step)`：用 `save_file` 把 `model.state_dict()` 存成 safetensors，metadata 里记下 `{"step": "<step>"}`。
 - `load_weights(model, path)`：用 `load_file` 读出来，strict 加载进 `model`；再用 `safe_open` 读 metadata，返回 step（int）。
+--- above
+# 上文：训练到第 3000 步，要把权重发布成 model.safetensors
+import os, tempfile
+trained = Net()                               # Net：今天卡片里的小模型，就当它已经训练好了
+deployed = Net()                              # 部署那边：用代码造好的模型，等着装数字
+run_dir = tempfile.TemporaryDirectory()       # 临时文件夹，用完会自动删掉
+weights_path = os.path.join(run_dir.name, "model.safetensors")
+--- below
+save_weights(trained, weights_path, 3000)
+step = load_weights(deployed, weights_path)
+print("读回来的 step:", step, "| 类型:", type(step).__name__)
+print("部署的模型和训练好的一样吗:", torch.equal(deployed.head.weight, trained.head.weight))
 --- starter
 def save_weights(model, path, step):
     raise todo()
@@ -773,6 +828,17 @@ ref: day20
 - 加载仍然是严格的：不许用 `strict=False` 糊过去。
 
 `safetensors.torch` 里除了 `save_file` / `load_file`，还有 `save_model` / `load_model`，都已经 import 好了。
+--- above
+# 上文：训练好的小语言模型，词嵌入和输出层共用一个权重（GPT-2 也是这样）
+import os, tempfile
+lm = TinyLM()                                 # TinyLM：今天卡片里的模型，lm.head.weight 就是 lm.emb.weight（10×8）
+run_dir = tempfile.TemporaryDirectory()       # 临时文件夹，用完会自动删掉
+lm_path = os.path.join(run_dir.name, "lm.safetensors")
+--- below
+save_lm(lm, lm_path)
+print("文件里存了:", list(load_file(lm_path)))
+fresh = load_lm(TinyLM(), lm_path)
+print("加载后仍然共享:", fresh.head.weight is fresh.emb.weight, "| 数字一样:", torch.equal(fresh.emb.weight, lm.emb.weight))
 --- starter
 def save_lm(model, path):
     save_file(model.state_dict(), path)
@@ -880,6 +946,21 @@ ref: day20
 要存的：模型、优化器、scheduler 各自的 `state_dict()`，step，以及随机数状态（至少 `torch.get_rng_state()`；有 GPU 时再加 `torch.cuda.get_rng_state_all()`；用了 `random` 模块再加 `random.getstate()`）。
 
 检查会做这个实验：A 不间断训练 5 步；B 训练 3 步 → 存 → 打乱随机数、造全新的对象 → 加载 → 再训练 2 步。A 和 B 的 loss 和最终权重必须**完全**一样。训练用的是卡片里的 `make_run()`（Net + AdamW + StepLR）和 `train_step()`（数据用 `torch.randn` 现造，模型里有 dropout）。
+--- above
+# 上文：训练跑了 3 步，这台机器要被收回了；换一台机器后要接着训练
+import os, tempfile
+net, optimizer, scheduler = make_run()        # make_run：卡片里的三件套（Net + AdamW + StepLR）
+for _ in range(3):
+    train_step(net, optimizer, scheduler)     # train_step：卡片里的「训练一步」
+new_net, new_opt, new_sched = make_run()      # 新机器上新造的三件套，权重是新的随机数
+run_dir = tempfile.TemporaryDirectory()       # 临时文件夹，代替真实项目里的 checkpoints/，用完会自动删掉
+ckpt_path = os.path.join(run_dir.name, "ckpt.pt")
+--- below
+save_checkpoint(ckpt_path, net, optimizer, scheduler, 3)
+not_stopped = [round(train_step(net, optimizer, scheduler), 4) for _ in range(3)]    # 没中断：直接训练第 4～6 步
+print("恢复到第几步:", load_checkpoint(ckpt_path, new_net, new_opt, new_sched))
+resumed = [round(train_step(new_net, new_opt, new_sched), 4) for _ in range(3)]      # 恢复后：也训练第 4～6 步
+print("第 4～6 步的 loss，没中断:", not_stopped, "| 恢复后:", resumed)
 --- starter
 import random
 
@@ -988,6 +1069,19 @@ ref: day20
 1. 先 `torch.save(obj, tmp)` 写到临时文件 `tmp = path + ".tmp"`（和 `path` 在**同一个文件夹**）；
 2. 写完整了，再 `os.replace(tmp, path)` 一步换过去（目标已存在时会被覆盖）；
 3. 如果中途出错：删掉临时文件，再把错误原样抛出去（`raise`）。旧的 `path` 不能被动过。
+--- above
+# 上文：训练时每隔一段就把 checkpoint 存进同一个 ckpt.pt，覆盖上一次的
+import os, tempfile
+run_dir = tempfile.TemporaryDirectory()       # 临时文件夹，代替真实项目里的 checkpoints/，用完会自动删掉
+ckpt_path = os.path.join(run_dir.name, "ckpt.pt")
+torch.save({"step": 500, "w": torch.ones(3)}, ckpt_path)                  # 上一次存好的 checkpoint
+next_ckpt = {"step": 1000, "w": torch.zeros(3), "log_fn": lambda s: s}    # 这次要存的：不小心混进了一个 pickle 存不了的 lambda
+--- below
+try:
+    atomic_save(next_ckpt, ckpt_path)
+except Exception as e:
+    print("这次保存失败了:", type(e).__name__)
+print("ckpt.pt 里的 step:", torch.load(ckpt_path, weights_only=True)["step"], "| 文件夹里:", sorted(os.listdir(run_dir.name)))
 --- starter
 import os
 
@@ -1108,6 +1202,21 @@ ref: day20
 不看卡片，写出 `save_checkpoint(path, model, opt, sched, step)` 和 `load_checkpoint(path, model, opt, sched)`（返回 step）。
 
 检查和第 11 题一样：checkpoint 用 `weights_only=True` 能加载；训练 3 步 → 存 → 打乱随机数、造全新的对象 → 加载 → 再训练 2 步，结果必须和不间断训练 5 步完全一样。
+--- above
+# 上文：训练跑到第 4 步，存一次 checkpoint；万一进程被杀，重启后要能接着训练
+import os, tempfile
+net, optimizer, scheduler = make_run()        # make_run：卡片里的三件套（Net + AdamW + StepLR）
+for _ in range(4):
+    train_step(net, optimizer, scheduler)     # train_step：卡片里的「训练一步」
+new_net, new_opt, new_sched = make_run()      # 重启以后新造的三件套，权重是新的随机数
+run_dir = tempfile.TemporaryDirectory()       # 临时文件夹，用完会自动删掉
+ckpt_path = os.path.join(run_dir.name, "ckpt.pt")
+--- below
+save_checkpoint(ckpt_path, net, optimizer, scheduler, 4)
+not_stopped = [round(train_step(net, optimizer, scheduler), 4) for _ in range(2)]    # 没被杀：直接训练第 5、6 步
+print("恢复到第几步:", load_checkpoint(ckpt_path, new_net, new_opt, new_sched), "| 学习率:", new_opt.param_groups[0]["lr"])
+resumed = [round(train_step(new_net, new_opt, new_sched), 4) for _ in range(2)]      # 重启以后：也训练第 5、6 步
+print("第 5、6 步的 loss，没被杀:", not_stopped, "| 重启以后:", resumed)
 --- starter
 import random
 
@@ -1206,6 +1315,20 @@ ref: day20
 上线前加载权重，最怕「加载成功了，但有一层是随机的」。先检查、把问题一次说清楚、没问题才加载，这个习惯能挡住一整类线上事故。
 --- prompt
 不看卡片，写出 `load_strict(model, sd)`：用 `model.state_dict()` 的 key（包括 buffer）和 `sd` 比较，找出 missing、unexpected 和 shape 不同的 key；有任何问题就 `raise ValueError`，消息里写出所有出问题的 key，而且模型一个数都不能变；全都对得上才加载，返回 `model`。
+--- above
+# 上文：要上线的 Net，和同事给的 checkpoint：他把 head 改成 5 个类别再训练的
+model_to_serve = Net()                        # Net：今天卡片里的小模型，head 输出 2 个类别
+colleague_ckpt = {                            # 名字 -> 张量
+    "body.weight": torch.randn(8, 4),
+    "body.bias": torch.randn(8),
+    "head.weight": torch.randn(5, 8),         # 5 个类别；现在的 Net 要的是 (2, 8)
+    "head.bias": torch.randn(5),
+}
+--- below
+try:
+    print("加载成功:", load_strict(model_to_serve, colleague_ckpt) is model_to_serve)
+except ValueError as e:
+    print("ValueError:", e)
 --- starter
 def load_strict(model, sd):
     raise todo()

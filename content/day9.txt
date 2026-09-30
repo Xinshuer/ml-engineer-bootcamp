@@ -278,6 +278,15 @@ UNet 里的 attention 层、DiT、ViT 都要先把 (B, C, H, W) 的特征图摊�
 - `to_spatial(tok, H, W)`：输入 (B, H*W, C)，输出 (B, C, H, W)。它是 `to_tokens` 的逆操作：`to_spatial(to_tokens(x), H, W)` 必须和 x 完全一样。
 
 例子：x 的形状是 (2, 8, 4, 6)，`to_tokens(x)` 是 (2, 24, 8)。
+--- above
+# 上文：UNet 里 attention 层拿到的特征图，形状 (B, C, H, W)
+feat = torch.arange(12.).reshape(1, 2, 2, 3)   # 1 张图、2 个通道、2 行 3 列
+# 通道 0 的 6 个像素是 0~5，通道 1 的是 6~11：数字按顺序排，方便看清谁去了哪
+--- below
+tok = to_tokens(feat)
+print("tokens:", tuple(tok.shape))
+print("每个 token:", tok[0].tolist())
+print("变回去一样吗:", torch.equal(to_spatial(tok, 2, 3), feat))
 --- starter
 def to_tokens(x):
     """(B, C, H, W) -> (B, H*W, C)。这一步之后，图像就变成了「一句话」。"""
@@ -325,6 +334,19 @@ Stable Diffusion 就是靠 cross-attention 把文字告诉 UNet 的：图像特�
 - 返回 (B, Tx, C)。
 
 测试先用 Tc=7 和参考结果对拍，再换成 Tc=77，看形状还对不对。
+--- above
+# 上文：UNet 里的 cross-attention：图像 token 来自特征图，文本来自 CLIP
+B, Tx, Tc, C, Cc, heads = 1, 4, 3, 8, 6, 2
+img_tokens = torch.randn(B, Tx, C)    # 4 个图像 token（2×2 的特征图摊平），每个 8 维
+text_emb = torch.randn(B, Tc, Cc)     # 提示词的 3 个 token，每个 6 维
+Wq = torch.randn(C, C) * 0.1          # 图像 8 维 -> 8 维
+Wk = torch.randn(Cc, C) * 0.1         # 文本 6 维 -> 8 维
+Wv = torch.randn(Cc, C) * 0.1         # 文本 6 维 -> 8 维
+--- below
+out = cross_attention(img_tokens, text_emb, Wq, Wk, Wv, heads)
+print("图像:", tuple(img_tokens.shape), " 文本:", tuple(text_emb.shape), " -> 输出:", tuple(out.shape))
+longer = torch.randn(B, 10, Cc)       # 换一条 10 个 token 的提示词
+print("文本换成 10 个 token -> 输出:", tuple(cross_attention(img_tokens, longer, Wq, Wk, Wv, heads).shape))
 --- starter
 def cross_attention(x, ctx, wq, wk, wv, n_head):
     """x:   (B, Tx, C)    图像 token
@@ -380,6 +402,15 @@ ref: day8, day9
 写 `combine_cond(t_emb, class_emb)`：两个输入都是 (B, D)，返回它们逐元素相加的结果，形状 (B, D)。
 
 这题很短。写完想一想：为什么加在一起，后面的层就能同时知道「现在是第几步」和「要画什么」？
+--- above
+# 上文：按类别生成数字图片：2 个样本在同一个时间步，一个要画「7」，一个要画「3」
+time_emb = timestep_embedding(torch.tensor([0, 0]), 4)   # 第 8 天写的时间嵌入，(2, 4)；t=0 时正好是 [1, 1, 0, 0]
+digit_emb = torch.tensor([[0.5, 0.0, 2.0, -1.0],         # 「7」的类别嵌入（真实模型里是 nn.Embedding 表的一行）
+                          [0.0, 1.5, -0.5, 0.0]])        # 「3」的类别嵌入
+--- below
+emb = combine_cond(time_emb, digit_emb)
+print("时间嵌入:", time_emb.tolist())
+print("相加以后:", emb.tolist())
 --- starter
 def combine_cond(t_emb, class_emb):
     """按类别生成最简单的做法：直接把类别嵌入加到时间嵌入上。
@@ -417,6 +448,15 @@ CFG 采样时要一个无条件预测，但没人想为它再训一个模型。�
 - 抽随机数时把 generator 传进去：`torch.rand(..., generator=generator)`。generator 是 None 时，用的就是全局随机数。
 
 测试：B=4000、p=0.1 时，被丢掉的行的比例要在 0.08 到 0.12 之间。
+--- above
+# 上文：训练时一个 batch 的条件嵌入：6 个样本，每个 2 维
+# 第 1 行全是 1，第 2 行全是 2……方便认出是哪一行
+batch_cond = torch.tensor([[1., 1.], [2., 2.], [3., 3.], [4., 4.], [5., 5.], [6., 6.]])
+null_vec = torch.tensor([-1., -1.])      # 「无条件」嵌入（真实模型里是一个可学习的向量）
+gen = torch.Generator().manual_seed(1)   # 固定的随机数生成器：每次运行丢掉的是同一批行
+--- below
+out = drop_cond(batch_cond, null_vec, 0.5, generator=gen)   # 这里 p 取 0.5，效果明显；真实训练常用 0.1
+print("丢弃以后:", out.tolist())
 --- starter
 def drop_cond(cond_emb, null_emb, p, generator=None):
     """以概率 p 把某些样本的条件整条换成 null_emb（无条件嵌入）。
@@ -471,6 +511,13 @@ eps_uncond + scale * (eps_cond - eps_uncond)
 - scale=0 时，结果正好是 eps_uncond
 - scale=1 时，结果正好是 eps_cond
 - scale 越大，结果离 eps_uncond 越远
+--- above
+# 上文：采样的某一步，模型对同一张带噪图预测了两次噪声（这里只看 3 个数）
+eps_u = torch.tensor([0.5, -1.0, 2.0])   # 给 null 条件时的预测（无条件）
+eps_c = torch.tensor([1.0, -1.0, 1.0])   # 给提示词时的预测（有条件）
+--- below
+for scale in [0.0, 1.0, 7.5]:
+    print("scale", scale, "->", cfg_combine(eps_u, eps_c, scale).tolist())
 --- starter
 def cfg_combine(eps_uncond, eps_cond, scale):
     """eps = eps_uncond + scale * (eps_cond - eps_uncond)
@@ -524,6 +571,18 @@ ref: day8, day9
 - 把输出拆成两半 (eps_uncond, eps_cond)，用 `cfg_combine(eps_uncond, eps_cond, scale)` 组合（这个函数已经给你了），返回 (B, C, H, W)。
 
 测试用的假模型，输出等于条件向量的均值：null 全是 0，cond 全是 2，scale=3，结果应该处处是 0 + 3 × (2 - 0) = 6。
+--- above
+# 上文：采样的一步：2 张带噪图、它们的时间步、提示词的条件向量，还有「无条件」向量
+# 假的噪声模型（已加载好）：输出和 x 同形，每个数都等于条件向量的均值
+unet = _FakeEps()
+noisy = torch.randn(2, 1, 2, 2)    # 2 张带噪图，每张 1 个通道、2×2
+t_now = torch.tensor([500, 500])   # 两张图都在第 500 步
+prompt_emb = torch.tensor([[1.0, 2.0], [4.0, 4.0]])   # 2 条提示词的条件向量，均值 1.5 和 4.0
+null_emb = torch.tensor([1.0, 0.0])                   # 「无条件」向量，均值 0.5
+--- below
+out = cfg_forward(unet, noisy, t_now, prompt_emb, null_emb, 2.0)
+print("输出:", tuple(out.shape))
+print("每张图的 4 个数:", out.flatten(1).tolist())
 --- starter
 def cfg_forward(model, x, t, cond, null_cond, scale):
     """不要跑两次 model。把 x 复制两份、条件拼成 [null, cond]，一次前向再拆开。
@@ -588,6 +647,14 @@ DDIM 只用训练时 1000 步里的一小部分（常见 20 到 50 步）来采�
 - T=1000，steps=5：tensor([800, 600, 400, 200, 0])
 - T=1000，steps=50：[980, 960, …, 20, 0]
 - T=100，steps=30：k=3，[87, 84, …, 3, 0]，正好 30 个
+--- above
+# 上文：模型训练时用了 T=1000 步，采样界面上把「采样步数」设成了 8
+T_train, n_steps = 1000, 8
+--- below
+ts = ddim_timesteps(T_train, n_steps)
+print("时间步:", ts.tolist())
+print("个数:", len(ts), "| dtype:", ts.dtype)
+print("1000 步里挑 3 步（除不尽）:", ddim_timesteps(1000, 3).tolist())
 --- starter
 def ddim_timesteps(T, steps):
     """从 [0, T) 里等间隔取 steps 个时间步，从大到小返回 1D LongTensor。
@@ -636,6 +703,18 @@ DDIM 是扩散模型最常用的快速采样器。这一步写对了，喂进真
 - t_prev 可能是 -1（表示走到头）。这时 ab_prev 按 1 算，于是返回的就是 x0_pred。
 
 第 8 天的 `linear_schedule`、`q_sample`、`extract` 已经加载好了，可以直接用。
+--- above
+# 上文：第 8 天的加噪：干净图加上噪声，得到第 700 步的带噪图
+schedule = linear_schedule(1000)                      # 第 8 天的线性调度（已加载好）
+clean = torch.tensor([[[[0.5, -0.5], [1.0, -1.0]]]])  # 一张 1 个通道、2×2 的干净图，形状 (1, 1, 2, 2)
+noise = torch.randn(1, 1, 2, 2)                       # 当初加进去的噪声
+t_now, t_300 = torch.tensor([700]), torch.tensor([300])   # 时间步是 (B,) 的张量，这里 B=1
+noisy = q_sample(clean, t_now, noise, schedule)       # 第 8 天的 q_sample：加噪到第 700 步
+--- below
+x_300 = ddim_step(noisy, t_now, t_300, noise, schedule)   # 假设模型正好猜中了噪声
+print("700 -> 300，和直接加噪到 300 一样吗:", torch.allclose(x_300, q_sample(clean, t_300, noise, schedule), atol=1e-4))
+x_end = ddim_step(noisy, t_now, torch.tensor([-1]), noise, schedule)  # t_prev=-1：走到头
+print("700 -> -1，得到的图:", [round(v, 3) for v in x_end.flatten().tolist()])
 --- starter
 def ddim_step(x_t, t, t_prev, eps_pred, sched):
     """x0_pred = (x_t - sqrt(1-ab_t) * eps) / sqrt(ab_t)
@@ -695,6 +774,18 @@ ref: day8, day9
 5. 返回最后的 x，形状等于 shape。
 
 `ddim_timesteps` 和 `ddim_step` 已经给你了（参考实现）。函数上面的 `@torch.no_grad()` 留着：采样不需要梯度。
+--- above
+# 上文：第 8 天的 MiniUNet 负责预测噪声（这里没训练过，只看采样流程）
+schedule = linear_schedule(100)          # 第 8 天的调度字典：T=100，里面有 "betas" 和 "alphas_cumprod"
+unet = MiniUNet(in_ch=1).eval()          # 第 8 天的 UNet（已加载好）：unet(x, t) -> 和 x 同形的噪声预测
+seen_t = []                              # 记下模型每次被调用时的时间步
+def eps_model(x, t):
+    seen_t.append(int(t[0]))
+    return unet(x, t)
+--- below
+img = ddim_sample(eps_model, (2, 1, 8, 8), schedule, steps=5)
+print("生成的图:", tuple(img.shape))
+print("模型依次在这些时间步被调用:", seen_t)
 --- starter
 @torch.no_grad()
 def ddim_sample(model, shape, sched, steps=10, device="cpu"):
@@ -777,6 +868,11 @@ ref: day8, day9
 - CLIP 文本嵌入：77 个 token，每个 768 维
 
 先心算，再运行。卡片里的例子用的是 batch 2、256×256，数字不一样，规则一样。
+--- below
+print("还没填的:", [name for name, shape in LDM_SHAPES.items() if shape is None])
+latent = torch.zeros(LDM_SHAPES["latent"])                                  # 按你填的形状造一个 latent（全 0）
+tokens = nn.Conv2d(4, 320, 3, padding=1)(latent).flatten(2).transpose(1, 2)  # UNet 第一层，再摊平
+print("算出来的 token 形状 == 你填的 latent_tokens:", tuple(tokens.shape) == tuple(LDM_SHAPES["latent_tokens"]))
 --- starter
 LDM_SHAPES = {
     "image":          None,   # 512x512 RGB 图像，batch 4
@@ -835,6 +931,18 @@ CFG 的 bug 不会报错，只会让图变差，很难发现。真实项目里�
 `cfg_sample_buggy` 本来应该和 `cfg_forward` 做完全一样的事：只前向一次，条件**前一半 null、后一半 cond**，再按 `eps_u + scale * (eps_c - eps_u)` 组合。现在它有 2 处错。找出来改好，函数名不要改。
 
 有两个检查：结果和 `cfg_forward` 一样；传给 model 的条件确实是前一半 null、后一半 cond。
+--- above
+# 上文：CFG 采样的一步：2 张带噪图、提示词的条件向量，还有「无条件」向量
+# 假的噪声模型（已加载好）：输出和 x 同形，每个数都等于条件向量的均值
+unet = _FakeEps()
+noisy = torch.randn(2, 1, 2, 2)         # 2 张带噪图，每张 1 个通道、2×2
+t_now = torch.tensor([500, 500])        # 两张图都在第 500 步
+prompt_emb = torch.tensor([[1.0, 1.0, 1.0], [2.0, 3.0, 4.0]])   # 2 条提示词的条件向量，均值 1.0 和 3.0
+null_emb = torch.tensor([0.5, 0.5, 0.5])                        # 「无条件」向量，均值 0.5
+--- below
+out = cfg_sample_buggy(unet, noisy, t_now, prompt_emb, null_emb, 2.0)
+print("输出:", tuple(out.shape))
+print("每张图的 4 个数:", out.flatten(1).tolist())
 --- starter
 def cfg_sample_buggy(model, x, t, cond, null_cond, scale):
     both_x = torch.cat([x, x])
@@ -1007,6 +1115,18 @@ CFG 的 batch 技巧是每个文生图推理代码里都有的几行。能不看
 - 拆成 (eps_uncond, eps_cond)，返回 `eps_uncond + scale * (eps_cond - eps_uncond)`，形状 (B, C, H, W)。
 
 `cfg_combine` 可以用，也可以直接写公式。
+--- above
+# 上文：CFG 采样的一步：3 张带噪图、提示词的条件向量，还有「无条件」向量
+# 假的噪声模型（已加载好）：输出和 x 同形，每个数都等于条件向量的均值
+unet = _FakeEps()
+noisy = torch.randn(3, 1, 2, 2)           # 3 张带噪图，每张 1 个通道、2×2
+t_now = torch.tensor([200, 200, 200])     # 三张图都在第 200 步
+prompt_emb = torch.tensor([[1.0, 1.0], [2.0, 4.0], [0.0, -1.0]])   # 3 条提示词的条件向量，均值 1.0、3.0、-0.5
+null_emb = torch.tensor([0.5, 0.5])                                # 「无条件」向量，均值 0.5
+--- below
+out = cfg_forward(unet, noisy, t_now, prompt_emb, null_emb, 3.0)
+print("输出:", tuple(out.shape))
+print("每张图的 4 个数:", out.flatten(1).tolist())
 --- starter
 def cfg_forward(model, x, t, cond, null_cond, scale):
     raise todo()
@@ -1062,6 +1182,18 @@ DDIM 一步是今天最核心的公式：先从 x_t 反推 x0，再用同一个�
 - t_prev 可能是 -1，这时 ab_prev 按 1 算（返回 x0_pred）。
 
 `extract`、`linear_schedule`、`q_sample` 可以直接用。
+--- above
+# 上文：第 8 天的加噪：干净图加上噪声，得到第 500 步的带噪图
+schedule = linear_schedule(1000)                      # 第 8 天的线性调度（已加载好）
+clean = torch.tensor([[[[2.0, 0.5], [-0.5, -2.0]]]])  # 一张 1 个通道、2×2 的干净图，形状 (1, 1, 2, 2)
+noise = torch.randn(1, 1, 2, 2)                       # 当初加进去的噪声
+t_now, t_100 = torch.tensor([500]), torch.tensor([100])   # 时间步是 (B,) 的张量，这里 B=1
+noisy = q_sample(clean, t_now, noise, schedule)       # 第 8 天的 q_sample：加噪到第 500 步
+--- below
+x_100 = ddim_step(noisy, t_now, t_100, noise, schedule)   # 假设模型正好猜中了噪声
+print("500 -> 100，和直接加噪到 100 一样吗:", torch.allclose(x_100, q_sample(clean, t_100, noise, schedule), atol=1e-4))
+x_end = ddim_step(noisy, t_now, torch.tensor([-1]), noise, schedule)  # t_prev=-1：走到头
+print("500 -> -1，得到的图:", [round(v, 3) for v in x_end.flatten().tolist()])
 --- starter
 def ddim_step(x_t, t, t_prev, eps_pred, sched):
     raise todo()

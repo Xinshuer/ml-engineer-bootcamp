@@ -456,6 +456,10 @@ ref: day22
 - 每个数都必须是有限的浮点数：NaN、inf、字符串 `"abc"`、`None` 都要拒绝。
 
 不合格时，`PredictRequest.model_validate(...)` 要抛 `ValidationError`。测试最后还会把它装进今天准备好的服务里，确认坏请求得到 422。
+--- above
+# 上文：客户端发到 /predict 的 JSON，读进 Python 就是一个 dict
+good = {"rows": [[6.1, 2.8, 4.7, 1.2], [5.0, 3.4, 1.5, 0.2]]}   # 2 行，每行 4 个数
+short = {"rows": [[6.1, 2.8, 4.7]]}                             # 这一行少了一个数
 --- starter
 from typing import Annotated
 from pydantic import BaseModel, Field, FiniteFloat
@@ -465,6 +469,11 @@ MAX_ROWS = 32
 
 class PredictRequest(BaseModel):
     rows: list[list[float]]
+--- below
+print("好请求读出来的 rows:", PredictRequest.model_validate(good).rows)
+# create_app、make_model 都是今天准备好的；这个服务用你写的 PredictRequest 检查 body
+client = TestClient(create_app(make_model), raise_server_exceptions=False)
+print("少一个数的请求，服务回的状态码:", client.post("/predict", json=short).status_code)
 --- solution
 from typing import Annotated
 from pydantic import BaseModel, Field, FiniteFloat
@@ -537,6 +546,10 @@ ref: day22
 结果是对的。但测试用一个会计数的 `load_model` 发现：服务启动时模型一次都没加载，之后每来一个请求就加载一次。
 
 改成：**`create_app` 里加载一次，之后所有请求共用这一个模型。**
+--- above
+# 上文：真实服务里 load_model 从硬盘读权重；这里换成会数次数的 CountingLoader
+load = CountingLoader()                    # 今天准备好的：每调用一次 load()，就「加载」一个模型，calls 加 1
+body = {"rows": [[6.3, 2.5, 5.0, 1.9]]}    # 客户端发来的一个请求：1 行，4 个数
 --- starter
 def create_app(load_model):
     app = FastAPI()
@@ -555,6 +568,11 @@ def create_app(load_model):
         return {"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}
 
     return app
+--- below
+client = TestClient(create_app(load))
+print("服务启动后，模型加载了几次:", load.calls)
+print("3 个请求的 labels:", [client.post("/predict", json=body).json()["labels"] for _ in range(3)])
+print("3 个请求之后，模型加载了几次:", load.calls)
 --- solution
 def create_app(load_model):
     model = load_model()             # 启动时加载一次；下面的 handler 通过闭包用它
@@ -619,6 +637,11 @@ ref: day22
 2. forward 没有放在 `torch.inference_mode()` 里，每个请求都在建计算图。
 
 修好它：请求里的 forward 必须在 eval 模式下、并且在 `torch.inference_mode()` 里跑。测试用的 `load_model` 返回一个 `SpyModel`，它会记下每次 forward 时的模式。
+--- above
+# 上文：load_model 返回刚加载的模型（train 模式）；这里用 CountingLoader 代替
+load = CountingLoader()                    # 今天准备好的；它加载的是 SpyModel：每次 forward 都在 log 里记一笔
+body = {"rows": [[6.3, 2.5, 5.0, 1.9]]}    # 客户端发来的一个请求：1 行，4 个数
+# log 里：training = 是不是 train 模式，inference = 在不在 inference_mode 里，grad = 梯度开没开
 --- starter
 def create_app(load_model):
     model = load_model()
@@ -635,6 +658,11 @@ def create_app(load_model):
         return {"labels": [LABELS[i] for i in probs.argmax(-1).tolist()], "probs": probs.tolist()}
 
     return app
+--- below
+client = TestClient(create_app(load))
+first, second = [client.post("/predict", json=body).json()["probs"] for _ in range(2)]
+print("同一个请求发两次，结果一样吗:", first == second)
+print("最后一次 forward 的记录:", load.models[0].log[-1])
 --- solution
 def create_app(load_model):
     model = load_model()
@@ -700,10 +728,18 @@ GPU 服务刚启动时，第一个请求可能要几秒（CUDA 初始化、torch
 - 用 `clock()`（返回毫秒）量出每一次花了多久，返回 dict `{B: 毫秒}`，比如 `{1: 502.25, 8: 504.0, 32: 510.0}`。服务启动时会把它写进日志。
 
 测试用的是 `SlowStartModel(clock)`：每遇到一种新的 batch 大小，第一次 forward 多花 500 ms；平时花 2 + 0.25·B ms。时间加在假时钟 `FakeClock` 上。
+--- above
+# 上文：服务启动后、接请求之前，用假数据把线上常见的 batch 大小先跑一遍
+clock = FakeClock()             # 今天准备好的假时钟，单位毫秒；模型跑的时候它才往前走
+model = SlowStartModel(clock)   # 今天准备好的模型：每种新的 batch 大小，第一次多花 500 ms
+sizes = [4, 16]                 # 线上常见的 batch 大小
 --- starter
 def warm_up(model, batch_sizes, clock):
     """对每个 batch 大小跑一次全 0 的假数据，返回 {B: 这一次用了多少毫秒}。"""
     raise todo()
+--- below
+print("第一次预热，每个 batch 大小花的 ms:", warm_up(model, sizes, clock))
+print("再跑一遍，每个 batch 大小花的 ms:  ", warm_up(model, sizes, clock))
 --- solution
 def warm_up(model, batch_sizes, clock):
     """对每个 batch 大小跑一次全 0 的假数据，返回 {B: 这一次用了多少毫秒}。"""
@@ -775,9 +811,19 @@ ref: day22
 3. `POST /predict`：body 按 `PredictRequest` 检查（已经准备好了：`rows` 是 1 到 32 行，每行 4 个有限的数）。在 `torch.inference_mode()` 里算 softmax 概率，回 `{"labels": [...], "probs": [[...], ...]}`：`probs` 是每行 3 个类别的概率，`labels` 是每行概率最大的那个类别的名字（名字在 `LABELS` 里）。
 
 可以直接用的名字：`FastAPI`、`torch`、`PredictRequest`、`LABELS`、`FEATURES`。
+--- above
+# 上文：真实服务里 load_model 从硬盘读权重；这里用今天准备好的 make_model
+# make_model() 每次返回一个权重相同的 TinyClassifier（train 模式）：4 个数 -> 3 个类别
+body = {"rows": [[6.3, 2.5, 5.0, 1.9], [4.9, 3.1, 1.5, 0.1]]}   # 客户端发来的 JSON：2 行，每行 4 个数
+bad = {"rows": [[6.3, 2.5]]}                                    # 坏请求：这一行只有 2 个数
 --- starter
 def create_app(load_model):
     raise todo()
+--- below
+client = TestClient(create_app(make_model))
+print("/health:", client.get("/health").json())
+print("/predict 的 labels:", client.post("/predict", json=body).json()["labels"])
+print("坏请求的状态码:", client.post("/predict", json=bad).status_code)
 --- solution
 def create_app(load_model):
     model = load_model()                         # 启动时加载一次
@@ -874,6 +920,13 @@ ref: day22
 - 其他情况照旧：200 和 `{"probs": ...}`。
 
 用 `raise HTTPException(status_code=..., detail=..., headers=...)`。
+--- above
+# 上文：服务的状态 ServiceState（今天准备好的）：ready = 准备好了没有，predict = 跑模型
+body = {"rows": [[6.3, 2.5, 5.0, 1.9]]}     # 客户端发来的一个请求
+# 一个还在加载模型的服务（reference_probs 是今天的小模型算出的概率）
+loading = ServiceState(lambda rows: reference_probs(rows).tolist(), ready=False)
+# 一个模型有 bug 的服务：矩阵形状对不上，一跑就抛 RuntimeError
+broken = ServiceState(lambda rows: torch.zeros(1, 5) @ torch.zeros(3, 3), ready=True)
 --- starter
 def create_status_app(state):
     app = FastAPI()
@@ -895,6 +948,11 @@ def create_status_app(state):
         return {"probs": probs}
 
     return app
+--- below
+r = TestClient(create_status_app(loading)).post("/predict", json=body)
+print("还在加载:", r.status_code, r.text, " Retry-After:", r.headers.get("retry-after"))
+r = TestClient(create_status_app(broken), raise_server_exceptions=False).post("/predict", json=body)
+print("模型出错:", r.status_code, r.text)
 --- solution
 def create_status_app(state):
     app = FastAPI()
@@ -990,6 +1048,17 @@ ref: day22
   - 最后返回这个 Ticket。
 
 `clock` 是假时钟 `FakeClock`，测试用它控制时间，不用 sleep。
+--- above
+# 上文：GPU 上只有一个模型，一次算一个请求；下面 3 个请求同时到达，每个是 4 个数
+clock = FakeClock()                        # 今天准备好的假时钟，单位毫秒，不会自己走
+
+def gpu_model(x):                          # 代替 GPU 上的模型：算一个请求要 150 ms
+    clock.advance(150)
+    return x * 2
+
+inputs = [torch.tensor([1.0, 2.0, 3.0, 4.0]),
+          torch.tensor([0.5, 0.5, 0.5, 0.5]),
+          torch.tensor([9.0, 8.0, 7.0, 6.0])]
 --- starter
 class RequestQueue:
     def __init__(self, model_fn, clock, max_waiting=4, timeout_ms=100):
@@ -1004,6 +1073,11 @@ class RequestQueue:
 
     def run_next(self):
         raise todo()
+--- below
+q = RequestQueue(gpu_model, clock, max_waiting=2, timeout_ms=100)
+tickets = [q.submit(x) for x in inputs]
+print("连着调 3 次 run_next:", q.run_next(), q.run_next(), q.run_next())
+print("3 个请求的 status:", [t.status for t in tickets], " 第 1 个的结果:", tickets[0].result.tolist())
 --- solution
 class RequestQueue:
     def __init__(self, model_fn, clock, max_waiting=4, timeout_ms=100):
@@ -1120,11 +1194,18 @@ ref: day22
 3. 答案是排好序后的第 k 个（从 1 数，也就是 `s[k - 1]`）。
 
 不许用 `numpy.percentile` / `torch.quantile`（它们默认用线性插值，结果不一样）。不要改动传进来的列表。
+--- above
+# 上文：压测时记下的 20 个请求的延迟（毫秒），按完成的先后排列，没有排序
+latencies = [23, 19, 21, 480, 20, 22, 18, 25, 21, 20,
+             19, 95, 22, 20, 24, 21, 19, 20, 23, 22]
 --- starter
 import math
 
 def latency_report(times_ms):
     raise todo()
+--- below
+print("平均:", sum(latencies) / len(latencies), "ms")
+print("百分位数:", latency_report(latencies))
 --- solution
 import math
 
@@ -1219,6 +1300,13 @@ GPU 算 32 行和算 1 行花的时间差不多，所以推理服务几乎都会
 - `flush()`：把 `pending` 里的请求全部取出来（`pending` 变空），用 `torch.stack` 拼成 (B, 4)，**只调用一次** `run_batch`，得到 B 行输出；第 i 行交给第 i 个 Ticket：`ticket.result = out[i]`，`ticket.status = 200`。`pending` 是空的就什么都不做。
 
 测试里的 `run_batch` 会记下每一批的大小，`clock` 是 `FakeClock`。
+--- above
+# 上文：线上的请求一个一个到达，每个是 4 个数；服务器把它们凑成一批再交给 GPU
+clock = FakeClock()                                  # 今天准备好的假时钟，单位毫秒
+# 代替 GPU 上的模型：一批 (B, 4) 进来，出来每行的和；BatchRecorder（今天准备好的）还会记下每一批的大小
+recorder = BatchRecorder(lambda xb: xb.sum(dim=1))
+inputs = [torch.tensor([1.0, 2.0, 3.0, 4.0]), torch.tensor([0.0, 0.0, 1.0, 1.0]),
+          torch.tensor([5.0, 5.0, 5.0, 5.0]), torch.tensor([2.0, 0.0, 2.0, 0.0])]
 --- starter
 class MicroBatcher:
     def __init__(self, run_batch, max_batch, max_wait_ms, clock):
@@ -1236,6 +1324,12 @@ class MicroBatcher:
 
     def flush(self):
         raise todo()
+--- below
+batcher = MicroBatcher(recorder, max_batch=3, max_wait_ms=5, clock=clock)
+tickets = [batcher.submit(x) for x in inputs]      # 4 个请求同时到
+clock.advance(5)                                   # 过了 5 ms，服务器的循环调用一次 poll
+batcher.poll()
+print("每一批的大小:", recorder.sizes, " 每个请求拿回的结果:", [t.result.item() for t in tickets])
 --- solution
 class MicroBatcher:
     def __init__(self, run_batch, max_batch, max_wait_ms, clock):
@@ -1427,9 +1521,18 @@ ref: day22
 3. `POST /predict`：body 按 `PredictRequest` 检查；在 `torch.inference_mode()` 里算 softmax 概率；回 `{"labels": [每行概率最大的类别名], "probs": [[3 个概率], ...]}`，类别名在 `LABELS` 里。
 
 可以直接用的名字：`FastAPI`、`torch`、`PredictRequest`、`LABELS`、`FEATURES`。
+--- above
+# 上文：真实服务里 load_model 从硬盘读权重；这里换成会数次数的 CountingLoader
+load = CountingLoader()                    # 今天准备好的：每调用一次 load()，就「加载」一个模型，calls 加 1
+body = {"rows": [[5.7, 2.8, 4.1, 1.3]]}    # 客户端发来的 JSON：1 行，4 个数
 --- starter
 def create_app(load_model):
     raise todo()
+--- below
+client = TestClient(create_app(load))
+print("/health:", client.get("/health").json(), " 模型加载了几次:", load.calls)
+answer = client.post("/predict", json=body).json()
+print("/predict:", answer["labels"], [round(p, 3) for p in answer["probs"][0]])
 --- solution
 def create_app(load_model):
     model = load_model()                         # 启动时加载一次
@@ -1519,11 +1622,17 @@ ref: day22
 写 `latency_report(times_ms)`：`times_ms` 是一串延迟（毫秒，至少 1 个，没排序）。用 nearest-rank 方法返回 `{"p50": ..., "p95": ..., "p99": ...}`：排好序，k = ⌈q × n / 100⌉，取第 k 个（从 1 数）。
 
 不许用 `numpy.percentile` / `torch.quantile`；不要改动传进来的列表。
+--- above
+# 上文：从服务日志里取出最近 10 个请求的延迟（毫秒），没有排序
+latencies = [105, 98, 110, 102, 99, 870, 101, 97, 104, 100]
 --- starter
 import math
 
 def latency_report(times_ms):
     raise todo()
+--- below
+print("百分位数:", latency_report(latencies))
+print("调用之后，latencies 的前 3 个:", latencies[:3])
 --- solution
 import math
 

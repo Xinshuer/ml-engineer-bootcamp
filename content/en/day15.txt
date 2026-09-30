@@ -274,10 +274,22 @@ Write `curve_verdict(losses)`:
   4. anything else → `"ok"`
 
 Note: you cannot test for nan with `v == float("nan")`. Why not? See the card "Where NaN and inf come from".
+--- above
+# Where the input comes from: one model trained for 3 steps with each of 4 learning rates; the script logged every loss
+# The model has 10 classes, so every run starts near ln 10 ≈ 2.303
+runs = {
+    "lr=0.001": [2.303, 2.302, 2.301],
+    "lr=0.1":   [2.303, 1.214, 0.387],
+    "lr=1.0":   [2.303, 3.925, 8.716],
+    "lr=10":    [2.303, 41.62, float("nan")],
+}
 --- starter
 def curve_verdict(losses):
     """losses: list of float -> "nan" / "exploding" / "flat" / "ok" (checked in this order)."""
     raise todo()
+--- below
+for name, curve in runs.items():
+    print(name, "->", curve_verdict(curve))
 --- solution
 def curve_verdict(losses):
     if not all(math.isfinite(v) for v in losses):     # nan and ±inf are not finite
@@ -389,11 +401,20 @@ The `my_cross_entropy(logits, y)` below usually works. But as soon as the logits
 - `logits`: (B, C) raw scores; `y`: (B,) int64 class ids
 - return the mean loss over the samples (it should equal `F.cross_entropy(logits, y)`)
 - do not call `F.cross_entropy` or `F.nll_loss` (the checks disable them). Pretend this is part of a more complicated custom loss
+--- above
+# Where the input comes from: the logits from a classifier's last layer (one raw score per class) and each sample's correct class
+scores = torch.tensor([[2.0, 0.5, -1.0],       # 3 samples, 3 classes
+                       [0.1, 0.2, 3.0],
+                       [0.0, 120.0, 0.0]])     # sample 3: the model is very sure it is class 1
+labels = torch.tensor([0, 2, 0])               # but sample 3 is really class 0
 --- starter
 def my_cross_entropy(logits, y):
     probs = logits.softmax(dim=-1)                   # (B, C) probabilities
     picked = probs[torch.arange(len(y)), y]          # (B,) probability of each sample's correct class
     return -torch.log(picked).mean()
+--- below
+print("my_cross_entropy:", round(my_cross_entropy(scores, labels).item(), 4))
+print("F.cross_entropy: ", round(F.cross_entropy(scores, labels).item(), 4))
 --- solution
 def my_cross_entropy(logits, y):
     logp = F.log_softmax(logits, dim=-1)             # (B, C) log probabilities, never -inf
@@ -464,10 +485,20 @@ In mixed-precision training most layers are fine in fp16, but "square, then aver
 - `x`: (..., D), possibly float16; `weight`: (D,), same dtype as x
 - formula: y = x / sqrt(mean(x², over the last dim) + eps) × weight
 - the output dtype must equal x's dtype (float16 in, float16 out)
+--- above
+# Where the input comes from: in mixed-precision training, RMSNorm gets fp16 hidden states; a few dims reach the hundreds
+hidden = torch.tensor([[0.5, -1.0, 2.0, 1.5],              # 2 tokens, 4 dims each
+                       [300.0, -20.0, 5.0, 40.0]], dtype=torch.float16)
+norm_weight = torch.ones(4, dtype=torch.float16)           # RMSNorm's scale parameter: all ones right after init
 --- starter
 def rms_norm(x, weight, eps=1e-6):
     ms = x.pow(2).mean(dim=-1, keepdim=True)         # mean square at each position
     return x * torch.rsqrt(ms + eps) * weight
+--- below
+out = rms_norm(hidden, norm_weight)
+print("dtype:", out.dtype)
+print("token 0:", [round(v, 3) for v in out[0].tolist()])
+print("token 1:", [round(v, 3) for v in out[1].tolist()])
 --- solution
 def rms_norm(x, weight, eps=1e-6):
     xf = x.float()                                   # square and average in float32: no overflow
@@ -519,10 +550,24 @@ Write `find_nan_layer(model, x)`:
 - if every layer's output is fine, return `None`
 
 The checks use a few small layers that are already defined: `Log()` takes the log of its input (negative numbers become nan), `Exp()` takes exp (large numbers become inf), and `Scale(s)` multiplies its input by s.
+--- above
+# Where the input comes from: the model's output contains nan / inf, and we want the layer where it starts
+# Log is a small layer the exercise provides: it takes the log of its input
+from collections import OrderedDict
+net = nn.Sequential(OrderedDict([
+    ("fc1", nn.Linear(4, 8)),
+    ("relu", nn.ReLU()),
+    ("log", Log()),
+    ("fc2", nn.Linear(8, 3)),
+]))
+batch = torch.randn(5, 4)                      # 5 samples, 4 features each
 --- starter
 def find_nan_layer(model, x):
     """Return the name of the first child whose output has nan/inf; None if all are fine."""
     raise todo()
+--- below
+print("this model:", find_nan_layer(net, batch))
+print("without the log layer:", find_nan_layer(nn.Sequential(net.fc1, net.relu, net.fc2), batch))
 --- solution
 def find_nan_layer(model, x):
     for name, layer in model.named_children():
@@ -576,6 +621,9 @@ Contrastive learning, clustering and triplet losses all need the distance betwee
 2. Fix it: the distance values stay the same (within 1e-4), and the gradient is finite where the distance is 0.
 
 - `a`: (N, D), `b`: (M, D) → return (N, M)
+--- above
+# Where the input comes from: a batch of embeddings in contrastive learning; every point is compared with every point, itself included
+emb = torch.tensor([[0.0, 0.0], [3.0, 4.0], [6.0, 8.0]], requires_grad=True)   # 3 points, 2 dims each
 --- starter
 def pairwise_dist(a, b):
     diff = a[:, None, :] - b[None, :, :]             # (N, M, D)
@@ -586,6 +634,11 @@ def pairwise_dist(a, b):
 # a = torch.randn(3, 2, requires_grad=True)
 # with torch.autograd.detect_anomaly():
 #     pairwise_dist(a, a).sum().backward()
+--- below
+d = pairwise_dist(emb, emb)                    # (3, 3)
+d.sum().backward()
+print("distances:", d.detach().round(decimals=2).tolist())
+print("any nan in emb.grad:", emb.grad.isnan().any().item())
 --- solution
 def pairwise_dist(a, b):
     diff = a[:, None, :] - b[None, :, :]             # (N, M, D)
@@ -641,10 +694,22 @@ Write `grad_norms(model)`, to be called after `loss.backward()`:
 - return a dict whose keys are the names from `model.named_parameters()`, in the same order
 - each value is the L2 norm of that parameter's gradient, as a Python float (use `.item()`)
 - if `p.grad` is None (frozen, or not used to compute the loss), the value is `None`
+--- above
+# Where the input comes from: training has just run loss.backward(), and we want to see how big each layer's gradient is
+net = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2))
+net[0].requires_grad_(False)                   # the first layer is frozen (say it is pretrained)
+x = torch.randn(6, 3)                          # 6 samples, 3 features each
+y = torch.tensor([0, 1, 1, 0, 1, 0])           # each sample's correct class (2 classes)
+F.cross_entropy(net(x), y).backward()
 --- starter
 def grad_norms(model):
     """{parameter name: L2 norm of its gradient (float)}; None for parameters without a gradient."""
     raise todo()
+--- below
+norms = grad_norms(net)
+print("keys:", list(norms))
+print("frozen first layer:", norms["0.weight"], norms["0.bias"])
+print("last layer:", round(norms["2.weight"], 4), round(norms["2.bias"], 4))
 --- solution
 def grad_norms(model):
     out = {}
@@ -696,6 +761,11 @@ Neither bug raises an error: the program runs to the end and the loss goes down,
 The function has two bugs: it cannot overfit one small batch no matter how long it trains, and from the second step on every update is wrong. Find and fix them.
 
 - `model` outputs logits (B, C); `x`: (B, D); `y`: (B,), int64
+--- above
+# Where the input comes from: one small batch of training data and a freshly initialized model; overfit it first to check the loop
+x_train = torch.randn(8, 4)                        # 8 samples, 4 features each
+y_train = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1])   # 3 classes, so the first loss should be near ln 3 ≈ 1.10
+net = nn.Sequential(nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 3))
 --- starter
 def train_classifier(model, x, y, steps=100, lr=0.5):
     opt = torch.optim.SGD(model.parameters(), lr=lr)
@@ -710,6 +780,10 @@ def train_classifier(model, x, y, steps=100, lr=0.5):
         opt.step()
         losses.append(loss.item())
     return losses
+--- below
+losses = train_classifier(net, x_train, y_train, steps=100, lr=0.5)
+print("first loss:", round(losses[0], 4))
+print("last loss:", round(losses[-1], 4))
 --- solution
 def train_classifier(model, x, y, steps=100, lr=0.5):
     opt = torch.optim.SGD(model.parameters(), lr=lr)
@@ -774,6 +848,11 @@ Shuffling x and y separately in a data pipeline is a bug that has happened count
 - it must still shuffle, and the same seed must give the same result
 - every x must stay with its own y
 - the last batch may be smaller than `batch_size`
+--- above
+# Where the input comes from: the data pipeline has loaded a tiny dataset: 6 samples, 2 features each
+# So you can see at a glance whether pairs stay together: sample i has features [i, 10i] and label i
+features = torch.tensor([[0., 0.], [1., 10.], [2., 20.], [3., 30.], [4., 40.], [5., 50.]])
+labels = torch.tensor([0, 1, 2, 3, 4, 5])
 --- starter
 def make_batches(x, y, batch_size, seed=0):
     g = torch.Generator().manual_seed(seed)
@@ -781,6 +860,9 @@ def make_batches(x, y, batch_size, seed=0):
     y = y[torch.randperm(len(y), generator=g)]
     return [(x[i:i + batch_size], y[i:i + batch_size])
             for i in range(0, len(x), batch_size)]
+--- below
+for xb, yb in make_batches(features, labels, batch_size=4, seed=0):
+    print("x:", xb.tolist(), " y:", yb.tolist())
 --- solution
 def make_batches(x, y, batch_size, seed=0):
     g = torch.Generator().manual_seed(seed)
@@ -837,6 +919,12 @@ What `finetune_new_head` is meant to do: freeze `model.backbone`, replace `model
 - use SGD and `F.cross_entropy`, and return the loss of every step (Python floats)
 - the backbone must stay frozen: `requires_grad=False`, and its weights unchanged after training
 - the checks use a `TinyNet`, which has two parts: `.backbone` and `.head`
+--- above
+# Where the input comes from: transfer learning, reusing a pretrained model for a new task with only 3 classes
+# TinyNet is a "pretrained model" the exercise provides: backbone (features) + head (the old 10-class classifier)
+pretrained = TinyNet()
+x_new = torch.randn(12, 8)                     # 12 samples for the new task, 8 features each
+y_new = torch.randint(0, 3, (12,))             # the new task has only 3 classes
 --- starter
 def finetune_new_head(model, x, y, num_classes, steps=100, lr=0.5):
     opt = torch.optim.SGD(model.parameters(), lr=lr)
@@ -851,6 +939,10 @@ def finetune_new_head(model, x, y, num_classes, steps=100, lr=0.5):
         opt.step()
         losses.append(loss.item())
     return losses
+--- below
+losses = finetune_new_head(pretrained, x_new, y_new, num_classes=3, steps=50, lr=0.5)
+for step in range(0, 50, 10):
+    print("step", step, "loss", round(losses[step], 3))
 --- solution
 def finetune_new_head(model, x, y, num_classes, steps=100, lr=0.5):
     for p in model.backbone.parameters():
@@ -928,9 +1020,18 @@ Write `train_classifier(model, x, y, steps=100, lr=0.5)` from scratch:
 - use `torch.optim.SGD` and `F.cross_entropy` (it takes logits), and train for `steps` steps on the same (x, y)
 - return the loss of every step (a list of Python floats)
 - if the loss is not a finite number, raise `FloatingPointError` right away, with the step in the message, like `"step 12: loss = nan"`
+--- above
+# Where the input comes from: one small batch of training data and a freshly initialized model; overfit it first to check the loop
+x_train = torch.randn(8, 4)                        # 8 samples, 4 features each
+y_train = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1])   # 3 classes, so the first loss should be near ln 3 ≈ 1.10
+net = nn.Sequential(nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 3))
 --- starter
 def train_classifier(model, x, y, steps=100, lr=0.5):
     raise todo()
+--- below
+losses = train_classifier(net, x_train, y_train, steps=100, lr=0.5)
+print("first loss:", round(losses[0], 4))
+print("last loss:", round(losses[-1], 4))
 --- solution
 def train_classifier(model, x, y, steps=100, lr=0.5):
     opt = torch.optim.SGD(model.parameters(), lr=lr)
@@ -993,9 +1094,21 @@ Write `grad_norms(model)` from scratch (it is called after `loss.backward()`):
 
 - return a dict whose keys are the names from `model.named_parameters()`, in the same order
 - each value is the L2 norm of the gradient (a Python float); when `p.grad` is None, the value is `None`
+--- above
+# Where the input comes from: training has just run loss.backward(), and we want to see how big each layer's gradient is
+net = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2))
+net[0].requires_grad_(False)                   # the first layer is frozen (say it is pretrained)
+x = torch.randn(6, 3)                          # 6 samples, 3 features each
+y = torch.tensor([0, 1, 1, 0, 1, 0])           # each sample's correct class (2 classes)
+F.cross_entropy(net(x), y).backward()
 --- starter
 def grad_norms(model):
     raise todo()
+--- below
+norms = grad_norms(net)
+print("keys:", list(norms))
+print("frozen first layer:", norms["0.weight"], norms["0.bias"])
+print("last layer:", round(norms["2.weight"], 4), round(norms["2.bias"], 4))
 --- solution
 def grad_norms(model):
     out = {}

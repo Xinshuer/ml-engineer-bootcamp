@@ -281,6 +281,14 @@ ref: day13
 - `tokens_per_second(frame_rate, n_q)`：在语言模型眼里，一秒音频是多少个 token（一个码 = 一个 token）。
 
 例子：EnCodec 24 kHz，frame_rate = 75，n_q = 8，codebook_size = 1024，码率是 6000.0 bps，一秒是 600 个 token。
+--- above
+# 上文：配置文件里的 codec 设置（EnCodec 24 kHz 的 3 kbps 档，只开 4 个码本）
+frame_rate, n_q, codebook_size = 75, 4, 1024   # 每秒 75 帧，每帧 4 个码，每个码本 1024 行
+clip_seconds = 10                              # 手上这段音频有 10 秒
+--- below
+print("码率:", codec_bitrate(frame_rate, n_q, codebook_size), "bps")
+print("每秒 token 数:", tokens_per_second(frame_rate, n_q))
+print("这段 10 秒音频的 token 数:", clip_seconds * tokens_per_second(frame_rate, n_q))
 --- starter
 def codec_bitrate(frame_rate, n_q, codebook_size):
     """每秒比特数 = frame_rate * n_q * log2(codebook_size)"""
@@ -324,6 +332,15 @@ ref: day13
 例子：2 秒、每秒 75 帧、8 个码本，返回 (8, 150)。
 
 注意返回的是 Python 的 tuple，不是 tensor。
+--- above
+# 上文：数据集里的两段语音：多长（秒），用哪个 codec 编码
+clips = [
+    ("hello.wav", 3.2, 75, 4),      # (文件名, 秒数, frame_rate, n_q)：EnCodec 24 kHz，4 个码本
+    ("reply.wav", 3.0, 12.5, 8),    # 另一个 codec（Mimi）：每秒只有 12.5 帧，8 个码本
+]
+--- below
+for name, seconds, frame_rate, n_q in clips:
+    print(name, "->", code_shape(seconds, frame_rate, n_q))
 --- starter
 def code_shape(seconds, frame_rate, n_q):
     """返回 (n_q, T) 这个 tuple，T = int(seconds * frame_rate)。"""
@@ -364,6 +381,17 @@ MusicGen 这类模型用 delay pattern 训练多码本 LM：只多走 n_q − 1 
 [[1, 2, 3],        [[1, 2, 3, 0],
  [4, 5, 6]]   ->    [0, 4, 5, 6]]
 ```
+--- above
+# 上文：codec 把一小段音频编成 3 个码本 × 4 帧的整数，送进 LM 之前先做 delay
+clip_codes = torch.tensor([[[311, 87, 902, 45],     # 码本 0
+                            [12, 640, 3, 777],      # 码本 1
+                            [505, 29, 118, 960]]])  # 码本 2      形状 (B=1, n_q=3, T=4)
+PAD = 1024                                          # 码的取值是 0～1023，1024 没人用，正好当 pad
+--- below
+delayed = build_delay(clip_codes, PAD)
+print("形状:", tuple(clip_codes.shape), "->", tuple(delayed.shape))
+for row in delayed[0].tolist():
+    print(row)
 --- starter
 def build_delay(codes, pad_id):
     """codes: (B, n_q, T) -> (B, n_q, T + n_q - 1)
@@ -408,6 +436,18 @@ ref: day13
 - 要求：对任何 codes，`undo_delay(build_delay(codes, pad_id), T)` 和 codes 完全相等
 
 build_delay 已经在隐藏的准备代码里（参考实现），检查会用它来做往返。
+--- above
+# 上文：音频 LM 按 delay pattern 生成完，拿到的是错开的码（1024 是 pad）
+generated = torch.tensor([[[88, 431, 7, 1002, 1024, 1024],
+                           [1024, 256, 19, 640, 333, 1024],
+                           [1024, 1024, 71, 900, 45, 128]]])   # (B=1, n_q=3, T + n_q - 1 = 6)
+n_frames = 4                                                    # 真正的帧数 T
+# 试一试的最后一行，会用隐藏准备代码里的 build_delay（参考实现）把结果变回去对一对
+--- below
+aligned = undo_delay(generated, n_frames)
+print("形状:", tuple(generated.shape), "->", tuple(aligned.shape))
+print("对齐以后:", aligned[0].tolist())
+print("再 build_delay 回去，和原来一样吗:", torch.equal(build_delay(aligned, 1024), generated))
 --- starter
 def undo_delay(delayed, T):
     """build_delay 的逆操作：(B, n_q, T + n_q - 1) -> (B, n_q, T)"""
@@ -445,6 +485,16 @@ ref: day13
 - 参数量应该正好是 n_q × vocab × dim
 
 检查会逐个改动每个码本的码：改了哪个码本，输出都必须跟着变（说明每张表都用上了）。
+--- above
+# 上文：codec 编出来的码，要送进 AudioLM 的第一层（码的取值 0～1023）
+audio_codes = torch.tensor([[[311, 87, 902, 45, 12],
+                             [640, 3, 777, 505, 29],
+                             [118, 960, 7, 256, 431]]])   # (B=1, n_q=3, T=5)：1 段音频，3 个码本，每本 5 帧
+--- below
+emb = CodeEmbedding(3, 1024, 16)        # n_q=3, vocab=1024, dim=16
+x = emb(audio_codes)
+print("codes:", tuple(audio_codes.shape), "-> x:", tuple(x.shape))
+print("参数量:", sum(p.numel() for p in emb.parameters()))
 --- starter
 class CodeEmbedding(nn.Module):
     """n_q 个 nn.Embedding(vocab, dim)，forward(codes) 把每个码本查表后**相加**。
@@ -503,6 +553,14 @@ ref: day13
 - 每个时间步那 n_q·vocab 个数里，第 k 段（第 k·vocab 到第 (k+1)·vocab − 1 个）是码本 k 的 logits
 
 检查不只看形状，还会核对 out[:, k, t] 是不是真的来自第 t 帧的第 k 段。
+--- above
+# 上文：AudioLM 的 Transformer 走完最后一层（ln_f 之后），每个时间步是一个 dim 维向量
+hidden = torch.randn(1, 5, 16)          # (B=1, T=5, dim=16)：1 段音频，5 个时间步
+--- below
+head = MultiHead(16, 3, 1024)           # dim=16, n_q=3, vocab=1024
+logits = head(hidden)
+print("hidden:", tuple(hidden.shape), "-> logits:", tuple(logits.shape))
+print("最后一步，每个码本分数最高的码:", logits[0, :, -1].argmax(-1).tolist())
 --- starter
 class MultiHead(nn.Module):
     """一个 Linear(dim, n_q * vocab)，输出变成 (B, n_q, T, vocab)。"""
@@ -559,6 +617,15 @@ ref: day13
 - 返回一个标量（0 维 tensor）
 
 target 等于 ignore_index 的位置，不参与 loss，也不算进平均的分母。
+--- above
+# 上文：AudioLM 打出的分数，和正确答案（delay 补的 pad 已换成 -100）
+model_logits = torch.randn(1, 2, 4, 10) * 0.1   # (B=1, n_q=2, T=4, V=10)：刚初始化，分数都接近 0
+target_codes = torch.tensor([[[3, 7, 1, -100],   # 码本 0：最后一格是 pad
+                              [-100, 5, 0, 9]]]) # 码本 1：第一格是 pad
+--- below
+loss = codebook_loss(model_logits, target_codes)
+print("loss:", round(loss.item(), 4), "| ln(10):", round(math.log(10), 4))
+print("算进 loss 的位置:", (target_codes != -100).sum().item(), "/", target_codes.numel())
 --- starter
 def codebook_loss(logits, targets, ignore_index=-100):
     """logits: (B, n_q, T, V)   targets: (B, n_q, T)
@@ -608,6 +675,16 @@ ref: day13
 `forward(codes)`：codes 是 (B, n_q, T)。嵌入 + 位置嵌入 → 依次过每个 Block → ln_f → head，返回 (B, n_q, T, vocab)。
 
 CodeEmbedding、MultiHead、Block 都已经在隐藏的准备代码里（参考实现），直接用。检查会看三件事：输出形状；因果性（改了后面的码，前面的预测不变）；随机初始化时 loss 在 ln(50) ≈ 3.91 附近。
+--- above
+# 上文：一段音频经 codec 编码、再做完 delay 的码：2 个码本，6 个时间步（1024 是 pad）
+audio_codes = torch.tensor([[[311, 87, 902, 45, 12, 1024],
+                             [1024, 640, 3, 777, 505, 29]]])   # (B=1, n_q=2, T=6)
+# 试一试里用到的 codebook_loss 是 d13-07 写过的函数，隐藏的准备代码里有
+--- below
+model = AudioLM(n_q=2, vocab=1025, dim=32)       # vocab = 1024 个码 + 1 个 pad；其余参数用默认值
+logits = model(audio_codes)
+print("codes:", tuple(audio_codes.shape), "-> logits:", tuple(logits.shape))
+print("刚初始化的 loss 离 ln(1025) ≈ 6.93 不到 1:", abs(codebook_loss(logits, audio_codes).item() - math.log(1025)) < 1)
 --- starter
 class AudioLM(nn.Module):
     """结构:
@@ -681,6 +758,16 @@ ref: day13
 - 合并多头，返回 (B, Ta, C)
 
 对照一下 Day 9 的 cross_attention：除了变量名，代码完全一样。
+--- above
+# 上文：MusicGen 生成到第 6 步；文本编码器把「欢快的钢琴曲」编成了 3 个向量
+audio_hidden = torch.randn(1, 6, 8)           # (B=1, Ta=6, C=8)：正在生成的音频，每步一个向量
+text_hidden = torch.randn(1, 3, 8)            # (B=1, Tt=3, C=8)：文本编码器的输出
+w_q, w_k, w_v = torch.randn(3, 8, 8) * 0.1    # 训练好的 3 个投影矩阵，各是 (C, C) = (8, 8)
+--- below
+out = text_cross_attn(audio_hidden, text_hidden, w_q, w_k, w_v, 2)          # n_head=2
+print("audio:", tuple(audio_hidden.shape), " text:", tuple(text_hidden.shape), "-> out:", tuple(out.shape))
+longer = text_cross_attn(audio_hidden, torch.randn(1, 10, 8), w_q, w_k, w_v, 2)
+print("文本换成 10 个 token -> out:", tuple(longer.shape))
 --- starter
 def text_cross_attn(audio_h, text_emb, wq, wk, wv, n_head):
     """audio_h: (B, Ta, C)   text_emb: (B, Tt, C)
@@ -734,6 +821,16 @@ ref: day13
 - 函数上面的 `@torch.no_grad()` 保留
 
 检查用的 model 是参考实现的 AudioLM。参数 vocab 这题用不上，留在签名里就行。
+--- above
+# 上文：一个音频 LM（没训练过，生成的码没有意义），和一段已有的码当开头
+audio_lm = AudioLM(n_q=2, vocab=1025, dim=32, n_layer=1).eval()   # d13-08 的 AudioLM，隐藏的准备代码里有
+prompt_codes = torch.tensor([[[311, 87, 902, 45],
+                              [1024, 640, 3, 777]]])               # (1, n_q=2, T0=4)，1024 是 pad
+--- below
+out = generate_codes(audio_lm, prompt_codes, 3, 1025)       # 接着往下生成 3 步
+print("开头:", tuple(prompt_codes.shape), "-> out:", tuple(out.shape))
+for row in out[0].tolist():
+    print(row)
 --- starter
 @torch.no_grad()
 def generate_codes(model, prompt, n_new, vocab):
@@ -913,6 +1010,18 @@ delay pattern 是多码本音频 LM 最有代表性的一步数据处理。能�
 - codes 是 (B, n_q, T) 的整数 tensor
 - 返回 (B, n_q, T + n_q − 1)：第 k 个码本整体右移 k 格，空位填 pad_id
 - dtype 和 device 和输入一样
+--- above
+# 上文：MusicGen 的 codec 有 4 个码本，每本 2048 行；这是一段音乐的前 3 帧
+music_codes = torch.tensor([[[1532, 88, 2011],
+                             [7, 1999, 640],
+                             [345, 1060, 12],
+                             [876, 50, 1300]]])   # (B=1, n_q=4, T=3)
+PAD = 2048                                         # 码的取值是 0～2047，2048 当 pad
+--- below
+delayed = build_delay(music_codes, PAD)
+print("形状:", tuple(music_codes.shape), "->", tuple(delayed.shape))
+for row in delayed[0].tolist():
+    print(row)
 --- starter
 def build_delay(codes, pad_id):
     raise todo()
@@ -953,6 +1062,19 @@ ref: day13
 - 要有位置嵌入（最长 max_len）、n_layer 个 Block 和最后的 LayerNorm
 
 检查和 d13-08 一样：输出形状、因果性、初始 loss 在 ln(50) 附近。
+--- above
+# 上文：一批 codec 编码、做完 delay 的音频码，一共 2 段（1024 是 pad）
+audio_codes = torch.tensor([[[311, 87, 902, 1024, 1024],
+                             [1024, 640, 3, 777, 1024],
+                             [1024, 1024, 118, 960, 7]],
+                            [[45, 12, 505, 1024, 1024],
+                             [1024, 29, 431, 256, 1024],
+                             [1024, 1024, 88, 19, 71]]])   # (B=2, n_q=3, T=5)：2 段音频，3 个码本，5 个时间步
+--- below
+model = AudioLM(n_q=3, vocab=1025, dim=48, n_head=4)    # vocab = 1024 个码 + 1 个 pad
+logits = model(audio_codes)
+print("codes:", tuple(audio_codes.shape), "-> logits:", tuple(logits.shape))
+print("参数量:", sum(p.numel() for p in model.parameters()))
 --- starter
 class AudioLM(nn.Module):
     def __init__(self, n_q=4, vocab=50, dim=64, n_layer=2, n_head=4, max_len=256):

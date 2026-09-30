@@ -322,6 +322,17 @@ Write `kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype)`. I
 - Do not forget that K and V are stored separately.
 
 The tests check real model configurations (Llama-2-7B: 32 layers, 32 KV heads, head_dim 128) and compare with the bytes `TinyLM`'s cache really holds.
+--- above
+# Where the input comes from: before deploying, read a few numbers from the model's config.json (here Qwen2-7B)
+config = {"num_hidden_layers": 28, "num_attention_heads": 28, "num_key_value_heads": 4, "hidden_size": 3584}
+layers = config["num_hidden_layers"]                                    # 28 layers
+kv_heads = config["num_key_value_heads"]                                # GQA: 28 q heads share 4 KV heads
+dim_per_head = config["hidden_size"] // config["num_attention_heads"]   # 3584 // 28 = 128
+tokens_per_chat, n_chats = 8192, 4                                      # up to 8192 tokens per chat, 4 chats at once
+--- below
+n_bytes = kv_cache_bytes(layers, kv_heads, dim_per_head, tokens_per_chat, n_chats, torch.bfloat16)
+print("Bytes the KV cache takes:", n_bytes)
+print("In GiB:", n_bytes / 1024**3)
 --- starter
 def kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype):
     bytes_per_number = dtype.itemsize
@@ -440,6 +451,15 @@ Write the **generator** `stream_tokens(model, prompt_ids, max_new_tokens, eos_id
 - The next token comes from `logits[0, -1]` (the last position). Yield a Python int (use `.item()`), because it will be turned into JSON for the user.
 - Stop when `eos_id` is generated; do not yield the eos itself. Yield at most `max_new_tokens` tokens.
 - No wasted forward passes: after the last token is yielded, do not call the model again. With `max_new_tokens=0`, do not call it at all.
+--- above
+# Where the input comes from: the user's message, tokenized into a prompt, goes to TinyLM (today's small model)
+lm = make_tiny_lm()                          # ready-made helper: a small LLM with random weights
+prompt = torch.tensor([[9, 4, 30, 17, 2]])   # 1 prompt of 5 tokens, shape (1, 5)
+# lm.calls lists how many tokens the model got on each call; for now it is []
+--- below
+for tok in stream_tokens(lm, prompt, max_new_tokens=4, eos_id=0):   # pretend token 0 is eos
+    print("sent to the user:", tok, "  model calls so far:", lm.calls)
+print("calls after generation ends:", lm.calls)
 --- starter
 def stream_tokens(model, prompt_ids, max_new_tokens, eos_id):
     ids, cache = prompt_ids, None
@@ -531,6 +551,12 @@ Return all the text before the first stop string (without the stop itself):
 - Return as soon as you find a stop and read no more pieces (in a real service, every extra piece is another GPU step).
 
 The current code only checks "is this piece a stop string". Fix it.
+--- above
+# Where the input comes from: a chat service gets the reply piece by piece, each piece decoded from one token
+reply_pieces = ["The", " fee", " is", " 5", "%.", "\n", "User", ":", " and", " tax", "?"]
+stop_strings = ["\nUser:"]     # in the chat template, this starts the user's next turn
+--- below
+print("returned text:", repr(text_until_stop(reply_pieces, stop_strings)))
 --- starter
 def text_until_stop(pieces, stops):
     text = ""
@@ -606,6 +632,13 @@ Requirements:
 4. Never yield an empty string.
 
 `held(text, stop)` on the card computes "how many characters at the end to hold back". Here there are several stop strings: compute it for each one and take the largest. `held` is not in the setup code: to use it, copy it into your answer, or write the loop yourself.
+--- above
+# Where the input comes from: the model sends its reply piece by piece; the service forwards it to the browser as it goes
+reply_pieces = ["Done", ".", "\n", "Any", " more", "?", "\n", "User", ":", " no"]
+stop_strings = ["\nUser:"]     # in the chat template, this starts the user's next turn
+--- below
+for chunk in stream_until_stop(reply_pieces, stop_strings):
+    print("sent to the user:", repr(chunk))
 --- starter
 def stream_until_stop(pieces, stops):
     buf = ""                                             # text not sent yet
@@ -709,6 +742,16 @@ Rules:
 - `top_k`: an integer (not a bool, and not a float such as 5.0), ≥ 0.
 - `max_new_tokens`: an integer (not a bool), ≥ 1, and `prompt_len + max_new_tokens <= context_len`.
 - At most one error per parameter; report every parameter that has a problem.
+--- above
+# Where the input comes from: the user's request JSON, read into a dict holding the sampling parameters they want
+prompt_tokens, context_tokens = 3000, 4096       # the prompt is 3000 tokens; the model sees at most 4096
+good_request = {"temperature": 0.7, "max_new_tokens": 1000}
+bad_request = {"temperature": 0.8, "top_p": 1.2, "max_tokens": 200, "max_new_tokens": 1500}
+--- below
+print("valid request:", validate_sampling(good_request, prompt_tokens, context_tokens))
+print("request with problems (sorted by parameter name):")
+for err in sorted(validate_sampling(bad_request, prompt_tokens, context_tokens)):
+    print("  ", err)
 --- starter
 def validate_sampling(params, prompt_len, context_len):
     errors = []
@@ -831,6 +874,14 @@ Time is counted in decode steps, starting at step 1. In each step:
 3. A request that now has `lengths[i]` tokens is done at this step and leaves its slot. The freed slot can be used from the next step on.
 
 Example: `lengths = [8, 2, 3, 2, 6, 1]` with 2 slots → `[8, 2, 5, 7, 13, 9]`. (Static batching gives `[8, 8, 11, 11, 17, 17]`, 17 steps in total.)
+--- above
+# Where the input comes from: 5 requests are waiting at once, each needing a different number of tokens
+request_lengths = [6, 2, 1, 4, 3]
+gpu_slots = 2                          # the GPU can decode only 2 sequences at a time
+--- below
+print("continuous, step at which each request is done:", simulate_continuous(request_lengths, gpu_slots))
+# simulate_static is a ready-made helper: the same requests, scheduled with static batching
+print("static batching, step at which each request is done:", simulate_static(request_lengths, gpu_slots))
 --- starter
 def simulate_continuous(lengths, n_slots):
     queue = list(range(len(lengths)))                    # waiting requests (in order)
@@ -943,6 +994,15 @@ Write `pick_steps(budget_ms, step_ms, overhead_ms, cfg, max_steps=50)`. It retur
 - Total time = `overhead_ms + steps × step_ms × (2 if cfg else 1)`, and it must be ≤ `budget_ms` (exactly equal still fits).
 - No more than `max_steps` (more steps would not improve the image).
 - If not even 1 step fits, return 0 (never a negative number). A 0 tells the caller to lower the resolution or reject the request.
+--- above
+# Where the input comes from: the product wants an image within 3 seconds; the two timings were measured on this GPU
+budget = 3000       # latency budget: 3000 ms
+unet_ms = 45        # one forward pass of the denoising network: 45 ms
+fixed_ms = 500      # fixed cost (text encoder + VAE decoding): 500 ms
+--- below
+print("without CFG (at most 50 steps):", pick_steps(budget, unet_ms, fixed_ms, cfg=False))
+print("with CFG:", pick_steps(budget, unet_ms, fixed_ms, cfg=True))
+print("budget of only 400 ms:", pick_steps(400, unet_ms, fixed_ms, cfg=True))
 --- starter
 def pick_steps(budget_ms, step_ms, overhead_ms, cfg, max_steps=50):
     per_step = step_ms * (2 if cfg else 1)
@@ -1202,6 +1262,14 @@ ref: day23
 The KV cache formula is the calculation that comes up most often in LLM deployment interviews. If you can write it with no references and explain every factor, you can estimate on the spot how many requests a GPU can serve.
 --- prompt
 Write `kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype)`. It returns the number of bytes the KV cache takes (a Python int). `dtype` is a PyTorch data type such as `torch.float16`.
+--- above
+# Where the input comes from: to estimate how many chats a GPU can serve, look up the model config (Llama-2-13B, no GQA)
+layers, kv_heads, dim_per_head = 40, 40, 128   # 40 layers, 40 KV heads, 128 numbers per head
+--- below
+per_token = kv_cache_bytes(layers, kv_heads, dim_per_head, 1, 1, torch.float16)
+per_chat = kv_cache_bytes(layers, kv_heads, dim_per_head, 4096, 1, torch.float16)
+print("each token takes:", per_token // 1024, "KiB")
+print("a 4096-token chat takes:", per_chat / 1024**3, "GiB")
 --- starter
 def kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype):
     raise todo()
@@ -1262,6 +1330,15 @@ Write the generator `stream_tokens(model, prompt_ids, max_new_tokens, eos_id)`: 
 - `prompt_ids`: (1, T) long. The model is called as `logits, cache = model(ids, cache)`.
 - The first call feeds the whole prompt (cache is `None`); after that, each call feeds only the previous new token (shape (1, 1)) together with the cache.
 - Stop when `eos_id` is generated, without yielding it; yield at most `max_new_tokens` tokens; do not call the model after the last token (with `max_new_tokens=0`, do not call it at all).
+--- above
+# Where the input comes from: the user's message, tokenized into a prompt, goes to TinyLM (today's small model)
+lm = make_tiny_lm()                     # ready-made helper: a small LLM with random weights
+prompt = torch.tensor([[20, 6, 11]])    # 1 prompt of 3 tokens, shape (1, 3)
+# lm.calls lists how many tokens the model got on each call; for now it is []
+--- below
+reply = list(stream_tokens(lm, prompt, max_new_tokens=10, eos_id=2))   # pretend token 2 is eos
+print("tokens sent to the user:", reply)
+print("model calls:", lm.calls)
 --- starter
 def stream_tokens(model, prompt_ids, max_new_tokens, eos_id):
     raise todo()

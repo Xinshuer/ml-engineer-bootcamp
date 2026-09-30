@@ -373,6 +373,10 @@ Write `psi(ref, live, bins=10, eps=1e-4)` that returns a Python float. `ref` is 
 1. The bin edges come from `ref` only: `torch.quantile(ref, torch.linspace(0, 1, bins + 1))[1:-1]` (drop the first and last, leaving bins − 1 edges).
 2. `torch.bucketize(x, edges)` gives each value's bin (0 to bins − 1); `torch.bincount(..., minlength=bins)` counts them; divide by the length to get the shares e (for ref) and a (for live).
 3. `clamp_min(eps)` both shares, then PSI = Σ (a − e) × ln(a / e).
+--- above
+# Where the input comes from: one feature of the training data (user age), and the same feature in live traffic today
+train_age = torch.randn(2000) * 10 + 35    # training time: 2000 users, 35 years old on average
+today_age = torch.randn(500) * 10 + 28     # live today: 500 users; a promotion brought in many younger people
 --- starter
 def psi(ref, live, bins=10, eps=1e-4):
     """ref: one feature at training time (N,); live: the same feature in production (M,). Returns PSI (a Python float)."""
@@ -380,6 +384,9 @@ def psi(ref, live, bins=10, eps=1e-4):
     e = ...          # 2. share of ref in each bin, length bins
     a = ...          #    share of live in each bin, length bins
     raise todo()     # 3. clamp_min(eps), apply the formula, return a float
+--- below
+print("training data vs itself:", round(psi(train_age, train_age), 4))
+print("today vs training:", round(psi(train_age, today_age), 4))
 --- solution
 def psi(ref, live, bins=10, eps=1e-4):
     edges = torch.quantile(ref, torch.linspace(0, 1, bins + 1))[1:-1]     # edges from the training data only
@@ -447,6 +454,10 @@ A real incident: a drift monitor ran for six months, PSI stayed below 0.01 every
 `fit_reference` runs once at training time: it fixes the bin edges and records the share of training data in each bin, and the result is saved together with the model. Once live, `daily_psi` runs every day to compare today's data with the training data.
 
 This monitor has been live for six months, and PSI is close to 0 every day, even when today's data has clearly changed. Find the bug and fix it: `daily_psi(fit_reference(train), today)` must give the same result as `psi(train, today)` from exercise 4.
+--- above
+# Where the input comes from: one feature at training time (order amount), and the same feature on one day in production
+train_amount = torch.rand(3000) * 100          # training time: 3000 orders, between 0 and 100 dollars
+today_amount = torch.rand(800) * 100 + 15      # today: 800 orders; after a big sale, amounts are 15 dollars higher across the board
 --- starter
 def fit_reference(train_values, bins=10):
     """Runs once at training time: fix the bin edges and record the share of training data in each bin."""
@@ -463,6 +474,10 @@ def daily_psi(reference, today_values, eps=1e-4):
     e = reference["shares"]
     a, e = a.clamp_min(eps), e.clamp_min(eps)
     return float(((a - e) * torch.log(a / e)).sum())
+--- below
+reference = fit_reference(train_amount)        # runs once at training time, saved together with the model
+print("saved edges:", [round(v, 1) for v in reference["edges"].tolist()])
+print("today's PSI:", round(daily_psi(reference, today_amount), 4))
 --- solution
 def fit_reference(train_values, bins=10):
     edges = torch.quantile(train_values, torch.linspace(0, 1, bins + 1))[1:-1]
@@ -552,10 +567,17 @@ Write `ks_statistic(a, b)` that returns a Python float. a and b are 1-D float te
 2. The places to look at: both datasets put together, `torch.cat([a, b])`.
 3. Evaluate both cumulative curves at those places: `torch.searchsorted(sorted a, places, right=True) / len(a)`, and the same for b.
 4. Return the largest absolute difference between the two curves.
+--- above
+# Where the input comes from: one feature (words per request) in the training data and in live traffic today
+train_len = torch.tensor([12., 30., 25., 18., 40., 22.])   # 6 requests from the training data, not sorted
+today_len = torch.tensor([35., 50., 28., 45.])            # 4 live requests today: a different count, longer in general
 --- starter
 def ks_statistic(a, b):
     """KS statistic of two 1-D datasets: the largest vertical distance between their empirical cumulative curves, between 0 and 1."""
     raise todo()
+--- below
+print("vs itself reversed:", ks_statistic(train_len, train_len.flip(0)))
+print("today vs training:", round(ks_statistic(train_len, today_len), 4))
 --- solution
 def ks_statistic(a, b):
     a = torch.sort(a).values                   # searchsorted needs sorted input
@@ -617,6 +639,10 @@ Write two functions:
 
 - `class_shares(pred, num_classes)`: pred is a 1-D long tensor where each element is a predicted class (0 to num_classes − 1). Return a float tensor of length num_classes: the share of each class. A class that never appears has share 0, and the length must not shrink.
 - `prediction_psi(ref_pred, live_pred, num_classes, eps=1e-4)`: e is the shares of ref_pred and a the shares of live_pred; `clamp_min(eps)` both, compute Σ (a − e) × ln(a / e), and return a Python float.
+--- above
+# Where the input comes from: a fraud model's predictions (0 normal, 1 human review, 2 fraud) in week one and today
+week1_pred = torch.tensor([0, 0, 1, 0, 2, 0, 0, 1, 0, 0])   # 10 predictions from the first week
+today_pred = torch.tensor([0, 1, 1, 0, 1, 0, 1, 0])         # 8 predictions today: not a single "fraud"
 --- starter
 def class_shares(pred, num_classes):
     """The share of predictions for each class, length num_classes."""
@@ -626,6 +652,10 @@ def class_shares(pred, num_classes):
 def prediction_psi(ref_pred, live_pred, num_classes, eps=1e-4):
     """Predictions right after launch vs predictions today: PSI (a float)."""
     raise todo()
+--- below
+print("week one, share of each class:", [round(v, 3) for v in class_shares(week1_pred, 3).tolist()])
+print("today, share of each class:   ", [round(v, 3) for v in class_shares(today_pred, 3).tolist()])
+print("PSI of the predictions:", round(prediction_psi(week1_pred, today_pred, 3), 4))
 --- solution
 def class_shares(pred, num_classes):
     return torch.bincount(pred, minlength=num_classes) / len(pred)     # minlength: classes that never appear still get a slot
@@ -684,6 +714,10 @@ Complete `ErrorRateAlert`:
 
 - `record(t, is_error)`: record one request. t is the time in seconds (always increasing); is_error is True / False. Store it in `self.events`.
 - `firing(now)`: look only at the requests of the last window_s seconds, that is those with now − window_s < t ≤ now. First `popleft` the older ones off the left of `self.events`, so memory does not keep growing. Return True only when the window has ≥ min_count requests **and** an error rate > threshold; otherwise return False (also when the window is empty).
+--- above
+# Where the input comes from: the service's request log, each entry is (second it arrived, did it fail), in time order
+request_log = [(1, True), (2, True),                                           # at first: only 2 requests, both failed
+               (30, False), (31, True), (32, False), (33, True), (34, True)]   # a bit later: more requests, many failing
 --- starter
 from collections import deque
 
@@ -699,6 +733,11 @@ class ErrorRateAlert:
 
     def firing(self, now):
         raise todo()
+--- below
+alert = ErrorRateAlert(window_s=10, threshold=0.2, min_count=5)   # last 10 s only; fire at >= 5 requests and > 20% errors
+for t, is_error in request_log:
+    alert.record(t, is_error)
+    print(f"second {t:2d} (error: {is_error}) -> firing: {alert.firing(t)}, requests in window: {len(alert.events)}")
 --- solution
 from collections import deque
 
@@ -785,6 +824,13 @@ Write two functions. The caller creates `stats`: `{"rows": 0, "disagree": 0, "sh
 4. If prod itself fails: do not catch it; let the error go out as usual.
 
 `disagreement_rate(stats)`: return disagree / rows; return None when rows is 0 (nothing compared yet).
+--- above
+# Where the input comes from: the old model serving live traffic, and the new one meant to replace it (4 features in, 3 classes out)
+prod_model = nn.Linear(4, 3)         # the old model: every answer users get comes from it
+new_model = nn.Linear(4, 3)          # the new model: different weights, so it answers some requests differently
+broken_model = nn.Linear(5, 3)       # a broken new model: it expects 5 features, the requests have 4, so it crashes
+requests = torch.randn(10, 4)        # 10 live requests, 4 features each
+shadow_stats = {"rows": 0, "disagree": 0, "shadow_errors": 0}   # the counters, created by the caller
 --- starter
 def serve_with_shadow(x, prod, shadow, stats):
     """Return prod's predictions (for the user); shadow is only compared, and its errors must never reach the user."""
@@ -793,6 +839,11 @@ def serve_with_shadow(x, prod, shadow, stats):
 
 def disagreement_rate(stats):
     raise todo()
+--- below
+answer = serve_with_shadow(requests, prod_model, new_model, shadow_stats)
+serve_with_shadow(requests, prod_model, broken_model, shadow_stats)   # the same requests once more; this time the shadow crashes
+print("answers the users got:", answer.tolist())
+print("counters:", shadow_stats, " disagreement rate:", disagreement_rate(shadow_stats))
 --- solution
 def serve_with_shadow(x, prod, shadow, stats):
     with torch.inference_mode():
@@ -928,6 +979,9 @@ The `canary_decision` below only checks which error rate is bigger. Fix it to fo
 1. If `base_n < min_n` or `canary_n < min_n`: return "wait". (Check this first; then no division happens at all.)
 2. Otherwise compute p_base, p_canary and se = sqrt(p_base(1 − p_base)/base_n + p_canary(1 − p_canary)/canary_n). If p_canary − p_base > z × se, return "rollback".
 3. In every other case: return "promote".
+--- above
+# Where the input comes from: request and failure counts the release system reads from monitoring; the baseline is the old model
+baseline_failed, baseline_total = 100, 5000   # baseline: 5000 requests, 100 failed (2.0%)
 --- starter
 def canary_decision(base_errors, base_n, canary_errors, canary_n, min_n=1000, z=2.0):
     p_base = base_errors / base_n
@@ -935,6 +989,10 @@ def canary_decision(base_errors, base_n, canary_errors, canary_n, min_n=1000, z=
     if p_canary > p_base:              # the canary's error rate is above the baseline's: roll back
         return "rollback"
     return "promote"
+--- below
+print("canary just got 12 requests, 1 failed:", canary_decision(baseline_failed, baseline_total, 1, 12))
+print("canary got 5000 requests, 110 failed (2.2%):", canary_decision(baseline_failed, baseline_total, 110, 5000))
+print("canary got 5000 requests, 175 failed (3.5%):", canary_decision(baseline_failed, baseline_total, 175, 5000))
 --- solution
 def canary_decision(base_errors, base_n, canary_errors, canary_n, min_n=1000, z=2.0):
     if base_n < min_n or canary_n < min_n:
@@ -1031,9 +1089,16 @@ PSI is today's most important function: when an interviewer asks "how do you det
 Without looking at the cards, write `psi(ref, live, bins=10, eps=1e-4)` that returns a Python float: the bin edges come from ref's quantiles only (bins − 1 of them); count the share of ref and of live in each bin with those same edges (length bins for both); clamp_min(eps) both; PSI = Σ (a − e) × ln(a / e).
 
 The checks are the same as in exercise 4.
+--- above
+# Where the input comes from: one feature of the training data (credit score), and the same feature in live traffic today
+train_score = torch.randn(3000) * 50 + 650    # training time: 3000 applicants, average credit score 650
+today_score = torch.randn(600) * 80 + 650     # today: 600 applicants, same average, but the scores are more spread out
 --- starter
 def psi(ref, live, bins=10, eps=1e-4):
     raise todo()
+--- below
+print("today vs training:", round(psi(train_score, today_score), 4))
+print("with only 5 bins:", round(psi(train_score, today_score, bins=5), 4))
 --- solution
 def psi(ref, live, bins=10, eps=1e-4):
     edges = torch.quantile(ref, torch.linspace(0, 1, bins + 1))[1:-1]
@@ -1105,6 +1170,11 @@ Without looking at the cards, write `ErrorRateAlert(window_s=300, threshold=0.05
 - `firing(now)` first drops requests with t ≤ now − window_s from the left, then returns True when the window has ≥ min_count requests and an error rate > threshold, otherwise False (also when there are no requests).
 
 The checks are the same as in exercise 9.
+--- above
+# Where the input comes from: the service's request log, each entry is (second it arrived, did it fail), in time order
+request_log = [(5, True),                                                        # at first: only 1 request, and it failed
+               (40, False), (41, False), (42, True), (43, True), (44, False),   # a bit later: errors pile up
+               (80, False)]                                                     # later still: one successful request
 --- starter
 from collections import deque
 
@@ -1117,6 +1187,11 @@ class ErrorRateAlert:
 
     def firing(self, now):
         raise todo()
+--- below
+alert = ErrorRateAlert(window_s=30, threshold=0.25, min_count=4)   # last 30 s only; fire at >= 4 requests and > 25% errors
+for t, is_error in request_log:
+    alert.record(t, is_error)
+    print(f"second {t:2d} (error: {is_error}) -> firing: {alert.firing(t)}, requests in window: {len(alert.events)}")
 --- solution
 from collections import deque
 

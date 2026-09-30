@@ -339,6 +339,16 @@ ViT、DiT 这类模型都要先把图片（或 latent）切成 patch，才能交
 - patchify 的逆操作：(B, N, C*p*p) → (B, C, H, W)
 
 检查：(2, 3, 8, 8) 用 p = 2 切成 (2, 16, 12)，拼回去必须和原图完全一样；每个 token 必须真的是一个方块，顺序是行优先。
+--- above
+# 上文：DiT 的输入是一批图片（或 VAE 压出来的 latent），形状 (B, C, H, W)
+n_ch, height, width = 1, 4, 6                             # 1 张图，1 个通道，4×6 像素
+img = torch.arange(24.).reshape(1, n_ch, height, width)   # 像素值就是编号 0..23，方便认出每块
+patch = 2                                                 # patch 大小：每块 2×2 像素
+--- below
+tokens = patchify(img, patch)
+print("tokens:", tuple(tokens.shape))
+print("token 0:", tokens[0, 0].tolist(), " token 1:", tokens[0, 1].tolist())
+print("拼回去和原图一样:", torch.equal(unpatchify(tokens, patch, height, width, n_ch), img))
 --- starter
 def patchify(x, p):
     """x: (B, C, H, W) -> (B, N, C*p*p)，N = (H/p) * (W/p)，patch 按行优先排列。"""
@@ -408,6 +418,14 @@ attention 分不清 token 的顺序，不加位置信息，模型就不知道一
 dim 是 4 的倍数，所以 dim/2 也是偶数。
 
 检查：(64, 4, 4) 得到 (16, 64)；相邻的 token 编码不同；同一行的 token 前 32 维相同，同一列的 token 后 32 维相同。
+--- above
+# 上文：图片切成 patch 后排成一串 token，模型要知道每块在第几行第几列
+rows, cols, dim = 3, 2, 8     # 3 行 × 2 列 = 6 个 patch，每个位置编码 8 维（前 4 维管行，后 4 维管列）
+--- below
+pe = pos_embed_2d(dim, rows, cols)
+print("pe:", tuple(pe.shape))
+print("token 0 和 1 同在第 0 行，前一半一样:", torch.equal(pe[0, :4], pe[1, :4]))
+print("token 0 和 2 同在第 0 列，后一半一样:", torch.equal(pe[0, 4:], pe[2, 4:]))
 --- starter
 def _pe_1d(d, pos):
     """pos: 整数位置 (L,) -> (L, d)。"""
@@ -463,6 +481,16 @@ ref: day8, day10
 - 注意 `1 +`：scale 和 shift 都是 0 时，必须原样返回 x
 
 检查：全 0 时是恒等；shift = 1 时整体加 1；scale = 1 时整体乘 2。
+--- above
+# 上文：DiTBlock 里，LayerNorm 后的 token 要用条件 c 算出的 shift/scale 调整
+tokens = torch.ones(2, 3, 4)                                          # 2 张图，每张 3 个 token，每个 4 维；为了好认，全是 1
+shifts = torch.tensor([[0.0, 0.0, 0.0, 0.0], [0.5, 0.5, 0.5, 0.5]])   # 每张图一行：第 0 张 shift = 0，第 1 张 shift = 0.5
+scales = torch.tensor([[1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0]])   # 每张图一行：第 0 张 scale = 1，第 1 张 scale = 0
+--- below
+y = modulate(tokens, shifts, scales)
+print("y:", tuple(y.shape))
+print("第 0 张图的 token 0:", y[0, 0].tolist())
+print("第 1 张图的 token 2:", y[1, 2].tolist())
 --- starter
 def modulate(x, shift, scale):
     """x: (B, N, D)   shift, scale: (B, D)   ->  x * (1 + scale) + shift"""
@@ -498,6 +526,15 @@ ref: day8, day10
 - `forward(c)`：c 的形状是 (B, dim)。先 SiLU，再 Linear，得到 (B, 6*dim)；切成 6 个 (B, dim) 返回（tuple 即可）。顺序是 shift_msa、scale_msa、gate_msa、shift_mlp、scale_mlp、gate_mlp
 
 检查：返回 6 个张量，每个 (B, dim)，而且刚建好时全是 0。
+--- above
+# 上文：时间 t 经过时间嵌入和一个小 MLP，变成每张图一个条件向量 c
+dim = 4
+cond = torch.randn(2, dim)       # 2 张图的条件向量，每个 4 维（随机数，不是 0）
+--- below
+mod = AdaLNModulation(dim)
+shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod(cond)
+print("每组的形状:", tuple(gate_msa.shape))
+print("gate_msa:", gate_msa.tolist())
 --- starter
 class AdaLNModulation(nn.Module):
     """c (B, dim) -> 6 个 (B, dim)：shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp"""
@@ -563,6 +600,16 @@ x = x + g2 * mlp(modulate(norm2(x), s2, sc2))
 gate 的形状是 (B, dim)，乘之前要变成 (B, 1, dim)。`modulate` 也已经提供。
 
 检查：刚建好的 block 必须是恒等映射（输出 = 输入）；把 modulation 的参数改成非零之后，输出必须真的变了。
+--- above
+# 上文：MiniDiT 里，patch token 加上位置编码后进 block，时间 t 变成条件 c
+dim, n_head = 8, 2
+tokens = torch.randn(2, 4, dim)   # 2 张图，每张 4 个 patch token，每个 8 维
+cond = torch.randn(2, dim)        # 每张图一个条件向量 c（来自时间 t）
+--- below
+block = DiTBlock(dim, n_head)
+out = block(tokens, cond)
+print("out:", tuple(out.shape))
+print("刚建好时，输出 = 输入:", torch.allclose(out, tokens))
 --- starter
 class DiTBlock(nn.Module):
     def __init__(self, dim, n_head):
@@ -624,6 +671,16 @@ ref: day8, day10
 让 t 能按样本广播到任意维数的数据上（不要假设一定是 4 维）。
 
 检查：t = 0 返回噪声，t = 1 返回数据，t = 0.5 是两者的平均；x_t 对 t 的数值导数等于 flow_target；batch 里每个样本用的是自己的 t。
+--- above
+# 上文：训练时取一批图，抽同样形状的噪声，再给每张图抽一个时刻 t
+images = torch.full((3, 1, 3, 3), 2.0)        # 3 张 1 通道 3×3 的「图」；为了好认，像素都是 2
+pure_noise = torch.full((3, 1, 3, 3), -1.0)   # 噪声本来用 torch.randn 抽，这里全用 -1，结果好算
+times = torch.tensor([0.0, 0.5, 1.0])         # 每张图自己的 t
+--- below
+x_t = flow_interpolate(pure_noise, images, times)
+print("x_t:", tuple(x_t.shape))
+print("每张图左上角的像素:", x_t[:, 0, 0, 0].tolist())
+print("速度目标（左上角）:", flow_target(pure_noise, images)[:, 0, 0, 0].tolist())
 --- starter
 def flow_interpolate(x0_noise, x1_data, t):
     """x_t = (1 - t) * noise + t * data。x: (B, C, H, W)，t: (B,)"""
@@ -690,6 +747,14 @@ ref: day8, day10
 `model(x, t)` 返回和 x 同形状的张量。随机数要和数据在同一个 device 上。
 
 检查：用一个永远输出 0 的模型、4096 个标准正态的「数据」，loss 应该 ≈ 2（为什么是 2，见卡片）；再用一个能算出真实速度的模型，loss 应该 ≈ 0。
+--- above
+# 上文：训练循环的每一步，从数据集取一批 latent 交给 flow_loss
+dit = MiniDiT(in_ch=4, img=8)        # d10-10 要写的模型，这里用后台的参考实现；还没训练，输出全是 0
+latents = torch.randn(64, 4, 8, 8)   # 64 个 latent（4 通道、8×8）；VAE 压出来的 latent 大致是标准正态
+--- below
+loss = flow_loss(dit, latents)
+print("loss:", round(loss.item(), 1))
+print("loss 是几维的张量:", loss.dim())
 --- starter
 def flow_loss(model, x1_data):
     """t ~ U(0,1) 每个样本一个；noise ~ N(0, I)；x_t = 插值；返回 mse(model(x_t, t), data - noise)。"""
@@ -751,6 +816,14 @@ ref: day8, day10
 - 函数上已经加了 `@torch.no_grad()`
 
 检查：速度恒为 5 的模型，4 步和 100 步的结果必须一样，而且正好是初始噪声 + 5；模型被调用 steps 次，收到的 t 依次是 0, dt, 2dt, …。检查会先设随机种子再调用，所以别在 `torch.randn(shape)` 之前再用别的随机数。
+--- above
+# 上文：训练好的模型给出速度 v(x, t)；这里用一个只见过一张小图的假模型
+pattern = torch.tensor([[1.0, -1.0], [-1.0, 1.0]])                        # 它见过的那张图：2×2 的棋盘格
+fake_model = lambda x, t: (pattern - x) / (1 - t).reshape(-1, 1, 1, 1)    # 总是指向那张图，剩下的时间里正好走到
+--- below
+imgs = flow_sample(fake_model, (3, 1, 2, 2), steps=4)
+print("imgs:", tuple(imgs.shape))
+print("第 0 张图:", imgs[0, 0].round(decimals=3).tolist())
 --- starter
 @torch.no_grad()
 def flow_sample(model, shape, steps=20, device="cpu"):
@@ -852,6 +925,15 @@ ref: day8, day10
 可以直接用：`patchify`、`unpatchify`、`pos_embed_2d`、`modulate`、`DiTBlock`（今天的参考实现），`timestep_embedding`（第 8 天）。
 
 检查：输出形状对；没训练时输出全是 0；参数加了扰动之后，t = 0 和 t = 1 的输出必须不同。
+--- above
+# 上文：训练时，flow_loss 把带噪的 x_t 和时刻 t 交给模型，要它预测速度
+x_t = torch.randn(3, 4, 8, 8)          # 3 张带噪的 latent：4 个通道，8×8
+times = torch.tensor([0.1, 0.5, 0.9])  # 每张一个时刻 t
+--- below
+model = MiniDiT()
+v = model(x_t, times)
+print("v:", tuple(v.shape), " 参数个数:", sum(p.numel() for p in model.parameters()))
+print("还没训练，输出全是 0:", torch.equal(v, torch.zeros_like(v)))
 --- starter
 class MiniDiT(nn.Module):
     """x (B, in_ch, img, img), t (B,) -> 和 x 同形状。
@@ -948,6 +1030,15 @@ ref: day8, day10
 找到这 4 处错并改好（类名不要改，`modulation` 保持 `nn.Sequential(SiLU, Linear)` 的写法即可）。
 
 检查：刚建好的 block 必须是恒等映射（输出 = 输入）；两个 LayerNorm 都不能带可学习的 γ/β。
+--- above
+# 上文：MiniDiT 里，patch token 加上位置编码后进 block，时间 t 变成条件 c
+dim, n_head = 8, 2
+tokens = torch.randn(2, 4, dim)   # 2 张图，每张 4 个 patch token，每个 8 维
+cond = torch.randn(2, dim)        # 每张图一个条件向量 c（来自时间 t）
+--- below
+block = DiTBlockBuggy(dim, n_head)
+print("刚建好时，输出 = 输入:", torch.allclose(block(tokens, cond), tokens))
+print("两个 LayerNorm 带可学习的 γ/β:", block.norm1.elementwise_affine, block.norm2.elementwise_affine)
 --- starter
 class DiTBlockBuggy(nn.Module):
     def __init__(self, dim, n_head):
@@ -1124,6 +1215,16 @@ DiTBlock 是今天最重要的一段代码：第 4 天的 pre-LN Block 加上 ad
 - MLP 是 `Linear(dim, 4*dim) → GELU → Linear(4*dim, dim)`
 
 检查：刚建好的 block 必须是恒等映射；modulation 的参数变成非零后，输出必须改变。
+--- above
+# 上文：MiniDiT 里，patch token 加上位置编码后进 block，时间 t 变成条件 c
+dim, n_head = 16, 4
+tokens = torch.randn(1, 9, dim)   # 1 张图，9 个 patch token（3×3 块），每个 16 维
+cond = torch.randn(1, dim)        # 这张图的条件向量 c（来自时间 t）
+--- below
+block = DiTBlock(dim, n_head)
+out = block(tokens, cond)
+print("out:", tuple(out.shape))
+print("刚建好时，输出 = 输入:", torch.allclose(out, tokens))
 --- starter
 class DiTBlock(nn.Module):
     def __init__(self, dim, n_head):
@@ -1178,6 +1279,14 @@ ref: day8, day10
 插值自己写，不要调用 `flow_interpolate` / `flow_target`。`model(x, t)` 返回和 x 同形状的张量，t 的形状是 (B,)。
 
 检查：永远输出 0 的模型，在标准正态数据上 loss ≈ 2；能算出真实速度的模型，loss ≈ 0。
+--- above
+# 上文：训练循环的每一步，从数据集取一批 latent 交给 flow_loss
+dit = MiniDiT(in_ch=4, img=8)        # d10-10 要写的模型，这里用后台的参考实现；还没训练，输出全是 0
+latents = torch.randn(64, 4, 8, 8)   # 64 个 latent（4 通道、8×8）；VAE 压出来的 latent 大致是标准正态
+--- below
+loss = flow_loss(dit, latents)
+print("loss:", round(loss.item(), 1))
+print("loss 是几维的张量:", loss.dim())
 --- starter
 def flow_loss(model, x1_data):
     raise todo()

@@ -399,6 +399,10 @@ Then add a method `scaled_lr(self, k)` that returns `self.lr * k`.
 TrainConfig().batch_size          ->  32
 TrainConfig(lr=1e-3).scaled_lr(2) ->  0.002
 ```
+--- below
+cfg = TrainConfig(n_layer=12, tags=["baseline"])   # this run changes two values, the rest keep their defaults
+print(cfg)
+print("lr for a 4x bigger batch:", cfg.scaled_lr(4))
 --- starter
 from dataclasses import dataclass, field
 
@@ -464,6 +468,13 @@ chunk([], 3)                     ->  []
 ```
 
 Use slices to take each piece, so that it works for lists and for strings (a slice of a string is a string). Return a real list.
+--- above
+# Where the input comes from: a tokenized text is one long list of token ids, cut into equal-length samples
+tokens = [15, 8, 42, 7, 3, 99, 21, 64, 5, 30]   # 10 token ids
+text = "transformer"                            # a character-level model can cut the string itself
+--- below
+print("token samples:", chunk(tokens, 4))
+print("string samples:", chunk(text, 4))
 --- starter
 def chunk(seq, n):
     """chunk([0, 1, 2, 3, 4, 5, 6], 3) -> [[0, 1, 2], [3, 4, 5]] (the last 6 is not a full piece of 3: dropped)"""
@@ -511,6 +522,13 @@ make_xy(data, 3, 5)  ->  ([3, 4, 5, 6, 7], [4, 5, 6, 7, 8])
 ```
 
 This is the plain Python version. On day 3, `get_batch` does the same thing with tensors for a whole batch at once.
+--- above
+# Where the input comes from: the training data is one long list of token ids (just 10 of them here)
+data = [5, 12, 7, 3, 9, 14, 2, 8, 11, 6]
+--- below
+x, y = make_xy(data, 2, 4)      # start at index 2, take 4
+print("x:", x)
+print("y:", y)
 --- starter
 def make_xy(data, i, block_size):
     """Take one training sample starting at i; return (x, y), two lists of length block_size.
@@ -558,6 +576,13 @@ Write two functions:
 f = char_freq("abracadabra")   ->  {"a": 5, "b": 2, "r": 2, "c": 1, "d": 1}
 top_k(f, 3)                    ->  [("a", 5), ("b", 2), ("r", 2)]
 ```
+--- above
+# Where the input comes from: before building a tokenizer, count each character in the corpus (one word here)
+corpus = "mississippi"
+--- below
+freq = char_freq(corpus)
+print("count per character:", freq)
+print("top 3:", top_k(freq, 3))
 --- starter
 def char_freq(text):
     """Count how often each character appears; return a dict. No collections.Counter."""
@@ -619,6 +644,14 @@ m.n       ->  2
 m.reset()
 m.value   ->  0.0
 ```
+--- above
+# Where the input comes from: the first 4 training steps, each one gives a loss
+losses = [3.0, 2.5, 2.0, 1.5]
+--- below
+m = RunningMean()
+for loss in losses:
+    m(loss)
+print("n:", m.n, "| value:", m.value)
 --- starter
 class RunningMean:
     def __init__(self):
@@ -697,6 +730,14 @@ e.n   ->  2
 Careful: the parent's `value` is a `@property`, so it can be read but not assigned (`self.value = ...` raises an error). Keep the EMA value in another attribute (for example `self._v`) and override the `value` property in the child to return it.
 
 Bonus (not checked): override `reset()`: call `super().reset()` first, then set `self._v` back to `None`.
+--- above
+# Where the input comes from: the loss in the training log jumps up and down; an EMA smooths it
+losses = [2.0, 3.0, 1.0, 2.0]
+--- below
+e = EMAMean(decay=0.5)
+for loss in losses:
+    e(loss)
+    print("fed", loss, "-> value =", e.value, "| n =", e.n)
 --- starter
 class EMAMean(RunningMean):
     pass
@@ -769,6 +810,14 @@ b.done       ->  False
 b.step = 100
 b.done       ->  True     # step changed, and done follows automatically
 ```
+--- above
+# Where the input comes from: this run is planned for 2000 steps and has reached step 600
+planned_steps, current_step = 2000, 600
+--- below
+b = Budget(planned_steps, current_step)
+print("step", b.step, "-> progress =", b.progress, "| done =", b.done)
+b.step = 2000                   # training has finished
+print("step", b.step, "-> progress =", b.progress, "| done =", b.done)
 --- starter
 class Budget:
     def __init__(self, total_steps, step=0):
@@ -831,6 +880,16 @@ def add(a, b, scale=1):
 add(1, 2)             ->  3     CALLS gets ("add", (1, 2), {})
 add(1, 2, scale=10)   ->  30    CALLS gets ("add", (1, 2), {"scale": 10})
 ```
+--- above
+# Where the input comes from: a function in the training script that gives the learning rate for a step;
+# we want to record every call to it
+def get_lr(step, warmup=100):
+    return 6e-4 * min(1.0, step / warmup)   # rises from 0 to 6e-4 over the first `warmup` steps
+--- below
+CALLS.clear()                    # empty it first, to see only the two calls below
+get_lr = logged(get_lr)          # the same as putting @logged on the line above def get_lr
+print("returned:", get_lr(50), get_lr(300, warmup=200))
+print("CALLS:", CALLS)
 --- starter
 import functools
 
@@ -907,6 +966,13 @@ Rules:
 - the parts are separated by ` | ` (one space on each side of the bar)
 
 `log_line(1200, 1.48321, 3e-4, 0.12534)` must match the line above exactly.
+--- above
+# Where the input comes from: every few hundred steps the training loop hands over 4 numbers:
+# the step, the loss, the learning rate and how many seconds the step took
+logs = [(300, 2.71828, 6e-4, 0.0875), (1500, 1.90311, 4.5e-4, 0.1102)]
+--- below
+for step, loss, lr, dt in logs:
+    print(log_line(step, loss, lr, dt))
 --- starter
 def log_line(step, loss, lr, dt):
     """Return a string like  step  1200 | loss 1.4832 | lr 3.00e-04 | 125.3ms"""
@@ -945,6 +1011,15 @@ deltas([3, 5, 4])                  ->  [2, -1]
 deltas([1])                        ->  []
 label_pairs(["a", "b"], [1, 2])    ->  ["0:a=1", "1:b=2"]
 ```
+--- above
+# Where the input comes from: every 500 steps the loss is measured on the validation set (round numbers, easy to read)
+val_losses = [2.5, 2.0, 1.75, 1.625]
+# 3 comparison runs were trained too: their names, and the final loss of each
+runs = ["baseline", "dropout", "wider"]
+final_losses = [1.62, 1.58, 1.71]
+--- below
+print("change between neighbours:", deltas(val_losses))
+print("numbered:", label_pairs(runs, final_losses))
 --- starter
 def deltas(xs):
     """Differences between neighbours: [3, 5, 4] -> [2, -1]. Use zip, not indexes."""
@@ -998,6 +1073,16 @@ p.name          ->  "ckpt_000500.pt"
 p.parent.name   ->  "gpt-tiny"
 p.parent.is_dir()  ->  True
 ```
+--- above
+# Where the input comes from: a real project saves checkpoints under runs/; here a temporary folder
+# that deletes itself afterwards stands in for it
+import tempfile
+tmp = tempfile.TemporaryDirectory()
+root = tmp.name
+--- below
+p = ckpt_path(root, "gpt-tiny", 1200)
+print("file name:", p.name, "| folder:", p.parent.name)
+print("folder exists:", p.parent.is_dir())
 --- starter
 from pathlib import Path
 
@@ -1069,6 +1154,12 @@ It has 3 mistakes. Fix it so every check passes.
 bucket_by_len(["ab", "cd", "ef", "xyz"], bucket_size=2)  ->  {2: ["ab", "cd"], 3: ["xyz"]}
 bucket_by_len(["q"])                                      ->  {1: ["q"]}
 ```
+--- above
+# Where the input comes from: a few tokenized training samples (short strings here), of different lengths
+samples = ["hi", "ok", "yes", "no", "cat", "dog"]
+--- below
+print("first call:", bucket_by_len(samples, bucket_size=2))
+print("second call:", bucket_by_len(["hey"]))
 --- starter
 def bucket_by_len(samples, bucket_size=2, out={}):
     for s in samples:
@@ -1242,6 +1333,14 @@ Without the cards, write the class `RunningMean` from blank:
 - `m.value`: the average so far (read without parentheses)
 - `m.n`: how many numbers have been recorded
 - `m.reset()`: back to the new state
+--- above
+# Where the input comes from: the validation set is split into 4 batches, each one gives a loss
+batch_losses = [1.75, 2.25, 2.0, 1.5]
+--- below
+m = RunningMean()
+for loss in batch_losses:
+    m(loss)
+print("n:", m.n, "| value:", m.value)
 --- starter
 class RunningMean:
     def __init__(self):
@@ -1305,6 +1404,13 @@ Without the cards, write `make_xy(data, i, block_size)` from blank: x is the `bl
 ```
 make_xy(list(range(20)), 3, 5)  ->  ([3, 4, 5, 6, 7], [4, 5, 6, 7, 8])
 ```
+--- above
+# Where the input comes from: the token ids of a short text (on day 3 you write a real tokenizer)
+data = [20, 31, 7, 7, 15, 0, 42, 11]
+--- below
+x, y = make_xy(data, 1, 5)      # start at index 1, take 5
+print("x:", x)
+print("y:", y)
 --- starter
 def make_xy(data, i, block_size):
     raise todo()

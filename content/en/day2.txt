@@ -308,6 +308,16 @@ d: (4, 6, 8, 8)   e: (64,)
 Replace every `None` in `SHAPES` with the shape of the result, written as a tuple such as `(8, 16)`.
 
 When you check, every wrong answer is listed with its real shape. Work out which step you got wrong: that is where all the value of this exercise is. Wrong guesses are fine; copying without guessing is the only way to waste it.
+--- above
+# Where the input comes from: the 5 tensors of the exercise (all zeros: only the shapes matter)
+a = torch.zeros(8, 16, 64)     # e.g. 8 sentences, 16 tokens each, each token a 64-dim vector
+b = torch.zeros(64, 32)        # e.g. a weight matrix that turns 64 dims into 32
+c = torch.zeros(8, 1, 64)      # one 64-dim vector per sentence, with an extra dim of length 1 in the middle
+d = torch.zeros(4, 6, 8, 8)    # e.g. 4 sentences, 6 heads, an 8×8 table of attention scores per head
+e = torch.zeros(64)            # a single 64-dim vector, e.g. the g of a LayerNorm
+--- below
+right = [expr for expr in SHAPES if SHAPES[expr] == tuple(eval(expr).shape)]   # eval runs the string as code
+print("Guessed right:", len(right), "/", len(SHAPES))
 --- starter
 SHAPES = {
     "a @ b":                                None,   # matrix multiply: only the last two dims
@@ -383,6 +393,16 @@ Write `split_heads(qkv, n_head)`:
 - each head gets one contiguous slice of the C dims: head 0 gets dims 0 to hs-1, head 1 the next hs dims, and so on
 
 Example: with `B, T, C, n_head = 2, 5, 12, 3`, q, k and v are all `(2, 3, 5, 4)`. The check tests the shapes, and also that q, k and v come from the right columns.
+--- above
+# Where the input comes from: in GPT's attention, one Linear turns each token's vector into q, k and v at once; stuck together they are qkv
+n_head = 3                        # 3 heads
+x = torch.randn(2, 5, 12)         # (B, T, C): 2 sentences, 5 tokens each, each token a 12-dim vector
+c_attn = nn.Linear(12, 3 * 12)    # computes q, k and v in one go
+qkv = c_attn(x)                   # (2, 5, 36): along the last dim come q, k, v, 12 dims each
+--- below
+q, k, v = split_heads(qkv, n_head)
+print("qkv:", tuple(qkv.shape))
+print("q:", tuple(q.shape), " k:", tuple(k.shape), " v:", tuple(v.shape))
 --- starter
 def split_heads(qkv, n_head):
     """qkv: (B, T, 3*C)  ->  q, k, v, each (B, n_head, T, head_dim)
@@ -431,6 +451,15 @@ Write `flatten_heads(x)`, the reverse of splitting heads:
 Example: input `(2, 3, 5, 4)`, output `(2, 5, 12)`. The output's `y[0, 1]` must equal `x[0, 0, 1]`, `x[0, 1, 1]` and `x[0, 2, 1]` joined together.
 
 Think first: why does a plain `view` right after the transpose fail?
+--- above
+# Where the input comes from: the attention output, one slice per head, stacked as (B, n_head, T, hs)
+heads = torch.arange(24.0)          # the numbers are just 0 to 23, so the order is easy to follow
+heads = heads.view(2, 2, 3, 2)      # 2 sentences, 2 heads, 3 tokens each, 2 dims per head
+--- below
+out = flatten_heads(heads)
+print("before:", tuple(heads.shape), " after:", tuple(out.shape))
+print("sentence 0, token 0, in each of the 2 heads:", heads[0, :, 0].tolist())
+print("the same token after merging:", out[0, 0].tolist())
 --- starter
 def flatten_heads(x):
     """x: (B, n_head, T, head_dim)  ->  (B, T, n_head * head_dim)
@@ -473,6 +502,14 @@ Write `my_linear(x, W, b)` so that the result is exactly what `nn.Linear` gives:
 - return `(..., out)`
 
 Use `@`; do not call `nn.Linear` or `F.linear`.
+--- above
+# Where the input comes from: an nn.Linear in a model that turns each token's 4-dim vector into 2 dims
+layer = nn.Linear(4, 2)        # layer.weight is (2, 4), layer.bias is (2,)
+hidden = torch.randn(3, 5, 4)  # 3 sentences, 5 tokens each, each token a 4-dim vector
+--- below
+out = my_linear(hidden, layer.weight, layer.bias)
+print("input:", tuple(hidden.shape), " output:", tuple(out.shape))
+print("same result as nn.Linear:", torch.allclose(out, layer(hidden)))
 --- starter
 def my_linear(x, W, b):
     """x: (..., in)   W: (out, in)   b: (out,)   ->  (..., out)"""
@@ -506,6 +543,15 @@ Write `my_softmax(x, dim=-1)`: softmax along `dim`; the output has the same shap
 - Do not use `F.softmax`, `torch.softmax`, `x.softmax` or any `log_softmax`. Calling them makes the check fail
 - It must be numerically stable: the input `[[1000., 1001., 1002.]]` must give the right answer, with no inf or nan
 - Really use the `dim` argument: the check also tests `dim=1`
+--- above
+# Where the input comes from: a classifier's 3 scores (logits) for each of 2 samples, not probabilities yet
+logits = torch.tensor([[2.0, 1.0, 0.1],
+                       [100.0, 101.0, 103.0]])   # sample 2 has big scores: a plain exp overflows to inf
+--- below
+probs = my_softmax(logits)
+print("sample 1 probabilities:", [round(p, 3) for p in probs[0].tolist()])
+print("sample 2 probabilities:", [round(p, 3) for p in probs[1].tolist()])
+print("each row adds up to:", [round(s, 3) for s in probs.sum(dim=-1).tolist()])
 --- starter
 def my_softmax(x, dim=-1):
     """softmax along dim. Subtract the max first, or large numbers overflow."""
@@ -550,6 +596,16 @@ Write `my_cross_entropy(logits, target)` so that it gives the same result as `F.
 - it must be numerically stable: do not write `softmax(...).log()`
 
 The check tests two more things: with all logits 0 (a uniform guess) the loss must be exactly `ln V`; with logits `[[0., 200.]]` and class 0 correct, the loss must be 200, not inf.
+--- above
+# Where the input comes from: a classifier's scores (logits) for 3 samples and 4 classes, and the right classes
+logits = torch.tensor([[2.0, 0.5, -1.0, 0.0],
+                       [0.1, 0.2, 3.0, -0.5],
+                       [1.0, 1.0, 1.0, 1.0]])   # sample 3 has 4 equal scores: a completely even guess
+labels = torch.tensor([0, 2, 3])                # the index of each sample's right class, int64
+--- below
+loss = my_cross_entropy(logits, labels)
+print("your loss:", round(loss.item(), 4))
+print("F.cross_entropy:", round(F.cross_entropy(logits, labels).item(), 4))
 --- starter
 def my_cross_entropy(logits, target):
     """logits: (N, V), not normalised; target: (N,) int64 class indices.
@@ -601,6 +657,14 @@ Write `seq_loss(logits, targets)`:
 - return a scalar: the mean cross-entropy over all `B*T` positions
 
 You may use `F.cross_entropy` here. But it wants the classes in dim 1: input `(N, V)` with labels `(N,)`. Passing `(B, T, V)` directly raises an error.
+--- above
+# Where the input comes from: a freshly initialised language model predicts the next token (5-word vocab)
+logits = torch.randn(2, 3, 5) * 0.1                  # (B, T, V): 2 sentences, 3 positions, 5 scores each, all near 0
+next_tokens = torch.tensor([[1, 4, 2], [0, 3, 3]])   # (2, 3): the real next token at each position, int64
+--- below
+loss = seq_loss(logits, next_tokens)
+print("loss:", round(loss.item(), 4), " shape:", tuple(loss.shape))
+print("an even guess over 5 words gives ln 5 =", round(math.log(5), 4))
 --- starter
 def seq_loss(logits, targets):
     """logits: (B, T, V)   targets: (B, T) int64  ->  scalar loss"""
@@ -640,6 +704,16 @@ Write two functions. Both normalise along the last dim, each vector on its own. 
 - `my_rmsnorm(x, g, eps=1e-6)`: no mean subtraction and no b: `x / sqrt(mean(x²) + eps) * g`
 
 Build them from basic operations (mean, var, sqrt); do not call `F.layer_norm` or `F.rms_norm`. The check also tests that with g all ones, every vector has a mean square close to 1 after RMSNorm, and it compares your RMSNorm with the formula above, element by element, for a random g.
+--- above
+# Where the input comes from: in a Transformer block, each token's vector is normalised before attention
+hidden = torch.tensor([[1.0, 2.0, 3.0, 6.0],
+                       [2.0, 4.0, 6.0, 12.0]])   # 2 tokens, 4 dims each; the second is exactly twice the first
+gain, bias = torch.ones(4), torch.zeros(4)       # the g and b of the functions: freshly initialised, all 1 and all 0
+--- below
+ln = my_layernorm(hidden, gain, bias)
+rms = my_rmsnorm(hidden, gain)
+print("LayerNorm:", [[round(v, 2) for v in row] for row in ln.tolist()])
+print("RMSNorm:  ", [[round(v, 2) for v in row] for row in rms.tolist()])
 --- starter
 def my_layernorm(x, g, b, eps=1e-5):
     """Normalise over the last dim. g and b both have shape (C,)."""
@@ -692,6 +766,14 @@ Write two functions that compute the same attention scores:
 - `attn_scores_einsum(q, k)`: must use `torch.einsum` (the check looks for an einsum call in the function)
 
 Both functions must give exactly the same result.
+--- above
+# Where the input comes from: q and k after the heads are split (the output of split_heads)
+q = torch.randn(1, 2, 3, 4)   # (B, n_head, T, hs): 1 sentence, 2 heads, 3 tokens, 4 dims per head
+k = torch.randn(1, 2, 3, 4)
+--- below
+s1, s2 = attn_scores_matmul(q, k), attn_scores_einsum(q, k)
+print("scores:", tuple(s1.shape), " both ways agree:", torch.allclose(s1, s2))
+print("head 0, scores of query 0 against the 3 keys:", [round(v, 3) for v in s1[0, 0, 0].tolist()])
 --- starter
 def attn_scores_matmul(q, k):
     """q, k: (B, nh, T, hs) -> (B, nh, T, T), using @. Do not forget to divide by sqrt(hs)"""
@@ -741,6 +823,15 @@ Write `masked_mean(x, mask)`:
 Example: a sample whose mask is `[1, 1, 0]` gets the average of its first two vectors.
 
 No for loops. You may assume every sample has at least one real token.
+--- above
+# Where the input comes from: a batch of 2 sentences, the shorter one padded on the right
+vecs = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]],    # (2, 4, 2): a 2-dim vector per token
+                     [[2.0, 2.0], [4.0, 0.0], [9.0, 9.0], [9.0, 9.0]]])   # the 9.0 at pad positions is meaningless
+attention_mask = torch.tensor([[1, 1, 1, 1],
+                               [1, 1, 0, 0]])   # 1 is a real token, 0 is pad: sentence 2 has only 2 real tokens
+--- below
+print("mean without the pad:", masked_mean(vecs, attention_mask).tolist())
+print("mean including the pad:", vecs.mean(dim=1).tolist())
 --- starter
 def masked_mean(x, mask):
     """x: (B, T, C)   mask: (B, T), 0/1, 1 means valid
@@ -780,6 +871,15 @@ Write `pick_target_logits(logits, targets)`:
 - return `(B, T)`: `out[b, t] = logits[b, t, targets[b, t]]`
 
 Use `torch.gather`, not a loop.
+--- above
+# Where the input comes from: a language model's logits (B, T, V), and the real next token at each position
+logits = torch.tensor([[[0.5, 2.0, -1.0, 0.0], [1.5, 0.0, 0.5, -0.5]],
+                       [[0.0, 0.0, 3.0, 1.0], [-1.0, 0.25, 0.0, 2.5]]])   # 2 sentences, 2 positions each, 4-word vocab
+next_tokens = torch.tensor([[1, 0],
+                            [3, 1]])   # (2, 2): the index of the right answer at each position
+--- below
+picked = pick_target_logits(logits, next_tokens)
+print("shape:", tuple(picked.shape), " picked logits:", picked.tolist())
 --- starter
 def pick_target_logits(logits, targets):
     """logits: (B, T, V)   targets: (B, T)  ->  (B, T)
@@ -820,6 +920,16 @@ Write an `nn.Module` subclass `Scaler(dim)`:
 - `forward(x)`: `x` is `(N, dim)`. First update `running_max` to the element-wise larger of itself and "the max of x along dim 0"; this update must stay out of the computation graph. Then return `x * weight`
 
 The check tests: `state_dict()` holds exactly `weight` and `running_max`; `named_parameters()` has only `weight`; the buffer does not require gradients; and running_max has the right value after one forward.
+--- above
+# Where the input comes from: the output of a middle layer of a model, a batch of 3 samples with 4 dims each
+acts = torch.tensor([[1.0, -2.0, 0.5, 3.0],
+                     [0.0, 4.0, -1.0, 1.0],
+                     [2.0, 1.0, -3.0, -1.0]])
+--- below
+m = Scaler(4)
+m(acts)
+print("learnable parameters:", [name for name, _ in m.named_parameters()], " state_dict:", list(m.state_dict()))
+print("running_max after one batch:", m.running_max.tolist())
 --- starter
 class Scaler(nn.Module):
     def __init__(self, dim):
@@ -872,6 +982,15 @@ backward computes derivatives for you, but you need to be able to derive simple 
 Write `manual_grad_mse(x, target)`: compute `d loss / d x` from the formula and return it, with the same shape as `x`. Do not call `backward` or `torch.autograd`.
 
 The check first gets the true gradient with autograd, then compares your formula with it.
+--- above
+# Where the input comes from: 4 predictions of a regression model and the true values; the loss is MSE
+pred = torch.tensor([2.0, 0.5, -1.0, 3.0])
+truth = torch.tensor([1.0, 0.5, 1.0, 1.0])
+--- below
+p = pred.clone().requires_grad_(True)   # let autograd compute it too, to compare
+((p - truth) ** 2).mean().backward()
+print("by hand: ", manual_grad_mse(pred, truth).tolist())
+print("autograd:", p.grad.tolist())
 --- starter
 def manual_grad_mse(x, target):
     """loss = mean((x - target)^2); return the formula for d loss / d x (no backward)."""
@@ -916,6 +1035,14 @@ x    = [[1, 2, 3], [4, 99, 99], [5, 6, 99]]
 mask = [[1, 1, 1], [1, 0, 0],   [1, 1, 0]]
 ```
 A for loop is fine here.
+--- above
+# Where the input comes from: the tokenizer turned 3 sentences into token ids of different lengths
+token_ids = [torch.tensor([12, 7, 3, 9]), torch.tensor([5, 2]), torch.tensor([8])]
+--- below
+x, mask = collate(token_ids, pad_id=0)
+print("x:   ", x.tolist())
+print("mask:", mask.tolist())
+print("dtype:", x.dtype)
 --- starter
 def collate(samples, pad_id=0):
     """samples: list of 1D LongTensors of different lengths.
@@ -962,6 +1089,15 @@ This training loop has **4 mistakes**. Fix all of them so that the loss really g
 - the check runs 200 steps and wants the last loss to be more than 10% below the first
 
 Some mistakes raise an error; others raise nothing and just give a wrong result. Run it once and start from the error.
+--- above
+# Where the input comes from: a small 3-class model and 32 training rows (4 features each)
+clf = nn.Linear(4, 3)
+features = torch.randn(32, 4)
+labels = torch.randint(0, 3, (32,))   # the right class of each row, int64
+--- below
+losses = train_one_epoch(clf, features, labels)
+print("losses holds:", type(losses[0]).__name__)
+print("loss at step 1:", round(losses[0], 4), " at the last step:", round(losses[-1], 4))
 --- starter
 def train_one_epoch(model, xs, ys, lr=0.1, steps=200):
     opt = torch.optim.SGD(model.parameters, lr=lr)
@@ -1116,6 +1252,15 @@ Without notes, write `split_heads(qkv, n_head)`:
 - input `qkv`: `(B, T, 3*C)`; along the last dim come q, then k, then v, C columns each
 - return `q, k, v`, each `(B, n_head, T, C // n_head)`
 - each head gets one contiguous slice of the C dims
+--- above
+# Where the input comes from: in attention, one Linear (c_attn) computes q, k and v at once: qkv
+n_head = 2                     # 2 heads
+x = torch.randn(1, 4, 8)       # (B, T, C): 1 sentence, 4 tokens, each token an 8-dim vector
+qkv = nn.Linear(8, 3 * 8)(x)   # (1, 4, 24): along the last dim come q, k, v, 8 dims each
+--- below
+q, k, v = split_heads(qkv, n_head)
+print("q:", tuple(q.shape), " k:", tuple(k.shape), " v:", tuple(v.shape))
+print("head 0 of q equals the first 4 columns of qkv:", torch.equal(q[0, 0], qkv[0, :, :4]))
 --- starter
 def split_heads(qkv, n_head):
     raise todo()
@@ -1158,6 +1303,16 @@ Without notes, write `my_cross_entropy(logits, target)`, giving the same result 
 - `logits`: `(N, V)`; `target`: `(N,)`, int64
 - return a scalar: the average over samples of `-log p(correct class)`
 - do not use `F.cross_entropy` or `F.nll_loss`; keep it numerically stable (no inf, even for widely spread logits)
+--- above
+# Where the input comes from: a language model's scores (logits) for 5 words at 3 positions, and the next words
+logits = torch.tensor([[4.0, 0.0, 1.0, 0.0, -1.0],
+                       [0.0, 0.0, 0.0, 0.0, 0.0],
+                       [0.5, 3.0, 0.0, 0.0, 2.0]])   # row 2 is all zeros: a completely even guess
+next_word = torch.tensor([0, 2, 4])                   # the index of the right answer at each position, int64
+--- below
+loss = my_cross_entropy(logits, next_word)
+print("your loss:", round(loss.item(), 4))
+print("F.cross_entropy:", round(F.cross_entropy(logits, next_word).item(), 4))
 --- starter
 def my_cross_entropy(logits, target):
     raise todo()

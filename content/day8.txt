@@ -330,6 +330,14 @@ ref: day8
 - `"alphas_cumprod"`：alphas 的累积乘积（alpha_bar）。第 i 个 = alphas[0] × alphas[1] × … × alphas[i]
 
 每个都用一行 torch 函数算出来，不需要写 for 循环。
+--- above
+# 上文：训练脚本一开头就定好一共加噪几步，beta 从多少涨到多少
+# 这里故意只用 6 步，打印出来能手算核对（真实训练常用 1000 步，beta 从 0.0001 到 0.02）
+num_steps, first_beta, last_beta = 6, 0.05, 0.3
+--- below
+sched = linear_schedule(num_steps, first_beta, last_beta)
+for name in ("betas", "alphas", "alphas_cumprod"):
+    print(f"{name}:", [round(v, 3) for v in sched[name].tolist()])
 --- starter
 def linear_schedule(T, beta_start=1e-4, beta_end=0.02):
     """返回 {"betas": (T,), "alphas": (T,), "alphas_cumprod": (T,)}"""
@@ -376,6 +384,16 @@ linear 调度的信号掉得太早，后半段很多训练步在「从纯噪声�
 5. `alphas = 1 - betas`
 
 `"alphas_cumprod"` 直接用第 3 步算出来的结果。`linear_schedule` 已经提供（检查会拿它来对比）。
+--- above
+# 上文：要在 32×32 的小图上训练，想把 linear 调度换成 cosine，先对比一下
+num_steps = 1000
+check_steps = [0, 200, 400, 600, 800, 999]   # 挑几个时间步，看各自还剩多少信号
+lin = linear_schedule(num_steps)             # 参考实现：第 1 题的 linear 调度
+--- below
+sched = cosine_schedule(num_steps)
+print("linear alpha_bar:", [round(lin["alphas_cumprod"][i].item(), 3) for i in check_steps])
+print("cosine alpha_bar:", [round(sched["alphas_cumprod"][i].item(), 3) for i in check_steps])
+print("cosine 最后一个 beta:", round(sched["betas"][-1].item(), 3))
 --- starter
 def cosine_schedule(T, s=0.008):
     """返回 {"betas": (T,), "alphas": (T,), "alphas_cumprod": (T,)}，alphas_cumprod 按 cosine 曲线算"""
@@ -427,6 +445,16 @@ ref: day8
 例子：arr = [0, 1, …, 9]，t = [3, 7]，x_shape = (2, 3, 4, 4) → 返回形状 (2, 1, 1, 1)，值是 3 和 7；x_shape = (2, 5) → 返回 (2, 1)。
 
 先把 arr 搬到 t 所在的设备上：`arr.to(t.device)`。
+--- above
+# 上文：训练时 batch 里每张图抽到自己的 t，要按 t 去系数表里取数
+alphas_cumprod = torch.tensor([0.99, 0.9, 0.7, 0.4, 0.1])   # 一张很短的系数表（T = 5）
+timesteps = torch.tensor([4, 0, 2])                         # 3 张图各自的 t
+images = torch.randn(3, 1, 8, 8)                            # 3 张 8×8 的灰度图：(B, C, H, W)
+--- below
+coef = extract(alphas_cumprod, timesteps, images.shape)
+print("取出的系数:", [round(v, 2) for v in coef.flatten().tolist()], " 形状:", tuple(coef.shape))
+print("乘上 images 之后:", tuple((coef * images).shape))
+print("x 的形状是 (3, 16) 时:", tuple(extract(alphas_cumprod, timesteps, (3, 16)).shape))
 --- starter
 def extract(arr, t, x_shape):
     """arr (T,), t (B,) -> (B, 1, 1, ...)，能和形状为 x_shape 的张量广播"""
@@ -473,6 +501,17 @@ x_t = sqrt(alpha_bar_t) * x0 + sqrt(1 - alpha_bar_t) * noise
 - 返回形状和 x0 一样
 
 第二个检查会先用 2 万个样本逐步加噪 61 步，再拿你的 q_sample 一步跳过去，比较两边的均值和标准差。
+--- above
+# 上文：训练时拿一批干净的图，每张图随机抽一个 t，再采一份同形状的噪声
+schedule = linear_schedule(1000)             # 参考实现：第 1 题的调度表
+images = torch.ones(3, 1, 32, 32)            # 3 张 32×32 的灰度图，像素全是 1.0，方便看
+timesteps = torch.tensor([10, 400, 900])     # 每张图自己的 t
+eps = torch.randn_like(images)               # 标准高斯噪声
+--- below
+noisy = q_sample(images, timesteps, eps, schedule)
+print("形状:", tuple(noisy.shape))
+print("每张图的均值:", [round(v, 2) for v in noisy.mean(dim=(1, 2, 3)).tolist()])
+print("每张图的标准差:", [round(v, 2) for v in noisy.std(dim=(1, 2, 3)).tolist()])
 --- starter
 def q_sample(x0, t, noise, sched):
     """x0, noise: (B, C, H, W)；t: (B,)  ->  x_t，形状和 x0 一样"""
@@ -550,6 +589,14 @@ UNet 必须知道输入里有多少噪声，才知道该去掉多少。t 是一�
 4. 返回 `cat([cos(args), sin(args)], dim=-1)`，**先 cos 后 sin**
 
 `torch.arange` 要写 `device=t.device`。在 CPU 上不写也能过检查，但模型一搬到 GPU 就会报「Expected all tensors to be on the same device」。
+--- above
+# 上文：一个 batch 里每张图抽到的 t，UNet 要先把这些整数变成向量
+timesteps = torch.tensor([0, 250, 999])      # 3 张图各自的 t
+--- below
+emb = timestep_embedding(timesteps, 8)
+print("形状:", tuple(emb.shape))
+for t_val, row in zip(timesteps.tolist(), emb.tolist()):
+    print(f"t={t_val}:", [round(v, 2) for v in row])
 --- starter
 def timestep_embedding(t, dim, max_period=10000):
     """t: (B,) 整数时间步  ->  (B, dim)，前一半 cos，后一半 sin"""
@@ -598,6 +645,15 @@ UNet 里每个 ResBlock 都要知道当前的 t。FiLM 是最常见的注入方�
   3. 返回 `h * (1 + scale) + shift`
 
 检查会把 Linear 的权重和 bias 全部清零，这时输出必须正好等于 h。
+--- above
+# 上文：UNet 某一层卷积算出的特征 h，和这批图的时间向量 emb
+features = torch.randn(2, 16, 8, 8)                       # 2 张图，16 个通道，8×8
+t_emb = timestep_embedding(torch.tensor([10, 900]), 32)   # (2, 32)，参考实现：第 5 题的时间嵌入
+--- below
+film = FiLM(32, 16)
+out = film(features, t_emb)
+print("h:", tuple(features.shape), " emb:", tuple(t_emb.shape), " 输出:", tuple(out.shape))
+print("FiLM 的参数个数:", sum(p.numel() for p in film.parameters()))
 --- starter
 class FiLM(nn.Module):
     """emb (B, t_dim) -> 每个通道的 scale、shift；输出 h * (1 + scale) + shift"""
@@ -656,6 +712,15 @@ return h + skip(x)
 - `skip`：in_ch ≠ out_ch 时是 `nn.Conv2d(in_ch, out_ch, 1)`，否则是 `nn.Identity()`
 - x 是 `(B, in_ch, H, W)`，emb 是 `(B, t_dim)`，输出 `(B, out_ch, H, W)`
 - `FiLM` 已经提供（参考版本）
+--- above
+# 上文：MiniUNet 编码器里，下采样之后的特征，和这批图的时间向量
+features = torch.randn(2, 32, 16, 16)        # 2 张图，32 个通道，16×16
+t_emb = torch.randn(2, 128)                  # 时间向量，t_dim = 128
+--- below
+for channels in (32, 64):
+    block = ResBlock(32, channels, 128)
+    n_params = sum(p.numel() for p in block.parameters())
+    print(f"ResBlock(32, {channels}, 128) 输出:", tuple(block(features, t_emb).shape), " 参数个数:", n_params)
 --- starter
 class ResBlock(nn.Module):
     """x (B, in_ch, H, W), emb (B, t_dim) -> (B, out_ch, H, W)"""
@@ -714,6 +779,15 @@ UNet 的 U 形靠 skip 连接：编码器的特征原样送到解码器，和上
 - 返回沿通道维拼接的结果 `(B, C1+C2, H, W)`，up_feat 在前，skip_feat 在后
 
 如果 H' 或 W' 比 skip 小（奇数尺寸下采样再上采样后常常差 1），先在 up_feat 的右边和下边补 0，补到和 skip_feat 一样大，再拼接。
+--- above
+# 上文：UNet 解码器里，上采样回来的特征要和编码器存下的特征拼在一起
+enc_feat = torch.randn(1, 32, 15, 15)        # 编码器存下的特征：32 个通道，15×15（奇数）
+dec_feat = torch.randn(1, 64, 7, 7)          # 解码器这一层的特征：64 个通道，7×7
+upsampled = nn.Upsample(scale_factor=2, mode="nearest")(dec_feat)   # 上采样到 14×14，比 15 少 1
+--- below
+merged = unet_skip_concat(upsampled, enc_feat)
+print("上采样后:", tuple(upsampled.shape), " skip:", tuple(enc_feat.shape))
+print("拼接后:", tuple(merged.shape))
 --- starter
 def unet_skip_concat(up_feat, skip_feat):
     """(B, C1, H', W') + (B, C2, H, W) -> (B, C1+C2, H, W)"""
@@ -771,6 +845,15 @@ out   : GroupNorm(8, 32) -> SiLU -> Conv2d(32, in_ch, 3, 1, 1)
 - `timestep_embedding`、`ResBlock`、`unet_skip_concat` 已经提供（参考版本）
 
 检查：输出形状和 x 一样；换一个 t，输出必须跟着变（证明时间条件接上了）。
+--- above
+# 上文：训练时把一批带噪的图和各自的 t 一起喂给 UNet，让它猜加进去的噪声
+noisy = torch.randn(2, 3, 32, 32)            # 2 张 32×32 的 RGB 带噪图，所以 in_ch = 3
+timesteps = torch.tensor([50, 800])
+--- below
+model = MiniUNet(in_ch=3)
+eps_pred = model(noisy, timesteps)
+print("输入:", tuple(noisy.shape), " 预测的噪声:", tuple(eps_pred.shape))
+print("参数个数:", sum(p.numel() for p in model.parameters()))
 --- starter
 class MiniUNet(nn.Module):
     """forward(x, t): x (B, in_ch, 32, 32), t (B,) -> 和 x 同形状（预测的噪声）。结构见题目。"""
@@ -843,6 +926,17 @@ DDPM 训练循环里真正的「算法」就这几行。把目标写成 x0 而�
 4. 返回 `model(x_t, t)` 和 `noise` 的 MSE —— 目标是噪声，不是 x0
 
 检查里有一个永远输出 0 的模型：它的 loss 应该约等于噪声的方差，也就是 1。
+--- above
+# 上文：训练循环的每一步，从数据集拿一批干净的图来算 loss
+num_steps = 1000
+schedule = linear_schedule(num_steps)        # 参考实现：第 1 题的调度表
+unet = MiniUNet(in_ch=1)                     # 参考实现：第 9 题的 UNet，还没训练过
+zero_model = lambda x, t: torch.zeros_like(x)   # 永远输出 0 的「模型」，当基准线
+images = torch.rand(8, 1, 32, 32) * 2 - 1    # 8 张 32×32 的灰度图，像素缩放到 [-1, 1]
+--- below
+loss = ddpm_loss(unet, images, schedule, num_steps)
+print("没训练过的 UNet：loss =", round(loss.item(), 1), " 形状:", tuple(loss.shape))
+print("永远输出 0 的模型：loss =", round(ddpm_loss(zero_model, images, schedule, num_steps).item(), 1))
 --- starter
 def ddpm_loss(model, x0, sched, T):
     """返回标量 loss：mse(model(x_t, t), noise)"""
@@ -897,6 +991,18 @@ x_0     = mean                            # t == 0：最后一步不加噪声
 - `t`：`(B,)`，每个样本可以不一样。所以「加不加噪声」要按样本决定（一个 `(B, 1, 1, 1)` 的 0/1 开关），不要对整个 batch 写一个 Python `if`
 - `noise` 是 None 时，自己用 `torch.randn_like(x_t)` 采
 - beta_t、alpha_t、alpha_bar_t 分别从 `sched["betas"]`、`sched["alphas"]`、`sched["alphas_cumprod"]` 用 `extract` 取
+--- above
+# 上文：采样循环里的一步：手上有带噪的图 x_t，UNet 刚给出预测的噪声
+schedule = linear_schedule(1000)                          # 参考实现：第 1 题的调度表
+clean = torch.ones(2, 1, 8, 8)                            # 假装知道原图（像素全是 1.0），方便对照
+true_eps = torch.randn_like(clean)
+timesteps = torch.tensor([0, 10])                         # 第 0 张图在最后一步，第 1 张还差 10 步
+noisy = q_sample(clean, timesteps, true_eps, schedule)    # 参考实现：第 4 题的加噪
+--- below
+prev = p_sample_step(noisy, timesteps, true_eps, schedule)   # 假设 UNet 猜得完全准
+print("形状:", tuple(prev.shape))
+gap = (prev - clean).abs().mean(dim=(1, 2, 3))                # 每张图和原图平均差多少
+print("和原图的平均差距:", [round(v, 3) for v in gap.tolist()])
 --- starter
 def p_sample_step(x_t, t, eps_pred, sched, noise=None):
     """DDPM 反向一步：x_t -> x_{t-1}。t: (B,)；t == 0 的样本不加噪声"""
@@ -968,6 +1074,14 @@ SNR(t) = alpha_bar_t / (1 - alpha_bar_t)
 - `sched`：第 1 题的 dict，alpha_bar 是 `sched["alphas_cumprod"]`
 - `t`：`(B,)` 的时间步
 - 返回 `(B,)`（这里不需要 reshape 成 `(B, 1, 1, 1)`）
+--- above
+# 上文：比较两种调度时，看同一个 t 上它们各自的 SNR
+timesteps = torch.tensor([100, 500, 900])
+linear = linear_schedule(1000)               # 参考实现：第 1 题
+cosine = cosine_schedule(1000)               # 参考实现：第 2 题
+--- below
+print("linear 的 SNR:", [round(v, 4) for v in snr(linear, timesteps).tolist()])
+print("cosine 的 SNR:", [round(v, 4) for v in snr(cosine, timesteps).tolist()])
 --- starter
 def snr(sched, t):
     """t: (B,) -> (B,)"""
@@ -1000,6 +1114,16 @@ ref: day8
 这段代码能跑、不报错、shape 也对，只是模型永远训不好。这种 bug 只能靠「和参考实现对拍」抓出来。
 --- prompt
 下面这个加噪函数有 **2 处**错。改好它，让它的输出和正确的 `q_sample` 完全一样（检查会在 t = 0、300、999 三处对比）。函数名不要改。
+--- above
+# 上文：训练之前，先拿一批图试一下这个加噪函数
+schedule = linear_schedule(1000)             # 参考实现：第 1 题的调度表
+images = torch.ones(3, 1, 32, 32)            # 3 张 32×32 的灰度图，像素全是 1.0
+timesteps = torch.tensor([50, 500, 950])
+eps = torch.randn_like(images)               # 标准高斯噪声
+--- below
+noisy = q_sample_buggy(images, timesteps, eps, schedule)
+print("每张图的均值:", [round(v, 2) for v in noisy.mean(dim=(1, 2, 3)).tolist()])
+print("每张图的标准差:", [round(v, 2) for v in noisy.std(dim=(1, 2, 3)).tolist()])
 --- starter
 def q_sample_buggy(x0, t, noise, sched):
     a = extract(sched["alphas"], t, x0.shape)
@@ -1124,6 +1248,17 @@ ref: day8
 - `x0`、`noise`：`(B, C, H, W)`；`t`：`(B,)`，每个样本的 t 可以不同
 - `sched`：`linear_schedule` 返回的 dict，有 `"betas"`、`"alphas"`、`"alphas_cumprod"`
 - `extract` 可以直接用
+--- above
+# 上文：训练循环里，一批 RGB 图各自抽到了 t，要一步加噪到第 t 步
+schedule = linear_schedule(1000)             # 参考实现：第 1 题的调度表
+images = torch.full((2, 3, 16, 16), 2.0)     # 2 张 16×16 的 RGB 图，像素全是 2.0
+timesteps = torch.tensor([100, 700])
+eps = torch.randn_like(images)               # 标准高斯噪声
+--- below
+noisy = q_sample(images, timesteps, eps, schedule)
+print("形状:", tuple(noisy.shape))
+print("每张图的均值:", [round(v, 2) for v in noisy.mean(dim=(1, 2, 3)).tolist()])
+print("每张图的标准差:", [round(v, 2) for v in noisy.std(dim=(1, 2, 3)).tolist()])
 --- starter
 def q_sample(x0, t, noise, sched):
     raise todo()
@@ -1198,6 +1333,17 @@ ref: day8
 - `t`：`(B,)`，每个样本可以不同。t > 0 的样本加上 sqrt(beta_t) 倍的噪声，t = 0 的样本不加
 - `noise` 是 None 时自己采
 - `sched` 有 `"betas"`、`"alphas"`、`"alphas_cumprod"`；`extract` 可以直接用
+--- above
+# 上文：采样快结束时，batch 里的几张图走到了不同的步
+schedule = linear_schedule(1000)                          # 参考实现：第 1 题的调度表
+clean = torch.full((3, 1, 8, 8), -0.5)                    # 假装知道原图，方便对照
+true_eps = torch.randn_like(clean)
+timesteps = torch.tensor([50, 1, 0])
+noisy = q_sample(clean, timesteps, true_eps, schedule)    # 参考实现：加噪到各自的 t
+--- below
+prev = p_sample_step(noisy, timesteps, true_eps, schedule)   # 假设 UNet 猜得完全准
+gap = (prev - clean).abs().mean(dim=(1, 2, 3))                # 每张图和原图平均差多少
+print("和原图的平均差距:", [round(v, 3) for v in gap.tolist()])
 --- starter
 def p_sample_step(x_t, t, eps_pred, sched, noise=None):
     raise todo()
